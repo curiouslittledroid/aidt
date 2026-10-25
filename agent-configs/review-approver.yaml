@@ -1,0 +1,13 @@
+id: review-approver
+description: Applies the human approval decision to published review follow-up issues.
+provider: openrouter
+model: openrouter/openai/gpt-5.6-luna
+thinking: low
+agents_md: agents/review-approver/AGENTS.md
+tools:
+  - bash
+prompt_templates:
+  - prompts
+session: fresh
+timeout_seconds: 900
+output: json

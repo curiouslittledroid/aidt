@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Direct AIDW entry point.
+
+Prefer ``uv run aidw ...`` from inside ``aidt/``. This shim exists for convenience:
+if AIDT's managed virtual environment (``aidt/.venv``) exists, it re-executes itself
+with that interpreter so the toolkit's dependencies are available without activating
+anything. Otherwise it runs on the current interpreter, which must already have the
+dependencies importable.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_AIDT_ROOT = os.path.dirname(_HERE)
+_VENV_DIR = os.path.join(_AIDT_ROOT, ".venv")
+_VENV_PYTHON = os.path.join(_VENV_DIR, "bin", "python")
+
+
+def _reexec_into_venv() -> None:
+    # ``.venv/bin/python`` is a symlink to the system interpreter, so comparing
+    # executables with realpath would falsely match. Compare the active prefix.
+    if os.path.realpath(sys.prefix) == os.path.realpath(_VENV_DIR):
+        return
+    if not os.path.exists(_VENV_PYTHON):
+        return
+    os.execv(_VENV_PYTHON, [_VENV_PYTHON, os.path.abspath(__file__), *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    _reexec_into_venv()
+
+    package_parent = os.path.dirname(_HERE)
+    if package_parent not in sys.path:
+        sys.path.insert(0, package_parent)
+
+    from aidw.cli import main  # noqa: E402
+
+    main()

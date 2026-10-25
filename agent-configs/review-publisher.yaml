@@ -1,0 +1,13 @@
+id: review-publisher
+description: Publishes completed review findings as a GitHub follow-up issue hierarchy via the bundled scripts.
+provider: openrouter
+model: openrouter/deepseek/deepseek-v4.1-flash
+thinking: low
+agents_md: agents/review-publisher/AGENTS.md
+tools:
+  - bash
+prompt_templates:
+  - prompts
+session: fresh
+timeout_seconds: 1200
+output: json

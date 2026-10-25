@@ -1,0 +1,16 @@
+id: task-author
+description: Authors an agent-ready task prompt from one roadmap task.
+provider: deepseek
+model: deepseek-v4-pro
+thinking: high
+agents_md: agents/task-author/AGENTS.md
+tools:
+  - read
+  - bash
+  - write
+  - edit
+prompt_templates:
+  - prompts
+session: fresh
+timeout_seconds: 1800
+output: json

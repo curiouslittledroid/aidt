@@ -1,0 +1,321 @@
+"""Tests for Pi JSON event parsing (no subprocess)."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from aidw.pi import (
+    PiResult,
+    Usage,
+    _invoke,
+    is_transient,
+    parse_events,
+    parse_json_lines,
+    write_meta,
+)
+
+
+def _events() -> list[dict]:
+    return [
+        {"type": "session", "version": 3, "id": "sess-1", "cwd": "/repo"},
+        {"type": "tool_execution_end", "toolName": "read", "isError": False},
+        {"type": "tool_execution_end", "toolName": "bash", "isError": True},
+        {"type": "message_end", "message": {"role": "assistant", "content": []}},
+        {
+            "type": "agent_end",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "hmm"},
+                        {"type": "text", "text": "FINAL ANSWER"},
+                    ],
+                    "usage": {
+                        "input": 10,
+                        "output": 2,
+                        "cacheRead": 1,
+                        "totalTokens": 13,
+                        "cost": {"total": 0.25},
+                    },
+                    "stopReason": "stop",
+                },
+            ],
+        },
+    ]
+
+
+def test_parse_events_extracts_final_message_and_usage() -> None:
+    parsed = parse_events(_events())
+    assert parsed.session_id == "sess-1"
+    assert parsed.final_message == "FINAL ANSWER"
+    assert parsed.usage.input_tokens == 10
+    assert parsed.usage.cost_usd == 0.25
+    assert parsed.usage.total_tokens == 13
+    assert parsed.stop_reason == "stop"
+    assert parsed.tool_calls == 2
+    assert parsed.tool_errors == 1
+    assert parsed.event_count == 5
+
+
+def test_parse_events_empty() -> None:
+    parsed = parse_events([])
+    assert parsed.final_message == ""
+    assert parsed.session_id is None
+
+
+def _usage(input_tokens: int, output_tokens: int, cache_read: int, cost: float) -> dict:
+    return {
+        "input": input_tokens,
+        "output": output_tokens,
+        "cacheRead": cache_read,
+        "cacheWrite": 0,
+        "reasoning": 0,
+        "totalTokens": input_tokens + output_tokens + cache_read,
+        "cost": {"total": cost},
+    }
+
+
+def test_parse_events_sums_usage_across_turns() -> None:
+    """Pi reports usage per assistant message; a stage's total is their sum."""
+    events = [
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "first"}],
+                "usage": _usage(100, 10, 20, 0.001),
+            },
+        },
+        {
+            "type": "turn_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "first"}],
+                "usage": _usage(100, 10, 20, 0.001),
+            },
+        },
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "last"}],
+                "usage": _usage(200, 20, 40, 0.002),
+                "stopReason": "stop",
+            },
+        },
+        {
+            "type": "turn_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "last"}],
+                "usage": _usage(200, 20, 40, 0.002),
+                "stopReason": "stop",
+            },
+        },
+        {
+            "type": "agent_end",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "last"}],
+                    "usage": _usage(200, 20, 40, 0.002),
+                    "stopReason": "stop",
+                }
+            ],
+        },
+    ]
+    parsed = parse_events(events)
+    assert parsed.final_message == "last"
+    assert parsed.usage.input_tokens == 300
+    assert parsed.usage.output_tokens == 30
+    assert parsed.usage.cache_read == 60
+    assert parsed.usage.total_tokens == 390
+    assert parsed.usage.cost_usd == pytest.approx(0.003)
+
+
+def test_parse_events_falls_back_to_agent_end_usage() -> None:
+    """Older/odd streams may carry usage only on the final agent message."""
+    parsed = parse_events(_events())
+    assert parsed.usage.input_tokens == 10
+    assert parsed.usage.cost_usd == 0.25
+
+
+def test_parse_json_lines_ignores_malformed() -> None:
+    lines = ["not json", '{"type":"session","id":"s"}', "", '{"broken":']
+    parsed = parse_json_lines(lines)
+    assert parsed.session_id == "s"
+
+
+def test_parse_json_lines_uses_last_assistant() -> None:
+    lines = [
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"first"}]}}',
+        '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"second"}]}}',
+    ]
+    assert parse_json_lines(lines).final_message == "second"
+
+
+def test_is_transient() -> None:
+    assert is_transient("Error: socket hang up", 1)
+    assert is_transient("HTTP 503 Service Unavailable", 1)
+    assert not is_transient("invalid API key", 1)
+    assert not is_transient("anything", 0)
+
+
+def test_parse_events_captures_provider_error() -> None:
+    events = [
+        {"type": "session", "id": "s"},
+        {
+            "type": "turn_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": "402: insufficient credits",
+            },
+        },
+    ]
+    parsed = parse_events(events)
+    assert parsed.stop_reason == "error"
+    assert parsed.error_message is not None and "402" in parsed.error_message
+
+
+def test_parse_events_captures_top_level_error() -> None:
+    parsed = parse_events([{"type": "error", "message": "boom"}])
+    assert parsed.error_message == "boom"
+
+
+def test_pi_result_failed_on_provider_error() -> None:
+    result = PiResult(
+        exit_code=0,
+        session_id=None,
+        final_message="",
+        usage=Usage(),
+        duration_seconds=0.0,
+        event_count=0,
+        tool_calls=0,
+        tool_errors=0,
+        stop_reason="error",
+        stderr="",
+        timed_out=False,
+        attempts=1,
+        jsonl_path="",
+        out_path=None,
+        error_message="402: insufficient credits",
+    )
+    assert result.provider_error is True
+    assert result.failed is True
+
+
+def test_write_meta_records_model_usage_and_prompt_provenance(tmp_path: Path) -> None:
+    """The stage metadata must answer "which prompt did this stage use?"."""
+    result = PiResult(
+        exit_code=0,
+        session_id="sess",
+        final_message="ok",
+        usage=Usage(input_tokens=5, total_tokens=5),
+        duration_seconds=1.5,
+        event_count=2,
+        tool_calls=0,
+        tool_errors=0,
+        stop_reason="stop",
+        stderr="",
+        timed_out=False,
+        attempts=1,
+        jsonl_path="stages/task-review.jsonl",
+        out_path=None,
+    )
+    path = tmp_path / "task-review.meta.json"
+    write_meta(
+        path,
+        result,
+        ["pi", "-p"],
+        model="openrouter/z-ai/glm-5.3",
+        stage="task-review",
+        agent="task-reviewer",
+        prompt_source="/aidt/prompts/task-review.md",
+        rendered_prompt="prompts/task-review.rendered.md",
+    )
+
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    assert meta["stage"] == "task-review"
+    assert meta["agent"] == "task-reviewer"
+    assert meta["prompt_source"] == "/aidt/prompts/task-review.md"
+    assert meta["rendered_prompt"] == "prompts/task-review.rendered.md"
+    assert meta["model"] == "openrouter/z-ai/glm-5.3"
+    assert meta["usage"]["input_tokens"] == 5
+
+
+# ── _invoke: streaming, prompt delivery, timeout ────────────────────────── #
+
+
+def test_invoke_streams_stdout_before_the_process_exits(tmp_path: Path) -> None:
+    """Progress must be fed as events arrive, not after Pi exits.
+
+    The child blocks until the first line has been fed, and exits non-zero if that
+    never happens — so a buffered implementation fails the test rather than passing
+    slowly.
+    """
+    sentinel = tmp_path / "go"
+    script = (
+        "import json, pathlib, sys, time\n"
+        "prompt = sys.stdin.read()\n"
+        "print(json.dumps({'type': 'session', 'prompt_len': len(prompt)}), flush=True)\n"
+        f"sentinel = pathlib.Path({str(sentinel)!r})\n"
+        "for _ in range(1000):\n"
+        "    if sentinel.exists():\n"
+        "        break\n"
+        "    time.sleep(0.01)\n"
+        "else:\n"
+        "    print(json.dumps({'type': 'error', 'message': 'line 1 was never fed'}), flush=True)\n"
+        "    sys.exit(3)\n"
+        "print(json.dumps({'type': 'message_end', 'message': {'role': 'assistant'}}), flush=True)\n"
+        "print('a warning', file=sys.stderr, flush=True)\n"
+    )
+
+    class Collector:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def feed(self, line: str) -> None:
+            self.lines.append(line)
+            if len(self.lines) == 1:
+                sentinel.write_text("go", encoding="utf-8")
+
+    collector = Collector()
+    code, stdout, stderr, timed_out = _invoke(
+        [sys.executable, "-c", script],
+        "the prompt",
+        env=dict(os.environ),
+        cwd=tmp_path,
+        timeout=30.0,
+        progress=collector,
+    )
+
+    assert timed_out is False
+    assert code == 0
+    assert len(collector.lines) == 2
+    assert json.loads(collector.lines[0])["prompt_len"] == len("the prompt")
+    assert json.loads(collector.lines[1])["type"] == "message_end"
+    assert len(stdout.splitlines()) == 2
+    assert "a warning" in stderr
+
+
+def test_invoke_enforces_the_timeout(tmp_path: Path) -> None:
+    start = time.monotonic()
+    code, _stdout, _stderr, timed_out = _invoke(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        "",
+        env=dict(os.environ),
+        cwd=tmp_path,
+        timeout=0.5,
+    )
+    assert timed_out is True
+    assert time.monotonic() - start < 20
+    assert code != 0

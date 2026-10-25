@@ -1,0 +1,16 @@
+id: task-fixer
+description: Revises a task prompt to resolve review findings, without expanding its scope.
+provider: openrouter
+model: openrouter/z-ai/glm-5.3
+thinking: high
+agents_md: agents/task-fixer/AGENTS.md
+tools:
+  - read
+  - bash
+  - write
+  - edit
+prompt_templates:
+  - prompts
+session: fresh
+timeout_seconds: 3600
+output: json

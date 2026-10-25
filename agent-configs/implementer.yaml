@@ -1,0 +1,16 @@
+id: implementer
+description: Implements a task prompt as code plus module contract/property tests, then owns traceability and architecture docs in the same session.
+provider: openrouter
+model: openrouter/deepseek/deepseek-v4.1-flash
+thinking: high
+agents_md: agents/implementer/AGENTS.md
+tools:
+  - read
+  - bash
+  - write
+  - edit
+prompt_templates:
+  - prompts
+session: shared
+timeout_seconds: 7200
+output: json

@@ -1,0 +1,16 @@
+id: fixer
+description: Implements exactly one approved review follow-up issue, verifies it, and closes it.
+provider: openrouter
+model: openrouter/z-ai/glm-5.3
+thinking: high
+agents_md: agents/fixer/AGENTS.md
+tools:
+  - read
+  - bash
+  - write
+  - edit
+prompt_templates:
+  - prompts
+session: fresh
+timeout_seconds: 5400
+output: json

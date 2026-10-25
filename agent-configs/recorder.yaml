@@ -1,0 +1,15 @@
+id: recorder
+description: Runs the full verification gate and records real outcomes in build-results.md.
+provider: openrouter
+model: openrouter/deepseek/deepseek-v4.1-flash
+thinking: low
+agents_md: agents/recorder/AGENTS.md
+tools:
+  - read
+  - bash
+  - write
+prompt_templates:
+  - prompts
+session: fresh
+timeout_seconds: 2400
+output: json

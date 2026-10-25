@@ -1,0 +1,32 @@
+[project]
+name = "aidt"
+version = "0.1.0"
+description = "AIDT = AI Developer Tools — Pi-driven development workflows for Mythical Forge"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6.0",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+rich = ["rich>=13"]
+
+[project.scripts]
+aidw = "aidw.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aidw"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "prompts/scripts/review-followup/tests"]
+addopts = "-q"

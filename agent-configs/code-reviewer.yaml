@@ -1,0 +1,17 @@
+id: code-reviewer
+description: Independently reviews the change set for defects; read-only.
+provider: openrouter
+model: openrouter/meta/muse-spark-1.3
+thinking: high
+system_prompt:
+  mode: append
+  file: agents/code-reviewer/SYSTEM.md
+agents_md: agents/code-reviewer/AGENTS.md
+tools:
+  - read
+  - bash
+prompt_templates:
+  - prompts
+session: fresh
+timeout_seconds: 3600
+output: json
