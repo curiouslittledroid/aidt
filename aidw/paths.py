@@ -344,9 +344,13 @@ class WorkspacePaths:
     Deliberately a distinct type from :class:`TargetRepo` and :class:`ToolkitPaths`
     (§3.1's "two distinct types" rule): ``workspace_root`` is the folder containing the
     bare repository and all its sibling worktrees — not itself a git repository — and
-    ``state_root`` is the per-repo run-state directory outside every worktree
-    (``<state base>/<repo_slug>``). ``repo_slug`` is the ``owner-name`` identifier that
-    keeps a shared fallback state root from colliding between repos.
+    ``state_root`` is the per-repo run-state directory (``<state base>/<repo_slug>``),
+    outside every worktree in the bare+worktrees layout (§3.2). In the §3.10
+    single-checkout case a plain clone has ``common_dir == <root>/.git``, so
+    ``workspace_root`` is the working tree itself and ``state_root`` lands *inside* it
+    (``<root>/.aidw/state/<repo_slug>``) — E2.2's layout guard later warns on exactly
+    that. ``repo_slug`` is the ``owner-name`` identifier that keeps a shared fallback
+    state root from colliding between repos.
 
     ``resolve()`` is the sole intended construction entry point (a call-site convention,
     not an enforced invariant: like :class:`TargetRepo`, the frozen dataclass carries no

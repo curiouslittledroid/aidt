@@ -524,3 +524,31 @@ def test_unrelated_env_and_home_do_not_leak_into_other_roots(
     monkeypatch.chdir(tmp_path)
 
     assert WorkspacePaths.resolve(repo) == expected
+
+
+# ---------------------------------------------------------------------------
+# Documentation contract (review follow-up: PR #5)
+# ---------------------------------------------------------------------------
+
+
+def test_class_docstring_qualifies_where_state_root_lives() -> None:
+    """The class docstring must not promise ``state_root`` is outside every worktree.
+
+    In the §3.10 single-checkout case ``state_root`` lands *inside* the working tree
+    (test_single_checkout_places_state_inside_the_working_tree); an unqualified
+    "outside every worktree" would let a future E1.4/E1.5 consumer treat in-tree state
+    as impossible and skip the E2.2 layout guard, risking ``git worktree remove`` or
+    clean operations deleting run state.
+    """
+    doc = WorkspacePaths.__doc__ or ""
+    assert doc, "WorkspacePaths must keep its class docstring"
+
+    # The placement claim must be scoped to the supported bare+worktrees layout,
+    # rather than remaining an unconditional promise.
+    assert "outside every worktree in the bare+worktrees layout (§3.2)" in doc
+    assert "is the per-repo run-state directory outside every worktree" not in doc
+
+    # The single-checkout exception and its future layout guard must remain explicit.
+    assert "single-checkout case a plain clone has ``common_dir == <root>/.git``" in doc
+    assert "``state_root`` lands *inside* it" in doc
+    assert "E2.2's layout guard later warns" in doc
