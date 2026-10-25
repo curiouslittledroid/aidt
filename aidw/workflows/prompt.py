@@ -105,6 +105,8 @@ def run(
     task: str,
     repo: Path,
     aidt: Path,
+    runs_dir: Path | None = None,
+    label: str | None = None,
     approve_all: bool = False,
     skip_gates: list[str] | None = None,
     deny_gates: list[str] | None = None,
@@ -116,7 +118,9 @@ def run(
 ) -> int:
     skip = set(skip_gates or [])
     deny = set(deny_gates or [])
-    runs_dir = aidt / "runs"
+    # ``aidt`` locates the toolkit's assets (prompts, agent configs); run state may live
+    # elsewhere so a caller (notably a test) can keep it out of the toolkit's ``runs/``.
+    runs_dir = runs_dir if runs_dir is not None else aidt / "runs"
 
     entries = load_tasks(repo / "docs" / "tasks")
     entry = find_task(entries, phase, epic, task)
@@ -156,7 +160,7 @@ def run(
         runs_dir,
         repo,
         "prompt",
-        label=f"{phase}-{task}",
+        label=label or f"{phase}-{task}",
         task={"phase": phase, "epic": epic, "task": task, "title": entry.title},
         strict=strict,
         branch=branch,
