@@ -11,6 +11,15 @@ The repository is `aidt`; the package and CLI are `aidw` — see
 The authoritative design is [`design.md`](./design.md). This README is both the quickstart
 and the operator guide.
 
+> **Not yet implemented.** [`EXPLICIT-RESOURCES.md`](./EXPLICIT-RESOURCES.md) describes the
+> planned future state in which an agent config file is the **only** place skills,
+> extensions, custom tools and MCP servers are declared for what Pi may pull into a stage —
+> the target repo's `AGENTS.md` and the agent's own `AGENTS.md` stay automatic. Today Pi's
+> own discovery still adds user-level and target-level resources to every stage. The
+> implementation plan is [`docs/tasks/01 - Explicit Resources.md`](./docs/tasks/01%20-%20Explicit%20Resources.md),
+> scheduled after the migration ([`docs/migration/EXTRACTION.md`](./docs/migration/EXTRACTION.md))
+> finishes.
+
 ## Repository, naming, and provenance
 
 This repository is **`aidt`** ("AI Developer Tools") — the toolkit's own home, not a
