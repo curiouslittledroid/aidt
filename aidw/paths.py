@@ -10,8 +10,9 @@ path internally as an absolute path. Two independent roots exist:
 * the **target repository root** — the working tree the workflows operate on, discovered
   from git.
 
-E1.2/E1.3 formalise these into ``ToolkitPaths`` / ``TargetRepo`` types and add the
-workspace and state roots; this module holds the transitional helpers until then.
+E1.2 formalises the toolkit root into the :class:`ToolkitPaths` type and E1.1 did the
+same for the target repository (:class:`TargetRepo`). E1.3 adds the workspace and state
+roots; :func:`aidt_root` and :func:`runs_dir` remain transitional aliases until E1.4.
 """
 
 from __future__ import annotations
@@ -165,8 +166,50 @@ def toolkit_root() -> Path:
     root), so it is stable under ``uv tool install`` and when the working directory is
     unrelated to any repository. The root holds ``prompts/``, ``agent-configs/``,
     ``agents/`` and ``tests/``.
+
+    This is the single source of truth for the toolkit location; :meth:`ToolkitPaths.resolve`
+    delegates to it rather than re-deriving the value.
     """
     return Path(__file__).resolve().parent.parent
+
+
+@dataclass(frozen=True)
+class ToolkitPaths:
+    """The installed toolkit's own root and the asset directories under it (§3.1/§3.12).
+
+    Deliberately a distinct type from :class:`TargetRepo`: every path here is resolved
+    from the installed package location, never from git or the working directory, so
+    toolkit-relative and target-relative paths can never be interchanged. ``resolve()``
+    is the sole intended construction entry point (a call-site convention, not an
+    enforced invariant: like :class:`TargetRepo`, the frozen dataclass carries no init
+    guard).
+    """
+
+    root: Path
+    prompts_dir: Path
+    agent_configs_dir: Path
+    agents_dir: Path
+    scripts_dir: Path
+
+    @classmethod
+    def resolve(cls) -> "ToolkitPaths":
+        """Resolve the toolkit root and its asset directories.
+
+        ``root`` is delegated to :func:`toolkit_root` (``Path(__file__)`` based) so there
+        is one source of truth for the package location; this method never consults git
+        or the current working directory. ``scripts_dir`` lives under ``prompts/`` — it is
+        the ``prompts/scripts/`` directory the bundled helper scripts sit in
+        (``inventory.REQUIRED_SCRIPTS``), not a ``root/scripts/`` directory.
+        """
+        root = toolkit_root().resolve()
+        prompts_dir = (root / "prompts").resolve()
+        return cls(
+            root=root,
+            prompts_dir=prompts_dir,
+            agent_configs_dir=(root / "agent-configs").resolve(),
+            agents_dir=(root / "agents").resolve(),
+            scripts_dir=(prompts_dir / "scripts").resolve(),
+        )
 
 
 def aidt_root() -> Path:

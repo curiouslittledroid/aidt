@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aidw import inventory
-from aidw.paths import RepoNotFoundError, aidt_root, repo_root
+from aidw.paths import RepoNotFoundError, ToolkitPaths, aidt_root, repo_root
 
 OK = "OK"
 WARN = "WARN"
@@ -251,6 +251,47 @@ def _check_archify() -> Check:
     )
 
 
+def _check_toolkit_root() -> Check:
+    """Report the installed toolkit root (EXTRACTION.md §3.1/§3.3).
+
+    Derived from :class:`ToolkitPaths`, which resolves from the package location, never
+    from git or the cwd, so this check still reports when AIDW runs outside any
+    repository (``/tmp``) — the early ``repo_root()`` refusal below would otherwise skip
+    it. It is ``FAIL`` when resolution fails, the root is missing, or a workflow-critical
+    asset (``prompts``/``scripts``) is absent; ``WARN`` when only the advisory
+    ``agent-configs``/``agents`` dirs are missing.
+    """
+    try:
+        toolkit = ToolkitPaths.resolve()
+    except Exception as exc:  # noqa: BLE001 - any resolution failure is a doctor FAIL
+        return Check("toolkit root", FAIL, f"unresolved: {exc}")
+
+    missing = [
+        label
+        for label, path in (
+            ("prompts", toolkit.prompts_dir),
+            ("scripts", toolkit.scripts_dir),
+            ("agent-configs", toolkit.agent_configs_dir),
+            ("agents", toolkit.agents_dir),
+        )
+        if not path.is_dir()
+    ]
+    if not toolkit.root.is_dir():
+        missing = ["root", *missing]
+
+    if {"root", "prompts", "scripts"} & set(missing):
+        status = FAIL
+    elif missing:
+        status = WARN
+    else:
+        status = OK
+
+    detail = str(toolkit.root)
+    if missing:
+        detail = f"{detail} (missing: {', '.join(missing)})"
+    return Check("toolkit root", status, detail)
+
+
 def collect_checks() -> list[Check]:
     checks: list[Check] = [
         _check_python(),
@@ -260,6 +301,9 @@ def collect_checks() -> list[Check]:
         _check_pi(),
         _check_gh(),
         _check_gh_version(),
+        # Must precede the repo_root() try/except: that branch returns early, and the
+        # toolkit root is deliberately resolvable with no repository at all.
+        _check_toolkit_root(),
     ]
 
     try:

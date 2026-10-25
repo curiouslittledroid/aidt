@@ -109,7 +109,7 @@
   - Deliverable: a `TargetRepo` type plus tests including: inside a worktree; inside a subdirectory; an explicit `--repo`; a non-repo path; the bare dir.
   - Done when: tests prove `repo_root` semantics are preserved and the bare dir is rejected.
 
-- [ ] **E1.2. `ToolkitPaths`**
+- [x] **E1.2. `ToolkitPaths`**
   Resolve the installed toolkit root from `Path(__file__)`/`importlib.resources` — never from git.
   Expose `prompts_dir`, `agent_configs_dir`, `agents_dir`, `scripts_dir`.
   - Deliverable: a `ToolkitPaths` type plus a test that it resolves when cwd is an unrelated directory.
