@@ -50,7 +50,7 @@
   - Deliverable: README section.
   - Done when: a reader with no context can explain the two roots after reading the README alone.
 
-- [ ] **E0.7. Convert this document's tasks into a roadmap (mandatory)**
+- [x] **E0.7. Convert this document's tasks into a roadmap (mandatory)**
   **Mandatory, not optional.** `aidw prompt` is roadmap-driven: `prompt.py:123` reads
   `repo/docs/tasks`, and `find_task` returning `None` exits `2` with `roadmap task not found`. Every
   task §5.5 sends through the pipeline therefore depends on this one. It cannot dogfood itself — it
