@@ -5,10 +5,40 @@ coding agent from the command line to develop the Mythical Forge application. It
 **separate from the Mythical Forge product**, is not built or tested by the product's
 pnpm pipeline, and creates no AWS resources.
 
-`AIDW` is the wrapper CLI; `AIDT` is the toolkit as a whole.
+The repository is `aidt`; the package and CLI are `aidw` — see
+[Repository, naming, and provenance](#repository-naming-and-provenance).
 
 The authoritative design is [`design.md`](./design.md). This README is both the quickstart
 and the operator guide.
+
+## Repository, naming, and provenance
+
+This repository is **`aidt`** ("AI Developer Tools") — the toolkit's own home, not a
+directory inside a product repository. The importable Python package and the console
+command are both **`aidw`** ("AI Developer Workflows").
+
+Two roots, resolved independently:
+
+| Root | What it is | Resolved from |
+|---|---|---|
+| **Toolkit root** | Where this repo's code, default prompts (`prompts/`), agent configs (`agent-configs/`) and bundled scripts live. | The installed package location, so it never depends on the working directory or on which repository `aidw` runs against. |
+| **Target repo root** | The working tree whose roadmap, task prompts and artifacts a workflow operates on. | Git, starting at the working directory; `--repo <path>` overrides it. |
+
+> **`aidw/` means two different things, by design.** Inside *this* repo, `aidw/` is the
+> Python **code**. Inside a *target* repo, a tracked `aidw/` folder is **configuration**:
+> `aidw/config.yaml`, optional `aidw/conventions.md`, and optional prompt overrides under
+> `aidw/prompts/`. A target repo with no `aidw/` folder is valid and gets the toolkit's
+> defaults.
+
+**Provenance.** This repository starts from a single verbatim copy of `aidt/` from
+`mythical-forge@31c720afb845e6bc23948f6f0aadae872ce3ff1c`, committed unmodified and tagged
+`baseline-verbatim` (inspect it with `git show baseline-verbatim`), so any later behavioural
+difference can be diffed against a known-good reference. The extraction plan of record is
+[`docs/migration/EXTRACTION.md`](./docs/migration/EXTRACTION.md).
+
+> **Interim state.** Sections below still read from the pre-extraction viewpoint, where the
+> toolkit lived at `aidt/` inside the Mythical Forge repository (for example `cd aidt`, or
+> `aidt/runs/`). They are rewritten in E9.4; the naming and roots above are the current truth.
 
 ## Status
 

@@ -646,7 +646,7 @@ from git, and re-point the existing global `--repo` so it selects the **target**
 - Deliverable: a CI workflow.
 - Done when: CI is green on `main` and on a test PR, and a deliberately broken test fails CI.
 
-- [ ] **E0.6 Provenance and naming note**
+- [x] **E0.6 Provenance and naming note**
 README states: the repo is `aidt`; the package/CLI is `aidw`; a target repo uses a tracked
 `aidw/` folder for config; the source SHA of the baseline; and that inside this repo `aidw/` is
 code while inside a target repo `aidw/` is configuration.
