@@ -628,7 +628,7 @@ move this document to `docs/migration/EXTRACTION.md`. No code behaviour changes.
 - Deliverable: the §3.12 directory layout, with placeholders for docs written later.
 - Done when: `git status` shows additions and renames only, and no Python file is modified.
 
-- [ ] **E0.4 Make the toolkit root its own repo (first functional commit)**
+- [x] **E0.4 Make the toolkit root its own repo (first functional commit)**
 Flattening `aidt/` to the repo root breaks the toolkit's own path resolution: `paths.aidt_root()`
 is `repo_root()/aidt` (`paths.py:40`) and `cli.py:54` does `aidt = repo / "aidt"`, so `prompts/`,
 `agent-configs/`, `inventory` and doctor all point at a non-existent directory. Resolve the

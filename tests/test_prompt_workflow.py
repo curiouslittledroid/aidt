@@ -20,12 +20,13 @@ def test_git_helpers_types() -> None:
     assert isinstance(git.status_short(repo), str)
 
 
-def test_prompt_workflow_dry_run() -> None:
+def test_prompt_workflow_dry_run(tmp_path: Path, monkeypatch) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch)
     code = prompt_workflow.run(
         phase="03",
         epic="E4",
         task="E4.1",
-        repo=repo_root(),
+        repo=tmp_path,
         aidt=aidt_root(),
         dry_run=True,
     )
@@ -36,40 +37,42 @@ def test_prompt_workflow_dry_run() -> None:
     assert all(s.status == state.SUCCEEDED for s in latest.stages)
 
 
-def test_prompt_workflow_unknown_task() -> None:
+def test_prompt_workflow_unknown_task(tmp_path: Path, monkeypatch) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch)
     code = prompt_workflow.run(
         phase="99",
         epic="Z",
         task="Z9",
-        repo=repo_root(),
+        repo=tmp_path,
         aidt=aidt_root(),
         dry_run=True,
     )
     assert code == 2
 
 
-def test_prompt_workflow_requires_main_for_real_run(monkeypatch) -> None:
+def test_prompt_workflow_requires_main_for_real_run(tmp_path: Path, monkeypatch) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch)
     monkeypatch.setattr(git, "current_branch", lambda repo: "feature-branch")
-    monkeypatch.setattr(git, "is_clean", lambda repo: True)
     code = prompt_workflow.run(
         phase="03",
         epic="E4",
         task="E4.1",
-        repo=repo_root(),
+        repo=tmp_path,
         aidt=aidt_root(),
         dry_run=False,
     )
     assert code == 4
 
 
-def test_prompt_workflow_requires_clean_tree(monkeypatch) -> None:
+def test_prompt_workflow_requires_clean_tree(tmp_path: Path, monkeypatch) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch)
     monkeypatch.setattr(git, "current_branch", lambda repo: "main")
     monkeypatch.setattr(git, "is_clean", lambda repo: False)
     code = prompt_workflow.run(
         phase="03",
         epic="E4",
         task="E4.1",
-        repo=repo_root(),
+        repo=tmp_path,
         aidt=aidt_root(),
         dry_run=False,
     )

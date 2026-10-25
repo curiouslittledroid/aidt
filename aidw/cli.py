@@ -19,7 +19,7 @@ from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.doctor import run_doctor
 from aidw.gates import GateDefault
 from aidw.log import RunLogger
-from aidw.paths import repo_root
+from aidw.paths import repo_root, toolkit_root
 from aidw.roadmap import filter_tasks, find_task, load_tasks, next_todo
 from aidw.report import rel_to, stage_lines, usage_line
 from aidw.runner import StageSpec, resolve_prompt, run_stage
@@ -48,14 +48,19 @@ _state: dict[str, object] = {"repo": None, "verbose": False}
 
 
 def _roots() -> tuple[Path, Path]:
-    """Resolve (repo_root, aidt_root), honouring the global --repo override."""
+    """Resolve ``(target repo root, toolkit root)``.
+
+    ``--repo`` selects the **target** repository only (E0.4). The toolkit root always
+    comes from the installed package location, so no flag can point the toolkit at a
+    checkout.
+    """
     override = _state.get("repo")
     repo = Path(override) if override else repo_root()
-    return repo, repo / "aidt"
+    return repo, toolkit_root()
 
 
-def _run_dir(repo: Path, run_id: str) -> Path:
-    return repo / "aidt" / "runs" / run_id
+def _run_dir(run_id: str) -> Path:
+    return toolkit_root() / "runs" / run_id
 
 
 def _gate_default_value(value: Optional[GateDefault]) -> Optional[str]:
@@ -89,7 +94,10 @@ def _main(
     repo: Optional[Path] = typer.Option(
         None,
         "--repo",
-        help="Override the repository root (default: auto-detect via git).",
+        help=(
+            "Override the target repository root (default: auto-detect via git). "
+            "Never selects the toolkit."
+        ),
         exists=True,
         file_okay=False,
         dir_okay=True,
@@ -528,7 +536,7 @@ def exec_stage(
         strict=strict,
         branch=git.current_branch(repo),
     )
-    logger = RunLogger(_run_dir(repo, run.run_id), stream=bool(_state["verbose"]))
+    logger = RunLogger(_run_dir(run.run_id), stream=bool(_state["verbose"]))
     spec = StageSpec(
         name=prompt_path.stem,
         agent_id=agent,
@@ -560,7 +568,7 @@ def exec_stage(
 
     if record.status == state_mod.SUCCEEDED and run.status != state_mod.SUCCEEDED:
         run.status = state_mod.SUCCEEDED
-        state_mod.save(_run_dir(repo, run.run_id), run)
+        state_mod.save(_run_dir(run.run_id), run)
 
     if dry_run:
         typer.echo("dry-run complete; Pi not invoked")
@@ -643,8 +651,8 @@ def runs(
 def prompts(
     action: str = typer.Argument("list", help="list | check"),
 ) -> None:
-    """List or check AIDT's own prompts and helper scripts."""
-    _repo, aidt = _roots()
+    """List or check the toolkit's own prompts and helper scripts."""
+    aidt = toolkit_root()
 
     if action == "list":
         files = inventory.list_files(aidt)

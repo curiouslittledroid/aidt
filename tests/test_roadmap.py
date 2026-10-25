@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aidw.paths import repo_root
 from aidw.roadmap import (
-    RoadmapTask,
     derive_epic,
     filter_tasks,
     find_task,
@@ -85,10 +83,11 @@ def test_find_filter_next(tmp_path: Path) -> None:
     assert next_todo(tasks, phase="99") is None
 
 
-def test_load_tasks_real_roadmap() -> None:
-    tasks = load_tasks(repo_root() / "docs" / "tasks")
-    assert len(tasks) > 200
-    entry = find_task(tasks, "03", "E2", "E2.9")
-    assert isinstance(entry, RoadmapTask)
-    assert entry.done is True
-    assert entry.epic == "E2"
+def test_load_tasks_reads_a_directory(tmp_path: Path) -> None:
+    (tmp_path / "07 - Test Phase.md").write_text(FIXTURE, encoding="utf-8")
+    (tmp_path / "99 - Other Phase.md").write_text(
+        "# Phase 99: Other Phase\n\n## Epic Z: Zed\n\n- [ ] **Z1. Zed task** text.\n",
+        encoding="utf-8",
+    )
+    tasks = load_tasks(tmp_path)
+    assert [t.task for t in tasks] == ["A1", "A2", "B1", "Z1"]

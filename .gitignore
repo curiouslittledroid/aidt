@@ -1,0 +1,7 @@
+# Generated and machine-local files (EXTRACTION.md §5.2). None of these belong in the
+# verbatim copy of aidt/ and none of them are ever committed.
+.venv/
+runs/
+__pycache__/
+*.py[cod]
+.pytest_cache/

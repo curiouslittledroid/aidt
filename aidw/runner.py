@@ -108,7 +108,7 @@ def run_stage(
     rendered = render_prompt_file(spec.prompt, spec.variables)
     if spec.extra:
         rendered = f"{rendered}\n\n{spec.extra}"
-    runs_root = runs_dir if runs_dir is not None else repo_root / "aidt" / "runs"
+    runs_root = runs_dir if runs_dir is not None else aidt_root / "runs"
     directory = run_dir(runs_root, state.run_id)
     prompts_dir = directory / "prompts"
     prompts_dir.mkdir(parents=True, exist_ok=True)
