@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aidw.report import rel_to, short_count, stage_lines, usage_line
+from aidw.report import cost_note, rel_to, short_count, stage_lines, usage_line
 from aidw.state import FAILED, PLANNED, SUCCEEDED, StageRecord
 
 USAGE = {
@@ -82,6 +82,44 @@ def test_stage_lines_report_a_failure_instead_of_usage() -> None:
     )
     assert lines[1] == "        error: cost_ceiling: $0.5 > $0.1"
     assert not any(line.strip().startswith("usage:") for line in lines)
+
+
+UNPRICED_USAGE = {
+    "input_tokens": 42726,
+    "output_tokens": 19242,
+    "cache_read": 873984,
+    "cache_write": 0,
+    "reasoning": 0,
+    "total_tokens": 935952,
+    "cost_usd": 0.0,
+}
+
+
+def test_cost_note_flags_tokens_with_no_cost() -> None:
+    note = cost_note("openrouter/deepseek/deepseek-v4.1-flash", UNPRICED_USAGE)
+    assert note is not None
+    assert note.startswith("936.0k tokens with $0.0000 cost")
+    assert "deepseek/deepseek-v4.1-flash has no pricing" in note
+    assert "modelOverrides" in note
+
+
+def test_cost_note_is_silent_for_priced_and_local_stages() -> None:
+    assert cost_note("openrouter/z-ai/glm-5.3", dict(UNPRICED_USAGE, cost_usd=0.0286)) is None
+    assert cost_note("ollama/qwen3.8:27b-mlx", UNPRICED_USAGE) is None
+    assert cost_note("openrouter/z-ai/glm-5.3", None) is None
+
+
+def test_stage_lines_add_a_note_for_an_unpriced_stage() -> None:
+    lines = stage_lines(
+        _record(usage=dict(UNPRICED_USAGE), cost_usd=0.0), repo_root=Path("/repo")
+    )
+    assert lines[2].startswith("        note:  936.0k tokens with $0.0000 cost")
+    assert lines[3] == "        out:   aidt/runs/x/stages/task-review.out.txt"
+
+
+def test_stage_lines_omit_the_note_for_a_planned_stage() -> None:
+    lines = stage_lines(_record(status=PLANNED, usage=dict(UNPRICED_USAGE), cost_usd=None))
+    assert not any("note:" in line for line in lines)
 
 
 def test_rel_to_falls_back_outside_the_base() -> None:

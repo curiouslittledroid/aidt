@@ -20,6 +20,7 @@ from aidw.log import RunLogger
 from aidw.pi import PiResult, execute, write_meta
 from aidw.progress import ProgressIndicator, resolve_enabled
 from aidw.prompts import render_prompt_file
+from aidw.report import cost_note
 from aidw.state import (
     FAILED,
     PLANNED,
@@ -188,6 +189,9 @@ def run_stage(
     record.usage = asdict(result.usage)
     record.log = f"stages/{spec.name}.jsonl"
     record.artifacts["out"] = result.out_path
+    # A zero cost for real token spend is a pricing gap, not a free run: surface it in
+    # run.log so it is caught during the run rather than in a later audit (design §9.2).
+    unpriced = cost_note(record.model, record.usage)
     over_budget = (
         agent.max_cost_usd is not None
         and result.usage.cost_usd > agent.max_cost_usd
@@ -214,6 +218,8 @@ def run_stage(
         else:
             record.status = SUCCEEDED
         save(directory, state)
+    if unpriced:
+        logger.warn(f"stage {spec.name}: {unpriced}")
     return record
 
 

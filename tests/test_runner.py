@@ -94,12 +94,12 @@ def test_dry_run_records_session_policy(tmp_path: Path) -> None:
     assert record.session_id == f"aidw-{run.run_id}-implementer"
 
 
-def _result(cost_usd: float) -> PiResult:
+def _result(cost_usd: float, *, tokens: int = 0) -> PiResult:
     return PiResult(
         exit_code=0,
         session_id="s",
         final_message="ok",
-        usage=Usage(cost_usd=cost_usd),
+        usage=Usage(cost_usd=cost_usd, total_tokens=tokens),
         duration_seconds=0.1,
         event_count=1,
         tool_calls=0,
@@ -111,6 +111,38 @@ def _result(cost_usd: float) -> PiResult:
         jsonl_path="",
         out_path=None,
     )
+
+
+def _run_with_result(tmp_path: Path, monkeypatch, result: PiResult):
+    agents, _ = load_all(aidt_root(), repo_root())
+    monkeypatch.setattr(runner_mod, "execute", lambda *args, **kwargs: result)
+    run = create_run(tmp_path, repo_root(), "stage", label="cost")
+    logger = RunLogger(tmp_path / run.run_id)
+    record = run_stage(
+        StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
+        repo_root=repo_root(),
+        aidt_root=aidt_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        runs_dir=tmp_path,
+    )
+    return record, (tmp_path / run.run_id / "run.log").read_text()
+
+
+def test_unpriced_stage_warns_in_the_run_log(tmp_path: Path, monkeypatch) -> None:
+    record, log = _run_with_result(tmp_path, monkeypatch, _result(0.0, tokens=935952))
+
+    assert record.status == SUCCEEDED
+    assert "[WARN] stage noop: 936.0k tokens with $0.0000 cost" in log
+    assert "has no pricing" in log
+
+
+def test_priced_stage_logs_no_warning(tmp_path: Path, monkeypatch) -> None:
+    record, log = _run_with_result(tmp_path, monkeypatch, _result(0.28, tokens=935952))
+
+    assert record.status == SUCCEEDED
+    assert "WARN" not in log
 
 
 def test_cost_ceiling_fails_a_stage(tmp_path: Path, monkeypatch) -> None:

@@ -406,6 +406,11 @@ terminal, not an auto-approval for a script, so `--yes` remains the way through 
 - Per-agent `max_cost_usd` in `aidt/agent-configs/<agent>.yaml` fails a stage with
   `cost_ceiling` when its cost exceeds the ceiling. Real cost is recorded per stage in
   `state.json` and `.meta.json`; the run's combined `totals` is at the top of `state.json`.
+- A stage that spends tokens at a `$0.0000` cost is reported as a pricing gap, not a free
+  run: `WARN stage <name>: …` in `run.log`, plus a `note:` line in the stage block. Pi prices
+  a model from its catalog entry, so a `models.json` `models` entry that shadows one without
+  `cost` silently zeroes it — use `modelOverrides`, which merges. Local providers (`ollama`)
+  are exempt. A zero-cost stage also disables that agent's `max_cost_usd` ceiling.
 
 ## Boundaries — what AIDT will not do
 

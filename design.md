@@ -622,6 +622,14 @@ aidt/runs/<utc-stamp>-<task-or-pr>-<workflow>/
 stage's `cost_usd` as the fallback when a record has no `usage`), giving the run's combined
 input tokens, output tokens, and cost.
 
+A stage that records token spend at a zero cost is a **pricing gap, not a free run**: Pi computes
+cost from the resolved model's price table, so a `models.json` `models` entry that shadows a
+catalog model without carrying `cost` (the fix is a `modelOverrides` entry, which merges instead of
+replacing) reports `$0.0000` for real tokens and leaves the agent's `max_cost_usd` ceiling
+unenforceable. AIDW warns once per such stage — `WARN stage <name>: …` in `run.log` — and repeats
+it as a `note:` line in the stage block (§9.3). Local providers (`ollama`) are exempt, because
+there zero is the truth.
+
 `stages/<name>.meta.json` carries the same counters plus the prompt provenance — `stage`, `agent`,
 `prompt_source` (the prompt file the stage was rendered from: an `aidt/prompts/*.md` file, or an
 absolute path when `aidw exec` was given one) and `rendered_prompt` — so "which prompt did this
@@ -636,6 +644,16 @@ output and the recorded evidence cannot drift apart:
 stage:  task-review-1 [succeeded] model=openrouter/meta/muse-spark-1.3 132.3s cost=$0.0287
         usage: total=50.6k in=193 out=16 cache_read=50.4k cache_write=0 reasoning=0 cost=$0.0287
         out:   aidt/runs/<run-id>/stages/task-review-1.out.txt
+```
+
+An unpriced stage (tokens recorded, cost `$0.0000`) adds a `note:` line so the gap is explained
+next to the zero that hides it:
+
+```text
+stage:  I2 impliment-task [succeeded] model=openrouter/deepseek/deepseek-v4.1-flash 248.9s
+        usage: total=936.0k in=42.7k out=19.2k cache_read=874.0k cache_write=0 reasoning=12.2k cost=$0.0000
+        note:  936.0k tokens with $0.0000 cost — openrouter/deepseek/deepseek-v4.1-flash has no pricing; check models.json (a "models" entry replaces catalog pricing, a "modelOverrides" entry merges)
+        out:   aidt/runs/<run-id>/stages/impliment-task.out.txt
 ```
 
 A workflow prefixes its own stage id (`stage:  I2 test [succeeded] …`), a failed stage reports

@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from aidw.cost import is_unpriced, total_tokens
 from aidw.state import PLANNED, RUNNING, SUCCEEDED, StageRecord
 
 #: Field order for the one-line usage summary.
@@ -44,6 +45,21 @@ def usage_line(usage: dict[str, Any] | None) -> str:
     cost = float(usage.get("cost_usd", 0.0) or 0.0)
     parts.append(f"cost=${cost:.4f}")
     return " ".join(parts)
+
+
+def cost_note(model: str, usage: dict[str, Any] | None) -> str | None:
+    """Warn about token spend with no recorded cost (design §9.2).
+
+    ``None`` when the stage was priced, measured nothing, or runs on a local provider,
+    so the note appears only where a zero cost is suspicious rather than true.
+    """
+    if not is_unpriced(model, usage):
+        return None
+    return (
+        f"{short_count(total_tokens(usage))} tokens with $0.0000 cost — {model} has no "
+        'pricing; check models.json (a "models" entry replaces catalog pricing, a '
+        '"modelOverrides" entry merges)'
+    )
 
 
 def rel_to(base: Path | None, path: str | Path | None) -> str:
@@ -84,6 +100,10 @@ def stage_lines(
         lines.append(f"        error: {record.error}")
     elif record.status in (SUCCEEDED, RUNNING) and usage_line(record.usage):
         lines.append(f"        usage: {usage_line(record.usage)}")
+
+    note = cost_note(record.model, record.usage)
+    if note and record.status != PLANNED:
+        lines.append(f"        note:  {note}")
 
     out = record.artifacts.get("out")
     if out and record.status != PLANNED:
