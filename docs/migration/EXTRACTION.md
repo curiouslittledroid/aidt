@@ -437,9 +437,10 @@ Measured by grepping every file for product tokens, not by inspection.
 | `aidw/inventory.py:23-50` | `REQUIRED_PROMPTS`, `REQUIRED_SCRIPTS`, `FOREIGN_PREFIX` | Split "toolkit defaults" from "resolved prompts"; keep the sentinel |
 | `aidw/git.py` | Clean — no product coupling | Extend with worktree primitives |
 | `aidw/cli.py:36,115`, `aidw/__init__.py:4-5` | Branding strings in help and docstring | Trivial |
-| `tests/test_paths.py` | Asserts the `<repo>/aidt` layout | Rewrite for the two-root model |
-| `tests/test_roadmap.py` | Inline fixture mentions "Design 07 §1" | Cosmetic; becomes the canonical format example |
-| Remaining ~23 test modules | **Product-free** (zero token hits) | Portable as-is |
+| `tests/test_paths.py` | Asserts the `<repo>/aidt` layout | **Resolved in E0.4** — now `toolkit_root() == repo_root()`, and asserts no `aidt/` subdirectory exists |
+| `tests/test_roadmap.py` | `test_load_tasks_real_roadmap` reads the **target repo's** `docs/tasks` and asserts Mythical Forge's content: `len(tasks) > 200`, and `03/E2/E2.9` present with `done is True`. The inline fixture itself is fine (its "Design 07 §1" text is cosmetic) | **Resolved in E0.4** — repo-ised to `test_load_tasks_reads_a_directory(tmp_path)`. Keep the inline fixture as the canonical format example (E5.4) |
+| `tests/test_prompt_workflow.py` | Three tests passed `repo=repo_root()` and expected a **real** Mythical Forge roadmap entry `03/E4/E4.1`: `test_prompt_workflow_dry_run` (asserts `code == 0`), `test_prompt_workflow_requires_main_for_real_run` and `..._requires_clean_tree` (assert `code == 4`). `load_tasks`/`find_task` run *before* the branch and clean-tree checks, so all three returned `2` instead | **Resolved in E0.4** — all three now use the file's own `_patch_prompt_repo(tmp_path)` fixture |
+| Remaining 21 test modules | **Product-free** (zero token hits) | Portable as-is |
 
 ### 4.2 Prompts — three buckets (31 files)
 
@@ -598,6 +599,14 @@ resolve its own prompts in the new repo before then (§5.2), so E0 and E1 are di
 work regardless of task class. Dogfooding is also not required for correctness — `fixtures/target-repo/`
 (E4.7, E2.9) proves the override and stage mechanisms deterministically, and in CI.
 
+**E0.7 is the gate for every task in the table above.** The roadmap is what makes roadmap-driven
+authoring possible: `aidw prompt` reads `repo/docs/tasks` and exits `2` when the task is not
+there. So E0.7 is **mandatory**, not optional, and it is the first thing to do once the toolkit
+self-hosts. It appears in the direct-implementation list only because it cannot dogfood itself.
+Conversely, a hand-written prompt file plus `aidw implement` skips the roadmap entirely —
+`implement` derives the task id from the prompt filename — but that forfeits the task-author and
+task-reviewer stages, which is most of the value for the tasks in the table.
+
 ---
 
 ## 6. Tasks
@@ -635,7 +644,13 @@ is `repo_root()/aidt` (`paths.py:40`) and `cli.py:54` does `aidt = repo / "aidt"
 **toolkit root from the package location** (`Path(__file__)` / `importlib.resources`) instead of
 from git, and re-point the existing global `--repo` so it selects the **target** only. Rewrite
 `tests/test_paths.py` (it asserts `<repo>/aidt`) and `pyproject.toml` `testpaths`.
-- Deliverable: toolkit-root resolution plus rewritten path tests.
+
+Also repo-ise the tests that assert the **target repo's** content, or this task's Done-when is
+unachievable: `test_roadmap.py::test_load_tasks_real_roadmap`, and
+`test_prompt_workflow.py::{test_prompt_workflow_dry_run,
+test_prompt_workflow_requires_main_for_real_run, test_prompt_workflow_requires_clean_tree}`
+(see §4.1). **A toolkit test may never assert a target repo's content.**
+- Deliverable: toolkit-root resolution, plus rewritten path tests and de-coupled roadmap tests.
 - Done when: `uv run pytest` is green from the new repo root, and `uv run aidw doctor` and
   `uv run aidw prompts check` are clean in a repo whose `prompts/` sits at the repo root.
 - Note: this is the minimal version of E1.2, landed early so the repo can run its own workflow.
@@ -653,16 +668,57 @@ code while inside a target repo `aidw/` is configuration.
 - Deliverable: README section.
 - Done when: a reader with no context can explain the two roots after reading the README alone.
 
-- [ ] **E0.7 Convert this document's tasks into a roadmap (optional)**
-Needed only if you want `aidw prompt` to author task prompts for later epics (§5.5). Create
-`docs/tasks/00 - Extraction.md` in the AIDT roadmap format (§3.7, E5.1): a `# Phase 0: …`
-heading, `## Epic E0: …` headings, and one `- [ ] **E0.1. <title>** …` entry per task with an
-**immediately following** `- Done when: …` line — the parser stops its Done-when scan at a blank
-line or the next entry.
-- Deliverable: the roadmap file, plus one task prompt authored through the toolkit as a smoke
-  test.
-- Done when: `uv run aidw tasks --phase 00` lists every §6 task, and one
-  `aidw prompt 00 E0 E0.1` run produces a prompt for review.
+- [ ] **E0.7 Convert this document's tasks into a roadmap (mandatory)**
+**Mandatory, not optional.** `aidw prompt` is roadmap-driven: `prompt.py:123` reads
+`repo/docs/tasks`, and `find_task` returning `None` exits `2` with `roadmap task not found`. Every
+task §5.5 sends through the pipeline therefore depends on this one. It cannot dogfood itself — it
+creates the file `aidw prompt` needs — so it is implemented directly.
+
+Note that `aidw implement` does **not** read the roadmap: it derives `(phase, task, branch)` from
+the prompt *filename* (`implement.py` `_PROMPT_NAME`). The roadmap gates prompt *authoring*, not
+implementation.
+
+Create `docs/tasks/00 - Extraction.md`. **The contract is five regexes in `aidw/roadmap.py`** —
+match those, not the summary in §3.7:
+
+    TASK_RE      ^\s*-\s*\[([ xX])\]\s*\*\*([A-Za-z0-9.]+)\.\s*(.*?)\*\*(.*)$
+    EPIC_RE      ^##\s+Epic\s+([A-Za-z0-9]+):\s*(.*)$
+    PHASE_RE     ^#\s+Phase\s+([0-9.]+):?\s*(.*)$
+    DONE_RE      ^\s*(?:-\s*)?\**Done when:?\**\s*(.*)$      (IGNORECASE)
+    _FILENAME_RE ^(\d{2}(?:\.\d+)?)\s*-\s*(.*)\.md$
+
+Rules that bite, each verified against the shipped parser:
+
+1. **The task id must be followed by a period inside the bold.** This document's own headings are
+   `- [x] **E0.1 Create the new repository**` — no period — and that parses as task id `E0` with
+   title `1 Create the new repository`. It fails *silently and destructively*: every entry
+   collapses to the epic-level id with a stray leading digit in the title, so `find_task` finds
+   nothing and `aidw prompt` fails. Add the period.
+2. **Phase comes from the filename, not the heading** — `00 - Extraction.md` yields
+   `entry.phase == "00"`, so the invocation is `aidw prompt 00 E0 E0.1`. `aidw prompt 0 …` does
+   not match `find_task`.
+3. **The filename must be exactly `\d{2}` + ` - ` + name + `.md`.** `0 -`, `000 -` and
+   `extraction.md` all fail.
+4. **`## Epic X:` and `# Phase N:` headings are cosmetic.** `epic` is derived from the task id
+   (`derive_epic("E0.1") → "E0"`), and `find_task` matches on phase + task only. For a `00 -`
+   file, `# Phase 0:` does not even match `PHASE_RE`, so `phase_title` stays `None`. Harmless.
+5. **`- Done when:` must appear before any blank line** after the task line. Intervening lines are
+   fine: this document's `- Deliverable:` line between the task and its `Done when` parses
+   correctly, and the task's prose detail may sit on the line *after* the `**` rather than inline.
+6. **Exclude MF.1–MF.6.** They would parse as phase-`00` tasks with id/epic `MF`, but they are
+   work in the *Mythical Forge* repo. They belong in Mythical Forge's roadmap, or nowhere.
+7. **Carry the checkbox state over** (`[x]` for E0.1–E0.6, `[ ]` for the rest). `find_task`
+   ignores `done`, and `aidw tasks --todo` filters on it.
+
+Guard against rule 1 before relying on the file. Kept to a single line, and single-quoted, so it
+survives a copy-paste out of this indented block; it exits non-zero on a collapsed id:
+
+    uv run python -c 'import pathlib; from aidw.roadmap import load_tasks; t=load_tasks(pathlib.Path("docs/tasks")); assert t, "no tasks parsed"; bad=[x.task for x in t if "." not in x.task]; assert not bad, f"MISPARSE: {bad}"; print(f"{len(t)} tasks, none collapsed")'
+
+- Deliverable: `docs/tasks/00 - Extraction.md`, plus one task prompt authored through the toolkit
+  as a smoke test.
+- Done when: `uv run aidw tasks --phase 00` lists every §6 task (E0–E9, none collapsed), the guard
+  above passes, and one `aidw prompt 00 E0 E0.1` run produces a prompt for review.
 - Known frictions: `prompt.py:123` hardcodes `docs/tasks` until E3, and `_FILENAME_RE` requires a
   two-digit phase, so branches are named `00-E0.1` until `repo.branch_pattern` is configurable
   (E4).
