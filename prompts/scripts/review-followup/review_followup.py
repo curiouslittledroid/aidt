@@ -13,8 +13,9 @@ What this script does NOT do: decide whether the code work is done. ``fixed`` is
 a separate, explicit call that the agent makes only after its own acceptance
 checks pass. Nothing here is ever chained automatically.
 
-Run with any Python 3.9+, no install step:
-  python3 aidt/prompts/scripts/review-followup/review_followup.py --help
+Run with any Python 3.9+, no install step (``AIDW_SCRIPTS_DIR`` is the toolkit's
+absolute ``prompts/scripts`` directory, set by ``aidw`` for every stage):
+  python3 "${AIDW_SCRIPTS_DIR:-<toolkit>/prompts/scripts}/review-followup/review_followup.py" --help
 
 Exit codes: 0 ok, 1 verification failed, 2 usage/GitHub error,
             3 no available child, 4 workflow conflict.

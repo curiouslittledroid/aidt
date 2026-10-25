@@ -22,16 +22,19 @@ inline. Everything here is exact-match and shell-free.
   standard library. There is no build step and no virtualenv of their own.
 - **No third-party dependencies.** Manifest validation is hand-written, so
   there is no schema library to install.
-- **No project-specific paths.** The prompts invoke the scripts through their
-  fixed `aidt/prompts/scripts/review-followup/...` location, not through
-  package-manager aliases.
+- **No project-specific paths.** The prompts invoke the scripts through the
+  toolkit's absolute `prompts/scripts` directory, passed to the stage as
+  `AIDW_SCRIPTS_DIR`, not through package-manager aliases and not through a
+  path relative to the target repository.
 - `gh` is the only external tool required, plus `git` for the branch check.
 
-Run a script by path:
+Run a script by path (set `AIDW_SCRIPTS_DIR` yourself when running outside
+`aidw`, which sets it for every stage):
 
 ```bash
-python3 aidt/prompts/scripts/review-followup/review_followup.py --help
-python3 aidt/prompts/scripts/review-followup/publish_review_followups.py --help
+scripts_dir="${AIDW_SCRIPTS_DIR:-/path/to/toolkit/prompts/scripts}"
+python3 "$scripts_dir/review-followup/review_followup.py" --help
+python3 "$scripts_dir/review-followup/publish_review_followups.py" --help
 ```
 
 `aidw fix` invokes the same entry points as a subprocess, using its own
@@ -47,22 +50,22 @@ chained automatically.
 ## `review_followup.py`
 
 ```bash
-runner="python3 aidt/prompts/scripts/review-followup/review_followup.py"
+scripts_dir="${AIDW_SCRIPTS_DIR:-/path/to/toolkit/prompts/scripts}"
 
 # Read-only: resolve PR -> parent issue -> first available child
-$runner select --pr 174
+"$scripts_dir/review-followup/review_followup.py" select --pr 174
 
 # Record the exact "Status: in progress" comment (idempotent)
-$runner start --pr 174 [--issue 176] [--dry-run]
+"$scripts_dir/review-followup/review_followup.py" start --pr 174 [--issue 176] [--dry-run]
 
 # Record the exact "Status: fixed" comment and close the issue
-$runner fixed --pr 174 --issue 176 --body-file ./close-body.md [--dry-run]
+"$scripts_dir/review-followup/review_followup.py" fixed --pr 174 --issue 176 --body-file ./close-body.md [--dry-run]
 
 # Read-only: assert closed, marked fixed, labels intact
-$runner verify --pr 174 --issue 176
+"$scripts_dir/review-followup/review_followup.py" verify --pr 174 --issue 176
 
 # Apply the human approval to every open child (idempotent)
-$runner approve --pr 174 [--dry-run]
+"$scripts_dir/review-followup/review_followup.py" approve --pr 174 [--dry-run]
 ```
 
 ### Exit codes
@@ -90,10 +93,10 @@ its main use is re-reading the child that was just closed.
 ## `publish_review_followups.py`
 
 ```bash
-publisher="python3 aidt/prompts/scripts/review-followup/publish_review_followups.py"
+scripts_dir="${AIDW_SCRIPTS_DIR:-/path/to/toolkit/prompts/scripts}"
 
-$publisher [--pr <number-or-url>] --input <manifest.json> [--repo <owner/name>] --dry-run
-$publisher [--pr <number-or-url>] --input <manifest.json> [--repo <owner/name>]
+"$scripts_dir/review-followup/publish_review_followups.py" [--pr <number-or-url>] --input <manifest.json> [--repo <owner/name>] --dry-run
+"$scripts_dir/review-followup/publish_review_followups.py" [--pr <number-or-url>] --input <manifest.json> [--repo <owner/name>]
 ```
 
 It validates the PR and manifest, creates missing labels, reconciles existing

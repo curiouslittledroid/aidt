@@ -13,11 +13,13 @@ import os
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Callable
 
 from aidw.agents import build_argv, build_env
 from aidw.config import AgentConfig, load_all
 from aidw.log import RunLogger
 from aidw.pi import PiResult, execute, write_meta
+from aidw.paths import SCRIPTS_DIR_ENV_VAR
 from aidw.progress import ProgressIndicator, resolve_enabled
 from aidw.prompts import render_prompt_file
 from aidw.report import cost_note
@@ -43,6 +45,13 @@ class StageSpec:
     variables: list[str]
     workflow: str = "stage"
     extra: str = ""
+    #: Optional postcondition, checked after Pi reports success. It must re-read the
+    #: external state the stage was supposed to change and return a human-readable
+    #: error when that state is wrong (``None`` when the stage's contract holds). A
+    #: zero exit from the agent is not evidence that the work happened: an agent can
+    #: stop and report a problem in its final message while still exiting 0, so the
+    #: stage is marked ``failed`` whenever the check does not pass (design §10).
+    verify: Callable[[], str | None] | None = None
 
 
 #: Retry a clearly transient Pi invocation error once (design E6, §10). ``aidw
@@ -119,6 +128,12 @@ def run_stage(
     sid = session_id(state.run_id, agent.id, spec.name, shared=agent.session == "shared")
     argv = build_argv(agent, session_id=sid)
     env = build_env(agent, dict(os.environ))
+    # Prompts invoke the bundled helper scripts with `python3`; the subprocess working
+    # directory is the *target* repo, where `aidt/prompts/scripts/...` does not exist
+    # once the toolkit lives in its own checkout. Expose the absolute toolkit path
+    # instead (EXTRACTION.md §3.6). Set after the agent's `env:` overrides so the
+    # toolkit location cannot be shadowed by config.
+    env[SCRIPTS_DIR_ENV_VAR] = str((Path(aidt_root) / "prompts" / "scripts").resolve())
 
     record = StageRecord(
         name=spec.name,
@@ -196,6 +211,20 @@ def run_stage(
         agent.max_cost_usd is not None
         and result.usage.cost_usd > agent.max_cost_usd
     )
+    # Pi exiting 0 only means the agent finished, not that it did the work: it can
+    # report a problem in its final message and still exit 0. When the stage declares a
+    # postcondition, re-read the external state and fail the stage if it does not hold
+    # (design §10). A check that raises fails the stage rather than crashing the run.
+    verification_error: str | None = None
+    if not result.failed and not over_budget and spec.verify is not None:
+        try:
+            verification_error = spec.verify() or None
+        except Exception as exc:  # noqa: BLE001 - any check failure fails the stage
+            verification_error = f"check raised {type(exc).__name__}: {exc}"
+        if verification_error:
+            logger.warn(
+                f"stage {spec.name}: postcondition not met: {verification_error}"
+            )
     with _STATE_LOCK:
         if result.failed:
             record.status = FAILED
@@ -213,6 +242,11 @@ def run_stage(
                 f"cost_ceiling: ${result.usage.cost_usd:.4f} > "
                 f"${agent.max_cost_usd:.4f}"
             )
+            state.resume = {"next_stage": spec.name}
+            state.status = FAILED
+        elif verification_error:
+            record.status = FAILED
+            record.error = f"postcondition not met: {verification_error}"
             state.resume = {"next_stage": spec.name}
             state.status = FAILED
         else:

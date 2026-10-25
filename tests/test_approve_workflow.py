@@ -131,6 +131,8 @@ def test_approved_runs_review_approver(tmp_path: Path, monkeypatch) -> None:
     assert spec.agent_id == "review-approver"
     assert spec.prompt.name == "approve-review-followups.md"
     assert spec.variables == ["7"]
+    # The stage must not succeed on the agent's exit code alone (design §10).
+    assert callable(spec.verify)
 
 
 def test_stage_failure_is_recorded(tmp_path: Path, monkeypatch) -> None:

@@ -82,3 +82,87 @@ def test_pr_view_returns_none_on_failure(monkeypatch) -> None:
         github, "_run", lambda argv, repo, timeout=github.DEFAULT_TIMEOUT: (1, "", "nope")
     )
     assert github.pr_view(Path("/repo"), 7) is None
+
+
+def _script_result(stdout: str, exit_code: int = 0, stderr: str = "") -> github.ScriptResult:
+    return github.ScriptResult([], exit_code, stdout, stderr)
+
+
+def _approve_children(*actions: str) -> str:
+    return json.dumps(
+        {
+            "action": "dry-run",
+            "children": [
+                {"number": 100 + index, "action": action}
+                for index, action in enumerate(actions)
+            ],
+        }
+    )
+
+
+def test_verify_approvals_holds_when_no_open_child_needs_changes(monkeypatch) -> None:
+    monkeypatch.setattr(
+        github,
+        "run_script",
+        lambda argv, repo, timeout: _script_result(
+            _approve_children("already-approved", "preserved-closed")
+        ),
+    )
+
+    assert github.verify_approvals(Path("/aidt"), Path("/repo"), 7) is None
+
+
+def test_verify_approvals_reports_children_still_pending(monkeypatch) -> None:
+    monkeypatch.setattr(
+        github,
+        "run_script",
+        lambda argv, repo, timeout: _script_result(
+            _approve_children("already-approved", "would-approve")
+        ),
+    )
+
+    error = github.verify_approvals(Path("/aidt"), Path("/repo"), 7)
+
+    assert error is not None and "#101" in error
+
+
+def test_verify_approvals_reports_a_read_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        github,
+        "run_script",
+        lambda argv, repo, timeout: _script_result("", exit_code=2, stderr="gh: not authenticated"),
+    )
+
+    error = github.verify_approvals(Path("/aidt"), Path("/repo"), 7)
+
+    assert error is not None
+    assert "exit 2" in error
+    assert "not authenticated" in error
+
+
+def test_verify_approvals_rejects_unparseable_output(monkeypatch) -> None:
+    monkeypatch.setattr(
+        github,
+        "run_script",
+        lambda argv, repo, timeout: _script_result("not json"),
+    )
+
+    error = github.verify_approvals(Path("/aidt"), Path("/repo"), 7)
+
+    assert error == "approve --dry-run returned unparseable output"
+
+
+def test_verify_approvals_runs_a_read_only_command(monkeypatch) -> None:
+    seen: dict = {}
+
+    def _capture(argv, repo, timeout):
+        seen["argv"] = argv
+        return _script_result(_approve_children("already-approved"))
+
+    monkeypatch.setattr(github, "run_script", _capture)
+
+    github.verify_approvals(Path("/aidt"), Path("/repo"), 7)
+
+    assert "approve" in seen["argv"]
+    assert "--dry-run" in seen["argv"]
+    assert "--pr" in seen["argv"]

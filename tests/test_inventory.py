@@ -66,3 +66,22 @@ def test_legacy_manifest_is_warning(tmp_path: Path) -> None:
         issue.level == WARNING and issue.source == inventory.LEGACY_MANIFEST
         for issue in issues
     )
+
+
+def test_prompt_invoking_a_script_must_use_the_env_var(tmp_path: Path) -> None:
+    """A cwd-relative script path resolves inside the target repo, not the toolkit."""
+    root = tmp_path / "aidt" / "prompts"
+    root.mkdir(parents=True)
+    (root / "approve-review-followups.md").write_text(
+        'runner="python3 aidt/prompts/scripts/review-followup/review_followup.py"\n',
+        encoding="utf-8",
+    )
+
+    issues = inventory.check(tmp_path / "aidt")
+
+    assert any(
+        issue.level == ERROR
+        and issue.source == "approve-review-followups.md"
+        and inventory.SCRIPTS_DIR_ENV_VAR in issue.message
+        for issue in issues
+    )

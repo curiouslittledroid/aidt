@@ -10,8 +10,8 @@ follow-up issue hierarchy: one parent issue and one native child per actionable 
 ## Hard rules
 
 - Use the bundled publisher at
-  `aidt/prompts/scripts/review-followup/publish_review_followups.py` (run it with
-  `python3`).
+  `$AIDW_SCRIPTS_DIR/review-followup/publish_review_followups.py` (run it with `python3`),
+  where `AIDW_SCRIPTS_DIR` is the toolkit's absolute `prompts/scripts` directory.
   Do **not** call `gh issue create`, `gh pr comment`, or mutating `gh api` directly.
 - Publish only findings from the review manifest AIDW provided. Invent nothing.
 - New child issues are created `decision-pending` and must not be implemented here.

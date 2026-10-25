@@ -156,6 +156,41 @@ def select_followups(
     return run_script(argv, repo, timeout)
 
 
+def verify_approvals(
+    aidt: Path, repo: Path, pr: int, timeout: int = DEFAULT_TIMEOUT
+) -> str | None:
+    """Read-only postcondition for the approve stage: every open child is approved.
+
+    A zero exit from the approver agent is not evidence that the GitHub writes
+    happened — it can stop and report a problem in its final message and still exit 0
+    (design §10). This re-reads the state through ``approve --dry-run``, which performs
+    no writes, and reports an error when any open child would still be changed.
+
+    Returns ``None`` when the postcondition holds, otherwise a human-readable error.
+    """
+    script = script_path(aidt, FOLLOWUP_SCRIPT)
+    argv = build_followup_argv(script, "approve", pr, dry_run=True)
+    result = run_script(argv, repo, timeout)
+    if result.exit_code != 0:
+        detail = (result.stderr or result.stdout).strip()[:300]
+        return (
+            f"could not read approval state (approve --dry-run exit "
+            f"{result.exit_code}): {detail}"
+        )
+    payload = parse_json_output(result.stdout)
+    if payload is None:
+        return "approve --dry-run returned unparseable output"
+    pending = [
+        child
+        for child in payload.get("children") or []
+        if child.get("action") == "would-approve"
+    ]
+    if pending:
+        numbers = ", ".join(f"#{child.get('number')}" for child in pending)
+        return f"open children still awaiting approval: {numbers}"
+    return None
+
+
 def parse_json_output(stdout: str) -> dict | None:
     """Parse the JSON that ``review_followup.py`` emits on stdout."""
     try:

@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from aidw.config import ERROR, WARNING, Issue
+from aidw.paths import SCRIPTS_DIR_ENV_VAR
 
 PROMPTS_SUBDIR = ("prompts",)
 
@@ -48,6 +49,17 @@ REQUIRED_SCRIPTS = (
 
 #: AIDT is self-contained: nothing under ``aidt/prompts`` may reference the old tree.
 FOREIGN_PREFIX = ".pi/prompts"
+
+#: Prompts that invoke a bundled helper script, mapped to the script they need. The
+#: invocation must locate the script through the runner-provided ``AIDW_SCRIPTS_DIR``
+#: (an absolute toolkit path). A path relative to the working directory — the old
+#: ``python3 aidt/prompts/scripts/...`` — resolves inside the *target* repository and
+#: fails as soon as the toolkit is its own checkout (EXTRACTION.md §3.6).
+PROMPT_INVOKED_SCRIPTS = {
+    "review-findings-to-github.md": "scripts/review-followup/publish_review_followups.py",
+    "approve-review-followups.md": "scripts/review-followup/review_followup.py",
+    "fix-next-review-followup.md": "scripts/review-followup/review_followup.py",
+}
 
 
 def prompts_dir(aidt_root: Path) -> Path:
@@ -99,6 +111,24 @@ def check(aidt_root: Path) -> list[Issue]:
         if FOREIGN_PREFIX in text:
             issues.append(
                 Issue(ERROR, rel, f"references `{FOREIGN_PREFIX}`, outside aidt/")
+            )
+
+    for prompt in PROMPT_INVOKED_SCRIPTS:
+        path = root / prompt
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if SCRIPTS_DIR_ENV_VAR not in text:
+            issues.append(
+                Issue(
+                    ERROR,
+                    prompt,
+                    f"must locate the bundled script via `{SCRIPTS_DIR_ENV_VAR}`, "
+                    "not a path relative to the target repository",
+                )
             )
 
     return issues

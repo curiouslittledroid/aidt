@@ -696,6 +696,7 @@ stage fails, so `--resume` continues from that stage.
 |---|---|
 | Pi process exits non-zero | Stage `failed`; state records exit code + tail of stderr; workflow stops (no auto-retry unless `--retry-transient`). |
 | Pi exits 0 but reports an in-stream provider error (`stopReason: "error"` or `errorMessage`, e.g. an OpenRouter 402) | Stage `failed` with the provider message; workflow stops. Credit/auth errors are not transient and are not retried. (Found by Phase 3 live validation.) |
+| Pi exits 0 but the stage's declared postcondition does not hold (the agent stopped and reported a problem in its final message instead of doing the work) | Stage `failed` with `postcondition not met: …`; the workflow stops. A zero exit only means the agent finished, so a stage whose job is an external change re-reads that state (`StageSpec.verify`, e.g. `github.verify_approvals`) before it can succeed. (Found by a live `approve-followups` run.) |
 | A review stage returns no final message | Stage `failed`; the workflow stops rather than treating it as "ambiguous" and running rework on empty findings. |
 | Pi invocation error that looks transient (network/provider 5xx) | With `--retry-transient` (default on for one attempt), retry once after a short backoff; record both attempts. Gate failures are never retried. |
 | Stage timeout | `failed`; process group terminated; partial log retained. |

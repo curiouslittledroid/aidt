@@ -162,6 +162,13 @@ class TargetRepo:
         return cls(root=root, git_dir=git_dir, common_dir=common_dir)
 
 
+#: Environment variable the stage runner sets to the toolkit's absolute
+#: ``prompts/scripts`` directory (EXTRACTION.md §3.6). Prompt-invoked helpers such as
+#: ``review_followup.py`` resolve through it, because a path relative to the stage's
+#: working directory would point inside the *target* repository, not the toolkit.
+SCRIPTS_DIR_ENV_VAR = "AIDW_SCRIPTS_DIR"
+
+
 def toolkit_root() -> Path:
     """Return the absolute root of the installed toolkit.
 

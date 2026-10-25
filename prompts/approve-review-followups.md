@@ -17,11 +17,15 @@ descriptions.
 Use only the bundled bookkeeping script for GitHub reads and writes:
 
 ```bash
-runner="python3 aidt/prompts/scripts/review-followup/review_followup.py"
+# AIDW exports AIDW_SCRIPTS_DIR = the toolkit's absolute prompts/scripts directory, for
+# every stage. It is inherited by each `bash` call, so the bundled script resolves no
+# matter which repository is the working directory; fail fast if it is unset rather than
+# guessing a path relative to the current directory.
+: "${AIDW_SCRIPTS_DIR:?AIDW_SCRIPTS_DIR is not set; run this prompt via aidw (aidw approve-followups or aidw fix)}"
 pr="<PR number or URL>"
 
-$runner approve --pr "$pr" --dry-run   # read-only: show exactly what would change
-$runner approve --pr "$pr"             # apply the approval
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" approve --pr "$pr" --dry-run   # read-only
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" approve --pr "$pr"             # apply
 ```
 
 Do not call `gh issue edit`, `gh issue comment`, `gh label create`, or a mutating `gh api`
@@ -46,7 +50,7 @@ The PR argument is `$1`. If it is missing, stop and ask for a PR number or URL.
 ## 1. Run the dry run first
 
 ```bash
-$runner approve --pr "$pr" --dry-run
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" approve --pr "$pr" --dry-run
 ```
 
 Stop and report if it fails. Read the JSON: it lists, per child, the action
@@ -56,7 +60,7 @@ Confirm the parent is the expected one. Do not continue on an ambiguity.
 ## 2. Apply the approval
 
 ```bash
-$runner approve --pr "$pr"
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" approve --pr "$pr"
 ```
 
 Read the exit code. On `0`, the JSON reports `labelCreated` and, per child, `action`,

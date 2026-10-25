@@ -304,7 +304,11 @@ Rules:
   stage declares one. **Verify Pi's precedence behaviour; do not assume it.**
 - The `prompts/scripts/review-followup/` bundled scripts stay with the **toolkit** (GitHub
   bookkeeping, not repo-specific). Python-owned calls use `sys.executable`; prompt-invoked calls
-  use `python3`, as today.
+  use `python3`, as today, but must locate the script through the runner-provided
+  `AIDW_SCRIPTS_DIR` (the toolkit's absolute `prompts/scripts` directory). A path relative to
+  the stage's working directory resolves inside the **target** repo, which has no `aidt/`
+  checkout once the toolkit is extracted; `AIDW_SCRIPTS_DIR` is how E1.2's `ToolkitPaths`
+  reaches a prompt.
 
 ### 3.7 Roadmap model (AIDT-owned, D6/D15)
 

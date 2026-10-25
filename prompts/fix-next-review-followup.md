@@ -13,22 +13,25 @@ The PR argument is `$1`. If it is missing, stop and ask for a PR number or URL.
 
 ## 0. Use the bookkeeping script
 
-`aidt/prompts/scripts/review-followup/` owns every mechanical part of the GitHub workflow described below. Prefer it over hand-written `gh` calls: it is exact-match, idempotent, and avoids the known shell hazards (`gh issue close` has no `--body-file`; `gh api --slurp` cannot be combined with `--jq`; long markdown bodies are unsafe to pass inline).
+The toolkit's `prompts/scripts/review-followup/` directory (`$AIDW_SCRIPTS_DIR/review-followup/`) owns every mechanical part of the GitHub workflow described below. Prefer it over hand-written `gh` calls: it is exact-match, idempotent, and avoids the known shell hazards (`gh issue close` has no `--body-file`; `gh api --slurp` cannot be combined with `--jq`; long markdown bodies are unsafe to pass inline).
 
 ```bash
-# Define once. This form keeps stdout as pure JSON and propagates exit codes.
-runner="python3 aidt/prompts/scripts/review-followup/review_followup.py"
+# AIDW exports AIDW_SCRIPTS_DIR = the toolkit's absolute prompts/scripts directory, for
+# every stage. It is inherited by each `bash` call, so the bundled script resolves no
+# matter which repository is the working directory; fail fast if it is unset rather than
+# guessing a path relative to the current directory.
+: "${AIDW_SCRIPTS_DIR:?AIDW_SCRIPTS_DIR is not set; run this prompt via aidw (aidw fix)}"
 pr="<PR number or URL>"
 
-$runner select --pr "$pr"          # read-only
-$runner start  --pr "$pr"          # records "Status: in progress"
-$runner fixed  --pr "$pr" --issue <child> --body-file "$body"
-$runner verify --pr "$pr" --issue <child>   # read-only
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" select --pr "$pr"          # read-only
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" start  --pr "$pr"          # records "Status: in progress"
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" fixed  --pr "$pr" --issue <child> --body-file "$body"
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" verify --pr "$pr" --issue <child>   # read-only
 ```
 
 Rules for using it:
 
-- Use the `$runner` form above. It runs on any Python 3.9+ with no install step and no third-party dependencies, so it works in any repository these prompts are copied into.
+- Use the `python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py"` form above. It runs on any Python 3.9+ with no install step and no third-party dependencies, so it works in any repository these prompts are copied into.
 - Do **not** route the output through a package-manager script alias when you need to read the JSON output — the package manager prefixes its own banner to stdout, and `pnpm -s` collapses every non-zero exit code to 1.
 - Read the exit code: `0` ok, `1` verification failed, `2` usage/GitHub error, `3` no available child, `4` workflow conflict. A non-zero code means stop and report — do not work around it.
 - The script never decides whether the *code* work is done. `fixed` is an explicit call you make only after section 5 passes. Never chain it to anything.
@@ -56,7 +59,7 @@ Children that appear *after* the selected child are not inspected. This prompt f
 Run the read-only validation first:
 
 ```bash
-$runner select --pr "$pr"
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" select --pr "$pr"
 ```
 
 This performs the access, PR, base-branch, and branch checks below and resolves the parent and selection in one call. It stops when:
@@ -113,7 +116,7 @@ Before editing code, report:
 
 ### Resuming after an interrupted run
 
-An exact `Status: in progress` comment makes a child unavailable, so a run that aborts after `start` would otherwise strand that child forever. If `select` reports `STATUS_IN_PROGRESS` for the child you were working on, and the user confirms you should resume it, run `$runner start --pr "$pr" --issue <child>` again: it is idempotent and reports `ALREADY_IN_PROGRESS` without posting a second comment. Only do this when you are resuming the same child in the same working tree; otherwise report the stranded child and stop.
+An exact `Status: in progress` comment makes a child unavailable, so a run that aborts after `start` would otherwise strand that child forever. If `select` reports `STATUS_IN_PROGRESS` for the child you were working on, and the user confirms you should resume it, run `python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" start --pr "$pr" --issue <child>` again: it is idempotent and reports `ALREADY_IN_PROGRESS` without posting a second comment. Only do this when you are resuming the same child in the same working tree; otherwise report the stranded child and stop.
 
 ## 4. Read the selected issue and repository guidance
 
@@ -132,7 +135,7 @@ Do not weaken the issue’s technical requirement. Do not expand into other revi
 Before implementation, record that work has started:
 
 ```bash
-$runner start --pr "$pr"
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" start --pr "$pr"
 ```
 
 This posts the exact comment `Status: in progress` to the selected issue. Only run it after the selected issue has been confirmed as available and the repository/issue context has been read. If it fails, stop before editing files.
@@ -226,7 +229,7 @@ The body must not begin with `Status: fixed`; that exact comment is posted separ
 Then:
 
 ```bash
-$runner fixed --pr "$pr" --issue <child> --body-file "$body"
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" fixed --pr "$pr" --issue <child> --body-file "$body"
 ```
 
 This posts the exact comment `Status: fixed` (skipped if already present), closes the issue with your body, and reports whether the labels survived.
@@ -240,7 +243,7 @@ Preserve the child’s priority label and `review-follow-up` label. Do not remov
 Re-read the selected issue:
 
 ```bash
-$runner verify --pr "$pr" --issue <child>
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" verify --pr "$pr" --issue <child>
 ```
 
 Confirm from its output:
@@ -269,7 +272,7 @@ Do not claim that the PR is approved, merged, or fully complete. This prompt fix
 
 ## Appendix: manual equivalents
 
-Use these only if `aidt/prompts/scripts/review-followup/` is unavailable. They require `jq`.
+Use these only if the toolkit's `prompts/scripts/review-followup/` scripts are unavailable. They require `jq`.
 
 Find the parent by exact marker (external `jq`, because `gh api --slurp` cannot be combined with `--jq`):
 

@@ -26,17 +26,21 @@ The optional argument is `$1`. If supplied, pass it as the PR number or URL. Oth
 Do not perform GitHub issue or PR writes directly. Use the script that ships beside this prompt:
 
 ```bash
-publisher="python3 aidt/prompts/scripts/review-followup/publish_review_followups.py"
+# AIDW exports AIDW_SCRIPTS_DIR = the toolkit's absolute prompts/scripts directory, for
+# every stage. It is inherited by each `bash` call, so the bundled script resolves no
+# matter which repository is the working directory; fail fast if it is unset rather than
+# guessing a path relative to the current directory.
+: "${AIDW_SCRIPTS_DIR:?AIDW_SCRIPTS_DIR is not set; run this prompt via aidw (aidw review or aidw fix)}"
 
-$publisher [--pr <PR number or URL>] --input <manifest path> --dry-run
-$publisher [--pr <PR number or URL>] --input <manifest path>
+python3 "$AIDW_SCRIPTS_DIR/review-followup/publish_review_followups.py" [--pr <PR number or URL>] --input <manifest path> --dry-run
+python3 "$AIDW_SCRIPTS_DIR/review-followup/publish_review_followups.py" [--pr <PR number or URL>] --input <manifest path>
 ```
 
 If the prompt argument contains a PR number or URL, pass it with `--pr`. If no argument was supplied, omit `--pr`; the script will resolve the PR for the current branch with `gh pr view`.
 
-The script is `aidt/prompts/scripts/review-followup/publish_review_followups.py`. It invokes the GitHub CLI, validates the PR and manifest, creates missing labels, reconciles existing parent/child issues using stable markers, verifies native sub-issue relationships, and creates or updates the PR summary comment. It is intentionally idempotent and stops on ambiguous matches.
+The script is `publish_review_followups.py` in the toolkit's `prompts/scripts/review-followup/` directory (`$AIDW_SCRIPTS_DIR/review-followup/`). It invokes the GitHub CLI, validates the PR and manifest, creates missing labels, reconciles existing parent/child issues using stable markers, verifies native sub-issue relationships, and creates or updates the PR summary comment. It is intentionally idempotent and stops on ambiguous matches.
 
-It has no install step and no third-party dependencies: run it with any Python 3.9+ (`python3`). If the script directory was not copied with the prompts, stop and report that the publisher is unavailable; do not hand-write the issue, label, sub-issue, and comment writes this prompt depends on.
+It has no install step and no third-party dependencies: run it with any Python 3.9+ (`python3`). If `AIDW_SCRIPTS_DIR` is unset or the script is missing, stop and report that the publisher is unavailable; do not hand-write the issue, label, sub-issue, and comment writes this prompt depends on.
 
 The script requires:
 

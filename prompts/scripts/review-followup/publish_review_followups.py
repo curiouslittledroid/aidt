@@ -6,8 +6,9 @@ Sibling of ``review_followup.py``; both share :mod:`constants`, :mod:`proc`,
 GitHub CLI. The script is idempotent by stable PR/finding markers and stops on
 ambiguous matches rather than guessing which issue to modify.
 
-Run with any Python 3.9+, no install step:
-  python3 aidt/prompts/scripts/review-followup/publish_review_followups.py \\
+Run with any Python 3.9+, no install step (``AIDW_SCRIPTS_DIR`` is the toolkit's
+absolute ``prompts/scripts`` directory, set by ``aidw`` for every stage):
+  python3 "${AIDW_SCRIPTS_DIR:-<toolkit>/prompts/scripts}/review-followup/publish_review_followups.py" \\
     --pr <number-or-url> --input <manifest.json> --dry-run
 """
 

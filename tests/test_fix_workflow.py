@@ -65,10 +65,12 @@ def _select_seq(items: list[github.ScriptResult]):
 class _FakeStages:
     def __init__(self, review_text: str = APPROVE_REVIEW) -> None:
         self.names: list[str] = []
+        self.specs: list = []
         self.review_text = review_text
 
     def __call__(self, spec, **kwargs):
         self.names.append(spec.name)
+        self.specs.append(spec)
         directory = run_dir(
             Path(kwargs["repo_root"]) / "aidt" / "runs", kwargs["state"].run_id
         )
@@ -133,6 +135,8 @@ def test_no_available_child_is_success(tmp_path: Path, monkeypatch) -> None:
 
     assert code == 0
     assert stages.names == ["round1-approve-review-followups"]
+    # The approve step must not succeed on the agent's exit code alone (design §10).
+    assert callable(stages.specs[0].verify)
 
 
 def test_clean_iteration_closes_child(tmp_path: Path, monkeypatch) -> None:

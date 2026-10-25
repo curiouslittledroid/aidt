@@ -147,7 +147,13 @@ def run(
         else:
             print("child:  unknown (`gh` not found)")
         record = run_stage(
-            StageSpec(STAGE, AGENT, aidt / "prompts" / PROMPT, [str(pr)]),
+            StageSpec(
+                STAGE,
+                AGENT,
+                aidt / "prompts" / PROMPT,
+                [str(pr)],
+                verify=lambda: github.verify_approvals(aidt, repo, pr),
+            ),
             repo_root=repo,
             aidt_root=aidt,
             state=state,
@@ -194,7 +200,13 @@ def run(
         return 3
 
     record = run_stage(
-        StageSpec(STAGE, AGENT, aidt / "prompts" / PROMPT, [str(pr)]),
+        StageSpec(
+            STAGE,
+            AGENT,
+            aidt / "prompts" / PROMPT,
+            [str(pr)],
+            verify=lambda: github.verify_approvals(aidt, repo, pr),
+        ),
         repo_root=repo,
         aidt_root=aidt,
         state=state,

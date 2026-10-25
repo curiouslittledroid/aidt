@@ -164,6 +164,7 @@ def _approval_round(
             "review-approver",
             aidt / "prompts" / "approve-review-followups.md",
             [str(pr)],
+            verify=lambda: github.verify_approvals(aidt, repo, pr),
         ),
         repo_root=repo,
         aidt_root=aidt,

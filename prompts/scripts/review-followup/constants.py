@@ -13,7 +13,7 @@ The scripts deliberately have no runtime dependencies beyond the Python
 standard library and no project-specific paths, so this directory can be copied
 into another repository with the prompts. They run on any Python 3.9+:
 
-    python3 aidt/prompts/scripts/review-followup/review_followup.py --help
+    python3 "${AIDW_SCRIPTS_DIR:-<toolkit>/prompts/scripts}/review-followup/review_followup.py" --help
 """
 
 from __future__ import annotations
