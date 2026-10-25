@@ -116,7 +116,7 @@
   - Done when: `aidw doctor` can report the toolkit root while invoked from `/tmp`.
   - Note: E0.4 lands the minimal version of this so the repo is runnable; this task formalises it into a type and covers the installed (non-repo, `uv tool install`) case.
 
-- [ ] **E1.3. Workspace and state root (D18)**
+- [x] **E1.3. Workspace and state root (D18)**
   `workspace_root = dirname(git rev-parse --path-format=absolute --git-common-dir)`;
   `state_root = AIDW_STATE_DIR or <workspace_root>/.aidw/state or ~/.aidw/state`; `repo_slug` from
   `git remote get-url origin`, else the workspace-root basename.
