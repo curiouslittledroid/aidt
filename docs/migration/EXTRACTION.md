@@ -618,7 +618,7 @@ exactly as in §5.2; tag `baseline-verbatim`.
   is empty and the tag exists. (A `git diff` against `<source-sha>:aidt` will *not* be empty — the
   copy is flattened, per §5.2.)
 
-- [ ] **E0.3 Repo skeleton (file moves only)**
+- [x] **E0.3 Repo skeleton (file moves only)**
 Move `aidw-initial-prompt*.md` to `docs/history/`; create `docs/roadmap-format.md`,
 `docs/target-repo-config.md`, `docs/schema/`, `fixtures/` and `docs/migration/` placeholders;
 move this document to `docs/migration/EXTRACTION.md`. No code behaviour changes.
