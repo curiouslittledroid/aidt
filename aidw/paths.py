@@ -17,9 +17,12 @@ roots; :func:`aidt_root` and :func:`runs_dir` remain transitional aliases until 
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 class RepoNotFoundError(RuntimeError):
@@ -209,6 +212,181 @@ class ToolkitPaths:
             agent_configs_dir=(root / "agent-configs").resolve(),
             agents_dir=(root / "agents").resolve(),
             scripts_dir=(prompts_dir / "scripts").resolve(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Workspace and per-repo state roots (E1.3 / D18 / R1)
+# ---------------------------------------------------------------------------
+
+#: Environment variable overriding the state-root base (EXTRACTION.md §3.10).
+STATE_DIR_ENV_VAR = "AIDW_STATE_DIR"
+
+#: Fallback slug when even the workspace-root basename is empty (filesystem root).
+_FALLBACK_SLUG = "repo"
+
+
+def _origin_remote(repo_root: Path) -> str | None:
+    """Return ``origin``'s URL for ``repo_root``, or ``None`` when git cannot tell us.
+
+    Any failure (no ``origin`` remote, not a repository, git missing) is treated the
+    same way: the caller falls back to the workspace-root basename. This deliberately
+    never raises — a missing remote is a normal, supported configuration.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return result.stdout.strip() or None
+
+
+def _slug_from_remote(remote: str) -> str | None:
+    """Derive ``owner-name`` from a git remote URL, or ``None`` when impossible.
+
+    Handles both URL forms (``https://host/<owner>/<name>.git``,
+    ``ssh://git@host/<owner>/<name>.git``) and the scp-like SSH form
+    (``git@host:<owner>/<name>.git``), where a ``:`` precedes the path. A trailing
+    ``.git`` is stripped, and the last two path segments are joined with ``-`` — so
+    hosts with subgroups (more than two segments) still yield a distinct slug. Fewer
+    than two path segments yields ``None`` so the caller can fall back.
+    """
+    text = remote.strip()
+    if text.endswith(".git"):
+        text = text[: -len(".git")]
+
+    # scp-like syntax: `git@host:owner/name` — the ':' is a path separator, not a port.
+    scp_like = re.match(r"^[^/]+@[^/:]+:(.+)$", text)
+    if scp_like:
+        text = scp_like.group(1)
+    else:
+        # For a URL the path component is after the host; for a plain/local path it is
+        # the whole string, so this is a no-op there.
+        text = urlparse(text).path or text
+
+    segments = [segment for segment in text.split("/") if segment]
+    if len(segments) < 2:
+        return None
+    return "-".join(segments[-2:])
+
+
+def _repo_slug(repo_root: Path, workspace_root: Path) -> str:
+    """``owner-name`` from ``origin``, else the workspace-root basename (§3.10/R1).
+
+    Always a non-empty string: the slug guarantees a fallback state root shared by
+    several repos cannot collide.
+    """
+    remote = _origin_remote(repo_root)
+    if remote:
+        slug = _slug_from_remote(remote)
+        if slug:
+            return slug
+    return workspace_root.name or _FALLBACK_SLUG
+
+
+def _is_usable_directory(path: Path) -> bool:
+    """Whether ``path`` can be created/used as a directory, without creating it.
+
+    Walks up to the nearest existing ancestor and checks it is a directory the current
+    user can write to. Deliberately an access check rather than a guarded ``mkdir``:
+    resolving paths must not write into a working tree (R8), and the single-checkout
+    case (§3.10) resolves state *inside* the tree. Existence of ``path`` is not
+    required — an ancestor that could host it is enough.
+    """
+    probe = path
+    while not probe.exists():
+        parent = probe.parent
+        if parent == probe:
+            return False
+        probe = parent
+    if not probe.is_dir():
+        return False
+    return os.access(probe, os.W_OK)
+
+
+def _state_base(
+    workspace_root: Path,
+    *,
+    state_dir_override: Path | None,
+    home: Path | None,
+) -> Path:
+    """Resolve the pre-slug state base: override, else workspace, else home (§3.10/R1).
+
+    The ``<workspace_root>/.aidw/state`` tier is only taken when it is usable; an
+    unwritable workspace root therefore falls closed to ``~/.aidw/state`` rather than
+    raising. Every tier is an absolute, resolved path — the ``<repo_slug>`` component is
+    appended by the caller in *all* three tiers.
+    """
+    if state_dir_override is not None:
+        return Path(state_dir_override).resolve()
+
+    env = os.environ.get(STATE_DIR_ENV_VAR)
+    if env:
+        return Path(env).resolve()
+
+    in_workspace = workspace_root / ".aidw" / "state"
+    if _is_usable_directory(in_workspace):
+        return in_workspace.resolve()
+
+    home_dir = Path(home).resolve() if home is not None else Path.home().resolve()
+    return (home_dir / ".aidw" / "state").resolve()
+
+
+@dataclass(frozen=True)
+class WorkspacePaths:
+    """The workspace root and the per-repo state root (EXTRACTION.md §3.1/§3.2/§3.10).
+
+    Deliberately a distinct type from :class:`TargetRepo` and :class:`ToolkitPaths`
+    (§3.1's "two distinct types" rule): ``workspace_root`` is the folder containing the
+    bare repository and all its sibling worktrees — not itself a git repository — and
+    ``state_root`` is the per-repo run-state directory outside every worktree
+    (``<state base>/<repo_slug>``). ``repo_slug`` is the ``owner-name`` identifier that
+    keeps a shared fallback state root from colliding between repos.
+
+    ``resolve()`` is the sole intended construction entry point (a call-site convention,
+    not an enforced invariant: like :class:`TargetRepo`, the frozen dataclass carries no
+    init guard).
+    """
+
+    workspace_root: Path
+    state_root: Path
+    repo_slug: str
+
+    @classmethod
+    def resolve(
+        cls,
+        repo: TargetRepo,
+        state_dir_override: Path | None = None,
+        home: Path | None = None,
+    ) -> "WorkspacePaths":
+        """Resolve the workspace and state roots for ``repo``.
+
+        ``workspace_root`` is ``repo.common_dir.parent`` — the ``dirname`` of the
+        absolute git-common-dir (§3.2). It is derived from the already-resolved
+        :class:`TargetRepo` and never re-runs git, so it is identical from every
+        worktree of one repository and correct for the plain-clone case too (where
+        ``common_dir == <root>/.git`` and ``workspace_root`` is the working tree).
+
+        ``state_root`` is ``<base>/<repo_slug>`` with ``base`` = ``state_dir_override``
+        (``AIDW_STATE_DIR`` when ``None``), else ``<workspace_root>/.aidw/state``, else
+        ``<home>/.aidw/state``. Both injection points default to the real environment so
+        tests can exercise every tier without touching it.
+        """
+        workspace_root = repo.common_dir.parent.resolve()
+        repo_slug = _repo_slug(repo.root, workspace_root)
+        base = _state_base(
+            workspace_root, state_dir_override=state_dir_override, home=home
+        )
+        state_root = (base / repo_slug).resolve()
+        return cls(
+            workspace_root=workspace_root,
+            state_root=state_root,
+            repo_slug=repo_slug,
         )
 
 
