@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The workflow only reads the repository.
+permissions:
+  contents: read
+
+# One run per ref; a newer push supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest and doctor
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+        with:
+          enable-cache: true
+
+      # `aidw doctor` reports a missing `pi` as a hard failure: it is the runtime every
+      # agent stage drives. Install it so CI validates the real prerequisite set rather
+      # than weakening the check. `--ignore-scripts` is Pi's documented install form.
+      - name: Install Pi
+        run: npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+
+      # `--frozen` makes a stale `uv.lock` a CI failure instead of a silent update.
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Run tests
+        run: uv run --frozen pytest
+
+      - name: Doctor
+        run: uv run --frozen aidw doctor
