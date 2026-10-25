@@ -641,7 +641,7 @@ from git, and re-point the existing global `--repo` so it selects the **target**
 - Note: this is the minimal version of E1.2, landed early so the repo can run its own workflow.
   E1.2 formalises it into a type; E1.1 and E1.3 add the target, workspace and state roots.
 
-- [ ] **E0.5 CI**
+- [x] **E0.5 CI**
 `.github/workflows/ci.yml`: `uv sync`, `uv run pytest`, `uv run aidw doctor` on push and PR.
 - Deliverable: a CI workflow.
 - Done when: CI is green on `main` and on a test PR, and a deliberately broken test fails CI.
