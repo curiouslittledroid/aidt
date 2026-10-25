@@ -718,9 +718,11 @@ survives a copy-paste out of this indented block; it exits non-zero on a collaps
 - Deliverable: `docs/tasks/00 - Extraction.md`, plus one task prompt authored through the toolkit
   as a smoke test.
 - Done when: `uv run aidw tasks --phase 00` lists every §6 task (E0–E9, none collapsed), the guard
-  above passes, and one `aidw prompt 00 E0 E0.1` run produces a prompt for review.
+  above passes, and one `aidw prompt 00 E1 E1.1` run produces a prompt for review. (E1.1 rather than
+  E0.1: E0.1 is already complete, so its prompt would be a throwaway, whereas E1.1 is the first task
+  that actually needs the pipeline — the smoke test doubles as its real authoring step.)
 - Known frictions: `prompt.py:123` hardcodes `docs/tasks` until E3, and `_FILENAME_RE` requires a
-  two-digit phase, so branches are named `00-E0.1` until `repo.branch_pattern` is configurable
+  two-digit phase, so branches are named `00-E1.1` until `repo.branch_pattern` is configurable
   (E4).
 
 ### E1 — Two-root core
