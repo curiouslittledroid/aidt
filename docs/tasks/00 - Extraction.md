@@ -103,7 +103,7 @@
 
 ## Epic E1: Two-root core
 
-- [ ] **E1.1. `TargetRepo` resolution (D19)**
+- [x] **E1.1. `TargetRepo` resolution (D19)**
   Implement target resolution: cwd walk-up, then `--repo <path>`, then `AIDW_REPO`. Expose
   `root`, `git_dir`, `common_dir`, `base_branch` (from config, E3).
   - Deliverable: a `TargetRepo` type plus tests including: inside a worktree; inside a subdirectory; an explicit `--repo`; a non-repo path; the bare dir.
