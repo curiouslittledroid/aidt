@@ -547,8 +547,11 @@ No changes from the source tree.
 
 - The new repo dogfoods its own SDLC (D21): `design.md`, a `docs/tasks/` roadmap, and task
   prompts. Until the toolkit is self-hosting (E4), tasks are plain markdown from this document.
-- Every task from §6 lands on its own branch and goes through a PR into the new repo's `main`.
-  Base branch is always `main`; **never merge from an agent** — the owner merges.
+- **Delivery depends on the task class (§5.5).** Only the tasks §5.5 sends through the pipeline —
+  the ones that dogfood AIDW by authoring a task prompt — land on their own branch and go through
+  a PR into the new repo's `main`. Base branch is always `main`, and **never merge from an agent**
+  — the owner merges. Every other §6 task is implemented directly from this document and committed
+  **straight to `main`**: no branch, no PR, because there is no pipeline output to review.
 - Conventional-commit titles, matching what Mythical Forge already does.
 - Ordering matters: E0 before everything; E1 and E2 before E3–E7, because later work assumes the
   two-root split and the worktree model.
