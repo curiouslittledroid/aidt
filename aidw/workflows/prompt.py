@@ -584,6 +584,22 @@ def run(
 
         if verdict == APPROVE:
             break
+        if verdict == VERDICT_BLOCKED:
+            # A `Blocked` verdict means a material ambiguity only a human can settle, so
+            # it short-circuits before any fix stage and before any ``approve_all`` path
+            # can reach the gate or :func:`_commit_reviewed_prompt` — the prompt stays
+            # uncommitted and the run fails closed (design §8.1/§8.3, L2.1). This runs
+            # before ``revisions += 1`` so a Blocked review never spawns a fixer, with or
+            # without parsed findings.
+            logger.error("task review returned Blocked; failing closed.")
+            state.status = BLOCKED
+            save(directory, state)
+            print(
+                "task review returned Blocked; a human must settle it.",
+                file=sys.stderr,
+            )
+            print(review_text, file=sys.stderr)
+            return 3
         if revisions >= MAX_REVISIONS:
             # No round left to run (MAX_REVISIONS is zero): accept what is already reviewed.
             assumed_ok = verdict != VERDICT_BLOCKED
