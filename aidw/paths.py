@@ -107,6 +107,36 @@ def _resolve_worktree_root(origin: Path) -> Path:
     return Path(top).resolve()
 
 
+def _rev_parse_roots(origin: Path) -> tuple[Path, Path, Path] | None:
+    """Resolve the worktree root, git dir and common dir in a single ``git`` call.
+
+    ``git rev-parse`` prints one line per requested field, in argument order, so the three
+    values :class:`TargetRepo` needs cost one process spawn instead of three — the hot path
+    of every ``aidw`` invocation and of roughly 400 resolutions in the test suite.
+
+    Returns ``None`` when the command fails or prints an unexpected shape, so the caller can
+    fall back to the step-by-step path. That fallback keeps the specific diagnostics
+    (:class:`BareRepositoryError` vs :class:`RepoNotFoundError`) exactly as they were.
+    """
+    try:
+        out = _git_output(
+            origin,
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+    lines = out.splitlines()
+    if len(lines) != 3 or not all(lines):
+        return None
+    root, git_dir, common_dir = (Path(line).resolve() for line in lines)
+    return root, git_dir, common_dir
+
+
 @dataclass(frozen=True)
 class TargetRepo:
     """The target repository a workflow operates on (EXTRACTION.md §3.1).
@@ -142,6 +172,11 @@ class TargetRepo:
                 )
         else:
             origin = (start or Path.cwd()).resolve()
+
+        roots = _rev_parse_roots(origin)
+        if roots is not None:
+            root, git_dir, common_dir = roots
+            return cls(root=root, git_dir=git_dir, common_dir=common_dir)
 
         root = _resolve_worktree_root(origin)
         try:
