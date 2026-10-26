@@ -69,7 +69,7 @@ DEFAULT_PROGRESS: bool | None = None
 _STATE_LOCK = threading.Lock()
 
 
-def resolve_prompt(aidt_root: Path, value: str) -> Path:
+def resolve_prompt(toolkit_root: Path, value: str) -> Path:
     """Resolve a prompt name (``code-review``) or path to a prompt file."""
     candidate = Path(value)
     if candidate.is_absolute() and candidate.is_file():
@@ -79,21 +79,21 @@ def resolve_prompt(aidt_root: Path, value: str) -> Path:
             return candidate.resolve()
 
     name = value if value.endswith(".md") else f"{value}.md"
-    return (aidt_root / "prompts" / name).resolve()
+    return (toolkit_root / "prompts" / name).resolve()
 
 
 def run_stage(
     spec: StageSpec,
     *,
     repo_root: Path,
-    aidt_root: Path,
+    toolkit_root: Path,
     state: RunState,
     logger: RunLogger,
     agents: dict[str, AgentConfig] | None = None,
     dry_run: bool = False,
     retry_transient: bool | None = None,
     show_progress: bool | None = None,
-    runs_dir: Path | None = None,
+    runs_root: Path,
 ) -> StageRecord:
     """Execute (or plan) one stage and persist its record in ``state``."""
     if retry_transient is None:
@@ -101,7 +101,7 @@ def run_stage(
     if show_progress is None:
         show_progress = DEFAULT_PROGRESS
     if agents is None:
-        agents, issues = load_all(aidt_root, repo_root)
+        agents, issues = load_all(toolkit_root, repo_root)
         errors = [i for i in issues if i.level == "error"]
         if errors:
             raise ValueError(
@@ -118,7 +118,6 @@ def run_stage(
     rendered = render_prompt_file(spec.prompt, spec.variables)
     if spec.extra:
         rendered = f"{rendered}\n\n{spec.extra}"
-    runs_root = runs_dir if runs_dir is not None else aidt_root / "runs"
     directory = run_dir(runs_root, state.run_id)
     prompts_dir = directory / "prompts"
     prompts_dir.mkdir(parents=True, exist_ok=True)
@@ -133,7 +132,7 @@ def run_stage(
     # once the toolkit lives in its own checkout. Expose the absolute toolkit path
     # instead (EXTRACTION.md §3.6). Set after the agent's `env:` overrides so the
     # toolkit location cannot be shadowed by config.
-    env[SCRIPTS_DIR_ENV_VAR] = str((Path(aidt_root) / "prompts" / "scripts").resolve())
+    env[SCRIPTS_DIR_ENV_VAR] = str((Path(toolkit_root) / "prompts" / "scripts").resolve())
 
     record = StageRecord(
         name=spec.name,

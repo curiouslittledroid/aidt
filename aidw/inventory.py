@@ -62,13 +62,13 @@ PROMPT_INVOKED_SCRIPTS = {
 }
 
 
-def prompts_dir(aidt_root: Path) -> Path:
-    return aidt_root.joinpath(*PROMPTS_SUBDIR)
+def prompts_dir(toolkit_root: Path) -> Path:
+    return toolkit_root.joinpath(*PROMPTS_SUBDIR)
 
 
-def list_files(aidt_root: Path) -> list[str]:
+def list_files(toolkit_root: Path) -> list[str]:
     """Every prompt/script file AIDT owns, relative to ``aidt/prompts/``."""
-    root = prompts_dir(aidt_root)
+    root = prompts_dir(toolkit_root)
     if not root.is_dir():
         return []
     return sorted(
@@ -78,10 +78,10 @@ def list_files(aidt_root: Path) -> list[str]:
     )
 
 
-def check(aidt_root: Path) -> list[Issue]:
+def check(toolkit_root: Path) -> list[Issue]:
     """Validate that the required prompts/scripts exist and stay inside ``aidt/``."""
     issues: list[Issue] = []
-    root = prompts_dir(aidt_root)
+    root = prompts_dir(toolkit_root)
     if not root.is_dir():
         return [Issue(ERROR, str(root), "prompts directory not found")]
 

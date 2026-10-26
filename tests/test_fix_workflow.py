@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from aidw import git, github
+from aidw.paths import TargetRepo, WorkspacePaths
 from aidw.state import SUCCEEDED, StageRecord, run_dir
 from aidw.workflows import fix as fix_workflow
 
@@ -31,6 +32,10 @@ def _init_repo(path: Path) -> None:
     subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
     (path / "aidt").mkdir()
+
+
+def _runs_root(repo: Path) -> Path:
+    return WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
 
 
 def _select_ok(number: int = 101, title: str = "Fix the loop") -> github.ScriptResult:
@@ -71,9 +76,7 @@ class _FakeStages:
     def __call__(self, spec, **kwargs):
         self.names.append(spec.name)
         self.specs.append(spec)
-        directory = run_dir(
-            Path(kwargs["repo_root"]) / "aidt" / "runs", kwargs["state"].run_id
-        )
+        directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
         out = stages / f"{spec.name}.out.txt"
@@ -159,7 +162,7 @@ def test_clean_iteration_closes_child(tmp_path: Path, monkeypatch) -> None:
         "iter1-test",
         "iter1-code-review",
     ]
-    state = next((tmp_path / "aidt" / "runs").iterdir())
+    state = next(_runs_root(tmp_path).iterdir())
     payload = json.loads((state / "artifacts" / "fix.json").read_text(encoding="utf-8"))
     assert payload["iterations"] == 1
     assert payload["closed_issues"][0]["number"] == 101
@@ -188,7 +191,7 @@ def test_findings_trigger_publish_and_second_approval(tmp_path: Path, monkeypatc
 def _gates(tmp_path: Path):
     from aidw import state as state_mod
 
-    run = state_mod.list_runs(tmp_path / "aidt" / "runs")[-1]
+    run = state_mod.list_runs(_runs_root(tmp_path))[-1]
     return run.gates
 
 

@@ -19,7 +19,7 @@ from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.doctor import run_doctor
 from aidw.gates import GateDefault
 from aidw.log import RunLogger
-from aidw.paths import repo_root, toolkit_root
+from aidw.paths import TargetRepo, WorkspacePaths, repo_root, toolkit_root
 from aidw.roadmap import filter_tasks, find_task, load_tasks, next_todo
 from aidw.report import rel_to, stage_lines, usage_line
 from aidw.runner import StageSpec, resolve_prompt, run_stage
@@ -57,10 +57,6 @@ def _roots() -> tuple[Path, Path]:
     override = _state.get("repo")
     repo = Path(override) if override else repo_root()
     return repo, toolkit_root()
-
-
-def _run_dir(run_id: str) -> Path:
-    return toolkit_root() / "runs" / run_id
 
 
 def _gate_default_value(value: Optional[GateDefault]) -> Optional[str]:
@@ -515,6 +511,8 @@ def exec_stage(
 ) -> None:
     """Run a single agent stage (the primitive workflows build on)."""
     repo, aidt = _roots()
+    state_root = WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root
+    runs_root = state_root / "runs"
     agents, issues = load_all(aidt, repo)
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
@@ -529,14 +527,15 @@ def exec_stage(
         raise typer.Exit(EXIT_USAGE) from exc
 
     run = state_mod.create_run(
-        aidt / "runs",
+        runs_root,
         repo,
         workflow,
         label=label,
         strict=strict,
         branch=git.current_branch(repo),
     )
-    logger = RunLogger(_run_dir(run.run_id), stream=bool(_state["verbose"]))
+    directory = state_mod.run_dir(runs_root, run.run_id)
+    logger = RunLogger(directory, stream=bool(_state["verbose"]))
     spec = StageSpec(
         name=prompt_path.stem,
         agent_id=agent,
@@ -549,12 +548,13 @@ def exec_stage(
         record = run_stage(
             spec,
             repo_root=repo,
-            aidt_root=aidt,
+            toolkit_root=aidt,
             state=run,
             logger=logger,
             agents=agents,
             dry_run=dry_run,
             retry_transient=retry_transient,
+            runs_root=runs_root,
         )
     except (ValueError, FileNotFoundError) as exc:
         typer.echo(str(exc), err=True)
@@ -564,11 +564,14 @@ def exec_stage(
     for line in stage_lines(record, repo_root=repo):
         typer.echo(line)
     if record.rendered_prompt:
-        typer.echo(f"rendered: aidt/runs/{run.run_id}/{record.rendered_prompt}")
+        rendered_rel = (
+            runs_root / run.run_id / record.rendered_prompt
+        ).relative_to(state_root)
+        typer.echo(f"rendered: {rendered_rel}")
 
     if record.status == state_mod.SUCCEEDED and run.status != state_mod.SUCCEEDED:
         run.status = state_mod.SUCCEEDED
-        state_mod.save(_run_dir(run.run_id), run)
+        state_mod.save(directory, run)
 
     if dry_run:
         typer.echo("dry-run complete; Pi not invoked")
@@ -589,11 +592,11 @@ def runs(
     run_id: Optional[str] = typer.Argument(None, help="Run id for `show`/`resume`."),
 ) -> None:
     """List, inspect, or resume workflow runs."""
-    repo, aidt = _roots()
-    runs_dir = aidt / "runs"
+    repo, _aidt = _roots()
+    runs_root = WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
 
     if action == "list":
-        states = state_mod.list_runs(runs_dir)
+        states = state_mod.list_runs(runs_root)
         if not states:
             typer.echo("no runs")
             return
@@ -608,7 +611,7 @@ def runs(
         if not run_id:
             typer.echo("`runs show` requires a run id", err=True)
             raise typer.Exit(EXIT_USAGE)
-        loaded = state_mod.find_run(runs_dir, run_id)
+        loaded = state_mod.find_run(runs_root, run_id)
         if loaded is None:
             typer.echo(f"unknown run: {run_id}", err=True)
             raise typer.Exit(EXIT_USAGE)

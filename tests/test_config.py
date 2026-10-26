@@ -17,7 +17,7 @@ from aidw.config import (
     load_all,
     load_agent,
 )
-from aidw.paths import aidt_root, repo_root
+from aidw.paths import toolkit_root, repo_root
 
 EXPECTED_AGENTS = {
     "task-author",
@@ -63,7 +63,7 @@ def make_agent(agent_id: str, model: str = "vendor/model", **overrides: object) 
 
 @pytest.fixture(scope="module")
 def real_agents() -> dict[str, AgentConfig]:
-    agents, issues = load_all(aidt_root(), repo_root())
+    agents, issues = load_all(toolkit_root(), repo_root())
     assert not [i for i in issues if i.level == ERROR], issues
     return agents
 

@@ -1,9 +1,9 @@
 """Shared test fixtures and session-wide guards.
 
-Tests must never leave run state in the toolkit's ``runs/`` directory: workflows take an
-explicit ``runs_dir`` and the prompt tests label their runs ``pytest``. The session
-fixture below deletes any ``runs/*-pytest-*`` directory, so a run that slips past the
-override — or one left behind by a crashed session — is cleaned up automatically.
+Tests must never leave run state in the toolkit's ``runs/`` directory: workflows write
+under the per-repo state root (E1.4) and the prompt tests label their runs ``pytest``.
+The session fixture below deletes any ``runs/*-pytest-*`` directory left under the
+toolkit root, so a stale artifact from a crashed session is cleaned up automatically.
 """
 
 from __future__ import annotations

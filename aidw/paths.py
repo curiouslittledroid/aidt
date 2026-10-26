@@ -10,9 +10,10 @@ path internally as an absolute path. Two independent roots exist:
 * the **target repository root** — the working tree the workflows operate on, discovered
   from git.
 
-E1.2 formalises the toolkit root into the :class:`ToolkitPaths` type and E1.1 did the
-same for the target repository (:class:`TargetRepo`). E1.3 adds the workspace and state
-roots; :func:`aidt_root` and :func:`runs_dir` remain transitional aliases until E1.4.
+E1.2 formalises the toolkit root into the :class:`ToolkitPaths` type, E1.1 did the same
+for the target repository (:class:`TargetRepo`) and E1.3 adds the workspace and state
+roots (:class:`WorkspacePaths`). Run artifacts are written under the per-repo state
+root, never into the toolkit root or the target working tree.
 """
 
 from __future__ import annotations
@@ -399,17 +400,3 @@ class WorkspacePaths:
             state_root=state_root,
             repo_slug=repo_slug,
         )
-
-
-def aidt_root() -> Path:
-    """Transitional alias for :func:`toolkit_root` (call sites are ported in E1.4)."""
-    return toolkit_root()
-
-
-def runs_dir() -> Path:
-    """Return the run artifact directory (``<toolkit root>/runs``).
-
-    Still rooted at the toolkit; E1.3 moves run state to the per-repo state root, which
-    lives outside every worktree.
-    """
-    return toolkit_root() / "runs"

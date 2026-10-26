@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from aidw.agents import build_argv, build_env, model_name
 from aidw.config import AgentConfig, SystemPrompt
-from aidw.paths import aidt_root, repo_root
+from aidw.paths import toolkit_root, repo_root
 import pytest
 
 
@@ -12,7 +12,7 @@ import pytest
 def agents() -> dict[str, AgentConfig]:
     from aidw.config import load_all
 
-    loaded, issues = load_all(aidt_root(), repo_root())
+    loaded, issues = load_all(toolkit_root(), repo_root())
     assert not [i for i in issues if i.level == "error"], issues
     return loaded
 

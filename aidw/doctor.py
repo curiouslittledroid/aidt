@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aidw import inventory
-from aidw.paths import RepoNotFoundError, ToolkitPaths, aidt_root, repo_root
+from aidw.paths import RepoNotFoundError, ToolkitPaths, repo_root, toolkit_root
 
 OK = "OK"
 WARN = "WARN"
@@ -316,7 +316,7 @@ def collect_checks() -> list[Check]:
     checks.append(_check_git(root))
     checks.append(_check_mcp(root))
 
-    aidt = aidt_root()
+    aidt = toolkit_root()
     checks.append(_check_prompts(aidt))
     checks.append(_check_agent_configs(aidt))
     checks.append(_check_archify())

@@ -1,8 +1,8 @@
 """Run state, artifacts, and resumability (design §9).
 
-A run is one execution of a workflow. State lives in
-``aidt/runs/<run_id>/state.json`` and records every stage and gate so a workflow can be
-inspected, logged, and resumed.
+A run is one execution of a workflow. State lives under the per-repo state root
+(``<state root>/runs/<run_id>/state.json``) and records every stage and gate so a
+workflow can be inspected, logged, and resumed.
 """
 
 from __future__ import annotations
@@ -171,12 +171,12 @@ def _filter(cls: type, data: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in data.items() if k in known}
 
 
-def run_dir(runs_dir: Path, run_id: str) -> Path:
-    return runs_dir / run_id
+def run_dir(runs_root: Path, run_id: str) -> Path:
+    return runs_root / run_id
 
 
 def create_run(
-    runs_dir: Path,
+    runs_root: Path,
     repo_root: Path,
     workflow: str,
     *,
@@ -196,7 +196,7 @@ def create_run(
         pr=pr or {},
         git={"branch": branch} if branch else {},
     )
-    save(run_dir(runs_dir, state.run_id), state)
+    save(run_dir(runs_root, state.run_id), state)
     return state
 
 
@@ -218,11 +218,11 @@ def load(directory: Path) -> RunState:
     return RunState.from_dict(data)
 
 
-def list_runs(runs_dir: Path) -> list[RunState]:
-    if not runs_dir.is_dir():
+def list_runs(runs_root: Path) -> list[RunState]:
+    if not runs_root.is_dir():
         return []
     states: list[RunState] = []
-    for directory in sorted(runs_dir.iterdir()):
+    for directory in sorted(runs_root.iterdir()):
         if not (directory / "state.json").is_file():
             continue
         try:
@@ -232,15 +232,15 @@ def list_runs(runs_dir: Path) -> list[RunState]:
     return states
 
 
-def find_run(runs_dir: Path, run_id: str) -> RunState | None:
-    directory = run_dir(runs_dir, run_id)
+def find_run(runs_root: Path, run_id: str) -> RunState | None:
+    directory = run_dir(runs_root, run_id)
     if (directory / "state.json").is_file():
         return load(directory)
     return None
 
 
-def latest_for_branch(runs_dir: Path, branch: str) -> RunState | None:
-    matches = [s for s in list_runs(runs_dir) if s.git.get("branch") == branch]
+def latest_for_branch(runs_root: Path, branch: str) -> RunState | None:
+    matches = [s for s in list_runs(runs_root) if s.git.get("branch") == branch]
     return matches[-1] if matches else None
 
 
