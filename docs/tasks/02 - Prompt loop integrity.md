@@ -127,7 +127,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
 
 ## Epic L2: Reviewer authority — stop the wrong prescription
 
-- [ ] **L2.1. Reviewer rules for dependencies and unresolved choices** (Design 8.3)
+- [ ] **L2.1. Reviewer rules for dependencies and unresolved choices** (Design 8.1)
   Review 1's costliest finding was factually wrong because it reasoned from roadmap prose about
   code that existed on an unmerged branch it never read. Extend the authority chain in
   `prompts/task-review.md` (bucket (i): generic, product-neutral):
@@ -143,7 +143,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     conflict as `Blocked` is recorded as a blocked run, not a fix round.
   - Tests: rendered-prompt assertion plus the `tests/test_prompt_workflow.py` verdict path.
 
-- [ ] **L2.2. Require the revision a finding was verified against** (Design 8.3)
+- [ ] **L2.2. Require the revision a finding was verified against** (Design 8.1)
   Round 2 and 3 findings that cite `origin/00-E1.5@<sha>` were decisive; round 1's citation-free
   finding was wrong. Require the reviewer to put its evidence in the `Where:` field — that field
   is already parsed and published, so no manifest change is needed.
