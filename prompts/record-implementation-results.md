@@ -26,7 +26,10 @@ Do **not** modify implementation code, unit/handler tests, integration suites, `
 
 ## Instructions
 
-1. Read `docs/implementation-results/TEMPLATE.md` in full — it is the required structure.
+1. Read `docs/implementation-results/TEMPLATE.md` in full — it is the required structure. If that
+   file does not exist, **stop and report it** — do not invent a structure and do not substitute
+   another document as the template. (The path is the target repo's configured build-results
+   template; resolving to a missing file is a configuration error to report, not to work around.)
 2. Determine the branch and the change set:
    ```bash
    git branch --show-current
@@ -50,6 +53,15 @@ Do **not** modify implementation code, unit/handler tests, integration suites, `
    `pnpm srd:check-references`, `pnpm srd:matrix-check`, `pnpm srd:report`,
    `pnpm --filter infra cdk synth -c env=dev`). Do not invent, round, or copy numbers from an
    earlier run or another document — record what this run actually produced.
+
+   **Run each command exactly once, and derive every results row from that single invocation.**
+   Do not re-run a suite, module or subset just to obtain a count for its own row — take subsets
+   from the same run (for example a per-file summary or a duration report). Re-running the gate is
+   the most expensive thing this stage does; a second run of the same suite buys nothing.
+
+   Avoid commands a non-interactive session refuses: do not `rm -rf` (build into `$(mktemp -d)`
+   instead) and prefer the repo's existing fixtures over `git init` scratch demos. A blocked
+   command costs a turn and produces no evidence.
 5. Populate `build-results.md` from the template:
    - Fill `{{TASK_ID}}`, `{{TASK_TITLE}}`, `{{BRANCH}}`, `{{DATE}}`, `{{SPEC_LIST}}`.
    - **Summary:** purpose, key design decisions, roadmap placement, and scope (including what the
