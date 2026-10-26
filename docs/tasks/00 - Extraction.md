@@ -151,7 +151,7 @@
 
 ## Epic E2: Worktree model (D20)
 
-- [ ] **E2.1. Git worktree primitives**
+- [x] **E2.1. Git worktree primitives**
   Add to `aidw/git.py`: `common_dir()`, `workspace_root()`, `worktrees()` (parse
   `git worktree list --porcelain`), `worktree_for_branch()`, `add_worktree()`, `remove_worktree()`,
   `is_linked_worktree()`.
