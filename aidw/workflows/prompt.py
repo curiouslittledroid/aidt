@@ -36,6 +36,7 @@ from aidw.findings import (
 )
 from aidw.gates import GateOutcome, decide
 from aidw.log import RunLogger
+from aidw.paths import TargetRepo, WorkspacePaths
 from aidw.report import print_stage
 from aidw.roadmap import find_task, load_tasks
 from aidw.runner import StageSpec, run_stage
@@ -105,7 +106,7 @@ def run(
     task: str,
     repo: Path,
     aidt: Path,
-    runs_dir: Path | None = None,
+    runs_root: Path | None = None,
     label: str | None = None,
     approve_all: bool = False,
     skip_gates: list[str] | None = None,
@@ -118,9 +119,13 @@ def run(
 ) -> int:
     skip = set(skip_gates or [])
     deny = set(deny_gates or [])
-    # ``aidt`` locates the toolkit's assets (prompts, agent configs); run state may live
-    # elsewhere so a caller (notably a test) can keep it out of the toolkit's ``runs/``.
-    runs_dir = runs_dir if runs_dir is not None else aidt / "runs"
+    # ``aidt`` locates the toolkit's assets (prompts, agent configs); run state lives
+    # under the per-repo state root (EXTRACTION.md §3.10). Tests may inject an isolated
+    # ``runs_root``; otherwise it is resolved once from the target repository.
+    if runs_root is None:
+        runs_root = (
+            WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
+        )
 
     entries = load_tasks(repo / "docs" / "tasks")
     entry = find_task(entries, phase, epic, task)
@@ -157,7 +162,7 @@ def run(
 
     default_rel = f"docs/task-prompts/{phase}-{task}-prompt.md"
     state = create_run(
-        runs_dir,
+        runs_root,
         repo,
         "prompt",
         label=label or f"{phase}-{task}",
@@ -165,7 +170,7 @@ def run(
         strict=strict,
         branch=branch,
     )
-    directory = run_dir(runs_dir, state.run_id)
+    directory = run_dir(runs_root, state.run_id)
     logger = RunLogger(directory, stream=stream)
     logger.info(f"prompt workflow {phase}/{epic}/{task}: {entry.title}")
     print(f"run:    {state.run_id}")
@@ -181,7 +186,8 @@ def run(
     rec1 = run_stage(
         author,
         repo_root=repo,
-        aidt_root=aidt,
+        toolkit_root=aidt,
+        runs_root=runs_root,
         state=state,
         logger=logger,
         agents=agents,
@@ -198,7 +204,8 @@ def run(
                 [default_rel],
             ),
             repo_root=repo,
-            aidt_root=aidt,
+            toolkit_root=aidt,
+            runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
@@ -244,7 +251,8 @@ def run(
                 [rel],
             ),
             repo_root=repo,
-            aidt_root=aidt,
+            toolkit_root=aidt,
+            runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
@@ -295,7 +303,8 @@ def run(
                     extra=f"## Review findings to address\n\n{review_text}",
                 ),
                 repo_root=repo,
-                aidt_root=aidt,
+                toolkit_root=aidt,
+                runs_root=runs_root,
                 state=state,
                 logger=logger,
                 agents=agents,
@@ -337,7 +346,8 @@ def run(
                         extra=extra,
                     ),
                     repo_root=repo,
-                    aidt_root=aidt,
+                    toolkit_root=aidt,
+                    runs_root=runs_root,
                     state=state,
                     logger=logger,
                     agents=agents,

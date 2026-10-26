@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from aidw.paths import aidt_root
+from aidw.paths import toolkit_root
 from aidw.prompts import (
     PromptError,
     load_prompt_file,
@@ -50,7 +50,7 @@ def test_render_no_variables_is_noop() -> None:
 
 
 def test_render_real_task_prompt() -> None:
-    path = aidt_root() / "prompts" / "task-prompt.md"
+    path = toolkit_root() / "prompts" / "task-prompt.md"
     rendered = render_prompt_file(path, ["03", "E2", "E2.9"])
     assert "$1" not in rendered
     assert "03" in rendered
@@ -58,7 +58,7 @@ def test_render_real_task_prompt() -> None:
 
 
 def test_load_prompt_strips_frontmatter() -> None:
-    path = aidt_root() / "prompts" / "pr.md"
+    path = toolkit_root() / "prompts" / "pr.md"
     text = load_prompt_file(path)
     assert not text.startswith("---")
     assert "# " in text

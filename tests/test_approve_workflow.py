@@ -8,6 +8,7 @@ from pathlib import Path
 
 from aidw import git, github
 from aidw.gates import GateOutcome
+from aidw.paths import TargetRepo, WorkspacePaths
 from aidw.state import SUCCEEDED, StageRecord, run_dir
 from aidw.workflows import approve as approve_workflow
 
@@ -17,6 +18,10 @@ def _init_repo(path: Path) -> None:
     subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
     (path / "aidt").mkdir()
+
+
+def _runs_root(repo: Path) -> Path:
+    return WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
 
 
 def _select_ok(number: int = 101, title: str = "Fix the loop") -> github.ScriptResult:
@@ -38,9 +43,7 @@ class _FakeStages:
     def __call__(self, spec, **kwargs):
         self.names.append(spec.name)
         self.specs.append(spec)
-        directory = run_dir(
-            Path(kwargs["repo_root"]) / "aidt" / "runs", kwargs["state"].run_id
-        )
+        directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
         out = stages / f"{spec.name}.out.txt"

@@ -33,6 +33,7 @@ from aidw import git
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
+from aidw.paths import TargetRepo, WorkspacePaths
 from aidw.report import print_stage
 from aidw.runner import StageSpec, run_stage
 from aidw.state import (
@@ -154,10 +155,10 @@ def _read_out(record) -> str | None:
     return None
 
 
-def _latest_implement_run(runs_dir: Path, branch: str) -> RunState | None:
+def _latest_implement_run(runs_root: Path, branch: str) -> RunState | None:
     matches = [
         state
-        for state in list_runs(runs_dir)
+        for state in list_runs(runs_root)
         if state.workflow == "implement" and state.git.get("branch") == branch
     ]
     return matches[-1] if matches else None
@@ -234,7 +235,7 @@ def run(
 ) -> int:
     skip = set(skip_gates or [])
     deny = set(deny_gates or [])
-    runs_dir = aidt / "runs"
+    runs_root = WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
 
     # --- resolve the task prompt and derive the task id --------------------- #
     raw_path = Path(task_prompt_path)
@@ -272,7 +273,7 @@ def run(
         return 2
 
     branch = git.current_branch(repo)
-    existing = _latest_implement_run(runs_dir, branch_name)
+    existing = _latest_implement_run(runs_root, branch_name)
 
     # --- preflight ---------------------------------------------------------- #
     if not dry_run:
@@ -300,7 +301,7 @@ def run(
             print(f"no implement run to resume for `{branch_name}`.", file=sys.stderr)
             return 2
         state = existing
-        directory = run_dir(runs_dir, state.run_id)
+        directory = run_dir(runs_root, state.run_id)
         logger = RunLogger(directory, stream=stream)
         print(f"resume: {state.run_id}")
         print("completed stages:")
@@ -310,7 +311,7 @@ def run(
             return 4
     else:
         state = create_run(
-            runs_dir,
+            runs_root,
             repo,
             "implement",
             label=branch_name,
@@ -320,7 +321,7 @@ def run(
         )
         if pr is not None:
             state.pr = {**state.pr, "number": pr}
-        directory = run_dir(runs_dir, state.run_id)
+        directory = run_dir(runs_root, state.run_id)
         logger = RunLogger(directory, stream=stream)
         save(directory, state)
 
@@ -339,7 +340,8 @@ def run(
             record = run_stage(
                 entry.spec(aidt),
                 repo_root=repo,
-                aidt_root=aidt,
+                toolkit_root=aidt,
+                runs_root=runs_root,
                 state=state,
                 logger=logger,
                 agents=agents,
@@ -381,7 +383,8 @@ def run(
         record = run_stage(
             entry.spec(aidt),
             repo_root=repo,
-            aidt_root=aidt,
+            toolkit_root=aidt,
+            runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
@@ -419,7 +422,8 @@ def run(
                         run_stage,
                         entry.spec(aidt),
                         repo_root=repo,
-                        aidt_root=aidt,
+                        toolkit_root=aidt,
+                        runs_root=runs_root,
                         state=state,
                         logger=logger,
                         agents=agents,
@@ -486,7 +490,8 @@ def run(
         record = run_stage(
             pr_plan.spec(aidt),
             repo_root=repo,
-            aidt_root=aidt,
+            toolkit_root=aidt,
+            runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,

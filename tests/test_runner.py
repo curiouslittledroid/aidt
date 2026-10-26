@@ -6,7 +6,7 @@ from pathlib import Path
 
 from aidw.config import load_all
 from aidw.log import RunLogger
-from aidw.paths import SCRIPTS_DIR_ENV_VAR, aidt_root, repo_root
+from aidw.paths import SCRIPTS_DIR_ENV_VAR, toolkit_root, repo_root
 from aidw.pi import PiResult, Usage
 from aidw import runner as runner_mod
 from aidw.runner import StageSpec, resolve_prompt, run_stage
@@ -14,32 +14,32 @@ from aidw.state import FAILED, SUCCEEDED, create_run
 
 
 def _noop_prompt() -> Path:
-    return aidt_root() / "tests" / "fixtures" / "noop.md"
+    return toolkit_root() / "tests" / "fixtures" / "noop.md"
 
 
 def test_resolve_prompt_by_name() -> None:
-    assert resolve_prompt(aidt_root(), "code-review") == aidt_root() / "prompts" / "code-review.md"
+    assert resolve_prompt(toolkit_root(), "code-review") == toolkit_root() / "prompts" / "code-review.md"
 
 
 def test_resolve_prompt_by_path() -> None:
-    resolved = resolve_prompt(aidt_root(), str(_noop_prompt()))
+    resolved = resolve_prompt(toolkit_root(), str(_noop_prompt()))
     assert resolved == _noop_prompt()
 
 
 def test_dry_run_writes_state_and_rendered_prompt(tmp_path: Path) -> None:
-    agents, _ = load_all(aidt_root(), repo_root())
+    agents, _ = load_all(toolkit_root(), repo_root())
     run = create_run(tmp_path, repo_root(), "stage", label="dry")
     logger = RunLogger(tmp_path / run.run_id)
 
     record = run_stage(
         StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
         repo_root=repo_root(),
-        aidt_root=aidt_root(),
+        toolkit_root=toolkit_root(),
         state=run,
         logger=logger,
         agents=agents,
         dry_run=True,
-        runs_dir=tmp_path,
+        runs_root=tmp_path,
     )
 
     directory = tmp_path / run.run_id
@@ -50,8 +50,35 @@ def test_dry_run_writes_state_and_rendered_prompt(tmp_path: Path) -> None:
     assert run.status == SUCCEEDED
 
 
+def test_run_stage_writes_under_the_threaded_runs_root(tmp_path: Path) -> None:
+    """``state.json`` and ``prompts/`` are siblings under the caller's ``runs_root``.
+
+    The toolkit-root fallback was deleted in E1.4: ``run_stage`` must not re-derive a
+    write directory, or the run would split across two locations.
+    """
+    agents, _ = load_all(toolkit_root(), repo_root())
+    run = create_run(tmp_path, repo_root(), "stage", label="threaded")
+    logger = RunLogger(tmp_path / run.run_id)
+
+    run_stage(
+        StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
+        repo_root=repo_root(),
+        toolkit_root=toolkit_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        dry_run=True,
+        runs_root=tmp_path,
+    )
+
+    directory = tmp_path / run.run_id
+    assert (directory / "state.json").is_file()
+    assert (directory / "prompts" / "noop.rendered.md").is_file()
+    assert not (toolkit_root() / "runs" / run.run_id).exists()
+
+
 def test_dry_run_renders_variables(tmp_path: Path) -> None:
-    agents, _ = load_all(aidt_root(), repo_root())
+    agents, _ = load_all(toolkit_root(), repo_root())
     run = create_run(tmp_path, repo_root(), "stage", label="dry")
     logger = RunLogger(tmp_path / run.run_id)
 
@@ -59,16 +86,16 @@ def test_dry_run_renders_variables(tmp_path: Path) -> None:
         StageSpec(
             name="task-prompt",
             agent_id="task-author",
-            prompt=aidt_root() / "prompts" / "task-prompt.md",
+            prompt=toolkit_root() / "prompts" / "task-prompt.md",
             variables=["03", "E2", "E2.9"],
         ),
         repo_root=repo_root(),
-        aidt_root=aidt_root(),
+        toolkit_root=toolkit_root(),
         state=run,
         logger=logger,
         agents=agents,
         dry_run=True,
-        runs_dir=tmp_path,
+        runs_root=tmp_path,
     )
     rendered = (tmp_path / run.run_id / "prompts" / "task-prompt.rendered.md").read_text()
     assert "$1" not in rendered
@@ -76,19 +103,19 @@ def test_dry_run_renders_variables(tmp_path: Path) -> None:
 
 
 def test_dry_run_records_session_policy(tmp_path: Path) -> None:
-    agents, _ = load_all(aidt_root(), repo_root())
+    agents, _ = load_all(toolkit_root(), repo_root())
     run = create_run(tmp_path, repo_root(), "stage", label="dry")
     logger = RunLogger(tmp_path / run.run_id)
 
     record = run_stage(
         StageSpec(name="impliment-task", agent_id="implementer", prompt=_noop_prompt(), variables=[]),
         repo_root=repo_root(),
-        aidt_root=aidt_root(),
+        toolkit_root=toolkit_root(),
         state=run,
         logger=logger,
         agents=agents,
         dry_run=True,
-        runs_dir=tmp_path,
+        runs_root=tmp_path,
     )
     # implementer's session policy is shared: no stage suffix.
     assert record.session_id == f"aidw-{run.run_id}-implementer"
@@ -103,7 +130,7 @@ def test_stage_env_exposes_the_toolkit_scripts_dir(
     ``python3 aidt/prompts/scripts/...``, which resolved inside the *target* repo and
     failed whenever the toolkit lived in its own checkout (EXTRACTION.md §3.6).
     """
-    agents, _ = load_all(aidt_root(), repo_root())
+    agents, _ = load_all(toolkit_root(), repo_root())
     captured: dict = {}
 
     def _capture(argv, prompt, **kwargs):
@@ -117,15 +144,15 @@ def test_stage_env_exposes_the_toolkit_scripts_dir(
     run_stage(
         StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
         repo_root=repo_root(),
-        aidt_root=aidt_root(),
+        toolkit_root=toolkit_root(),
         state=run,
         logger=logger,
         agents=agents,
-        runs_dir=tmp_path,
+        runs_root=tmp_path,
     )
 
     scripts_dir = captured["env"][SCRIPTS_DIR_ENV_VAR]
-    assert scripts_dir == str(aidt_root() / "prompts" / "scripts")
+    assert scripts_dir == str(toolkit_root() / "prompts" / "scripts")
     assert Path(scripts_dir).is_absolute()
     assert (Path(scripts_dir) / "review-followup" / "review_followup.py").is_file()
 
@@ -133,7 +160,7 @@ def test_stage_env_exposes_the_toolkit_scripts_dir(
 def test_agent_env_cannot_shadow_the_toolkit_scripts_dir(
     tmp_path: Path, monkeypatch
 ) -> None:
-    agents, _ = load_all(aidt_root(), repo_root())
+    agents, _ = load_all(toolkit_root(), repo_root())
     agents["code-reviewer"].env[SCRIPTS_DIR_ENV_VAR] = "/tmp/not-the-toolkit"
     captured: dict = {}
 
@@ -148,14 +175,14 @@ def test_agent_env_cannot_shadow_the_toolkit_scripts_dir(
     run_stage(
         StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
         repo_root=repo_root(),
-        aidt_root=aidt_root(),
+        toolkit_root=toolkit_root(),
         state=run,
         logger=logger,
         agents=agents,
-        runs_dir=tmp_path,
+        runs_root=tmp_path,
     )
 
-    assert captured["env"][SCRIPTS_DIR_ENV_VAR] == str(aidt_root() / "prompts" / "scripts")
+    assert captured["env"][SCRIPTS_DIR_ENV_VAR] == str(toolkit_root() / "prompts" / "scripts")
 
 
 def _result(cost_usd: float, *, tokens: int = 0) -> PiResult:
@@ -178,18 +205,18 @@ def _result(cost_usd: float, *, tokens: int = 0) -> PiResult:
 
 
 def _run_with_result(tmp_path: Path, monkeypatch, result: PiResult):
-    agents, _ = load_all(aidt_root(), repo_root())
+    agents, _ = load_all(toolkit_root(), repo_root())
     monkeypatch.setattr(runner_mod, "execute", lambda *args, **kwargs: result)
     run = create_run(tmp_path, repo_root(), "stage", label="cost")
     logger = RunLogger(tmp_path / run.run_id)
     record = run_stage(
         StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
         repo_root=repo_root(),
-        aidt_root=aidt_root(),
+        toolkit_root=toolkit_root(),
         state=run,
         logger=logger,
         agents=agents,
-        runs_dir=tmp_path,
+        runs_root=tmp_path,
     )
     return record, (tmp_path / run.run_id / "run.log").read_text()
 
@@ -210,7 +237,7 @@ def test_priced_stage_logs_no_warning(tmp_path: Path, monkeypatch) -> None:
 
 
 def _run_with_verify(tmp_path: Path, monkeypatch, verify, *, dry_run: bool = False):
-    agents, _ = load_all(aidt_root(), repo_root())
+    agents, _ = load_all(toolkit_root(), repo_root())
     monkeypatch.setattr(runner_mod, "execute", lambda *args, **kwargs: _result(0.10))
     run = create_run(tmp_path, repo_root(), "stage", label="verify")
     logger = RunLogger(tmp_path / run.run_id)
@@ -223,12 +250,12 @@ def _run_with_verify(tmp_path: Path, monkeypatch, verify, *, dry_run: bool = Fal
             verify=verify,
         ),
         repo_root=repo_root(),
-        aidt_root=aidt_root(),
+        toolkit_root=toolkit_root(),
         state=run,
         logger=logger,
         agents=agents,
         dry_run=dry_run,
-        runs_dir=tmp_path,
+        runs_root=tmp_path,
     )
     return record, run, (tmp_path / run.run_id / "run.log").read_text()
 
@@ -285,7 +312,7 @@ def test_postcondition_is_not_checked_on_a_dry_run(tmp_path: Path, monkeypatch) 
 
 
 def test_cost_ceiling_fails_a_stage(tmp_path: Path, monkeypatch) -> None:
-    agents, _ = load_all(aidt_root(), repo_root())
+    agents, _ = load_all(toolkit_root(), repo_root())
     agents["code-reviewer"].max_cost_usd = 0.01
     monkeypatch.setattr(runner_mod, "execute", lambda *args, **kwargs: _result(0.50))
 
@@ -294,11 +321,11 @@ def test_cost_ceiling_fails_a_stage(tmp_path: Path, monkeypatch) -> None:
     record = run_stage(
         StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
         repo_root=repo_root(),
-        aidt_root=aidt_root(),
+        toolkit_root=toolkit_root(),
         state=run,
         logger=logger,
         agents=agents,
-        runs_dir=tmp_path,
+        runs_root=tmp_path,
     )
 
     assert record.status == FAILED
@@ -307,7 +334,7 @@ def test_cost_ceiling_fails_a_stage(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_under_cost_ceiling_succeeds(tmp_path: Path, monkeypatch) -> None:
-    agents, _ = load_all(aidt_root(), repo_root())
+    agents, _ = load_all(toolkit_root(), repo_root())
     agents["code-reviewer"].max_cost_usd = 1.00
     monkeypatch.setattr(runner_mod, "execute", lambda *args, **kwargs: _result(0.50))
 
@@ -316,11 +343,11 @@ def test_under_cost_ceiling_succeeds(tmp_path: Path, monkeypatch) -> None:
     record = run_stage(
         StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
         repo_root=repo_root(),
-        aidt_root=aidt_root(),
+        toolkit_root=toolkit_root(),
         state=run,
         logger=logger,
         agents=agents,
-        runs_dir=tmp_path,
+        runs_root=tmp_path,
     )
 
     assert record.status == SUCCEEDED

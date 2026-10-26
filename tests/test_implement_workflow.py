@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from aidw import git
+from aidw.paths import TargetRepo, WorkspacePaths
 from aidw.state import (
     FAILED,
     SUCCEEDED,
@@ -35,6 +36,11 @@ def _make_inputs(tmp_path: Path) -> Path:
     return prompt
 
 
+def _runs_root(repo: Path) -> Path:
+    """Where E1.4 writes run state: the per-repo state root, never the toolkit."""
+    return WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
+
+
 class _Recorder:
     """Fake ``run_stage`` that records stages and returns canned statuses."""
 
@@ -46,9 +52,7 @@ class _Recorder:
     def __call__(self, spec, **kwargs):
         self.names.append(spec.name)
         self.specs.append(spec)
-        directory = run_dir(
-            Path(kwargs["repo_root"]) / "aidt" / "runs", kwargs["state"].run_id
-        )
+        directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
         out = stages / f"{spec.name}.out.txt"
@@ -148,6 +152,28 @@ def test_dry_run_plans_all_six_stages(tmp_path: Path, monkeypatch) -> None:
     ]
 
 
+def test_dry_run_writes_runs_under_the_state_root(tmp_path: Path, monkeypatch) -> None:
+    """E1.4: a run lives under the state root, never under ``repo/aidt/runs``.
+
+    ``_make_inputs`` pre-creates ``repo/aidt``; after the run that tree must still have
+    no ``runs/`` directory (the toolkit-root assumption is gone).
+    """
+    prompt = _make_inputs(tmp_path)
+    _patch(monkeypatch)
+    monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, repo=tmp_path, aidt=tmp_path / "aidt", dry_run=True
+    )
+
+    assert code == 0
+    runs_root = _runs_root(tmp_path)
+    run_dirs = list(runs_root.iterdir())
+    assert len(run_dirs) == 1
+    assert (run_dirs[0] / "state.json").is_file()
+    assert not (tmp_path / "aidt" / "runs").exists()
+
+
 # --------------------------------------------------------------------------- #
 # Preflight
 # --------------------------------------------------------------------------- #
@@ -206,12 +232,13 @@ def test_full_run_succeeds_and_records_pr(tmp_path: Path, monkeypatch) -> None:
     )
 
     assert code == 0
-    runs = list((tmp_path / "aidt" / "runs").iterdir())
-    state = implement_workflow.list_runs(tmp_path / "aidt" / "runs")[-1]
+    runs = list(_runs_root(tmp_path).iterdir())
+    state = implement_workflow.list_runs(_runs_root(tmp_path))[-1]
     assert state.status == SUCCEEDED
     assert state.gates and state.gates[-1].name == implement_workflow.GATE
     assert state.pr.get("number") == 42
     assert len(runs) == 1
+    assert not (tmp_path / "aidt" / "runs").exists()
 
 
 def test_stage_failure_returns_one(tmp_path: Path, monkeypatch) -> None:
@@ -227,7 +254,7 @@ def test_stage_failure_returns_one(tmp_path: Path, monkeypatch) -> None:
     )
 
     assert code == 1
-    state = implement_workflow.list_runs(tmp_path / "aidt" / "runs")[-1]
+    state = implement_workflow.list_runs(_runs_root(tmp_path))[-1]
     assert state.status == FAILED
 
 
@@ -250,7 +277,7 @@ def test_gate_denied_returns_blocked(tmp_path: Path, monkeypatch) -> None:
 def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
     prompt = _make_inputs(tmp_path)
     _patch(monkeypatch)
-    runs_dir = tmp_path / "aidt" / "runs"
+    runs_dir = _runs_root(tmp_path)
 
     state = create_run(
         runs_dir,
@@ -297,7 +324,7 @@ def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
 def test_from_forces_rerun(tmp_path: Path, monkeypatch) -> None:
     prompt = _make_inputs(tmp_path)
     _patch(monkeypatch)
-    runs_dir = tmp_path / "aidt" / "runs"
+    runs_dir = _runs_root(tmp_path)
 
     state = create_run(
         runs_dir, tmp_path, "implement", label="03-E4.1", branch="03-E4.1"

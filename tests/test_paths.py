@@ -1,8 +1,10 @@
-"""Tests for toolkit-root and target-repository path resolution (E0.4).
+"""Tests for toolkit-root and target-repository path resolution (E0.4/E1.4).
 
 The toolkit root resolves from the installed package location; the target repository
 root resolves from git. The two are independent: the toolkit is installed outside any
-product checkout (see ``docs/migration/EXTRACTION.md`` §3.1).
+product checkout (see ``docs/migration/EXTRACTION.md`` §3.1). Run state no longer lives
+under the toolkit root (E1.4 / §3.10), so the old ``aidt_root``/``runs_dir`` aliases and
+their names are gone.
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from aidw import paths
-from aidw.paths import repo_root, runs_dir, toolkit_root
+from aidw.paths import repo_root, toolkit_root
 
 
 def test_toolkit_root_holds_the_shipped_assets() -> None:
@@ -40,9 +42,21 @@ def test_toolkit_root_is_independent_of_cwd(monkeypatch, tmp_path: Path) -> None
     assert toolkit_root() == expected
 
 
-def test_runs_dir_is_under_the_toolkit_root() -> None:
-    assert runs_dir() == toolkit_root() / "runs"
-
-
 def test_repo_root_from_explicit_start() -> None:
     assert repo_root(Path(__file__).parent) == repo_root()
+
+
+def test_no_old_helper_names_survive_under_aidw() -> None:
+    """The literal E1.4 gate: ``rg "aidt_root|runs_dir" aidw/`` matches nothing.
+
+    Implemented in Python rather than shelling out to ``rg`` so it runs in any CI
+    environment. It covers parameter/local names too, not just the deleted functions.
+    """
+    aidw_dir = toolkit_root() / "aidw"
+    offenders: list[str] = []
+    for path in sorted(aidw_dir.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for banned in ("aidt_root", "runs_dir"):
+            if banned in text:
+                offenders.append(f"{path.relative_to(aidw_dir)}: {banned}")
+    assert offenders == []

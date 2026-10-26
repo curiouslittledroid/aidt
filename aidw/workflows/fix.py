@@ -33,6 +33,7 @@ from aidw import git, github
 from aidw.config import ERROR, WARNING, Issue, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
+from aidw.paths import TargetRepo, WorkspacePaths
 from aidw.report import print_stage
 from aidw.runner import StageSpec, run_stage
 from aidw.state import (
@@ -72,10 +73,10 @@ def _read_out(record) -> str | None:
     return None
 
 
-def _latest_fix_run(runs_dir: Path, branch: str) -> RunState | None:
+def _latest_fix_run(runs_root: Path, branch: str) -> RunState | None:
     matches = [
         state
-        for state in list_runs(runs_dir)
+        for state in list_runs(runs_root)
         if state.workflow == "fix" and state.git.get("branch") == branch
     ]
     return matches[-1] if matches else None
@@ -124,6 +125,7 @@ def _approval_round(
     state: RunState,
     logger: RunLogger,
     directory: Path,
+    runs_root: Path,
     approve_all: bool,
     skip: set[str],
     deny: set[str] | None = None,
@@ -167,7 +169,8 @@ def _approval_round(
             verify=lambda: github.verify_approvals(aidt, repo, pr),
         ),
         repo_root=repo,
-        aidt_root=aidt,
+        toolkit_root=aidt,
+        runs_root=runs_root,
         state=state,
         logger=logger,
         agents=agents,
@@ -196,7 +199,7 @@ def run(
 ) -> int:
     skip = set(skip_gates or [])
     deny = set(deny_gates or [])
-    runs_dir = aidt / "runs"
+    runs_root = WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
 
     agents, issues = load_all(aidt, repo)
     errors = [i for i in issues if i.level == ERROR]
@@ -250,7 +253,7 @@ def run(
                 file=sys.stderr,
             )
             return 4
-        existing = _latest_fix_run(runs_dir, branch) if branch else None
+        existing = _latest_fix_run(runs_root, branch) if branch else None
         if existing is not None and existing.status == RUNNING:
             print(
                 f"another fix run for `{branch}` is still marked running: "
@@ -264,7 +267,7 @@ def run(
         return 2
 
     state = create_run(
-        runs_dir,
+        runs_root,
         repo,
         "fix",
         label=f"pr-{pr}",
@@ -276,7 +279,7 @@ def run(
         strict=strict,
         branch=branch,
     )
-    directory = run_dir(runs_dir, state.run_id)
+    directory = run_dir(runs_root, state.run_id)
     logger = RunLogger(directory, stream=stream)
     print(f"run:    {state.run_id}")
     print(f"pr:     #{pr}" + (f" {pr_info['url']}" if pr_info.get("url") else ""))
@@ -319,7 +322,8 @@ def run(
             record = run_stage(
                 StageSpec(name, agent, aidt / "prompts" / prompt, variables, extra=extra),
                 repo_root=repo,
-                aidt_root=aidt,
+                toolkit_root=aidt,
+                runs_root=runs_root,
                 state=state,
                 logger=logger,
                 agents=agents,
@@ -344,6 +348,7 @@ def run(
         state=state,
         logger=logger,
         directory=directory,
+        runs_root=runs_root,
         approve_all=approve_all,
         skip=skip,
         deny=deny,
@@ -400,7 +405,8 @@ def run(
                 [str(pr)],
             ),
             repo_root=repo,
-            aidt_root=aidt,
+            toolkit_root=aidt,
+            runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
@@ -422,7 +428,8 @@ def run(
                 extra=_TEST_EXTRA.format(pr=pr, iteration=iterations),
             ),
             repo_root=repo,
-            aidt_root=aidt,
+            toolkit_root=aidt,
+            runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
@@ -443,7 +450,8 @@ def run(
                 [],
             ),
             repo_root=repo,
-            aidt_root=aidt,
+            toolkit_root=aidt,
+            runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
@@ -513,7 +521,8 @@ def run(
                     extra=findings_mod.MANIFEST_EXTRA.format(manifest_rel=manifest_rel),
                 ),
                 repo_root=repo,
-                aidt_root=aidt,
+                toolkit_root=aidt,
+                runs_root=runs_root,
                 state=state,
                 logger=logger,
                 agents=agents,
@@ -535,6 +544,7 @@ def run(
                 state=state,
                 logger=logger,
                 directory=directory,
+                runs_root=runs_root,
                 approve_all=approve_all,
                 skip=skip,
                 deny=deny,

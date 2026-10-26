@@ -123,7 +123,7 @@
   - Deliverable: resolution helpers plus tests for: bare+worktrees; single checkout; no remote; unwritable workspace root; `AIDW_STATE_DIR` override.
   - Done when: tests prove the state root is identical from every worktree of one repo and differs between repos sharing a parent directory.
 
-- [ ] **E1.4. Port consumers and delete the old helpers**
+- [x] **E1.4. Port consumers and delete the old helpers**
   Replace every `aidt_root()`/`runs_dir()` call site with the new types; remove both helpers;
   rewrite `test_paths.py`.
   - Deliverable: no remaining `repo_root()/aidt` assumption anywhere.

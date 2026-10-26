@@ -127,7 +127,7 @@ def _require(config: dict[str, Any], key: str, source: str, issues: list[Issue])
 
 
 def _load_system_prompt(
-    raw: Any, aidt_root: Path, source: str, issues: list[Issue]
+    raw: Any, toolkit_root: Path, source: str, issues: list[Issue]
 ) -> SystemPrompt:
     if raw is None:
         return SystemPrompt(mode="none")
@@ -160,7 +160,7 @@ def _load_system_prompt(
         )
         return SystemPrompt(mode=mode)
 
-    path = _resolve(str(file_value), aidt_root)
+    path = _resolve(str(file_value), toolkit_root)
     if not path.is_file():
         issues.append(Issue(ERROR, source, f"system_prompt.file not found: {path}"))
         return SystemPrompt(mode=mode, file=path)
@@ -188,7 +188,7 @@ def _load_path_list(
 
 
 def load_agent(
-    path: Path, aidt_root: Path, repo_root: Path
+    path: Path, toolkit_root: Path, repo_root: Path
 ) -> AgentConfig:
     """Load and validate a single agent config file."""
     source = path.name
@@ -266,7 +266,7 @@ def load_agent(
     agents_md: Path | None = None
     agents_md_content: str | None = None
     if agents_md_raw:
-        agents_md = _resolve(str(agents_md_raw), aidt_root)
+        agents_md = _resolve(str(agents_md_raw), toolkit_root)
         if not agents_md.is_file():
             issues.append(Issue(ERROR, source, f"agents_md not found: {agents_md}"))
         else:
@@ -275,7 +275,7 @@ def load_agent(
     mcp_raw = raw.get("mcp_config")
     mcp_config: Path | None = None
     if mcp_raw:
-        mcp_config = _resolve(str(mcp_raw), aidt_root)
+        mcp_config = _resolve(str(mcp_raw), toolkit_root)
         if not mcp_config.is_file():
             issues.append(Issue(ERROR, source, f"mcp_config not found: {mcp_config}"))
 
@@ -296,14 +296,14 @@ def load_agent(
         provider=provider,
         model=model,
         thinking=thinking,
-        system_prompt=_load_system_prompt(raw.get("system_prompt"), aidt_root, source, issues),
+        system_prompt=_load_system_prompt(raw.get("system_prompt"), toolkit_root, source, issues),
         agents_md=agents_md,
         agents_md_content=agents_md_content,
         tools=tools,
-        skills=_load_path_list(raw.get("skills"), aidt_root, "skills", source, issues),
-        extensions=_load_path_list(raw.get("extensions"), aidt_root, "extensions", source, issues),
+        skills=_load_path_list(raw.get("skills"), toolkit_root, "skills", source, issues),
+        extensions=_load_path_list(raw.get("extensions"), toolkit_root, "extensions", source, issues),
         prompt_templates=_load_path_list(
-            raw.get("prompt_templates"), aidt_root, "prompt_templates", source, issues
+            raw.get("prompt_templates"), toolkit_root, "prompt_templates", source, issues
         ),
         mcp_config=mcp_config,
         cwd=cwd,
@@ -319,14 +319,14 @@ def load_agent(
 
 
 def load_all(
-    aidt_root: Path, repo_root: Path
+    toolkit_root: Path, repo_root: Path
 ) -> tuple[dict[str, AgentConfig], list[Issue]]:
     """Load every ``*.yaml`` under ``aidt/agent-configs/``.
 
     Returns the agents keyed by id and the combined issue list (per-agent errors plus
     cross-agent independence checks).
     """
-    config_dir = aidt_root / "agent-configs"
+    config_dir = toolkit_root / "agent-configs"
     agents: dict[str, AgentConfig] = {}
     issues: list[Issue] = []
 
@@ -335,7 +335,7 @@ def load_all(
         return agents, issues
 
     for path in sorted(config_dir.glob("*.yaml")):
-        agent = load_agent(path, aidt_root, repo_root)
+        agent = load_agent(path, toolkit_root, repo_root)
         if agent.id in agents:
             issues.append(Issue(ERROR, path.name, f"duplicate agent id `{agent.id}`"))
         agents[agent.id] = agent

@@ -6,22 +6,22 @@ from pathlib import Path
 
 from aidw import inventory
 from aidw.config import ERROR, WARNING
-from aidw.paths import aidt_root
+from aidw.paths import toolkit_root
 
 
 def test_real_inventory_is_complete() -> None:
-    issues = inventory.check(aidt_root())
+    issues = inventory.check(toolkit_root())
     errors = [issue for issue in issues if issue.level == ERROR]
     assert errors == [], errors
 
 
 def test_real_inventory_has_no_legacy_manifest() -> None:
-    issues = inventory.check(aidt_root())
+    issues = inventory.check(toolkit_root())
     assert not any(issue.source == inventory.LEGACY_MANIFEST for issue in issues)
 
 
 def test_list_files_includes_known_prompts() -> None:
-    files = inventory.list_files(aidt_root())
+    files = inventory.list_files(toolkit_root())
     assert "code-review.md" in files
     assert "scripts/review-followup/review_followup.py" in files
 

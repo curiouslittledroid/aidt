@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from aidw import git, github
+from aidw.paths import TargetRepo, WorkspacePaths
 from aidw.state import SUCCEEDED, StageRecord, run_dir
 from aidw.workflows import review as review_workflow
 
@@ -35,6 +36,10 @@ def _init_repo(path: Path) -> None:
     (path / "aidt").mkdir()
 
 
+def _runs_root(repo: Path) -> Path:
+    return WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
+
+
 class _FakeStages:
     def __init__(self, review_text: str) -> None:
         self.names: list[str] = []
@@ -42,9 +47,7 @@ class _FakeStages:
 
     def __call__(self, spec, **kwargs):
         self.names.append(spec.name)
-        directory = run_dir(
-            Path(kwargs["repo_root"]) / "aidt" / "runs", kwargs["state"].run_id
-        )
+        directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
         out = stages / f"{spec.name}.out.txt"
@@ -104,7 +107,7 @@ def test_blocked_does_not_publish(tmp_path: Path, monkeypatch) -> None:
 
     assert code == 3
     assert "review-findings-to-github" not in stages.names
-    directory = next((tmp_path / "aidt" / "runs").iterdir())
+    directory = next(_runs_root(tmp_path).iterdir())
     recorded = json.loads(
         (directory / "artifacts" / "findings.json").read_text(encoding="utf-8")
     )
@@ -134,7 +137,7 @@ def test_request_changes_publishes_and_records(tmp_path: Path, monkeypatch) -> N
 
     assert code == 0
     assert stages.names == ["code-review", "review-findings-to-github"]
-    directory = next((tmp_path / "aidt" / "runs").iterdir())
+    directory = next(_runs_root(tmp_path).iterdir())
     manifest = json.loads(
         (directory / "artifacts" / "review-manifest.json").read_text(encoding="utf-8")
     )

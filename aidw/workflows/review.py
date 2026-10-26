@@ -23,6 +23,7 @@ from aidw import findings as findings_mod
 from aidw import git, github
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.log import RunLogger
+from aidw.paths import TargetRepo, WorkspacePaths
 from aidw.report import print_stage
 from aidw.runner import StageSpec, run_stage
 from aidw.state import (
@@ -78,7 +79,7 @@ def run(
     force_model: bool = False,
     stream: bool = False,
 ) -> int:
-    runs_dir = aidt / "runs"
+    runs_root = WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
 
     agents, issues = load_all(aidt, repo)
     errors = [i for i in issues if i.level == ERROR]
@@ -115,7 +116,7 @@ def run(
             return 4
 
     state = create_run(
-        runs_dir,
+        runs_root,
         repo,
         "review",
         label=f"pr-{pr}",
@@ -127,7 +128,7 @@ def run(
         strict=strict,
         branch=branch,
     )
-    directory = run_dir(runs_dir, state.run_id)
+    directory = run_dir(runs_root, state.run_id)
     logger = RunLogger(directory, stream=stream)
     print(f"run:    {state.run_id}")
     print(f"pr:     #{pr}" + (f" {pr_info['url']}" if pr_info.get("url") else ""))
@@ -145,7 +146,8 @@ def run(
             record = run_stage(
                 spec,
                 repo_root=repo,
-                aidt_root=aidt,
+                toolkit_root=aidt,
+                runs_root=runs_root,
                 state=state,
                 logger=logger,
                 agents=agents,
@@ -171,7 +173,8 @@ def run(
     rec1 = run_stage(
         r1,
         repo_root=repo,
-        aidt_root=aidt,
+        toolkit_root=aidt,
+        runs_root=runs_root,
         state=state,
         logger=logger,
         agents=agents,
@@ -260,7 +263,8 @@ def run(
             extra=extra,
         ),
         repo_root=repo,
-        aidt_root=aidt,
+        toolkit_root=aidt,
+        runs_root=runs_root,
         state=state,
         logger=logger,
         agents=agents,
