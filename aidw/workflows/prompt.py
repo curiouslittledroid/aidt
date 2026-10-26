@@ -14,9 +14,12 @@ Stages:
 4. optional gate ``approve-task-prompt``.
 
 A real run requires ``main`` and a clean working tree, because the ``task-prompt`` prompt
-requires it. It then fetches ``origin`` and refuses (exit 4) when the base branch is behind
-or diverged from ``origin/<base>``; ``--no-fetch`` skips both the fetch and the comparison.
-A ``--dry-run`` plans the stages without those preconditions and never touches the network.
+requires it. It then refuses (exit 4) when an earlier task in the same ``docs/tasks/*.md``
+phase file is unticked, unless ``--allow-incomplete-prereqs`` is given, then fetches
+``origin`` and refuses (exit 4) when the base branch is behind or diverged from
+``origin/<base>``; ``--no-fetch`` skips both the fetch and the comparison.
+A ``--dry-run`` plans the stages without those preconditions, reports the incomplete
+predecessors, and never touches the network.
 The approval gate is off by default; pass ``--require-approval`` to pause for a human decision.
 """
 
@@ -40,7 +43,7 @@ from aidw.gates import GateOutcome, decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.roadmap import find_task, load_tasks
+from aidw.roadmap import RoadmapTask, find_task, load_tasks
 from aidw.runner import StageSpec, run_stage
 from aidw.state import (
     BLOCKED,
@@ -189,6 +192,59 @@ def _verify_base_branch(repo: TargetRepo, *, no_fetch: bool) -> int | None:
     return None
 
 
+def _incomplete_predecessors(
+    entries: list[RoadmapTask], entry: RoadmapTask
+) -> list[RoadmapTask]:
+    """Earlier, unticked tasks in the target's own roadmap file (L1.2, design §11).
+
+    Roadmap ordering is the line order within ``RoadmapTask.file``; an epic-id sort is
+    not the authority. ``load_tasks`` returns every phase file, so the filter is on the
+    file, not the phase id — otherwise an unticked backlog in phase 00 would block every
+    other phase.
+    """
+    return [
+        candidate
+        for candidate in entries
+        if candidate.file == entry.file
+        and candidate.line < entry.line
+        and not candidate.done
+    ]
+
+
+def _render_predecessors(predecessors: list[RoadmapTask]) -> str:
+    """One ``id — title`` line per predecessor, in roadmap order (never a bare count)."""
+    return "\n".join(f"  {p.task} — {p.title}" for p in predecessors)
+
+
+def _refuse_incomplete_predecessors(
+    entry: RoadmapTask, predecessors: list[RoadmapTask]
+) -> None:
+    """Exit-4 refusal naming the target, its phase file and every predecessor."""
+    print(
+        f"refusing: cannot author `{entry.task}` in phase file `{entry.file}`; "
+        "earlier tasks in the same file are incomplete:",
+        file=sys.stderr,
+    )
+    print(_render_predecessors(predecessors), file=sys.stderr)
+    print(
+        "Tick each predecessor once its work is merged (a merged task may still be "
+        "unticked, so the roadmap cannot tell the difference), or re-run with "
+        "`--allow-incomplete-prereqs` to author anyway.",
+        file=sys.stderr,
+    )
+
+
+def _warn_incomplete_predecessors(
+    entry: RoadmapTask, predecessors: list[RoadmapTask]
+) -> None:
+    print(
+        f"warning: --allow-incomplete-prereqs: authoring `{entry.task}` anyway; "
+        "skipping incomplete predecessor(s):",
+        file=sys.stderr,
+    )
+    print(_render_predecessors(predecessors), file=sys.stderr)
+
+
 def run(
     *,
     phase: str,
@@ -206,6 +262,7 @@ def run(
     strict: bool = False,
     dry_run: bool = False,
     no_fetch: bool = False,
+    allow_incomplete_prereqs: bool = False,
     stream: bool = False,
 ) -> int:
     skip = set(skip_gates or [])
@@ -224,12 +281,26 @@ def run(
         )
         return 2
 
+    # L1.2 (design §8.1, §11): computed once, before the ``dry_run`` split, so the
+    # dry-run note and the real-run refusal cannot disagree. ``entries`` already holds
+    # every parsed phase file; the filter is on the target's own file and a strictly
+    # earlier line, never on epic-id order (a later-sorting epic can sit on an earlier
+    # line) and never across files (phase 00's unticked backlog must not block phase 02).
+    incomplete = _incomplete_predecessors(entries, entry)
+
     branch = git.current_branch(repo.root)
     if dry_run:
         if branch != "main":
             print(f"[dry-run] a real run requires `main` (currently `{branch}`).")
         if not git.is_clean(repo.root):
             print("[dry-run] a real run requires a clean working tree.")
+        if incomplete:
+            print(
+                f"[dry-run] incomplete predecessors for `{entry.task}` in "
+                f"`{entry.file}`:\n{_render_predecessors(incomplete)}"
+            )
+        else:
+            print(f"[dry-run] no incomplete predecessors in `{entry.file}`.")
         print(
             "[dry-run] a real run will fetch and verify the base branch against "
             f"`{REMOTE}/{repo.base_branch}`."
@@ -245,7 +316,15 @@ def run(
             print("working tree is dirty; commit or stash first.", file=sys.stderr)
             return 4
         # Refuse before ``load_all``/``create_run`` so a stale base leaves no run
-        # directory, no ``{phase}-{task}`` branch and no prompt file behind.
+        # directory, no ``{phase}-{task}`` branch and no prompt file behind. A refusal
+        # on roadmap ordering is deliberately checked before the network fetch: it is a
+        # purely local, in-memory condition, so an unreachable ``origin`` must not be
+        # spent first.
+        if incomplete:
+            if not allow_incomplete_prereqs:
+                _refuse_incomplete_predecessors(entry, incomplete)
+                return EXIT_REFUSED
+            _warn_incomplete_predecessors(entry, incomplete)
         refusal = _verify_base_branch(repo, no_fetch=no_fetch)
         if refusal is not None:
             return refusal

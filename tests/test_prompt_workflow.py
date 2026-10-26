@@ -6,7 +6,10 @@ import re
 import subprocess
 from pathlib import Path
 
+from typer.testing import CliRunner
+
 from aidw import git, state
+from aidw.cli import app
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths, repo_root
 from aidw.workflows import prompt as prompt_workflow
 
@@ -195,11 +198,27 @@ Request changes — one should-fix item remains.
 """
 
 
-def _patch_prompt_repo(tmp_path: Path, monkeypatch) -> None:
+def _patch_prompt_repo(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    roadmap: str | None = None,
+    extra_files: dict[str, str] | None = None,
+) -> None:
+    """A lightweight fake repo (no origin) carrying ``docs/tasks/03 - Test Phase.md``.
+
+    ``roadmap`` defaults to :data:`ROADMAP_FIXTURE`; the default cannot be a literal
+    default argument because that fixture is defined later in this module. ``extra_files``
+    adds further phase files for the ``file``-scope tests.
+    """
     _init_repo(tmp_path)
     tasks_dir = tmp_path / "docs" / "tasks"
     tasks_dir.mkdir(parents=True)
-    (tasks_dir / "03 - Test Phase.md").write_text(ROADMAP_FIXTURE, encoding="utf-8")
+    (tasks_dir / "03 - Test Phase.md").write_text(
+        roadmap if roadmap is not None else ROADMAP_FIXTURE, encoding="utf-8"
+    )
+    for name, text in (extra_files or {}).items():
+        (tasks_dir / name).write_text(text, encoding="utf-8")
     monkeypatch.setattr(git, "current_branch", lambda repo: "main")
     monkeypatch.setattr(git, "is_clean", lambda repo: True)
 
@@ -687,7 +706,9 @@ def _explode_stage(*args: object, **kwargs: object) -> object:
     raise AssertionError("no stage may run when the preflight refuses")
 
 
-def _origin_and_clone(tmp_path: Path) -> tuple[Path, Path]:
+def _origin_and_clone(
+    tmp_path: Path, *, roadmap: str = ROADMAP_FIXTURE
+) -> tuple[Path, Path]:
     """Build a bare ``origin`` and a clone whose ``main`` carries the roadmap fixture.
 
     The clone is the target repo the workflow drives; ``origin/main`` tracks it. The
@@ -700,7 +721,7 @@ def _origin_and_clone(tmp_path: Path) -> tuple[Path, Path]:
     _run_git(["clone", "-q", str(origin), str(clone)], tmp_path)
     tasks_dir = clone / "docs" / "tasks"
     tasks_dir.mkdir(parents=True)
-    (tasks_dir / "03 - Test Phase.md").write_text(ROADMAP_FIXTURE, encoding="utf-8")
+    (tasks_dir / "03 - Test Phase.md").write_text(roadmap, encoding="utf-8")
     _run_git(["add", "."], clone)
     _run_git(["commit", "-qm", "init"], clone)
     _run_git(["push", "-q", "-u", "origin", "main"], clone)
@@ -1000,3 +1021,331 @@ def test_dry_run_never_fetches_with_an_unreachable_origin(
     assert calls == []
     assert comparisons == []
     assert "[dry-run] a real run will fetch and verify the base branch" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# L1.2 — refuse to author when earlier tasks in the same phase file are unticked
+#        (design §8.1, §11)
+# ---------------------------------------------------------------------------
+
+#: Target ``E4.1`` has an earlier unticked ``E3.1`` in the same phase file.
+ROADMAP_INCOMPLETE_PREDECESSOR = """# Phase 3: Test Phase
+
+## Epic E3: Earlier Epic
+
+- [ ] **E3.1. An earlier unticked task** per Design 09..
+  - Done when: whatever the task requires.
+
+## Epic E4: Defensive Combat
+
+- [ ] **E4.1. Implement Total Defense** per Design 09..
+  - Done when: applyTotalDefense returns the fixed effect.
+"""
+
+#: The same shape with the earlier task ticked: the ``[x]`` state must satisfy the gate.
+ROADMAP_COMPLETE_PREDECESSORS = """# Phase 3: Test Phase
+
+## Epic E3: Earlier Epic
+
+- [x] **E3.1. An earlier ticked task** per Design 09..
+  - Done when: whatever the task requires.
+
+## Epic E4: Defensive Combat
+
+- [ ] **E4.1. Implement Total Defense** per Design 09..
+  - Done when: applyTotalDefense returns the fixed effect.
+"""
+
+#: An earlier line inside a later-sorting epic (E9) must still block E4.1: line order is
+#: the authority, never epic-id order.
+ROADMAP_EARLIER_LINE_LATER_EPIC = """# Phase 3: Test Phase
+
+## Epic E9: Later Epic
+
+- [ ] **E9.1. A later-sorting epic on an earlier line** per Design 09..
+  - Done when: whatever the task requires.
+
+## Epic E4: Defensive Combat
+
+- [ ] **E4.1. Implement Total Defense** per Design 09..
+  - Done when: applyTotalDefense returns the fixed effect.
+"""
+
+#: A later, unticked sibling (E4.2) must not block an earlier target (E4.1).
+ROADMAP_LATER_UNTICKED_SIBLING = """# Phase 3: Test Phase
+
+## Epic E4: Defensive Combat
+
+- [ ] **E4.1. Implement Total Defense** per Design 09..
+  - Done when: applyTotalDefense returns the fixed effect.
+
+- [ ] **E4.2. Implement Parry** per Design 09..
+  - Done when: applyParry returns the fixed effect.
+"""
+
+#: An unticked task in a different phase file must not block phase 03's runs.
+OTHER_PHASE_FIXTURE = """# Phase 4: Another Phase
+
+## Epic E4: Defensive Combat
+
+- [ ] **E4.1. An unticked task in another phase file** per Design 09..
+  - Done when: it stays out of scope.
+"""
+
+#: Multiple predecessors prove that the refusal is an ordered list, not a count or sample.
+ROADMAP_MULTIPLE_INCOMPLETE_PREDECESSORS = """# Phase 3: Test Phase
+
+## Epic E3: Earlier Epic
+
+- [ ] **E3.1. First incomplete predecessor** per Design 09..
+  - Done when: whatever the task requires.
+
+- [ ] **E3.2. Second incomplete predecessor** per Design 09..
+  - Done when: whatever the task requires.
+
+## Epic E4: Defensive Combat
+
+- [ ] **E4.1. Implement Total Defense** per Design 09..
+  - Done when: applyTotalDefense returns the fixed effect.
+"""
+
+
+runner = CliRunner()
+
+
+def test_l12_incomplete_predecessor_refuses_without_writing(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """An unticked earlier task refuses with 4 and names file, target and predecessor."""
+    _patch_prompt_repo(tmp_path, monkeypatch, roadmap=ROADMAP_INCOMPLETE_PREDECESSOR)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert "03 - Test Phase.md" in err
+    assert "E4.1" in err
+    assert "E3.1 — An earlier unticked task" in err
+    assert "Tick each predecessor once its work is merged" in err
+    assert "or re-run with `--allow-incomplete-prereqs`" in err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert git.current_branch(tmp_path) == "main"
+    assert not (tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
+
+
+def test_l12_refusal_names_all_predecessors_in_roadmap_order(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _patch_prompt_repo(
+        tmp_path, monkeypatch, roadmap=ROADMAP_MULTIPLE_INCOMPLETE_PREDECESSORS
+    )
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 4
+    err = capsys.readouterr().err
+    first = err.index("E3.1 — First incomplete predecessor")
+    second = err.index("E3.2 — Second incomplete predecessor")
+    assert first < second
+    assert "incomplete predecessor(s)" not in err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+
+
+def test_l12_all_predecessors_ticked_proceeds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The gate reads ``[x]`` state, not the mere presence of earlier tasks."""
+    _patch_prompt_repo(tmp_path, monkeypatch, roadmap=ROADMAP_COMPLETE_PREDECESSORS)
+    seen, fake = _approve_first_review()
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    assert seen[0][0] == "task-prompt"
+    assert state.list_runs(_runs_root(tmp_path))
+
+
+def test_l12_later_unticked_sibling_does_not_block(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch, roadmap=ROADMAP_LATER_UNTICKED_SIBLING)
+    seen, fake = _approve_first_review()
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    assert "E4.2" not in capsys.readouterr().err
+
+
+def test_l12_line_order_beats_epic_order(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """An earlier line in a later-sorting epic still blocks."""
+    _patch_prompt_repo(tmp_path, monkeypatch, roadmap=ROADMAP_EARLIER_LINE_LATER_EPIC)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 4
+    assert "E9.1 — A later-sorting epic on an earlier line" in capsys.readouterr().err
+
+
+def test_l12_other_phase_file_does_not_block(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Unticked entries in another phase file are out of scope (the ``file`` filter)."""
+    _patch_prompt_repo(
+        tmp_path,
+        monkeypatch,
+        extra_files={"04 - Another Phase.md": OTHER_PHASE_FIXTURE},
+    )
+    seen, fake = _approve_first_review()
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+
+
+def test_l12_allow_incomplete_prereqs_warns_and_proceeds(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _patch_prompt_repo(
+        tmp_path, monkeypatch, roadmap=ROADMAP_MULTIPLE_INCOMPLETE_PREDECESSORS
+    )
+    seen, fake = _approve_first_review()
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        allow_incomplete_prereqs=True,
+    )
+
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "E3.1 — First incomplete predecessor" in err
+    assert "E3.2 — Second incomplete predecessor" in err
+    assert "--allow-incomplete-prereqs" in err
+
+
+def test_l12_dry_run_reports_incomplete_predecessors(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Dry-run reports and never refuses; it writes nothing."""
+    _patch_prompt_repo(tmp_path, monkeypatch, roadmap=ROADMAP_INCOMPLETE_PREDECESSOR)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, dry_run=True
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[dry-run] incomplete predecessors for `E4.1`" in out
+    assert "E3.1 — An earlier unticked task" in out
+    assert (tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists() is False
+
+
+def test_l12_dry_run_states_when_there_are_none(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch, roadmap=ROADMAP_COMPLETE_PREDECESSORS)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, dry_run=True
+    )
+
+    assert code == 0
+    assert (
+        "[dry-run] no incomplete predecessors in `03 - Test Phase.md`."
+        in capsys.readouterr().out
+    )
+
+
+def test_l12_refusal_precedes_the_origin_fetch(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The purely local ordering refusal must not spend a network fetch first."""
+    _origin, clone = _origin_and_clone(tmp_path, roadmap=ROADMAP_INCOMPLETE_PREDECESSOR)
+    _break_origin(clone)
+    fetch_calls: list[tuple] = []
+
+    def spy_fetch(*args, **kwargs):
+        fetch_calls.append(args)
+        return False, "boom"
+
+    monkeypatch.setattr(git, "fetch", spy_fetch)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 4
+    assert fetch_calls == []
+    assert "E3.1 — An earlier unticked task" in capsys.readouterr().err
+
+
+def test_l12_cli_flag_is_forwarded_to_prompt_workflow(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch, roadmap=ROADMAP_INCOMPLETE_PREDECESSOR)
+    captured: dict[str, object] = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(prompt_workflow, "run", fake_run)
+    result = runner.invoke(
+        app,
+        [
+            "--repo",
+            str(tmp_path),
+            "prompt",
+            "03",
+            "E4",
+            "E4.1",
+            "--allow-incomplete-prereqs",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["allow_incomplete_prereqs"] is True
+
+
+def test_l12_wrong_branch_refusal_precedes_the_prerequisite_check(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """On the wrong branch and out of order, the branch refusal is reported first."""
+    _patch_prompt_repo(tmp_path, monkeypatch, roadmap=ROADMAP_INCOMPLETE_PREDECESSOR)
+    monkeypatch.setattr(git, "current_branch", lambda repo: "feature-branch")
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert "must run on `main`" in err
+    assert "earlier tasks in the same file are incomplete" not in err

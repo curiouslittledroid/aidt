@@ -94,7 +94,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     silently pass as current.
   - Tests: `tests/test_prompt_workflow.py`, building a bare `origin` plus a clone inline.
 
-- [ ] **L1.2. Refuse to author a task whose predecessors are incomplete** (Design 11)
+- [x] **L1.2. Refuse to author a task whose predecessors are incomplete** (Design 11)
   `aidw prompt` resolves the roadmap entry and then proceeds regardless of ordering. E1.6 was
   authored against E1.4's tree with E1.5 unticked, which is what forced the author to invent a
   prerequisite paragraph. Gate on the roadmap itself: every task **preceding** the target in
