@@ -12,13 +12,56 @@ from pathlib import Path
 
 
 def _git(repo: Path, args: list[str]) -> tuple[int, str]:
+    code, out, err = _git_out(repo, args)
+    return code, (out + err).strip()
+
+
+def _git_out(repo: Path, args: list[str]) -> tuple[int, str, str]:
+    """Run git and return ``(code, stdout, stderr)`` with stdout untouched.
+
+    ``-z``-delimited output is parsed by splitting on NUL, so it must not be stripped:
+    a path may legitimately begin or end with whitespace.
+    """
     try:
         result = subprocess.run(
             ["git", *args], cwd=repo, capture_output=True, text=True, check=False
         )
     except FileNotFoundError:
-        return 127, "git: not found"
-    return result.returncode, (result.stdout + result.stderr).strip()
+        return 127, "", "git: not found"
+    return result.returncode, result.stdout, result.stderr
+
+
+def rev_parse(repo: Path, rev: str) -> str | None:
+    """Resolve ``rev`` to a commit sha, or ``None`` when it does not exist."""
+    code, out, _ = _git_out(repo, ["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"])
+    value = out.strip()
+    return value if code == 0 and value else None
+
+
+def changed_paths(repo: Path, base: str = "main") -> list[str] | None:
+    """Paths whose content differs between ``base`` and the working tree.
+
+    Compares ``base`` against the working tree (so committed and uncommitted work both
+    count) with rename detection off, so a rename reports both the removed and the added
+    path. Returns ``None`` — never an empty list — when ``base`` cannot be resolved, so a
+    caller hashing the change set fails closed instead of reading "no changes".
+    """
+    if rev_parse(repo, base) is None:
+        return None
+    code, out, _ = _git_out(repo, ["diff", "--no-renames", "--name-only", "-z", base])
+    if code != 0:
+        return None
+    return _split_nul(out)
+
+
+def untracked_paths(repo: Path) -> list[str]:
+    """Untracked, non-ignored paths (gitignored build and run output is excluded)."""
+    code, out, _ = _git_out(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
+    return _split_nul(out) if code == 0 else []
+
+
+def _split_nul(text: str) -> list[str]:
+    return [item for item in text.split("\0") if item]
 
 
 def current_branch(repo: Path) -> str | None:

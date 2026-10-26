@@ -34,6 +34,19 @@ Prove the behaviour that matters. A passing build or a source-code reading can s
    pnpm --filter @mythical-forge/<pkg> test
    ```
    Prefer the affected package(s); the full `pnpm -r` matrix is the next stage's job.
+   Run each command through `aidw gate run <key> -- <command>`, with the gates named as
+   `pr.md` names them and the same `--ignore` scope `pr.md` declares, so this run records the
+   outcome against the tree it gated:
+   ```bash
+   SCOPE="--ignore docs/implementation-results --ignore docs/architecture --ignore docs/tasks --ignore docs/task-prompts"
+   aidw gate run smoke $SCOPE -- pnpm --filter @mythical-forge/<pkg> test
+   ```
+   The scope declares what the command cannot read (the documents the other stages write); never
+   ignore source, tests, config or lockfiles. Asking again for the same key, command and scope
+   against content that differs only inside that scope prints
+   `reused: gate '<key>' passed for tree <id> at <time> by stage '<stage>' (<summary>) [scope excludes: ...]`
+   and exits 0 without re-running — cite that line, with its origin, as evidence. A same-run,
+   same-tree outcome is evidence, not a number copied from an earlier run. `--force` re-runs.
 7. When browser-rendered behaviour changes, start the documented app and check the required flows and affected failures in a real browser.
    - Check desktop and mobile when layout or responsive styles changed.
    - Check keyboard use when interactions changed.
@@ -60,7 +73,8 @@ Lead with failures and unverified criteria. Do not hide them below passing check
 - Do not modify implementation code or fix unrelated failures.
 - Do not touch the catalog, vector matrix, roadmap, results doc, or architecture docs.
 - If required browser tooling is unavailable, report the check as blocked unless the user explicitly accepts a manual exception.
-- Do not claim a command ran or a criterion passed unless you observed it.
+- Do not claim a command ran or a criterion passed unless you observed it. An `aidw gate run`
+  `reused:` line is observed evidence — quote it with its origin rather than re-running the gate.
 
 ## Final response
 

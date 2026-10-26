@@ -204,6 +204,14 @@ class TargetRepo:
 #: working directory would point inside the *target* repository, not the toolkit.
 SCRIPTS_DIR_ENV_VAR = "AIDW_SCRIPTS_DIR"
 
+#: Environment variables the stage runner sets so a gate the *agent* runs lands in the
+#: right run state (EXTRACTION.md E4.8). ``aidw gate run`` reads them to record an
+#: outcome against the run and stage that produced it, which is what lets a later stage
+#: cite it. Unset (a human at a terminal, or a repo under plain ``aidw gate run``) simply
+#: means nothing is recorded; the gate still runs.
+RUN_ID_ENV_VAR = "AIDW_RUN_ID"
+STAGE_ENV_VAR = "AIDW_STAGE"
+
 
 def toolkit_root() -> Path:
     """Return the absolute root of the installed toolkit.

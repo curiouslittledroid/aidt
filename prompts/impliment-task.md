@@ -67,6 +67,23 @@ If an instruction conflicts with the repo (a gate that would go red, a validator
   ```
   This is a fast sanity check, not the acceptance gate. The full `pnpm -r` matrix and the
   task-specific gates are run and recorded by `record-implementation-results.md`.
+  Run each of these through `aidw gate run <key> -- <command>`, with the gates named as `pr.md`
+  names them (`lint`, `build`, `suite`) and the same `--ignore` scope `pr.md` declares, so this run
+  records the outcome against the tree it gated and a later stage cites it instead of re-running
+  it:
+  ```bash
+  SCOPE="--ignore docs/implementation-results --ignore docs/architecture --ignore docs/tasks --ignore docs/task-prompts"
+  aidw gate run smoke $SCOPE -- pnpm --filter @mythical-forge/<pkg> test
+  ```
+  The scope declares what the command cannot read (the documents the other stages write); never
+  ignore source, tests, config or lockfiles. Asking again for the same key, command and scope
+  against content that differs only inside that scope prints
+  `reused: gate '<key>' passed for tree <id> at <time> by stage '<stage>' (<summary>) [scope excludes: ...]`
+  and exits 0 without re-running. A same-run, same-tree outcome is evidence, not a number copied
+  from an earlier run; `--force` re-runs when you doubt it. If the task prompt names a wider
+  acceptance command (the repo's full suite), run that one through `aidw gate run suite $SCOPE --
+  <command>` too — that is the outcome the later stages reuse. Use `smoke` for a package-scoped
+  check.
 - **Do not edit** `docs/rules-coverage/catalog.json`, `docs/rules-coverage/report.md`,
   `tests/integration/src/vector-matrix/vectors.ts`, the roadmap checkbox in `docs/tasks/`, or
   `docs/implementation-results/**`. Downstream prompts own those.
@@ -94,9 +111,12 @@ sections, in this order and under these exact headings:
 
 1. **`## What I built`** — 2–6 bullets on the delivered code and contract tests, naming real file
    paths. Call out any deviation from the task prompt explicitly, and what you chose instead.
-2. **`## Verification (real outcomes)`** — the exact package-scoped commands you ran and their
+2. **`## Verification (real outcomes)`** — the exact commands you ran and their
    real results (pass/fail, test counts). Never invent numbers. If a command could not run
    (missing credentials, no network), say so and why. Do not claim the full `pnpm -r` gate ran.
+   A command you ran through `aidw gate run` has a recorded outcome: quote its one-line outcome,
+   and for a `reused:` citation give the origin (tree, stage, timestamp) instead of implying you
+   ran it in this stage.
 3. **`## Flagged for downstream stages`** — the traceability refs to add, the PR-body flags, and
    every ambiguity/deviation/pre-existing bug you found, plus what you did about it.
 

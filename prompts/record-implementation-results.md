@@ -54,6 +54,32 @@ Do **not** modify implementation code, unit/handler tests, integration suites, `
    `pnpm --filter infra cdk synth -c env=dev`). Do not invent, round, or copy numbers from an
    earlier run or another document — record what this run actually produced.
 
+   Run each command through `aidw gate run <key> -- <command>`, with the gates named as `pr.md`
+   names them and the same `--ignore` scope `pr.md` declares:
+   ```bash
+   SCOPE="--ignore docs/implementation-results --ignore docs/architecture --ignore docs/tasks --ignore docs/task-prompts"
+   aidw gate run lint  $SCOPE -- pnpm -r lint
+   aidw gate run build $SCOPE -- pnpm -r build
+   aidw gate run suite $SCOPE -- pnpm -r test
+   ```
+   The scope declares what the command cannot read: the document this stage writes
+   (`implementation_results_dir`) and the ones the other stages write — including any traceability or
+   report directory a stage of this workflow writes, which belongs in the same list in every stage so
+   the outcomes line up. It is what lets `/pr` cite these outcomes instead of buying the whole gate
+   again: this stage writes its results document *after* gating, so without a scope the tree `/pr`
+   delivers never matches the tree gated here. Never ignore source, tests, config or lockfiles:
+   those must always re-run the gate.
+
+   `aidw gate run` records the outcome against the tree it gated and prints one line naming it.
+   Asking again for the same key, command and scope against content that differs only inside that
+   scope prints
+   `reused: gate 'suite' passed for tree <id> at <time> by stage '<stage>' (<summary>) [scope excludes: ...]`
+   and exits 0 **without re-running**. That is evidence, not a copied number: cite it in the row with
+   its origin (key, tree, stage, timestamp), because it is this run's own recorded observation of
+   this same content. Anything outside this run, or against content that has changed outside the
+   scope, is still a number you must not use — re-run it (`aidw gate run --force`) or mark the row
+   unverified.
+
    **Run each command exactly once, and derive every results row from that single invocation.**
    Do not re-run a suite, module or subset just to obtain a count for its own row — take subsets
    from the same run (for example a per-file summary or a duration report). Re-running the gate is
@@ -93,4 +119,5 @@ Do **not** modify implementation code, unit/handler tests, integration suites, `
 ## Final response
 
 Return: the document path, the exact gate commands with their real outcomes (pass/fail, counts),
-and anything that could not be run and why.
+and anything that could not be run and why. Mark an outcome you cited from `aidw gate` rather than
+ran here with its origin (key, tree, stage, timestamp).

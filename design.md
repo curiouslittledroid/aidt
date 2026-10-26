@@ -815,6 +815,9 @@ aidw tasks     [--todo] [--phase NN] [--epic X] [--show "03 E2 E2.9"] [--next]
 aidw agents    list | show <id> | validate
 aidw runs      list | show <run-id> | resume <run-id>
 aidw prompts list | check
+aidw gate      run <key> -- <command> [args...] | list
+               run a whole-repo verification gate once per tree; a later stage of the
+               same run cites the recorded outcome instead of re-running it (E4.8)
 
 # global
 --repo <path>   override repo root

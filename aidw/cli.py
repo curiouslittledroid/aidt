@@ -9,6 +9,7 @@ Design reference: ``aidt/design.md`` §14 (CLI reference), §16 (build plan).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -17,11 +18,14 @@ from typing import Optional
 import typer
 
 from aidw import __version__, git, inventory, runner as runner_mod, state as state_mod
+from aidw import verification
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.doctor import run_doctor
 from aidw.gates import GateDefault
 from aidw.log import RunLogger
 from aidw.paths import (
+    RUN_ID_ENV_VAR,
+    STAGE_ENV_VAR,
     STATE_DIR_ENV_VAR,
     RepoNotFoundError,
     TargetRepo,
@@ -715,6 +719,9 @@ def runs(
                 typer.echo(f"          error: {stage.error}")
         for gate in loaded.gates:
             typer.echo(f"  gate {gate.name}: {gate.decision} ({gate.mechanism})")
+        for outcome in loaded.gate_outcomes:
+            for line in verification.describe(outcome):
+                typer.echo(line)
         return
 
     if action == "resume":
@@ -727,6 +734,186 @@ def runs(
 
     typer.echo(f"unknown action: {action} (expected list | show | resume)", err=True)
     raise typer.Exit(EXIT_USAGE)
+
+
+@app.command(
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True}
+)
+def gate(
+    ctx: typer.Context,
+    action: str = typer.Argument("list", help="run | list"),
+    key: Optional[str] = typer.Argument(
+        None, help="Gate key for `run` — a short name such as suite, lint, build."
+    ),
+    run_id: Optional[str] = typer.Option(
+        None,
+        "--run",
+        help=f"Run id to record into (default: ${RUN_ID_ENV_VAR}, which a stage sets).",
+    ),
+    stage: Optional[str] = typer.Option(
+        None,
+        "--stage",
+        help=f"Stage to cite as the origin (default: ${STAGE_ENV_VAR}, else cli).",
+    ),
+    base: str = typer.Option(
+        verification.BASE_DEFAULT,
+        "--base",
+        help="Base branch the tree identity is measured against.",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Run even when this tree already passed this gate."
+    ),
+    ignore: list[str] = typer.Option(
+        [],
+        "--ignore",
+        help=(
+            "Repo-relative prefix this gate's command cannot read (repeatable). A gate "
+            "never re-runs for a change confined to an ignored path, so cite it only for "
+            "paths the command genuinely does not read — documents other stages write, "
+            "never source, tests, config or lockfiles."
+        ),
+    ),
+    tail: int = typer.Option(
+        verification.DEFAULT_TAIL, "--tail", help="Lines of output to show."
+    ),
+    timeout: Optional[float] = typer.Option(
+        None, "--timeout", help="Seconds before the gate command is killed."
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit one JSON object instead of text."
+    ),
+) -> None:
+    """Run a whole-repo verification gate, or list the ones this run recorded (E4.8).
+
+    A gate is run **once per tree**: the second and later stages of a run to ask for the
+    same gate against unchanged content cite the recorded outcome instead of paying for
+    it again, and the citation names its origin. Content is what counts, so committing
+    the verified change set does not invalidate its own verification.
+
+    The command is the **repo's own** and is passed after ``--`` (click stops parsing
+    options there, so a gate's own flags come through untouched):
+
+    \b
+        aidw gate run suite -- uv run --frozen pytest
+        aidw gate run suite -- pnpm -r test
+
+    Use ``--ignore <prefix>`` (repeatable) for paths this gate's command cannot read, and
+    pass the same values from every stage that runs it. Without it the gate is tied to the
+    whole tree, and in the implement chain it will re-run: ``record`` writes its results
+    document after running the gate, so the tree ``pr`` delivers never matches the tree
+    ``test`` gated. With the documents declared, the suite is bought once per run.
+
+    Nothing is skipped that cannot be proven: without a resolvable base branch, without
+    a run to cite from, with a differently declared scope, or with a previously *failed*
+    outcome for this tree, the command runs. Use ``--force`` to run regardless.
+    """
+    repo, _aidt, workspace = _roots()
+    runs_root = workspace.state_root / "runs"
+    # The run's own artifacts must never count as part of the gated content: with
+    # AIDW_STATE_DIR inside the repo (and not gitignored) every stage writes logs, so
+    # nothing would ever be reusable.
+    exclude = (workspace.state_root,)
+
+    if action == "list":
+        target = _gate_run(runs_root, run_id, repo.root)
+        if target is None:
+            typer.echo(
+                f"no run to list gates for (pass --run, set {RUN_ID_ENV_VAR}, or run a "
+                "workflow first)",
+                err=True,
+            )
+            raise typer.Exit(EXIT_USAGE)
+        if json_output:
+            typer.echo(
+                json.dumps(
+                    {
+                        "run": target.run_id,
+                        "gates": [dataclasses.asdict(o) for o in target.gate_outcomes],
+                    }
+                )
+            )
+            return
+        if not target.gate_outcomes:
+            typer.echo(f"no gate outcomes recorded for {target.run_id}")
+            return
+        typer.echo(f"run: {target.run_id} ({target.git.get('branch') or '-'})")
+        for outcome in target.gate_outcomes:
+            for line in verification.describe(outcome):
+                typer.echo(line)
+        return
+
+    if action != "run":
+        typer.echo(f"unknown action: {action} (expected run | list)", err=True)
+        raise typer.Exit(EXIT_USAGE)
+
+    command = list(ctx.args)
+    if not key or not command:
+        typer.echo(
+            "usage: aidw gate run <key> -- <command> [args...] "
+            '(for example: aidw gate run suite -- uv run --frozen pytest)',
+            err=True,
+        )
+        raise typer.Exit(EXIT_USAGE)
+
+    try:
+        verification.normalise_ignore(ignore)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(EXIT_USAGE)
+
+    recorded = _gate_run(runs_root, run_id, repo.root)
+
+    result = verification.run_gate(
+        key,
+        command,
+        repo_root=repo.root,
+        run=recorded,
+        stage=stage or os.environ.get(STAGE_ENV_VAR) or "cli",
+        base=base,
+        exclude=exclude,
+        ignore=ignore,
+        force=force,
+        tail=tail,
+        timeout=timeout,
+    )
+    if recorded is not None and not result.reused:
+        state_mod.save(state_mod.run_dir(runs_root, recorded.run_id), recorded)
+
+    if json_output:
+        typer.echo(json.dumps(result.to_dict()))
+        raise typer.Exit(result.exit_code)
+
+    # The real output first, the one-line outcome last: the summary is the takeaway, and
+    # a failed gate is legible without re-reading the tail.
+    if not result.reused:
+        for line in result.tail_lines(tail):
+            typer.echo(line)
+    typer.echo(result.citation)
+    if result.note:
+        typer.echo(f"note: {result.note}", err=True)
+    raise typer.Exit(result.exit_code)
+
+
+def _gate_run(
+    runs_root: Path, run_id: Optional[str], repo_root: Path
+) -> state_mod.RunState | None:
+    """Resolve the run a gate records into: ``--run`` > ``$AIDW_RUN_ID`` > this branch.
+
+    The environment variable is how a stage's agent finds its own run; the branch
+    fallback is for a human at a terminal, who has no run id to hand and means the one
+    they are working in. An explicitly named run that does not exist is an error rather
+    than a silent fall-through to the branch, so a typo cannot quietly record an outcome
+    against the wrong run.
+    """
+    value = run_id or (os.environ.get(RUN_ID_ENV_VAR) or "").strip()
+    if value:
+        found = state_mod.find_run(runs_root, value)
+        if found is None:
+            typer.echo(f"unknown run: {value}", err=True)
+            raise typer.Exit(EXIT_USAGE)
+        return found
+    branch = git.current_branch(repo_root)
+    return state_mod.latest_for_branch(runs_root, branch) if branch else None
 
 
 @app.command()

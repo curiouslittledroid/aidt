@@ -273,6 +273,29 @@ repo's verification gate, so the concrete commands (Mythical Forge's `pnpm -r li
 inline in a toolkit prompt. A repo with no conventions yet gets the gates its task prompt names
 plus its stack's obvious build/test commands. A toolkit prompt must not name a package manager.
 
+**One gate, one tree, one run (E4.8).** A stage that runs a gate records it through `aidw gate run
+<key> -- <command>`, which hashes the change set it gated and stores the outcome in run state. A
+later stage asking for the same key against identical content is handed
+`reused: gate 'suite' passed for tree <id> at <time> by stage '<stage>' (<summary>)` instead of
+re-running it, and cites that line with its origin. The identity deliberately excludes `HEAD`,
+because `/pr` commits the very tree it gated — a `HEAD`-based identity would make the delivering
+stage the one stage that can never reuse its predecessors' work. It is the content of the change
+set relative to the base branch plus untracked non-ignored paths, minus the run's own state root
+(otherwise every stage's log write would invalidate the tree) and minus any paths the gate
+*declares* it cannot read (R18). Everything that cannot be proven runs: no resolvable base branch,
+no run to cite from, a different command under the same key, a differently declared scope, or a
+previous failure all mean the gate executes.
+
+The declared scope is what makes the reuse real rather than theoretical. `record` (I5) writes its
+results document *after* it gates, and `update-traceability`/`update-architecture` write their own
+documents earlier in the chain, so without a declaration no two stages ever agree on a tree and the
+suite is bought again in `record` and again in `pr` — the exact ~390s of one E1.6 run. The default
+declaration in the implement-chain prompts is the four configured write-targets
+(`implementation_results_dir`, `architecture_dir`, `roadmap_dir`, `task_prompts_dir`), with the
+rule stated alongside it: never ignore source, tests, config or lockfiles, and pass the same values
+from every stage or the outcomes cannot line up. As with gate commands themselves (R14), the repo
+owns the declaration; the toolkit only records it and prints it in every citation.
+
 ### 3.5 Stage and workflow model
 
 `build_plan()` in `workflows/implement.py:104` already returns a list of
@@ -473,7 +496,7 @@ only, and those are frozen).
 | Prompt | What to change |
 |---|---|
 | `test.md` | `pnpm --filter @mythical-forge/<pkg> test`; `docs/task-prompts/…`; `<file>.test.ts` co-location; `catalog.json` / `vectors.ts` |
-| `pr.md` | The `pnpm install / -r lint / -r build / -r test` block; scope examples (`rules-engine`, `player-api`); the `(03-E2.9)` task-id example |
+| `pr.md` | The `pnpm install / -r lint / -r build / -r test` block; scope examples (`rules-engine`, `player-api`); the `(03-E2.9)` task-id example. **Partly edited ahead of E7.2:** the unconditional block is now a table keyed off files the repo has (`pnpm-workspace.yaml` → pnpm; `pyproject.toml`/`uv.lock` → uv) plus the `aidw gate run` idiom, so a non-pnpm repo no longer wastes turns on pnpm. The package-manager names, the scope examples and the task-id example remain E7.2's to remove (R17). |
 | `fix-next-review-followup.md` | `pnpm --filter <affected-package>`; the marker literal; the AWS-credentials caveat |
 | `record-implementation-results.md` | `docs/implementation-results/<branch>/build-results.md`, `TEMPLATE.md`, the `pnpm -r` matrix, `pnpm srd:*` validators, `cdk synth` |
 | `impliment-task.md` | `pnpm srd:matrix-check`, `@mythical-forge/<pkg>`, `tests/integration/src/vector-matrix/vectors.ts`, `AGENTS.md` §6, `docs/conventions/srd-traceability.md`, **and the `git checkout -b` branch setup** (§3.2) |
@@ -1002,6 +1025,15 @@ plus the working-tree state as the interim identity.
 - Done when: a run whose `test` stage gated tree `T` performs no second full-suite run for `T` in
   `record`, the recorded row still carries real numbers with their origin, and a changed tree forces
   a fresh run.
+- **Landed so far:** the `aidw gate run|list` primitive, content tree identity (E4.8 chose content
+  over the `HEAD`-plus-worktree interim: R16 records why), the declared gate scope that makes reuse
+  fire across the document-writing stages (R18), `gate_outcomes` in run state under the existing
+  `schema_version` (an older `state.json` still loads), `AIDW_RUN_ID`/`AIDW_STAGE` in the stage
+  environment, and the gate idiom in the four implement-chain prompts (`impliment-task`, `test`,
+  `record-implementation-results`, `pr`). **Remaining:** the same idiom in
+  `fix-next-review-followup.md` (not in this chain), confirming reuse end-to-end against a real
+  run, and E7.2's de-naming of `pr.md`'s stack-keyed command table and of the default `--ignore`
+  path list (R17/R18 — both belong in the target repo's conventions, not the toolkit).
 
 ### E5 — Roadmap as an AIDT-owned format (D6, D15)
 
@@ -1280,3 +1312,6 @@ these before starting E3**; several are cheap now and expensive later.
 | R13 | The AIDT repo carries its own `docs/implementation-results/TEMPLATE.md` (the *format*, with this repo's stack in the example rows), so dogfooding resolves the same path a target repo does instead of depending on a Mythical-Forge-shaped default it does not satisfy. AIDT needs no `aidw/config.yaml` for this: the file now sits at the default path. | Without it every AIDT run from E1.3 onward hits the missing-template path: five runs already paid for the workaround, each recording a hand-written caveat and a longer list of prior offenders. R7's defaults are deliberately not neutral, so a repo using them must supply what they name — the fix is to supply it, not to neutralise the default and break Mythical Forge. |
 | R14 | Gate commands travel in the target repo's `aidw/conventions.md` by name; no toolkit prompt names a package manager or a repo-specific validator. | Keeps D16/R10's single-sourcing and removes the last "the toolkit knows a product" coupling. A structured `gates:` config field was considered and rejected: it would be a third mechanism duplicating D16, and gate *commands* are prose the repo already owns. |
 | R15 | A configured read-path that does not exist fails closed (E3.7), and the record stage stops and reports rather than inventing a structure. Write-targets are exempt: they are created on demand and required only by the stage that writes them. | Matches E4.2's rule for prompts ("never a silent skip"). The observed alternative — each run reverse-engineering the previous documents — is unbounded work that grows with the number of runs, and it hides a real configuration error. The read/write split matters immediately: AIDT's own `docs/architecture/` does not exist, and treating it as a must-exist read-path would fail the toolkit's own repo. |
+| R16 | A gate outcome is identified by **content**, never by `HEAD`, and may only be cited within the same run. The identity is the change set relative to the base branch plus untracked non-ignored paths, minus the run's own state root; the recording primitive runs the command itself instead of accepting a reported result. | `/pr` commits the tree it just gated, so a `HEAD`-based identity (the interim E4.8 suggested) would make the delivering stage the one stage that can never reuse its predecessors' work — the exact cost E4.8 exists to remove. Content-only identity gives up a little precision (a rebuilt `.venv` is invisible to it), which `--force` and the always-present origin citation cover. Same run only: an earlier run's outcome is not evidence about this one. Running the command inside the primitive is what makes the recorded number real rather than transcribed. |
+| R17 | `pr.md` names its stack's commands in a table keyed off files the target repo has, rather than being fully de-named now. E7.2 still owns removing the package-manager names. | The E1.6 evidence is that the old *unconditional* `pnpm` block cost the PR stage two wasted turns in a uv repo while staying correct for Mythical Forge. A file-keyed table removes the waste without stripping Mythical Forge's gates before MF.2 can supply same-named overrides — the regression E7.2/MF.2 exist to avoid. |
+| R18 | A gate may **declare** the paths its command cannot read (`aidw gate run --ignore <prefix>`), and the declaration is part of what must match before its outcome can be cited. The scope is stored in the outcome and printed in every citation; nothing is inferred from file type or location. | A whole-tree identity is sound but useless in practice: I5 writes its results document after gating, so the tree I6 delivers never matches the tree I2 gated, and the suite is bought at every stage — the cost E4.8 exists to remove. No *automatic* narrowing is sound, because nothing can prove a gate did not read a given file (AIDT's own suite reads prompts and roadmaps; Mythical Forge's `srd:*` gates read `docs/rules-coverage/`). Declaring the scope at the stage that ran the gate keeps the claim explicit and auditable, in the same spirit as R14. |

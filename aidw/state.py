@@ -23,6 +23,11 @@ BLOCKED = "blocked"
 ABORTED = "aborted"
 PLANNED = "planned"
 
+#: Verification gate outcome statuses (``GateOutcome``, E4.8). A gate is never
+#: "succeeded" — that word describes a *stage*; a gate passed or failed.
+PASSED = "passed"
+GATE_FAILED = "failed"
+
 _LABEL_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -92,6 +97,35 @@ class GateRecord:
 
 
 @dataclass
+class GateOutcome:
+    """One whole-repo verification gate outcome, tied to the tree it gated (E4.8).
+
+    Distinct from :class:`GateRecord`, which records a *human* approval gate (design §6).
+    This is a verification result: ``command`` was run, ``exit_code`` came back, and
+    ``tree`` is the identity of the content it ran against (see ``aidw.verification``).
+    Recording the origin — ``stage``, ``at`` and the command — is what lets a later
+    stage of the same run cite the outcome as evidence rather than copy a bare number.
+    """
+
+    key: str
+    command: list[str]
+    tree: str
+    status: str
+    stage: str
+    at: str
+    exit_code: int | None = None
+    duration_seconds: float | None = None
+    summary: str = ""
+    #: Repo-relative prefixes this gate declares its command cannot read; part of what
+    #: must match before the outcome may be cited (see ``aidw.verification``).
+    ignored: list[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return self.status == PASSED
+
+
+@dataclass
 class RunState:
     run_id: str
     workflow: str
@@ -105,6 +139,8 @@ class RunState:
     status: str = RUNNING
     stages: list[StageRecord] = field(default_factory=list)
     gates: list[GateRecord] = field(default_factory=list)
+    #: Whole-repo verification gate outcomes (E4.8), newest last.
+    gate_outcomes: list[GateOutcome] = field(default_factory=list)
     resume: dict[str, Any] = field(default_factory=dict)
 
     def totals(self) -> dict[str, Any]:
@@ -147,9 +183,14 @@ class RunState:
         known = {f.name for f in fields(cls)}
         stages = [StageRecord(**_filter(StageRecord, s)) for s in data.get("stages", [])]
         gates = [GateRecord(**_filter(GateRecord, g)) for g in data.get("gates", [])]
+        outcomes = [
+            GateOutcome(**_filter(GateOutcome, o))
+            for o in data.get("gate_outcomes", [])
+        ]
         scalar = {k: v for k, v in data.items() if k in known}
         scalar["stages"] = stages
         scalar["gates"] = gates
+        scalar["gate_outcomes"] = outcomes
         return cls(**scalar)
 
     def stage(self, name: str) -> StageRecord | None:
@@ -168,6 +209,21 @@ class RunState:
 
     def record_gate(self, record: GateRecord) -> None:
         self.gates.append(record)
+
+    def gate_outcome(self, key: str, tree: str) -> GateOutcome | None:
+        """The newest outcome for exactly this gate key and tree, if any.
+
+        Both ``key`` and ``tree`` must match: two different gates never cite each other,
+        and a different tree is a different question that must be answered by running.
+        """
+        for outcome in reversed(self.gate_outcomes):
+            if outcome.key == key and outcome.tree == tree:
+                return outcome
+        return None
+
+    def record_gate_outcome(self, outcome: GateOutcome) -> GateOutcome:
+        self.gate_outcomes.append(outcome)
+        return outcome
 
 
 def _filter(cls: type, data: dict[str, Any]) -> dict[str, Any]:

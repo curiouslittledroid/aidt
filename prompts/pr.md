@@ -19,13 +19,51 @@ the PR.
   git diff main...HEAD --stat
   ```
 - Review the complete change set relative to `main` — the working tree, not only commits.
-- Run the verification commands and capture the **real** results (never invent them):
+- Run the verification gates and capture the **real** results (never invent them). The commands are
+  the **repo's own** — take them from the target repo, not from this prompt: its
+  `aidw/conventions.md`, its `AGENTS.md`, the task prompt for this task, or its stack. The rows
+  below are keyed off files the repo actually has, so run the row that matches and nothing for a
+  stack it does not have:
+
+  | the repo has | its gates |
+  |---|---|
+  | `pnpm-workspace.yaml` | `pnpm install`, `pnpm -r lint`, `pnpm -r build`, `pnpm -r test` |
+  | `pyproject.toml` / `uv.lock` | `uv sync --frozen`, `uv build`, `uv run --frozen pytest` |
+
+  Another stack uses its own package manager's install/lint/build/test scripts, or whatever the repo
+  documents. A command from another repo's stack is not a gate here, and running one costs a turn
+  and produces no evidence.
+- Run each gate through `aidw gate run <key> -- <command>` so its outcome is recorded against the
+  exact tree it gated, and a later stage of this run cites it instead of paying for the same run
+  twice:
+
   ```bash
-  pnpm install
-  pnpm -r lint
-  pnpm -r build
-  pnpm -r test        # or pnpm --filter <pkg> test for the package(s) this branch touched
+  # what this gate's command cannot read: the documents the *other* stages write
+  SCOPE="--ignore docs/implementation-results --ignore docs/architecture --ignore docs/tasks --ignore docs/task-prompts"
+  aidw gate run lint  $SCOPE -- <the repo's lint command, as the repo writes it>
+  aidw gate run suite $SCOPE -- <the repo's full test command>
   ```
+
+  `--ignore` declares paths the gate's command cannot read. The four above are the write-targets of
+  the other stages (`implementation_results_dir`, `architecture_dir`, `roadmap_dir`,
+  `task_prompts_dir`; `docs/implementation-results`, `docs/architecture`, `docs/tasks`,
+  `docs/task-prompts` by default): a document those stages wrote cannot change a lint, build or test
+  result. If a stage of this workflow writes anywhere else — a traceability report directory, for
+  example — add that too: the list is every path a stage *writes* and no path a gate *reads*.
+  Declaring them is what makes reuse work at all — `/record` writes its results document *after* it
+  gates, so without a scope every tree this stage delivers differs from the tree that was verified,
+  and the suite is bought again here. **Never ignore anything else**: source, tests, config and
+  lockfiles must always re-run the gate. Every stage that runs a gate must pass the same `--ignore`
+  values, or the outcomes will not line up.
+
+  Keys name gates: use `suite` for the full test gate, `lint` for lint, `build` for build, and ask
+  for the same gate under the same key from every stage so the outcomes line up. `aidw gate run`
+  runs the command in the repo root, prints its output and a one-line outcome, and records it in
+  this run. Asking again for the same key against content that differs only inside the declared
+  scope prints
+  `reused: gate 'suite' passed for tree <id> at <time> by stage '<stage>' (<summary>) [scope excludes: ...]`
+  and exits 0 **without re-running** — cite that line, with its origin, in `## Verification`. A
+  same-run, same-tree outcome is evidence, not a stale number; `--force` re-runs when you doubt it.
 - If anything fails, stop and fix it before committing.
 
 ## Commit
@@ -59,7 +97,8 @@ Use `gh pr create --base main --head <branch>` (base is **always** `main`).
 - **Body** with these exact sections:
   - `## Summary` — 1–2 sentences: what changed and which spec section / roadmap task it implements.
   - `## Changes` — bullet list of files added/modified with their paths.
-  - `## Verification` — the exact commands run and their outcomes (pass/fail, test counts).
+  - `## Verification` — the exact commands run and their outcomes (pass/fail, test counts), naming
+    the origin (`tree`, `stage`, timestamp) of any outcome you cite from `aidw gate` rather than ran.
 
 ## Do NOT merge
 

@@ -6,7 +6,13 @@ from pathlib import Path
 
 from aidw.config import load_all
 from aidw.log import RunLogger
-from aidw.paths import SCRIPTS_DIR_ENV_VAR, toolkit_root, repo_root
+from aidw.paths import (
+    RUN_ID_ENV_VAR,
+    SCRIPTS_DIR_ENV_VAR,
+    STAGE_ENV_VAR,
+    toolkit_root,
+    repo_root,
+)
 from aidw.pi import PiResult, Usage
 from aidw import runner as runner_mod
 from aidw.runner import StageSpec, resolve_prompt, run_stage
@@ -155,6 +161,68 @@ def test_stage_env_exposes_the_toolkit_scripts_dir(
     assert scripts_dir == str(toolkit_root() / "prompts" / "scripts")
     assert Path(scripts_dir).is_absolute()
     assert (Path(scripts_dir) / "review-followup" / "review_followup.py").is_file()
+
+
+def test_stage_env_exposes_the_run_and_stage_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A gate the agent runs records into the run and stage that produced it (E4.8).
+
+    ``aidw gate run`` is executed by the agent's own shell, not by the runner, so the
+    identity cannot travel in the prompt: it travels in the environment the stage inherits.
+    """
+    agents, _ = load_all(toolkit_root(), repo_root())
+    captured: dict = {}
+
+    def _capture(argv, prompt, **kwargs):
+        captured.update(kwargs)
+        return _result(0.0)
+
+    monkeypatch.setattr(runner_mod, "execute", _capture)
+    run = create_run(tmp_path, repo_root(), "stage", label="identity")
+    logger = RunLogger(tmp_path / run.run_id)
+
+    run_stage(
+        StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
+        repo_root=repo_root(),
+        toolkit_root=toolkit_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        runs_root=tmp_path,
+    )
+
+    assert captured["env"][RUN_ID_ENV_VAR] == run.run_id
+    assert captured["env"][STAGE_ENV_VAR] == "noop"
+
+
+def test_agent_env_cannot_shadow_the_run_identity(tmp_path: Path, monkeypatch) -> None:
+    """An agent's ``env:`` must not be able to point gates at another run."""
+    agents, _ = load_all(toolkit_root(), repo_root())
+    agents["code-reviewer"].env[RUN_ID_ENV_VAR] = "someone-elses-run"
+    agents["code-reviewer"].env[STAGE_ENV_VAR] = "someone-elses-stage"
+    captured: dict = {}
+
+    def _capture(argv, prompt, **kwargs):
+        captured.update(kwargs)
+        return _result(0.0)
+
+    monkeypatch.setattr(runner_mod, "execute", _capture)
+    run = create_run(tmp_path, repo_root(), "stage", label="identity-shadow")
+    logger = RunLogger(tmp_path / run.run_id)
+
+    run_stage(
+        StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
+        repo_root=repo_root(),
+        toolkit_root=toolkit_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        runs_root=tmp_path,
+    )
+
+    assert captured["env"][RUN_ID_ENV_VAR] == run.run_id
+    assert captured["env"][STAGE_ENV_VAR] == "noop"
 
 
 def test_agent_env_cannot_shadow_the_toolkit_scripts_dir(

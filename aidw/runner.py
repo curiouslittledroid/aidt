@@ -19,7 +19,7 @@ from aidw.agents import build_argv, build_env
 from aidw.config import AgentConfig, load_all
 from aidw.log import RunLogger
 from aidw.pi import PiResult, execute, write_meta
-from aidw.paths import SCRIPTS_DIR_ENV_VAR
+from aidw.paths import RUN_ID_ENV_VAR, SCRIPTS_DIR_ENV_VAR, STAGE_ENV_VAR
 from aidw.progress import ProgressIndicator, resolve_enabled
 from aidw.prompts import render_prompt_file
 from aidw.report import cost_note
@@ -133,6 +133,11 @@ def run_stage(
     # instead (EXTRACTION.md §3.6). Set after the agent's `env:` overrides so the
     # toolkit location cannot be shadowed by config.
     env[SCRIPTS_DIR_ENV_VAR] = str((Path(toolkit_root) / "prompts" / "scripts").resolve())
+    # Same rule for the run/stage identity a gate needs to record its outcome against
+    # (E4.8): the agent runs `aidw gate run` from a subprocess, so the identity travels
+    # in the environment it inherits, not in its prompt.
+    env[RUN_ID_ENV_VAR] = state.run_id
+    env[STAGE_ENV_VAR] = spec.name
 
     record = StageRecord(
         name=spec.name,

@@ -159,6 +159,14 @@ uv run aidw implement docs/task-prompts/03-E4.1-prompt.md
 Preflight refuses to run on `main`, when the current branch does not match the task id
 (`<phase>-<task>`), or when another implement run for the branch is still marked running.
 
+The stages run the repo's verification commands through `aidw gate run`, with the gates named
+`lint`, `build` and `suite` and one shared `--ignore` scope across every stage. That is what lets
+`pr` (I6) cite the suite `test` (I2) or `record` (I5) already ran for the same content instead of
+running it a fourth time. Because the stages leave the tree uncommitted, a gate's identity is
+the content of the change set relative to `main`, not `HEAD` — so `/pr` committing the gated
+tree does not invalidate its own verification. See [`aidw gate`](#aidw-gate--whole-repo-verification-gates)
+for the identity rules, the declared scope and when the gate re-runs.
+
 Resume a run after a failure — completed stages are never re-run; the gate is not re-asked
 once approved:
 
@@ -267,6 +275,81 @@ uv run aidw tasks --phase 03 --epic E4
 uv run aidw tasks --next --phase 03
 ```
 
+### `aidw gate` — whole-repo verification gates
+
+`aidw gate run` runs one of the repo's own verification commands — the suite, lint, a build —
+and records its outcome against the identity of the tree it gated. The second and later stages
+of a run to ask for the same gate against the same content **cite the recorded outcome instead
+of running it again**, so a full suite is bought once per run rather than once per stage. In the
+implement chain the same suite is asked for at several stages and answered once.
+
+```bash
+# the command is the repo's own and goes after -- (click stops parsing options there)
+uv run aidw gate run suite -- uv run --frozen pytest
+uv run aidw gate run suite -- pnpm -r test
+
+# list the outcomes this run recorded
+uv run aidw gate list            # or: uv run aidw runs show <run-id>
+```
+
+A gate is identified by its key (`suite`, `lint`, `build` — whatever the stages agree on),
+so stages asking for the same gate must use the same key. The first ask runs the command and
+prints its output tail followed by one outcome line; a later ask prints:
+
+```text
+note: this run already passed this gate for this tree
+reused: gate 'suite' passed for tree 14acd7750fe3 at 2026-10-26T05:46:36Z by stage 'test' (439 passed in 97.98s)
+```
+
+and exits `0` without running anything. The citation names its origin — key, tree, stage and
+timestamp — so a reader judges it rather than trusting a bare number. It exits with the
+gate's own exit code, so a failing gate still fails the stage that asked for it.
+
+**Identity is content, not commit history.** The identity hashes every path whose content
+differs from the base branch (`--base`, default `main`) plus every untracked, non-ignored path.
+`HEAD` is deliberately excluded: `/pr` commits the change set it just gated, and committing a
+verified tree must not invalidate its own verification. Any content change — an edit, a new
+file, a deletion, an execution-bit flip — changes the identity and the gate re-runs. A commit,
+an identical rebase or a `git add` does not.
+
+**Declared scope (`--ignore`).** A whole-tree identity is sound but rarely reusable in the real
+chain, because `record` (I5) writes its results document *after* running the gate: the tree
+`pr` delivers is never byte-identical to the tree `test` gated. So a gate may declare paths its
+command cannot read:
+
+```bash
+uv run aidw gate run suite \
+  --ignore docs/implementation-results --ignore docs/architecture \
+  --ignore docs/tasks --ignore docs/task-prompts \
+  -- uv run --frozen pytest
+```
+
+The declaration is made by the stage that ran the gate, stored in the outcome, printed in every
+citation, and is part of what must match before anything is cited — two stages must pass the same
+`--ignore` values or the outcomes cannot line up. It is a *declaration*, not an inference:
+nothing is guessed from file type or location. Declare only the documents other stages write —
+never source, tests, config or lockfiles — and add any directory a stage of the workflow writes
+(for example a traceability report). Nothing outside the declared scope can be skipped.
+
+**Fail closed.** The command runs, exactly as it always did, when the outcome cannot be proven:
+no resolvable base branch; no run to record into (then a `note:` says so); a different command
+under the same key; a differently declared scope; a previous **failed** outcome for this tree;
+or a change set too large to hash cheaply (over 5000 paths or 256 MB — a repo that does not
+gitignore `node_modules` costs a listing, not minutes of hashing). There is no path from
+"unknown" to "skip". Reuse is also confined to the **same run**: an outcome from an earlier run
+is not evidence about this one. `--force` runs regardless — use it when the environment changed
+under a passing gate (dependencies reinstalled, a gitignored cache rebuilt). A failed outcome is
+still recorded, so `aidw gate list` shows it.
+
+Gates are recorded in `state.json` under `gate_outcomes`, and both `aidw runs show <run-id>` and
+`aidw gate list` print them with their command, summary, duration and declared scope. `--json`
+emits one object instead of text.
+
+A stage's agent finds its own run without being told: the stage runner exports `AIDW_RUN_ID` and
+`AIDW_STAGE`, which `aidw gate run` uses when `--run`/`--stage` are absent. At a terminal with
+neither set, the gate records into the latest run for the current branch; naming a run that does
+not exist is a usage error rather than a silent fall-through to the branch.
+
 ### `aidw exec` — a single stage
 
 `aidw exec` runs one agent stage — the primitive the workflows build on. It is also the
@@ -284,7 +367,10 @@ Run artifacts land under `aidt/runs/<utc-stamp>-<task-or-pr>-<workflow>/` (gitig
 `state.json`, `run.log`,
 `prompts/<stage>.rendered.md`, `stages/<stage>.jsonl` (the raw Pi event stream) with its
 `.out.txt` and `.meta.json` siblings, and `artifacts/`. `state.json` starts with a `totals`
-section — the combined input tokens, output tokens, and cost across every stage in the run.
+section — the combined input tokens, output tokens, and cost across every stage in the run — and
+carries `gate_outcomes`: every verification gate recorded for the run, with its tree identity,
+command, exit code, summary, duration, origin stage and declared scope (`aidw runs show <run-id>`
+prints them; see [`aidw gate`](#aidw-gate--whole-repo-verification-gates)).
 
 Each finished stage also prints a report block — model, duration, cost, generation speed, usage
 counters, and the `stages/<stage>.out.txt` path:
@@ -384,12 +470,23 @@ aidw tasks     [--todo] [--phase NN] [--epic X] [--next]
 aidw agents    list | show <id> | validate
 aidw runs      list | show <id> | resume <id>
 aidw prompts   list | check
+aidw exec      --agent <id> --prompt <name|path> [--label <name>] [--dry-run]
+aidw gate      run <key> -- <command> [args...] [--run <id>] [--stage <name>]
+               [--base <branch>] [--ignore <prefix> ...] [--force]
+               [--tail N] [--timeout S] [--json]
+               list [--run <id>] [--json]
 ```
 
 Global options: `--repo <path>`, `--verbose`, `--retry-transient/--no-retry-transient`,
 `--progress/--no-progress`.
 
 ## Gates
+
+These are the **human approval** gates a workflow asks you to confirm, and are distinct from
+`aidw gate run`'s **verification** gates — a repo's own commands (`pytest`, `pnpm -r test`) whose
+outcomes are recorded and reused within a run (see
+[`aidw gate`](#aidw-gate--whole-repo-verification-gates)). An approval gate asks a person; a
+verification gate runs a command. Both record their decisions in `state.json`.
 
 | Gate | Workflow | What approval does |
 |---|---|---|
@@ -434,6 +531,11 @@ terminal, not an auto-approval for a script, so `--yes` remains the way through 
 - Python never calls a mutating `gh` command; GitHub writes go through the bundled
   Python scripts under `aidt/prompts/scripts/review-followup/`.
 - `implement`/`fix` refuse to run on `main` or on a branch that is not the task/PR head.
+- Never skips a verification gate it cannot prove redundant. `aidw gate run` reuses an outcome
+  only for the same run, the same key and command, the same declared scope, and content that
+  differs only inside that scope; every other case runs the command. A failed gate is never cited.
+- Runs a gate's command as an argv list, never through a shell, so the gate cannot be altered by
+  quoting in whatever wrote it down. A repo needing a pipeline runs each side as its own gate.
 
 ## Troubleshooting
 
@@ -448,6 +550,8 @@ terminal, not an auto-approval for a script, so `--yes` remains the way through 
 | `Unknown JSON field: "subIssues"` in a review/fix stage | A stale or shadowed `gh` is first on `PATH` (sub-issues need `gh` ≥ 2.94.0). `aidw doctor` fails this as `gh version`; upgrade `gh` and check `which -a gh`. |
 | A stage is stuck/slow | Wall-clock timeout per agent (`timeout_seconds`); the process group is terminated and the partial log kept. |
 | Need to continue after a failure | `aidw implement ... --resume` (or `--from <stage>`). `fix` has no resume in v1. |
+| A gate re-ran when you expected a citation | Its key, command or `--ignore` scope differs from the earlier ask, the base branch does not resolve, or the content changed outside the declared scope. `aidw gate list` shows what was recorded and with which scope. |
+| A gate was cited but you do not trust it | The citation names its origin (tree, stage, timestamp); `aidw gate run ... --force` runs it again. An environment rebuilt under a passing gate — dependencies reinstalled, a gitignored cache regenerated — is the case `--force` exists for. |
 
 ## Layout
 
