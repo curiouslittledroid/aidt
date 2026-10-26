@@ -135,12 +135,14 @@ def _parse_blocked(out: str | None) -> str | None:
 def _probe_branch(repo: Path, name: str) -> tuple[bool, str | None]:
     """``(answered, sha)`` for ``refs/heads/<name>`` — advisory, never raises (L1.3).
 
-    ``git.rev_parse`` collapses a missing ref and a git failure into ``None``, so the
-    caller distinguishes "the probe could not answer" from "the branch exists" by the
-    first element and never warns on a probe that failed.
+    ``git.probe_ref`` distinguishes "the branch is absent" (rev-parse exit 1) from
+    "git could not answer" (any other non-zero exit — a missing git binary, a timeout,
+    a fatal plumbing error), so a transient pre-author probe failure reads as
+    unanswerable, never as "absent", and cannot yield a spurious "created branch"
+    warning for a branch that legitimately pre-existed (review follow-up F1, PR #16).
     """
     try:
-        return True, git.rev_parse(repo, f"refs/heads/{name}")
+        return git.probe_ref(repo, f"refs/heads/{name}")
     except Exception:  # advisory probe: it must never stop the blocked report
         return False, None
 

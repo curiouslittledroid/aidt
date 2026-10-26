@@ -1537,6 +1537,42 @@ def test_l13_unanswerable_branch_probe_does_not_warn(
     assert git.rev_parse(clone, "03-E4.1") is not None
 
 
+def test_l13_transient_probe_spawn_failure_does_not_blame_preexisting_branch(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A pre-author probe git cannot answer must not read as "the branch is absent".
+
+    Review follow-up F1 (PR #16): the before-probe's git spawn fails transiently while
+    the branch legitimately pre-exists, and the after-probe answers. Collapsing the
+    failed spawn into ``None`` (as ``rev_parse`` alone does) would make the run warn
+    "blocked run created branch" for a branch it did not create.
+    """
+    _origin, clone = _origin_and_clone(tmp_path)
+    _run_git(["branch", "03-E4.1"], clone)  # the branch legitimately pre-exists
+    real_git_out = git._git_out
+    failed_once = [False]
+
+    def flaky_git_out(repo, args, **kwargs):
+        # Fail exactly one spawn of the branch probe (the ref arg carries `^{commit}`);
+        # every other git call is real.
+        if not failed_once[0] and f"refs/heads/03-E4.1" in " ".join(args):
+            failed_once[0] = True
+            return 127, "", "git: not found"
+        return real_git_out(repo, args, **kwargs)
+
+    monkeypatch.setattr(git, "_git_out", flaky_git_out)
+    _seen, fake = _blocked_author_stages("blocked: prerequisite missing\n")
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 3
+    assert failed_once[0]  # the transient failure was actually injected
+    assert "created branch" not in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("output", "reason"),
     [
