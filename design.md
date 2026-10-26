@@ -444,6 +444,7 @@ preflight (clean tree, on main; fetch and refuse when the base branch is behind 
 ```
 
 - The preflight fetches `origin` and refuses (exit 4) when the local base branch is behind or diverged from `origin/<base>`; `--no-fetch` skips the fetch and the comparison.
+- Before that fetch, the preflight refuses (exit 4) when an earlier task in the target's own `docs/tasks/*.md` phase file is still unticked, naming every incomplete predecessor in roadmap order. `--allow-incomplete-prereqs` proceeds with a warning instead. `--dry-run` reports the incomplete predecessors and never refuses.
 - `P1` receives `$1=phase`, `$2=epic`, `$3=task`. The prompt itself creates the `{phase}-{task}`
   branch and commits the prompt.
 - `P2` receives `$1=<task-prompt-file>`.
@@ -809,7 +810,8 @@ aidw --help
 aidw doctor
 
 # workflows
-aidw prompt    <phase> <epic> <task> [--require-approval] [--yes] [--no-fetch] [--skip-gates ...]
+aidw prompt    <phase> <epic> <task> [--require-approval] [--yes] [--no-fetch]
+              [--allow-incomplete-prereqs] [--skip-gates ...]
               [--deny-gates ...] [--gate-default approve|deny] [--strict] [--dry-run]
 aidw implement <task-prompt-path> [--pr <n>] [--resume] [--from <stage>] [--parallel]
               [--yes] [--skip-gates ...] [--deny-gates ...] [--gate-default approve|deny]

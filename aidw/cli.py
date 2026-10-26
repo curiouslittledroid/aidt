@@ -265,6 +265,11 @@ def prompt(
         "--no-fetch",
         help="Skip fetching and the base-branch freshness check (offline runs).",
     ),
+    allow_incomplete_prereqs: bool = typer.Option(
+        False,
+        "--allow-incomplete-prereqs",
+        help="Author even when earlier tasks in the same phase file are unticked.",
+    ),
 ) -> None:
     """Generate and review a task prompt (workflow group 1)."""
     repo, aidt, workspace = _roots()
@@ -283,6 +288,7 @@ def prompt(
         strict=strict,
         dry_run=dry_run,
         no_fetch=no_fetch,
+        allow_incomplete_prereqs=allow_incomplete_prereqs,
         stream=bool(_state["verbose"]),
     )
     raise typer.Exit(code)
