@@ -29,6 +29,7 @@ from aidw import verification
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.doctor import run_doctor
 from aidw.gates import GateDefault
+from aidw.layout import LayoutError, check_layout
 from aidw.log import RunLogger
 from aidw.paths import (
     RUN_ID_ENV_VAR,
@@ -116,7 +117,18 @@ def _roots() -> tuple[TargetRepo, ToolkitPaths, WorkspacePaths]:
         # (BareRepositoryError subclasses RepoNotFoundError and keeps its message).
         typer.echo(str(exc), err=True)
         raise typer.Exit(EXIT_REFUSED)
-    return target, ToolkitPaths.resolve(), WorkspacePaths.resolve(target)
+    workspace = WorkspacePaths.resolve(target)
+    try:
+        # E2.2 layout guards (§3.2/§3.10). The clone-of-a-worktree trap is a hard
+        # failure mirroring the RepoNotFoundError catch above; the state-inside-tree
+        # case is advisory and is echoed to stderr without blocking.
+        warnings = check_layout(target, workspace)
+    except LayoutError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(EXIT_REFUSED)
+    for warning in warnings:
+        typer.echo(warning, err=True)
+    return target, ToolkitPaths.resolve(), workspace
 
 
 def _state_root_source(workspace: WorkspacePaths) -> str:

@@ -23,6 +23,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+import shlex
 from urllib.parse import urlparse
 
 
@@ -94,9 +95,15 @@ def _resolve_worktree_root(origin: Path) -> Path:
         top = _git_output(origin, "rev-parse", "--show-toplevel")
     except (subprocess.CalledProcessError, FileNotFoundError):
         if _is_bare_repository(origin):
+            # EXTRACTION.md §3.2: a bare repo has no working tree, so AIDW refuses with
+            # a copy-pasteable §3.2 bootstrap. The branch word is the literal `main`
+            # (the §3.2 example, matching TargetRepo.base_branch's current default) —
+            # no config-resolved base branch exists at this raise site, and a bare dir
+            # has no working tree to read `aidw/config.yaml` from (E3 owns that).
             raise BareRepositoryError(
-                f"'{origin}' is a bare repository; run from a worktree instead "
-                "(for example the control worktree checked out from it)."
+                f"'{origin}' is a bare repository: it has no working tree, so AIDW has "
+                "nothing to operate on. Bootstrap a control worktree and run from it:\n"
+                f"  git -C {shlex.quote(str(origin))} worktree add ../main main"
             )
         for candidate in (origin, *origin.parents):
             if (candidate / ".git").exists():
@@ -295,6 +302,17 @@ def _origin_remote(repo_root: Path) -> str | None:
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
     return result.stdout.strip() or None
+
+
+def origin_remote(repo_root: Path) -> str | None:
+    """Public accessor for ``repo_root``'s ``origin`` remote URL (EXTRACTION.md §3.10).
+
+    Exposes :func:`_origin_remote` across module boundaries — ``aidw/layout.py`` builds
+    a copy-pasteable re-bootstrap command from it and must not import the underscore
+    private name. Same contract: any git failure or a missing ``origin`` returns
+    ``None``; a missing remote is a normal, supported configuration.
+    """
+    return _origin_remote(repo_root)
 
 
 def _slug_from_remote(remote: str) -> str | None:
