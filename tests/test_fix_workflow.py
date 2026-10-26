@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 from aidw import git, github
-from aidw.paths import TargetRepo, WorkspacePaths
+from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import SUCCEEDED, StageRecord, run_dir
 from aidw.workflows import fix as fix_workflow
 
@@ -34,8 +34,19 @@ def _init_repo(path: Path) -> None:
     (path / "aidt").mkdir()
 
 
+def _roots(repo: Path) -> dict:
+    target = TargetRepo.resolve(repo)
+    return {
+        "repo": target,
+        "aidt": ToolkitPaths.resolve(),
+        "workspace": WorkspacePaths.resolve(
+            target, state_dir_override=repo.parent / f"{repo.name}-state"
+        ),
+    }
+
+
 def _runs_root(repo: Path) -> Path:
-    return WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
+    return _roots(repo)["workspace"].state_root / "runs"
 
 
 def _select_ok(number: int = 101, title: str = "Fix the loop") -> github.ScriptResult:
@@ -116,7 +127,7 @@ def test_dry_run_lists_child_and_plans(tmp_path: Path, monkeypatch, capsys) -> N
     stages = _FakeStages()
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
-    code = fix_workflow.run(pr=7, repo=tmp_path, aidt=tmp_path / "aidt", dry_run=True)
+    code = fix_workflow.run(pr=7, **_roots(tmp_path), dry_run=True)
 
     assert code == 0
     out = capsys.readouterr().out
@@ -133,7 +144,7 @@ def test_no_available_child_is_success(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
     code = fix_workflow.run(
-        pr=7, repo=tmp_path, aidt=tmp_path / "aidt", approve_all=True
+        pr=7, **_roots(tmp_path), approve_all=True
     )
 
     assert code == 0
@@ -152,7 +163,7 @@ def test_clean_iteration_closes_child(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
     code = fix_workflow.run(
-        pr=7, repo=tmp_path, aidt=tmp_path / "aidt", approve_all=True
+        pr=7, **_roots(tmp_path), approve_all=True
     )
 
     assert code == 0
@@ -178,7 +189,7 @@ def test_findings_trigger_publish_and_second_approval(tmp_path: Path, monkeypatc
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
     code = fix_workflow.run(
-        pr=7, repo=tmp_path, aidt=tmp_path / "aidt", approve_all=True
+        pr=7, **_roots(tmp_path), approve_all=True
     )
 
     assert code == 0
@@ -202,7 +213,7 @@ def test_gate_denied_stops_before_approver(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
     # No --yes and a non-interactive session: the gate fails closed.
-    code = fix_workflow.run(pr=7, repo=tmp_path, aidt=tmp_path / "aidt")
+    code = fix_workflow.run(pr=7, **_roots(tmp_path))
 
     assert code == 3
     assert stages.names == []
@@ -215,7 +226,7 @@ def test_max_iterations_bounds_the_loop(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
     code = fix_workflow.run(
-        pr=7, repo=tmp_path, aidt=tmp_path / "aidt", approve_all=True, max_iterations=1
+        pr=7, **_roots(tmp_path), approve_all=True, max_iterations=1
     )
 
     assert code == 3
@@ -230,7 +241,7 @@ def test_preflight_rejects_non_main_base(tmp_path: Path, monkeypatch) -> None:
         view={"number": 7, "url": "u", "baseRefName": "develop", "headRefName": "03-E4.1"},
     )
     monkeypatch.setattr(fix_workflow, "run_stage", _FakeStages())
-    assert fix_workflow.run(pr=7, repo=tmp_path, aidt=tmp_path / "aidt") == 4
+    assert fix_workflow.run(pr=7, **_roots(tmp_path)) == 4
 
 
 def test_preflight_rejects_branch_mismatch(tmp_path: Path, monkeypatch) -> None:
@@ -241,7 +252,7 @@ def test_preflight_rejects_branch_mismatch(tmp_path: Path, monkeypatch) -> None:
         view={"number": 7, "url": "u", "baseRefName": "main", "headRefName": "03-E4.1"},
     )
     monkeypatch.setattr(fix_workflow, "run_stage", _FakeStages())
-    assert fix_workflow.run(pr=7, repo=tmp_path, aidt=tmp_path / "aidt") == 4
+    assert fix_workflow.run(pr=7, **_roots(tmp_path)) == 4
 
 
 def test_preflight_missing_pr(tmp_path: Path, monkeypatch) -> None:
@@ -249,7 +260,7 @@ def test_preflight_missing_pr(tmp_path: Path, monkeypatch) -> None:
     _patch(monkeypatch)
     monkeypatch.setattr(github, "pr_view", lambda repo, pr: None)
     monkeypatch.setattr(fix_workflow, "run_stage", _FakeStages())
-    assert fix_workflow.run(pr=7, repo=tmp_path, aidt=tmp_path / "aidt") == 2
+    assert fix_workflow.run(pr=7, **_roots(tmp_path)) == 2
 
 
 def test_zero_max_iterations_is_usage_error(tmp_path: Path, monkeypatch) -> None:
@@ -258,7 +269,7 @@ def test_zero_max_iterations_is_usage_error(tmp_path: Path, monkeypatch) -> None
     monkeypatch.setattr(fix_workflow, "run_stage", _FakeStages())
     assert (
         fix_workflow.run(
-            pr=7, repo=tmp_path, aidt=tmp_path / "aidt", max_iterations=0
+            pr=7, **_roots(tmp_path), max_iterations=0
         )
         == 2
     )

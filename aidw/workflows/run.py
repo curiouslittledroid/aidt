@@ -14,6 +14,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.workflows import fix as fix_workflow
 from aidw.workflows import implement as implement_workflow
 from aidw.workflows import prompt as prompt_workflow
@@ -38,8 +39,9 @@ def task_to_pr(
     phase: str,
     epic: str,
     task: str,
-    repo: Path,
-    aidt: Path,
+    repo: TargetRepo,
+    aidt: ToolkitPaths,
+    workspace: WorkspacePaths,
     approve_all: bool = False,
     deny_gates: list[str] | None = None,
     gate_default: str | None = None,
@@ -54,6 +56,7 @@ def task_to_pr(
         task=task,
         repo=repo,
         aidt=aidt,
+        workspace=workspace,
         approve_all=approve_all,
         deny_gates=deny_gates,
         gate_default=gate_default,
@@ -66,9 +69,9 @@ def task_to_pr(
         return code
 
     if dry_run:
-        prompt_path = repo / "docs" / "task-prompts" / f"{phase}-{task}-prompt.md"
+        prompt_path = repo.root / "docs" / "task-prompts" / f"{phase}-{task}-prompt.md"
     else:
-        found = find_task_prompt(repo, phase, task)
+        found = find_task_prompt(repo.root, phase, task)
         if found is None:
             print(
                 f"chain stopped: no task prompt found for {phase}-{task} after `prompt`.",
@@ -81,6 +84,7 @@ def task_to_pr(
         task_prompt_path=prompt_path,
         repo=repo,
         aidt=aidt,
+        workspace=workspace,
         approve_all=approve_all,
         deny_gates=deny_gates,
         gate_default=gate_default,
@@ -94,8 +98,9 @@ def task_to_pr(
 def review_and_fix(
     *,
     pr: int,
-    repo: Path,
-    aidt: Path,
+    repo: TargetRepo,
+    aidt: ToolkitPaths,
+    workspace: WorkspacePaths,
     approve_all: bool = False,
     deny_gates: list[str] | None = None,
     gate_default: str | None = None,
@@ -109,6 +114,7 @@ def review_and_fix(
         pr=pr,
         repo=repo,
         aidt=aidt,
+        workspace=workspace,
         approve_all=approve_all,
         strict=strict,
         dry_run=dry_run,
@@ -127,6 +133,7 @@ def review_and_fix(
         pr=pr,
         repo=repo,
         aidt=aidt,
+        workspace=workspace,
         max_iterations=max_iterations,
         approve_all=approve_all,
         deny_gates=deny_gates,

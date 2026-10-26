@@ -9,6 +9,7 @@ Design reference: ``aidt/design.md`` §14 (CLI reference), §16 (build plan).
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -19,7 +20,12 @@ from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.doctor import run_doctor
 from aidw.gates import GateDefault
 from aidw.log import RunLogger
-from aidw.paths import TargetRepo, WorkspacePaths, repo_root, toolkit_root
+from aidw.paths import (
+    RepoNotFoundError,
+    TargetRepo,
+    ToolkitPaths,
+    WorkspacePaths,
+)
 from aidw.roadmap import filter_tasks, find_task, load_tasks, next_todo
 from aidw.report import rel_to, stage_lines, usage_line
 from aidw.runner import StageSpec, resolve_prompt, run_stage
@@ -43,20 +49,41 @@ EXIT_USAGE = 2
 EXIT_BLOCKED = 3
 EXIT_REFUSED = 4
 
+#: Environment variable overriding ``--repo``'s target selection (EXTRACTION.md §3.3/D19).
+AIDW_REPO_ENV_VAR = "AIDW_REPO"
+
 # Populated by the top-level callback; read by commands.
 _state: dict[str, object] = {"repo": None, "verbose": False}
 
 
-def _roots() -> tuple[Path, Path]:
-    """Resolve ``(target repo root, toolkit root)``.
+def _roots() -> tuple[TargetRepo, ToolkitPaths, WorkspacePaths]:
+    """Resolve ``(target repo, toolkit, workspace)`` once for a command.
 
-    ``--repo`` selects the **target** repository only (E0.4). The toolkit root always
-    comes from the installed package location, so no flag can point the toolkit at a
-    checkout.
+    Target selection precedence is ``--repo`` > ``$AIDW_REPO`` > cwd (EXTRACTION.md
+    §3.3/D19), mirroring ``aidw/gates.py`` (``--gate-default`` > ``$AIDW_GATE_DEFAULT``).
+    ``--repo`` is validated by Typer; ``AIDW_REPO`` is raw environment text normalised
+    here — stripped, with an empty/whitespace-only value treated as unset — and passed
+    as ``explicit=`` so an invalid override refuses rather than falling back to cwd.
+    The toolkit root always comes from the installed package location, so no flag can
+    point the toolkit at a checkout. This is the single ``TargetRepo``/
+    ``WorkspacePaths`` resolution site: ``run.py`` and the workflows receive the typed
+    objects and pass those same objects on.
     """
     override = _state.get("repo")
-    repo = Path(override) if override else repo_root()
-    return repo, toolkit_root()
+    explicit = Path(override) if override else None
+    if explicit is None:
+        raw = (os.environ.get(AIDW_REPO_ENV_VAR) or "").strip()
+        if raw:
+            explicit = Path(raw)
+    try:
+        target = TargetRepo.resolve(explicit=explicit)
+    except RepoNotFoundError as exc:
+        # One catch site for every `explicit=` failure: a bad AIDW_REPO, or a --repo
+        # that passed Typer's exists=True but is not a repo or is bare
+        # (BareRepositoryError subclasses RepoNotFoundError and keeps its message).
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(EXIT_REFUSED)
+    return target, ToolkitPaths.resolve(), WorkspacePaths.resolve(target)
 
 
 def _gate_default_value(value: Optional[GateDefault]) -> Optional[str]:
@@ -91,8 +118,8 @@ def _main(
         None,
         "--repo",
         help=(
-            "Override the target repository root (default: auto-detect via git). "
-            "Never selects the toolkit."
+            "Override the target repository root (default: $AIDW_REPO, else "
+            "auto-detect via git). Never selects the toolkit."
         ),
         exists=True,
         file_okay=False,
@@ -116,7 +143,10 @@ def _main(
         ),
     ),
 ) -> None:
-    """AIDT = AI Developer Tools — Pi-driven workflows for Mythical Forge."""
+    """AIDT = AI Developer Tools — Pi-driven workflows for Mythical Forge.
+
+    The target repository is ``--repo > $AIDW_REPO > cwd`` (EXTRACTION.md §3.3/D19).
+    """
     _state["repo"] = repo
     _state["verbose"] = verbose
     _state["retry_transient"] = retry_transient
@@ -163,13 +193,14 @@ def prompt(
     dry_run: bool = typer.Option(False, "--dry-run", help="Plan only; no writes."),
 ) -> None:
     """Generate and review a task prompt (workflow group 1)."""
-    repo, aidt = _roots()
+    repo, aidt, workspace = _roots()
     code = prompt_workflow.run(
         phase=phase,
         epic=epic,
         task=task,
         repo=repo,
         aidt=aidt,
+        workspace=workspace,
         approve_all=yes,
         skip_gates=list(skip_gates),
         deny_gates=list(deny_gates),
@@ -203,11 +234,12 @@ def implement(
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     """Implement a task prompt and open the PR (workflow group 2)."""
-    repo, aidt = _roots()
+    repo, aidt, workspace = _roots()
     code = implement_workflow.run(
         task_prompt_path=task_prompt_path,
         repo=repo,
         aidt=aidt,
+        workspace=workspace,
         pr=pr,
         resume=resume,
         from_stage=from_stage,
@@ -234,11 +266,12 @@ def review(
     ),
 ) -> None:
     """Review a PR and publish findings as GitHub issues (workflow group 3)."""
-    repo, aidt = _roots()
+    repo, aidt, workspace = _roots()
     code = review_workflow.run(
         pr=pr,
         repo=repo,
         aidt=aidt,
+        workspace=workspace,
         approve_all=yes,
         strict=strict,
         dry_run=dry_run,
@@ -263,11 +296,12 @@ def fix(
     force_model: bool = typer.Option(False, "--force-model"),
 ) -> None:
     """Fix approved review follow-ups, one at a time (workflow group 4)."""
-    repo, aidt = _roots()
+    repo, aidt, workspace = _roots()
     code = fix_workflow.run(
         pr=pr,
         repo=repo,
         aidt=aidt,
+        workspace=workspace,
         max_iterations=max_iterations,
         approve_all=yes,
         skip_gates=list(skip_gates),
@@ -292,11 +326,12 @@ def approve_followups(
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     """Approve a PR's open review follow-up issues (workflow group 5)."""
-    repo, aidt = _roots()
+    repo, aidt, workspace = _roots()
     code = approve_workflow.run(
         pr=pr,
         repo=repo,
         aidt=aidt,
+        workspace=workspace,
         approve_all=yes,
         skip_gates=list(skip_gates),
         deny_gates=list(deny_gates),
@@ -324,7 +359,7 @@ def run_chain(
     max_iterations: int = typer.Option(10, "--max-iterations"),
 ) -> None:
     """Run a convenience chain of workflows."""
-    repo, aidt = _roots()
+    repo, aidt, workspace = _roots()
 
     if workflow == "task-to-pr":
         if not (phase and epic and task):
@@ -336,6 +371,7 @@ def run_chain(
             task=task,
             repo=repo,
             aidt=aidt,
+            workspace=workspace,
             approve_all=yes,
             deny_gates=list(deny_gates),
             gate_default=_gate_default_value(gate_default),
@@ -352,6 +388,7 @@ def run_chain(
             pr=pr,
             repo=repo,
             aidt=aidt,
+            workspace=workspace,
             approve_all=yes,
             deny_gates=list(deny_gates),
             gate_default=_gate_default_value(gate_default),
@@ -386,8 +423,8 @@ def tasks(
     next_: bool = typer.Option(False, "--next", help="Show the next unchecked task."),
 ) -> None:
     """List or inspect roadmap tasks parsed from docs/tasks/."""
-    repo, _aidt = _roots()
-    entries = load_tasks(repo / "docs" / "tasks")
+    repo, _aidt, _workspace = _roots()
+    entries = load_tasks(repo.root / "docs" / "tasks")
     if not entries:
         typer.echo("no roadmap tasks found", err=True)
         raise typer.Exit(EXIT_USAGE)
@@ -443,8 +480,8 @@ def agents(
     ),
 ) -> None:
     """List, inspect, or validate agent configs."""
-    repo, aidt = _roots()
-    configs, issues = load_all(aidt, repo)
+    repo, aidt, _workspace = _roots()
+    configs, issues = load_all(aidt.root, repo.root)
 
     if action == "list":
         width = max((len(a.id) for a in configs.values()), default=4)
@@ -510,10 +547,10 @@ def exec_stage(
     ),
 ) -> None:
     """Run a single agent stage (the primitive workflows build on)."""
-    repo, aidt = _roots()
-    state_root = WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root
+    repo, aidt, workspace = _roots()
+    state_root = workspace.state_root
     runs_root = state_root / "runs"
-    agents, issues = load_all(aidt, repo)
+    agents, issues = load_all(aidt.root, repo.root)
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
     if errors or (strict and warnings):
@@ -521,18 +558,18 @@ def exec_stage(
         raise typer.Exit(EXIT_STAGE_FAILURE)
 
     try:
-        prompt_path = resolve_prompt(aidt, prompt)
+        prompt_path = resolve_prompt(aidt.root, prompt)
     except Exception as exc:  # pragma: no cover - defensive
         typer.echo(str(exc), err=True)
         raise typer.Exit(EXIT_USAGE) from exc
 
     run = state_mod.create_run(
         runs_root,
-        repo,
+        repo.root,
         workflow,
         label=label,
         strict=strict,
-        branch=git.current_branch(repo),
+        branch=git.current_branch(repo.root),
     )
     directory = state_mod.run_dir(runs_root, run.run_id)
     logger = RunLogger(directory, stream=bool(_state["verbose"]))
@@ -547,8 +584,8 @@ def exec_stage(
     try:
         record = run_stage(
             spec,
-            repo_root=repo,
-            toolkit_root=aidt,
+            repo_root=repo.root,
+            toolkit_root=aidt.root,
             state=run,
             logger=logger,
             agents=agents,
@@ -561,7 +598,7 @@ def exec_stage(
         raise typer.Exit(EXIT_USAGE) from exc
 
     typer.echo(f"run:      {run.run_id}")
-    for line in stage_lines(record, repo_root=repo):
+    for line in stage_lines(record, repo_root=repo.root):
         typer.echo(line)
     if record.rendered_prompt:
         rendered_rel = (
@@ -592,8 +629,8 @@ def runs(
     run_id: Optional[str] = typer.Argument(None, help="Run id for `show`/`resume`."),
 ) -> None:
     """List, inspect, or resume workflow runs."""
-    repo, _aidt = _roots()
-    runs_root = WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
+    repo, _aidt, workspace = _roots()
+    runs_root = workspace.state_root / "runs"
 
     if action == "list":
         states = state_mod.list_runs(runs_root)
@@ -655,7 +692,7 @@ def prompts(
     action: str = typer.Argument("list", help="list | check"),
 ) -> None:
     """List or check the toolkit's own prompts and helper scripts."""
-    aidt = toolkit_root()
+    aidt = ToolkitPaths.resolve().root
 
     if action == "list":
         files = inventory.list_files(aidt)
