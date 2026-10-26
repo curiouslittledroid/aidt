@@ -36,7 +36,7 @@ from aidw.findings import (
 )
 from aidw.gates import GateOutcome, decide
 from aidw.log import RunLogger
-from aidw.paths import TargetRepo, WorkspacePaths
+from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
 from aidw.roadmap import find_task, load_tasks
 from aidw.runner import StageSpec, run_stage
@@ -104,9 +104,9 @@ def run(
     phase: str,
     epic: str,
     task: str,
-    repo: Path,
-    aidt: Path,
-    runs_root: Path | None = None,
+    repo: TargetRepo,
+    aidt: ToolkitPaths,
+    workspace: WorkspacePaths,
     label: str | None = None,
     approve_all: bool = False,
     skip_gates: list[str] | None = None,
@@ -120,14 +120,11 @@ def run(
     skip = set(skip_gates or [])
     deny = set(deny_gates or [])
     # ``aidt`` locates the toolkit's assets (prompts, agent configs); run state lives
-    # under the per-repo state root (EXTRACTION.md §3.10). Tests may inject an isolated
-    # ``runs_root``; otherwise it is resolved once from the target repository.
-    if runs_root is None:
-        runs_root = (
-            WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
-        )
+    # under the per-repo state root (EXTRACTION.md §3.10), resolved once by ``_roots``
+    # and threaded in as ``workspace`` so no workflow re-resolves it.
+    runs_root = workspace.state_root / "runs"
 
-    entries = load_tasks(repo / "docs" / "tasks")
+    entries = load_tasks(repo.root / "docs" / "tasks")
     entry = find_task(entries, phase, epic, task)
     if entry is None:
         print(
@@ -136,11 +133,11 @@ def run(
         )
         return 2
 
-    branch = git.current_branch(repo)
+    branch = git.current_branch(repo.root)
     if dry_run:
         if branch != "main":
             print(f"[dry-run] a real run requires `main` (currently `{branch}`).")
-        if not git.is_clean(repo):
+        if not git.is_clean(repo.root):
             print("[dry-run] a real run requires a clean working tree.")
     else:
         if branch != "main":
@@ -149,11 +146,11 @@ def run(
                 file=sys.stderr,
             )
             return 4
-        if not git.is_clean(repo):
+        if not git.is_clean(repo.root):
             print("working tree is dirty; commit or stash first.", file=sys.stderr)
             return 4
 
-    agents, issues = load_all(aidt, repo)
+    agents, issues = load_all(aidt.root, repo.root)
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
     if errors or (strict and warnings):
@@ -163,7 +160,7 @@ def run(
     default_rel = f"docs/task-prompts/{phase}-{task}-prompt.md"
     state = create_run(
         runs_root,
-        repo,
+        repo.root,
         "prompt",
         label=label or f"{phase}-{task}",
         task={"phase": phase, "epic": epic, "task": task, "title": entry.title},
@@ -179,32 +176,32 @@ def run(
     author = StageSpec(
         "task-prompt",
         "task-author",
-        aidt / "prompts" / "task-prompt.md",
+        aidt.prompts_dir / "task-prompt.md",
         [phase, epic, task],
     )
 
     rec1 = run_stage(
         author,
-        repo_root=repo,
-        toolkit_root=aidt,
+        repo_root=repo.root,
+        toolkit_root=aidt.root,
         runs_root=runs_root,
         state=state,
         logger=logger,
         agents=agents,
         dry_run=dry_run,
     )
-    print_stage(rec1, repo_root=repo)
+    print_stage(rec1, repo_root=repo.root)
 
     if dry_run:
         rec2 = run_stage(
             StageSpec(
                 "task-review-1",
                 "task-reviewer",
-                aidt / "prompts" / "task-review.md",
+                aidt.prompts_dir / "task-review.md",
                 [default_rel],
             ),
-            repo_root=repo,
-            toolkit_root=aidt,
+            repo_root=repo.root,
+            toolkit_root=aidt.root,
             runs_root=runs_root,
             state=state,
             logger=logger,
@@ -221,7 +218,7 @@ def run(
         print(f"task-prompt stage failed: {rec1.error}", file=sys.stderr)
         return 1
 
-    prompt_path = _resolve_prompt_path(repo, rec1, default_rel)
+    prompt_path = _resolve_prompt_path(repo.root, rec1, default_rel)
     if prompt_path is None:
         print(
             f"generated task prompt not found at {default_rel}",
@@ -230,7 +227,7 @@ def run(
         state.status = FAILED
         save(directory, state)
         return 1
-    rel = prompt_path.relative_to(repo).as_posix()
+    rel = prompt_path.relative_to(repo.root).as_posix()
     print(f"prompt: {rel}")
     state.git["branch"] = f"{phase}-{task}"
     save(directory, state)
@@ -247,17 +244,17 @@ def run(
             StageSpec(
                 name,
                 "task-reviewer",
-                aidt / "prompts" / "task-review.md",
+                aidt.prompts_dir / "task-review.md",
                 [rel],
             ),
-            repo_root=repo,
-            toolkit_root=aidt,
+            repo_root=repo.root,
+            toolkit_root=aidt.root,
             runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
         )
-        print_stage(rec, repo_root=repo)
+        print_stage(rec, repo_root=repo.root)
         if rec.status != SUCCEEDED:
             state.status = FAILED
             save(directory, state)
@@ -298,18 +295,18 @@ def run(
                 StageSpec(
                     f"task-review-fixes-{revisions}",
                     "task-fixer",
-                    aidt / "prompts" / "task-review-fixes.md",
+                    aidt.prompts_dir / "task-review-fixes.md",
                     [rel],
                     extra=f"## Review findings to address\n\n{review_text}",
                 ),
-                repo_root=repo,
-                toolkit_root=aidt,
+                repo_root=repo.root,
+                toolkit_root=aidt.root,
                 runs_root=runs_root,
                 state=state,
                 logger=logger,
                 agents=agents,
             )
-            print_stage(rec_fix, repo_root=repo)
+            print_stage(rec_fix, repo_root=repo.root)
             if rec_fix.status != SUCCEEDED:
                 state.status = FAILED
                 save(directory, state)
@@ -341,18 +338,18 @@ def run(
                     StageSpec(
                         f"task-review-fixes-{revisions}-{index}",
                         "task-fixer",
-                        aidt / "prompts" / "task-review-fixes.md",
+                        aidt.prompts_dir / "task-review-fixes.md",
                         [rel],
                         extra=extra,
                     ),
-                    repo_root=repo,
-                    toolkit_root=aidt,
+                    repo_root=repo.root,
+                    toolkit_root=aidt.root,
                     runs_root=runs_root,
                     state=state,
                     logger=logger,
                     agents=agents,
                 )
-                print_stage(rec_fix, repo_root=repo)
+                print_stage(rec_fix, repo_root=repo.root)
                 if rec_fix.status != SUCCEEDED:
                     state.status = FAILED
                     save(directory, state)
@@ -388,7 +385,7 @@ def run(
     summary = "\n".join(
         [
             f"Task: {phase} {epic} {task} — {entry.title}",
-            f"Prompt: {prompt_path.relative_to(repo)}",
+            f"Prompt: {prompt_path.relative_to(repo.root)}",
             verdict_line,
         ]
     )
@@ -423,7 +420,7 @@ def run(
     # The initial task-prompt stage commits the prompt, but the review-fix loop runs
     # afterwards. Commit the reviewed prompt so the branch is clean when the
     # implementation workflow starts. Only the owned prompt path is committed.
-    if _commit_reviewed_prompt(repo, rel, phase, task):
+    if _commit_reviewed_prompt(repo.root, rel, phase, task):
         logger.info(f"reviewed prompt committed or unchanged: {rel}")
     else:
         logger.error(f"failed to commit reviewed prompt {rel}")

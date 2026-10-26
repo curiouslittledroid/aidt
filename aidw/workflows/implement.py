@@ -33,7 +33,7 @@ from aidw import git
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
-from aidw.paths import TargetRepo, WorkspacePaths
+from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
 from aidw.runner import StageSpec, run_stage
 from aidw.state import (
@@ -219,8 +219,9 @@ def _write_artifacts(directory: Path, state: RunState, branch: str) -> Path:
 def run(
     *,
     task_prompt_path: Path,
-    repo: Path,
-    aidt: Path,
+    repo: TargetRepo,
+    aidt: ToolkitPaths,
+    workspace: WorkspacePaths,
     pr: int | None = None,
     resume: bool = False,
     from_stage: str | None = None,
@@ -235,18 +236,18 @@ def run(
 ) -> int:
     skip = set(skip_gates or [])
     deny = set(deny_gates or [])
-    runs_root = WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
+    runs_root = workspace.state_root / "runs"
 
     # --- resolve the task prompt and derive the task id --------------------- #
     raw_path = Path(task_prompt_path)
     if not raw_path.is_absolute():
-        raw_path = repo / raw_path
+        raw_path = repo.root / raw_path
     prompt_path = raw_path.resolve()
     if not prompt_path.is_file():
         print(f"task prompt not found: {prompt_path}", file=sys.stderr)
         return 2
     try:
-        prompt_rel = prompt_path.relative_to(repo).as_posix()
+        prompt_rel = prompt_path.relative_to(repo.root).as_posix()
     except ValueError:
         print(
             f"task prompt must live inside the repository: {prompt_path}",
@@ -265,14 +266,14 @@ def run(
     task_id = f"{phase}-{task}"
 
     # --- agents/config ---------------------------------------------------------- #
-    agents, issues = load_all(aidt, repo)
+    agents, issues = load_all(aidt.root, repo.root)
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
     if errors or (strict and warnings):
         print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
         return 2
 
-    branch = git.current_branch(repo)
+    branch = git.current_branch(repo.root)
     existing = _latest_implement_run(runs_root, branch_name)
 
     # --- preflight ---------------------------------------------------------- #
@@ -312,7 +313,7 @@ def run(
     else:
         state = create_run(
             runs_root,
-            repo,
+            repo.root,
             "implement",
             label=branch_name,
             task={"phase": phase, "task": task, "prompt_path": prompt_rel},
@@ -330,7 +331,9 @@ def run(
     print(f"branch: {branch_name}")
     print(f"prompt: {prompt_rel}")
 
-    plan = build_plan(aidt=aidt, prompt_rel=prompt_rel, branch=branch_name, task_id=task_id)
+    plan = build_plan(
+        aidt=aidt.root, prompt_rel=prompt_rel, branch=branch_name, task_id=task_id
+    )
     pre_pr = plan[:-1]
     pr_plan = plan[-1]
 
@@ -338,9 +341,9 @@ def run(
     if dry_run:
         for entry in plan:
             record = run_stage(
-                entry.spec(aidt),
-                repo_root=repo,
-                toolkit_root=aidt,
+                entry.spec(aidt.root),
+                repo_root=repo.root,
+                toolkit_root=aidt.root,
                 runs_root=runs_root,
                 state=state,
                 logger=logger,
@@ -381,15 +384,15 @@ def run(
             print(f"stage:  {entry.id} {entry.name} [skipped]")
             return True
         record = run_stage(
-            entry.spec(aidt),
-            repo_root=repo,
-            toolkit_root=aidt,
+            entry.spec(aidt.root),
+            repo_root=repo.root,
+            toolkit_root=aidt.root,
             runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
         )
-        print_stage(record, repo_root=repo, prefix=entry.id)
+        print_stage(record, repo_root=repo.root, prefix=entry.id)
         if record.status != SUCCEEDED:
             print(f"stage {entry.name} failed: {record.error}", file=sys.stderr)
             state.status = FAILED
@@ -420,9 +423,9 @@ def run(
                 futures = {
                     pool.submit(
                         run_stage,
-                        entry.spec(aidt),
-                        repo_root=repo,
-                        toolkit_root=aidt,
+                        entry.spec(aidt.root),
+                        repo_root=repo.root,
+                        toolkit_root=aidt.root,
                         runs_root=runs_root,
                         state=state,
                         logger=logger,
@@ -433,7 +436,7 @@ def run(
                 for future in as_completed(futures):
                     entry = futures[future]
                     record = future.result()
-                    print_stage(record, repo_root=repo, prefix=entry.id)
+                    print_stage(record, repo_root=repo.root, prefix=entry.id)
                     if record.status != SUCCEEDED:
                         print(
                             f"stage {entry.name} failed: {record.error}",
@@ -457,7 +460,7 @@ def run(
     if approved:
         print(f"gate:   {GATE} [already approved]")
     else:
-        summary = _gate_summary(state, repo, branch_name, prompt_rel)
+        summary = _gate_summary(state, repo.root, branch_name, prompt_rel)
         outcome = decide(
             GATE,
             summary,
@@ -488,19 +491,19 @@ def run(
     # --- I6 ------------------------------------------------------------------ #
     if should_run(len(plan) - 1, pr_plan.name):
         record = run_stage(
-            pr_plan.spec(aidt),
-            repo_root=repo,
-            toolkit_root=aidt,
+            pr_plan.spec(aidt.root),
+            repo_root=repo.root,
+            toolkit_root=aidt.root,
             runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
         )
-        print_stage(record, repo_root=repo, prefix=pr_plan.id)
+        print_stage(record, repo_root=repo.root, prefix=pr_plan.id)
         if record.status != SUCCEEDED:
             print(f"stage {pr_plan.name} failed: {record.error}", file=sys.stderr)
             return 1
-        _record_pr(state, repo, record)
+        _record_pr(state, repo.root, record)
     else:
         print(f"stage:  {pr_plan.id} {pr_plan.name} [skipped]")
 

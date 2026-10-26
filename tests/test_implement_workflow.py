@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from aidw import git
-from aidw.paths import TargetRepo, WorkspacePaths
+from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import (
     FAILED,
     SUCCEEDED,
@@ -36,9 +36,20 @@ def _make_inputs(tmp_path: Path) -> Path:
     return prompt
 
 
+def _roots(repo: Path) -> dict:
+    target = TargetRepo.resolve(repo)
+    return {
+        "repo": target,
+        "aidt": ToolkitPaths.resolve(),
+        "workspace": WorkspacePaths.resolve(
+            target, state_dir_override=repo.parent / f"{repo.name}-state"
+        ),
+    }
+
+
 def _runs_root(repo: Path) -> Path:
     """Where E1.4 writes run state: the per-repo state root, never the toolkit."""
-    return WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
+    return _roots(repo)["workspace"].state_root / "runs"
 
 
 class _Recorder:
@@ -138,7 +149,7 @@ def test_dry_run_plans_all_six_stages(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
-        task_prompt_path=prompt, repo=tmp_path, aidt=tmp_path / "aidt", dry_run=True
+        task_prompt_path=prompt, **_roots(tmp_path), dry_run=True
     )
 
     assert code == 0
@@ -163,7 +174,7 @@ def test_dry_run_writes_runs_under_the_state_root(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
 
     code = implement_workflow.run(
-        task_prompt_path=prompt, repo=tmp_path, aidt=tmp_path / "aidt", dry_run=True
+        task_prompt_path=prompt, **_roots(tmp_path), dry_run=True
     )
 
     assert code == 0
@@ -185,7 +196,7 @@ def test_refuses_on_main(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
 
     code = implement_workflow.run(
-        task_prompt_path=prompt, repo=tmp_path, aidt=tmp_path / "aidt"
+        task_prompt_path=prompt, **_roots(tmp_path)
     )
 
     assert code == 4
@@ -197,7 +208,7 @@ def test_refuses_on_branch_mismatch(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
 
     code = implement_workflow.run(
-        task_prompt_path=prompt, repo=tmp_path, aidt=tmp_path / "aidt"
+        task_prompt_path=prompt, **_roots(tmp_path)
     )
 
     assert code == 4
@@ -208,8 +219,7 @@ def test_missing_prompt_is_usage_error(tmp_path: Path, monkeypatch) -> None:
     _patch(monkeypatch)
     code = implement_workflow.run(
         task_prompt_path=tmp_path / "docs" / "task-prompts" / "nope.md",
-        repo=tmp_path,
-        aidt=tmp_path / "aidt",
+        **_roots(tmp_path),
     )
     assert code == 2
 
@@ -226,8 +236,7 @@ def test_full_run_succeeds_and_records_pr(tmp_path: Path, monkeypatch) -> None:
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        repo=tmp_path,
-        aidt=tmp_path / "aidt",
+        **_roots(tmp_path),
         approve_all=True,
     )
 
@@ -248,8 +257,7 @@ def test_stage_failure_returns_one(tmp_path: Path, monkeypatch) -> None:
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        repo=tmp_path,
-        aidt=tmp_path / "aidt",
+        **_roots(tmp_path),
         approve_all=True,
     )
 
@@ -266,7 +274,7 @@ def test_gate_denied_returns_blocked(tmp_path: Path, monkeypatch) -> None:
 
     # No --yes and a non-interactive session: the gate fails closed.
     code = implement_workflow.run(
-        task_prompt_path=prompt, repo=tmp_path, aidt=tmp_path / "aidt"
+        task_prompt_path=prompt, **_roots(tmp_path)
     )
 
     assert code == 3
@@ -304,8 +312,7 @@ def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        repo=tmp_path,
-        aidt=tmp_path / "aidt",
+        **_roots(tmp_path),
         resume=True,
         approve_all=True,
     )
@@ -341,8 +348,7 @@ def test_from_forces_rerun(tmp_path: Path, monkeypatch) -> None:
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        repo=tmp_path,
-        aidt=tmp_path / "aidt",
+        **_roots(tmp_path),
         resume=True,
         from_stage="test",
         approve_all=True,
@@ -393,8 +399,7 @@ def test_serial_runs_the_pair_one_at_a_time(tmp_path: Path, monkeypatch) -> None
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        repo=tmp_path,
-        aidt=tmp_path / "aidt",
+        **_roots(tmp_path),
         approve_all=True,
     )
 
@@ -412,8 +417,7 @@ def test_parallel_runs_test_and_architecture_concurrently(
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        repo=tmp_path,
-        aidt=tmp_path / "aidt",
+        **_roots(tmp_path),
         approve_all=True,
         parallel=True,
     )

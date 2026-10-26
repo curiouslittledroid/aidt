@@ -8,7 +8,7 @@ from pathlib import Path
 
 from aidw import git, github
 from aidw.gates import GateOutcome
-from aidw.paths import TargetRepo, WorkspacePaths
+from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import SUCCEEDED, StageRecord, run_dir
 from aidw.workflows import approve as approve_workflow
 
@@ -20,8 +20,19 @@ def _init_repo(path: Path) -> None:
     (path / "aidt").mkdir()
 
 
+def _roots(repo: Path) -> dict:
+    target = TargetRepo.resolve(repo)
+    return {
+        "repo": target,
+        "aidt": ToolkitPaths.resolve(),
+        "workspace": WorkspacePaths.resolve(
+            target, state_dir_override=repo.parent / f"{repo.name}-state"
+        ),
+    }
+
+
 def _runs_root(repo: Path) -> Path:
-    return WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
+    return _roots(repo)["workspace"].state_root / "runs"
 
 
 def _select_ok(number: int = 101, title: str = "Fix the loop") -> github.ScriptResult:
@@ -85,7 +96,7 @@ def test_dry_run_plans_stage_and_gate(tmp_path: Path, monkeypatch, capsys) -> No
     monkeypatch.setattr(approve_workflow, "run_stage", stages)
 
     code = approve_workflow.run(
-        pr=7, repo=tmp_path, aidt=tmp_path / "aidt", dry_run=True
+        pr=7, **_roots(tmp_path), dry_run=True
     )
 
     assert code == 0
@@ -107,7 +118,7 @@ def test_gate_denied_stops_without_stage(tmp_path: Path, monkeypatch) -> None:
         lambda *a, **k: GateOutcome(approve_workflow.GATE, False, "human-denied"),
     )
 
-    code = approve_workflow.run(pr=7, repo=tmp_path, aidt=tmp_path / "aidt")
+    code = approve_workflow.run(pr=7, **_roots(tmp_path))
 
     assert code == 3
     assert stages.names == []
@@ -125,7 +136,7 @@ def test_approved_runs_review_approver(tmp_path: Path, monkeypatch) -> None:
     )
 
     code = approve_workflow.run(
-        pr=7, repo=tmp_path, aidt=tmp_path / "aidt", approve_all=True
+        pr=7, **_roots(tmp_path), approve_all=True
     )
 
     assert code == 0
@@ -150,7 +161,7 @@ def test_stage_failure_is_recorded(tmp_path: Path, monkeypatch) -> None:
     )
 
     code = approve_workflow.run(
-        pr=7, repo=tmp_path, aidt=tmp_path / "aidt", approve_all=True
+        pr=7, **_roots(tmp_path), approve_all=True
     )
 
     assert code == 1
@@ -162,6 +173,6 @@ def test_missing_pr_is_usage_error(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(github, "pr_view", lambda repo, pr: None)
     monkeypatch.setattr(approve_workflow, "run_stage", _FakeStages())
 
-    code = approve_workflow.run(pr=7, repo=tmp_path, aidt=tmp_path / "aidt")
+    code = approve_workflow.run(pr=7, **_roots(tmp_path))
 
     assert code == 2

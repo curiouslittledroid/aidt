@@ -15,13 +15,12 @@ bundled ``review_followup.py`` script the prompt invokes (design §13).
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 from aidw import git, github
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
-from aidw.paths import TargetRepo, WorkspacePaths
+from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
 from aidw.runner import StageSpec, run_stage
 from aidw.state import (
@@ -72,8 +71,9 @@ def _selection_summary(selection: github.ScriptResult) -> str:
 def run(
     *,
     pr: int,
-    repo: Path,
-    aidt: Path,
+    repo: TargetRepo,
+    aidt: ToolkitPaths,
+    workspace: WorkspacePaths,
     approve_all: bool = False,
     skip_gates: list[str] | None = None,
     deny_gates: list[str] | None = None,
@@ -84,23 +84,23 @@ def run(
 ) -> int:
     skip = set(skip_gates or [])
     deny = set(deny_gates or [])
-    runs_root = WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
+    runs_root = workspace.state_root / "runs"
 
-    agents, issues = load_all(aidt, repo)
+    agents, issues = load_all(aidt.root, repo.root)
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
     if errors or (strict and warnings):
         print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
         return 2
 
-    branch = git.current_branch(repo)
+    branch = git.current_branch(repo.root)
     pr_info: dict = {}
 
     if not dry_run:
         if not github.gh_available():
             print("`gh` was not found on PATH.", file=sys.stderr)
             return 4
-        view = github.pr_view(repo, pr)
+        view = github.pr_view(repo.root, pr)
         if view is None:
             print(f"PR #{pr} was not found (or `gh` failed).", file=sys.stderr)
             return 2
@@ -108,7 +108,7 @@ def run(
 
     state = create_run(
         runs_root,
-        repo,
+        repo.root,
         "approve",
         label=f"pr-{pr}",
         pr={
@@ -125,7 +125,7 @@ def run(
 
     if dry_run:
         if github.gh_available():
-            selection = github.select_followups(aidt, repo, pr)
+            selection = github.select_followups(aidt.root, repo.root, pr)
             payload = github.parse_json_output(selection.stdout) or {}
             if selection.exit_code == github.EXIT_NONE_AVAILABLE:
                 print("child:  none available")
@@ -151,12 +151,12 @@ def run(
             StageSpec(
                 STAGE,
                 AGENT,
-                aidt / "prompts" / PROMPT,
+                aidt.prompts_dir / PROMPT,
                 [str(pr)],
-                verify=lambda: github.verify_approvals(aidt, repo, pr),
+                verify=lambda: github.verify_approvals(aidt.root, repo.root, pr),
             ),
-            repo_root=repo,
-            toolkit_root=aidt,
+            repo_root=repo.root,
+            toolkit_root=aidt.root,
             runs_root=runs_root,
             state=state,
             logger=logger,
@@ -173,7 +173,7 @@ def run(
         print("dry-run complete; Pi not invoked, no GitHub state written")
         return 0
 
-    selection = github.select_followups(aidt, repo, pr)
+    selection = github.select_followups(aidt.root, repo.root, pr)
     outcome = decide(
         GATE,
         _selection_summary(selection),
@@ -205,18 +205,18 @@ def run(
         StageSpec(
             STAGE,
             AGENT,
-            aidt / "prompts" / PROMPT,
+            aidt.prompts_dir / PROMPT,
             [str(pr)],
-            verify=lambda: github.verify_approvals(aidt, repo, pr),
+            verify=lambda: github.verify_approvals(aidt.root, repo.root, pr),
         ),
-        repo_root=repo,
-        toolkit_root=aidt,
+        repo_root=repo.root,
+        toolkit_root=aidt.root,
         runs_root=runs_root,
         state=state,
         logger=logger,
         agents=agents,
     )
-    print_stage(record, repo_root=repo)
+    print_stage(record, repo_root=repo.root)
     if record.status != SUCCEEDED:
         state.status = FAILED
         save(directory, state)

@@ -129,7 +129,7 @@
   - Deliverable: no remaining `repo_root()/aidt` assumption anywhere.
   - Done when: `rg "aidt_root|runs_dir" aidw/` returns nothing, and `runs` are written under the state root.
 
-- [ ] **E1.5. CLI plumbing**
+- [x] **E1.5. CLI plumbing**
   The global `--repo` already exists (`cli.py:89`), but `_roots()` (`cli.py:51-54`) conflates the two
   roots; E0.4 re-points it at the target only. Add `AIDW_REPO`, and thread the resolved `TargetRepo`
   and `ToolkitPaths` through every workflow, replacing the `(repo, aidt)` tuple and
