@@ -446,7 +446,14 @@ preflight (clean tree, on main; fetch and refuse when the base branch is behind 
 - The preflight fetches `origin` and refuses (exit 4) when the local base branch is behind or diverged from `origin/<base>`; `--no-fetch` skips the fetch and the comparison.
 - Before that fetch, the preflight refuses (exit 4) when an earlier task in the target's own `docs/tasks/*.md` phase file is still unticked, naming every incomplete predecessor in roadmap order. `--allow-incomplete-prereqs` proceeds with a warning instead. `--dry-run` reports the incomplete predecessors and never refuses.
 - `P1` receives `$1=phase`, `$2=epic`, `$3=task`. The prompt itself creates the `{phase}-{task}`
-  branch and commits the prompt.
+  branch and commits the prompt. Before branching, the author checks feasibility — the roadmap
+  entry and the spec sections it cites, and whether what the task depends on exists. When
+  authoring cannot proceed it reports `blocked: <reason>` as the first line and changes nothing;
+  the run is then `blocked` (exit 3) with the reason in the run log and on stderr. AIDT reports,
+  never repairs, what the blocked run can see it left behind: an uncommitted change under
+  `docs/task-prompts/`, and a `{phase}-{task}` branch that appeared during the run (probed before
+  and after the author stage, so a pre-existing branch is never blamed on the run). The author
+  stage itself stays `succeeded` — it exited 0 with a valid report; it is the run that is blocked.
 - `P2` receives `$1=<task-prompt-file>`.
 - `P2a` uses the short `aidt/prompts/task-review-fixes.md`; it receives `$1=<task-prompt-file>`
   and, per finding, that finding re-rendered in the reviewer's own block format. AIDW runs one fix
@@ -731,6 +738,7 @@ stage fails, so `--resume` continues from that stage.
 | Cost ceiling exceeded | `failed` with reason `cost_ceiling`; run stops. |
 | Gate denied | `blocked`; run stops cleanly, leaving state resumable. |
 | `/code-review` returns `Blocked` | `blocked`; findings are still written, publication is not attempted. |
+| `task-prompt` author reports `blocked: <reason>` | run `blocked` (exit 3); the reason is recorded in the run log and printed to stderr; a `{phase}-{task}` branch created during the run and any uncommitted change under `docs/task-prompts/` are reported, never repaired; the author stage itself stays `succeeded`. |
 | `review_followup.py` exit 3 (no available child) | Fix loop ends successfully with `closed_issues`. |
 | `review_followup.py` exit 1/2/4 | `failed`; wrapper surfaces the script's JSON error and does not work around it. |
 | A required prompt or helper script is missing (`aidw prompts check`) | `prompts check` fails; a workflow stage raises `FileNotFoundError` when its prompt file is absent. |

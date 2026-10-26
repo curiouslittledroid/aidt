@@ -109,7 +109,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     E5.1/E5.2 own, and D15 forbids a second dialect). Phase-scoping means a genuinely
     parallelisable pair needs the flag; that is the accepted trade.
 
-- [ ] **L1.3. Give the author a blocked channel** (Design 8.1, EXTRACTION.md §3.8)
+- [x] **L1.3. Give the author a blocked channel** (Design 8.1, EXTRACTION.md §3.8)
   `prompts/task-prompt.md` requires the output to be *exclusively* the prompt path and the
   branch to exist before writing, so an author that finds its prerequisite missing has no way
   to report it — it must either stop silently or invent a workaround. Define `blocked: <reason>`

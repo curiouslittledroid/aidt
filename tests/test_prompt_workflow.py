@@ -6,11 +6,13 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from aidw import git, state
 from aidw.cli import app
-from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths, repo_root
+from aidw.paths import ToolkitPaths, TargetRepo, WorkspacePaths, repo_root, toolkit_root
+from aidw.prompts import render_prompt_file
 from aidw.workflows import prompt as prompt_workflow
 
 #: Test-only run label. It keeps test-created runs identifiable and lets the session
@@ -1349,3 +1351,274 @@ def test_l12_wrong_branch_refusal_precedes_the_prerequisite_check(
     err = capsys.readouterr().err
     assert "must run on `main`" in err
     assert "earlier tasks in the same file are incomplete" not in err
+
+
+# ---------------------------------------------------------------------------
+# L1.3 — the author's blocked channel (design §8.1, §10, §13; EXTRACTION.md §3.8)
+# ---------------------------------------------------------------------------
+
+
+def _blocked_author_stages(
+    output: str,
+    *,
+    write_prompt: bool = False,
+    create_branch: str | None = None,
+):
+    """A fake ``run_stage`` whose author returns ``output`` (usually ``blocked: ...``).
+
+    Kept separate from :func:`_fake_stages` so the shared normal-path fake keeps returning
+    a real path: only the blocked cases write the marker.
+    """
+    from aidw.state import SUCCEEDED, StageRecord, run_dir
+
+    seen: list[str] = []
+
+    def fake_run_stage(spec, **kwargs):
+        repo = kwargs["repo_root"]
+        state = kwargs["state"]
+        directory = run_dir(kwargs["runs_root"], state.run_id)
+        stages = directory / "stages"
+        stages.mkdir(parents=True, exist_ok=True)
+        seen.append(spec.name)
+
+        if spec.name == "task-prompt":
+            if write_prompt:
+                created = repo / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+                created.parent.mkdir(parents=True, exist_ok=True)
+                created.write_text("prompt body\n", encoding="utf-8")
+            if create_branch:
+                _run_git(["branch", create_branch], repo)
+
+        out = stages / f"{spec.name}.out.txt"
+        out.write_text(output, encoding="utf-8")
+        record = StageRecord(
+            name=spec.name,
+            agent=spec.agent_id,
+            model="test-model",
+            status=SUCCEEDED,
+            artifacts={"out": str(out)},
+        )
+        state.record_stage(record)
+        return record
+
+    return seen, fake_run_stage
+
+
+def _run_log(repo: Path, run_id: str) -> str:
+    return (_runs_root(repo) / run_id / "run.log").read_text(encoding="utf-8")
+
+
+def test_l13_blocked_report_ends_the_run_without_authoring(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _blocked_author_stages("blocked: cited Design 09 §5.2 is absent\n")
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 3
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    assert seen == ["task-prompt"]  # no review stage, no fix loop
+    # The author stage exited 0 with a valid report, so its own record stays succeeded;
+    # it is the run that is blocked.
+    author = latest.stage("task-prompt")
+    assert author is not None and author.status == state.SUCCEEDED
+
+    assert "Design 09 §5.2 is absent" in _run_log(tmp_path, latest.run_id)
+    err = capsys.readouterr().err
+    assert "Design 09 §5.2 is absent" in err
+    # Nothing was committed or written under the author's directory.
+    assert git.status_short(tmp_path, paths=["docs/task-prompts"]) == ""
+    assert not (tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
+    assert git.rev_parse(tmp_path, "03-E4.1") is None
+    assert git.rev_parse(tmp_path, "HEAD") is None
+
+
+def test_l13_blocked_detection_precedes_path_resolution(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A leftover file must not be resolved as the prompt when the report is blocked."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _blocked_author_stages(
+        "blocked: prerequisite branch is missing\n", write_prompt=True
+    )
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 3
+    assert seen == ["task-prompt"]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    # The file the author left is not committed and not removed; it is uncommitted.
+    leftover = tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+    assert leftover.exists()
+    assert git.status_short(tmp_path, paths=["docs/task-prompts"]).startswith("??")
+
+
+def test_l13_leftover_prompt_is_reported_not_removed(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _blocked_author_stages("blocked: no reason\n", write_prompt=True)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert "docs/task-prompts/03-E4.1-prompt.md" in err
+    assert "neither committed nor removed" in err
+    assert (tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
+
+
+def test_l13_branch_created_during_run_is_reported_not_deleted(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _origin, clone = _origin_and_clone(tmp_path)
+    _seen, fake = _blocked_author_stages(
+        "blocked: prerequisite missing\n", create_branch="03-E4.1"
+    )
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert "created branch" in err and "03-E4.1" in err
+    assert git.rev_parse(clone, "03-E4.1") is not None  # reported, never deleted
+
+
+def test_l13_preexisting_branch_is_not_reported(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A branch that existed before the run must not be blamed on the run."""
+    _origin, clone = _origin_and_clone(tmp_path)
+    _run_git(["branch", "03-E4.1"], clone)
+    _seen, fake = _blocked_author_stages("blocked: prerequisite missing\n")
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 3
+    assert "created branch" not in capsys.readouterr().err
+
+
+def test_l13_unanswerable_branch_probe_does_not_warn(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """An advisory probe failure must not guess that the author created a branch."""
+    _origin, clone = _origin_and_clone(tmp_path)
+    _seen, fake = _blocked_author_stages(
+        "blocked: prerequisite missing\n", create_branch="03-E4.1"
+    )
+    probes = iter([(False, None), (True, "branch-sha")])
+    monkeypatch.setattr(prompt_workflow, "_probe_branch", lambda *args: next(probes))
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 3
+    assert "created branch" not in capsys.readouterr().err
+    assert git.rev_parse(clone, "03-E4.1") is not None
+
+
+@pytest.mark.parametrize(
+    ("output", "reason"),
+    [
+        ("blocked: missing spec section\n", "missing spec section"),
+        ("\n  blocked: leading blank line\n", "leading blank line"),
+        ("BLOCKED: upper case marker\n", "upper case marker"),
+        ("blocked: first line\nsecond line\n", "second line"),
+    ],
+)
+def test_l13_marker_parsing_reaches_the_log(
+    tmp_path: Path, monkeypatch, capsys, output: str, reason: str
+) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _blocked_author_stages(output)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 3
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    log = _run_log(tmp_path, latest.run_id)
+    assert reason in log
+    assert reason in capsys.readouterr().err
+
+
+def test_l13_empty_reason_is_still_blocked(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _blocked_author_stages("blocked:\n")
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 3
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    assert "no reason" in capsys.readouterr().err
+
+
+def test_l13_empty_author_output_keeps_the_not_found_failure(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """No output is not a blocked report: it stays today's exit-1 failure."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _blocked_author_stages("")
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 1
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.FAILED
+    assert "generated task prompt not found" in capsys.readouterr().err
+
+
+def test_l13_rendered_author_prompt_and_agent_context_state_the_contract() -> None:
+    """The blocked contract is in the rendered prompt and the author's context file."""
+    rendered = render_prompt_file(
+        toolkit_root() / "prompts" / "task-prompt.md", ["03", "E4", "E4.1"]
+    )
+    assert "blocked: <reason>" in rendered
+    assert "a cited spec section is missing or contradicts the roadmap entry" in rendered
+    assert "before creating or switching to the `{phase}-{task}` branch" in rendered
+    assert "or, when blocked, `blocked: <reason>`" in rendered
+    # Feasibility is checked before the branch is created or switched to.
+    feasibility = rendered.index(
+        "before creating or switching to the `{phase}-{task}` branch"
+    )
+    branch = rendered.index("create or switch to the dedicated `{phase}-{task}` branch")
+    assert feasibility < branch
+
+    author_md = (toolkit_root() / "agents" / "task-author" / "AGENTS.md").read_text(
+        encoding="utf-8"
+    )
+    assert "blocked: <reason>" in author_md
+    assert "stop and report" in author_md
+    assert "Before creating or switching to the `{phase}-{task}` branch" in author_md

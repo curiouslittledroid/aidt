@@ -20,6 +20,10 @@ phase file is unticked, unless ``--allow-incomplete-prereqs`` is given, then fet
 ``origin/<base>``; ``--no-fetch`` skips both the fetch and the comparison.
 A ``--dry-run`` plans the stages without those preconditions, reports the incomplete
 predecessors, and never touches the network.
+When the author's first output line is ``blocked: <reason>`` the run ends ``blocked``
+(exit 3) with the reason in the run log and on stderr; the leftovers the run can see — an
+uncommitted change under ``docs/task-prompts/`` and a ``{phase}-{task}`` branch it created
+during the run — are reported, never repaired (design §13, L1.3).
 The approval gate is off by default; pass ``--require-approval`` to pause for a human decision.
 """
 
@@ -100,6 +104,101 @@ def _resolve_prompt_path(
 
     fallback = repo / default_rel
     return fallback if fallback.is_file() else None
+
+
+#: Directory the author owns. A blocked run reports uncommitted changes here and never
+#: commits or removes them (design §13, L1.3).
+_PROMPTS_DIR = "docs/task-prompts"
+
+#: First-line marker the author uses to report it cannot author the task (L1.3).
+_BLOCKED_MARKER = "blocked:"
+
+
+def _parse_blocked(out: str | None) -> str | None:
+    """Reason when the author's first output line is ``blocked: <reason>`` (L1.3).
+
+    Uses the same strip-then-first-line convention as :func:`_resolve_prompt_path`, so a
+    backticked or fenced marker is recognised, and is case-insensitive. Returns ``None``
+    when the output is absent/empty or does not start with the marker; an empty string
+    means the author reported ``blocked:`` without a reason.
+    """
+    if not out or not out.strip():
+        return None
+    lines = out.strip().splitlines()
+    first = lines[0].strip().strip("`").strip()
+    if not first.lower().startswith(_BLOCKED_MARKER):
+        return None
+    remainder = [first[len(_BLOCKED_MARKER):].strip(), *lines[1:]]
+    return "\n".join(part.strip() for part in remainder if part.strip()).strip()
+
+
+def _probe_branch(repo: Path, name: str) -> tuple[bool, str | None]:
+    """``(answered, sha)`` for ``refs/heads/<name>`` — advisory, never raises (L1.3).
+
+    ``git.rev_parse`` collapses a missing ref and a git failure into ``None``, so the
+    caller distinguishes "the probe could not answer" from "the branch exists" by the
+    first element and never warns on a probe that failed.
+    """
+    try:
+        return True, git.rev_parse(repo, f"refs/heads/{name}")
+    except Exception:  # advisory probe: it must never stop the blocked report
+        return False, None
+
+
+def _uncommitted_prompt_paths(repo: Path) -> list[str]:
+    """Repo-relative paths under ``docs/task-prompts/`` with uncommitted changes.
+
+    Uncommitted changes are enumerated one file at a time. ``git status --porcelain``
+    collapses a wholly-untracked directory to a single ``?? docs/task-prompts/`` line, so
+    untracked paths come from :func:`aidw.git.untracked_paths` instead; a blocked run must
+    name every file it did not commit, not the directory it sits in.
+    """
+    prefix = f"{_PROMPTS_DIR}/"
+    paths: list[str] = []
+    for line in git.status_short(repo, paths=[_PROMPTS_DIR]).splitlines():
+        if len(line) < 4 or line[:2] == "??":
+            continue
+        entry = line[3:].strip()
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        entry = entry.strip('"')
+        if entry not in paths:
+            paths.append(entry)
+    for rel in git.untracked_paths(repo):
+        if rel.startswith(prefix) and rel not in paths:
+            paths.append(rel)
+    return paths
+
+
+def _report_blocked_leftovers(
+    repo: Path, *, branch: str, branch_before: tuple[bool, str | None]
+) -> None:
+    """Report — never repair — what a blocked run can see it left behind (design §13).
+
+    AIDT never deletes a branch and never discards work, so a blocked run leaves the tree
+    as the author left it and names it instead. The branch is only reported when the
+    pre-author probe saw it absent and the post-block probe sees it present, so a branch
+    that legitimately pre-existed is never blamed on the run.
+    """
+    for rel in _uncommitted_prompt_paths(repo):
+        print(
+            f"warning: blocked run left an uncommitted change under `{_PROMPTS_DIR}/`: "
+            f"{rel} (the run neither committed nor removed it).",
+            file=sys.stderr,
+        )
+    answered_before, sha_before = branch_before
+    answered_after, sha_after = _probe_branch(repo, branch)
+    if (
+        answered_before
+        and answered_after
+        and sha_before is None
+        and sha_after is not None
+    ):
+        print(
+            f"warning: blocked run created branch `{branch}`; the run does not delete "
+            "it. Remove it manually if it is not wanted.",
+            file=sys.stderr,
+        )
 
 
 def _commit_reviewed_prompt(repo: Path, rel: str, phase: str, task: str) -> bool:
@@ -359,6 +458,13 @@ def run(
         [phase, epic, task],
     )
 
+    # L1.3: probe for the author's branch before it runs, so a blocked run can tell a
+    # branch the author created from one that legitimately pre-existed (the author reuses
+    # one based on ``main``). ``--dry-run`` plans no branch and does no comparison.
+    branch_before: tuple[bool, str | None] | None = None
+    if not dry_run:
+        branch_before = _probe_branch(repo.root, f"{phase}-{task}")
+
     rec1 = run_stage(
         author,
         repo_root=repo.root,
@@ -396,6 +502,24 @@ def run(
     if rec1.status != SUCCEEDED:
         print(f"task-prompt stage failed: {rec1.error}", file=sys.stderr)
         return 1
+
+    # L1.3: detect the blocked report before ``_resolve_prompt_path`` tries the first
+    # line as a path and falls back to the conventional location — otherwise a
+    # ``blocked:`` line would be silently ignored whenever the author also left a file.
+    # The author stage stays ``succeeded`` (it exited 0 with a valid report); the *run* is
+    # what is blocked, and no commit, review or fix stage follows.
+    blocked_reason = _parse_blocked(_read_out(rec1))
+    if blocked_reason is not None:
+        reason = blocked_reason or "no reason given"
+        logger.error(f"task-prompt author reported blocked: {reason}")
+        if branch_before is not None:
+            _report_blocked_leftovers(
+                repo.root, branch=f"{phase}-{task}", branch_before=branch_before
+            )
+        state.status = BLOCKED
+        save(directory, state)
+        print(f"blocked: {reason}", file=sys.stderr)
+        return 3
 
     prompt_path = _resolve_prompt_path(repo.root, rec1, default_rel)
     if prompt_path is None:
