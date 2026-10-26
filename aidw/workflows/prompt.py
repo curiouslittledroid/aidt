@@ -14,8 +14,10 @@ Stages:
 4. optional gate ``approve-task-prompt``.
 
 A real run requires ``main`` and a clean working tree, because the ``task-prompt`` prompt
-requires it. A ``--dry-run`` plans the stages without those preconditions. The approval gate
-is off by default; pass ``--require-approval`` to pause for a human decision.
+requires it. It then fetches ``origin`` and refuses (exit 4) when the base branch is behind
+or diverged from ``origin/<base>``; ``--no-fetch`` skips both the fetch and the comparison.
+A ``--dry-run`` plans the stages without those preconditions and never touches the network.
+The approval gate is off by default; pass ``--require-approval`` to pause for a human decision.
 """
 
 from __future__ import annotations
@@ -53,6 +55,13 @@ from aidw.state import (
 from aidw.verdict import APPROVE, BLOCKED as VERDICT_BLOCKED, parse_verdict
 
 GATE = "approve-task-prompt"
+
+#: Remote the base-branch preflight fetches (L1.1, design §8.1). Full ``git fetch origin``
+#: keeps ``refs/remotes/origin/<base>`` current; a partial refspec would not.
+REMOTE = "origin"
+
+#: Exit code for a preflight/safety refusal (design §14).
+EXIT_REFUSED = 4
 
 #: Review rounds. Each round reviews the prompt and, unless it approves, one round of fixes
 #: follows (one stage per blocking finding, one combined stage for the could-fix findings).
@@ -99,6 +108,87 @@ def _commit_reviewed_prompt(repo: Path, rel: str, phase: str, task: str) -> bool
     )
 
 
+def _verify_base_branch(repo: TargetRepo, *, no_fetch: bool) -> int | None:
+    """Fetch and require the base branch to be current (L1.1, design §8.1).
+
+    Returns :data:`EXIT_REFUSED` when the base branch is provably stale or diverged, else
+    ``None``. The fetch outcome is reported as a warning but never decides the verdict on
+    its own: the comparison against ``origin/<base>`` (last known refs after a failed
+    fetch) is what refuses, so an offline run still catches a stale base. Every message is
+    operator-facing on stderr and carries no credential (design §13).
+    """
+    base = repo.base_branch
+    remote_ref = f"{REMOTE}/{base}"
+
+    if no_fetch:
+        print(
+            f"warning: --no-fetch: base branch `{base}` was not verified against "
+            f"`{remote_ref}`.",
+            file=sys.stderr,
+        )
+        return None
+
+    fetched, reason = git.fetch(repo.root, REMOTE)
+    if not fetched:
+        detail = f" ({reason})" if reason else ""
+        print(
+            f"warning: could not fetch `{REMOTE}`{detail}; comparing `{base}` against "
+            f"the last known `{remote_ref}`.",
+            file=sys.stderr,
+        )
+
+    local = git.rev_parse(repo.root, base)
+    remote = git.rev_parse(repo.root, remote_ref)
+    if local is None or remote is None:
+        print(
+            f"warning: cannot verify base branch `{base}` against `{remote_ref}` "
+            f"(no such remote-tracking ref); continuing.",
+            file=sys.stderr,
+        )
+        return None
+
+    if local == remote:
+        return None
+
+    behind = git.is_ancestor(repo.root, local, remote)
+    if behind is True:
+        print(
+            f"refusing: base branch `{base}` is behind `{remote_ref}`.\n"
+            f"  local  {base}  {local}\n"
+            f"  remote {remote_ref}  {remote}\n"
+            "Run `git pull --ff-only` in the base worktree, then retry.",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+
+    ahead = git.is_ancestor(repo.root, remote, local)
+    if ahead is True:
+        print(
+            f"warning: base branch `{base}` is ahead of `{remote_ref}` "
+            f"(unpushed commits); continuing.",
+            file=sys.stderr,
+        )
+        return None
+
+    if behind is False and ahead is False:
+        print(
+            f"refusing: base branch `{base}` has diverged from `{remote_ref}`.\n"
+            f"  local  {base}  {local}\n"
+            f"  remote {remote_ref}  {remote}\n"
+            "Reconcile the base branch with its remote before authoring.",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+
+    # ``is_ancestor`` answered ``None`` (git could not decide): warn, never pass as current.
+    print(
+        f"warning: could not verify whether base branch `{base}` is current with "
+        f"`{remote_ref}`; continuing.",
+        file=sys.stderr,
+    )
+    return None
+
+
 def run(
     *,
     phase: str,
@@ -115,6 +205,7 @@ def run(
     require_approval: bool = False,
     strict: bool = False,
     dry_run: bool = False,
+    no_fetch: bool = False,
     stream: bool = False,
 ) -> int:
     skip = set(skip_gates or [])
@@ -139,6 +230,10 @@ def run(
             print(f"[dry-run] a real run requires `main` (currently `{branch}`).")
         if not git.is_clean(repo.root):
             print("[dry-run] a real run requires a clean working tree.")
+        print(
+            "[dry-run] a real run will fetch and verify the base branch against "
+            f"`{REMOTE}/{repo.base_branch}`."
+        )
     else:
         if branch != "main":
             print(
@@ -149,6 +244,11 @@ def run(
         if not git.is_clean(repo.root):
             print("working tree is dirty; commit or stash first.", file=sys.stderr)
             return 4
+        # Refuse before ``load_all``/``create_run`` so a stale base leaves no run
+        # directory, no ``{phase}-{task}`` branch and no prompt file behind.
+        refusal = _verify_base_branch(repo, no_fetch=no_fetch)
+        if refusal is not None:
+            return refusal
 
     agents, issues = load_all(aidt.root, repo.root)
     errors = [i for i in issues if i.level == ERROR]

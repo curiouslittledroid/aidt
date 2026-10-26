@@ -80,7 +80,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
 
 ## Epic L1: Scheduling and preflight — stop the bad seed
 
-- [ ] **L1.1. Fetch, and require the base branch to be current** (Design 8.1, Design 14)
+- [x] **L1.1. Fetch, and require the base branch to be current** (Design 8.1, Design 14)
   `aidw prompt`'s preflight checks the branch name and the clean tree and never fetches, so a
   run can start on a stale local base — exactly what E1.6 did. Add a `git fetch` preflight plus
   a comparison of the local base branch against `origin/<base_branch>` (`TargetRepo.base_branch`,
