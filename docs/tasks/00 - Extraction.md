@@ -158,7 +158,7 @@
   - Deliverable: primitives plus tests against a real temporary bare+worktree repo.
   - Done when: tests pass on macOS with git ≥ 2.31, and the parser handles the `bare` marker and detached HEAD.
 
-- [ ] **E2.2. Target/layout guards**
+- [x] **E2.2. Target/layout guards**
   Refuse to run when the target is the bare dir; **fail** when the workspace root is itself a
   registered worktree of the same repo (the clone-of-a-worktree trap, §3.2); **warn** when the state
   root falls inside a working tree.
