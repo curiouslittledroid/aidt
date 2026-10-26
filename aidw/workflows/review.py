@@ -23,7 +23,7 @@ from aidw import findings as findings_mod
 from aidw import git, github
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.log import RunLogger
-from aidw.paths import TargetRepo, WorkspacePaths
+from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
 from aidw.runner import StageSpec, run_stage
 from aidw.state import (
@@ -71,17 +71,18 @@ def _write_artifacts(
 def run(
     *,
     pr: int,
-    repo: Path,
-    aidt: Path,
+    repo: TargetRepo,
+    aidt: ToolkitPaths,
+    workspace: WorkspacePaths,
     approve_all: bool = False,
     strict: bool = False,
     dry_run: bool = False,
     force_model: bool = False,
     stream: bool = False,
 ) -> int:
-    runs_root = WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
+    runs_root = workspace.state_root / "runs"
 
-    agents, issues = load_all(aidt, repo)
+    agents, issues = load_all(aidt.root, repo.root)
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
     if force_model:
@@ -91,14 +92,14 @@ def run(
         print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
         return 2
 
-    branch = git.current_branch(repo)
+    branch = git.current_branch(repo.root)
     pr_info: dict = {}
 
     if not dry_run:
         if not github.gh_available():
             print("`gh` was not found on PATH.", file=sys.stderr)
             return 4
-        view = github.pr_view(repo, pr)
+        view = github.pr_view(repo.root, pr)
         if view is None:
             print(f"PR #{pr} was not found (or `gh` failed).", file=sys.stderr)
             return 2
@@ -117,7 +118,7 @@ def run(
 
     state = create_run(
         runs_root,
-        repo,
+        repo.root,
         "review",
         label=f"pr-{pr}",
         pr={
@@ -133,11 +134,11 @@ def run(
     print(f"run:    {state.run_id}")
     print(f"pr:     #{pr}" + (f" {pr_info['url']}" if pr_info.get("url") else ""))
 
-    r1 = StageSpec(R1, "code-reviewer", aidt / "prompts" / "code-review.md", [])
+    r1 = StageSpec(R1, "code-reviewer", aidt.prompts_dir / "code-review.md", [])
     r2 = StageSpec(
         R2,
         "review-publisher",
-        aidt / "prompts" / "review-findings-to-github.md",
+        aidt.prompts_dir / "review-findings-to-github.md",
         [str(pr)],
     )
 
@@ -145,8 +146,8 @@ def run(
         for spec in (r1, r2):
             record = run_stage(
                 spec,
-                repo_root=repo,
-                toolkit_root=aidt,
+                repo_root=repo.root,
+                toolkit_root=aidt.root,
                 runs_root=runs_root,
                 state=state,
                 logger=logger,
@@ -161,9 +162,13 @@ def run(
                 f"agent={record.agent} model={record.model}{suffix}"
             )
         manifest_path = directory / "artifacts" / "review-manifest.json"
-        publisher = github.script_path(aidt, github.PUBLISH_SCRIPT)
+        publisher = github.script_path(aidt.root, github.PUBLISH_SCRIPT)
         argv = github.build_publish_argv(publisher, pr, manifest_path, dry_run=True)
-        print(f"manifest: {manifest_path.relative_to(repo)}")
+        try:
+            manifest_display = manifest_path.relative_to(repo.root)
+        except ValueError:
+            manifest_display = manifest_path
+        print(f"manifest: {manifest_display}")
         print("publisher argv: " + " ".join(argv))
         state.status = SUCCEEDED
         save(directory, state)
@@ -172,14 +177,14 @@ def run(
 
     rec1 = run_stage(
         r1,
-        repo_root=repo,
-        toolkit_root=aidt,
+        repo_root=repo.root,
+        toolkit_root=aidt.root,
         runs_root=runs_root,
         state=state,
         logger=logger,
         agents=agents,
     )
-    print_stage(rec1, repo_root=repo)
+    print_stage(rec1, repo_root=repo.root)
     if rec1.status != SUCCEEDED:
         print(f"stage {R1} failed: {rec1.error}", file=sys.stderr)
         state.status = FAILED
@@ -258,18 +263,18 @@ def run(
         StageSpec(
             R2,
             "review-publisher",
-            aidt / "prompts" / "review-findings-to-github.md",
+            aidt.prompts_dir / "review-findings-to-github.md",
             [str(pr)],
             extra=extra,
         ),
-        repo_root=repo,
-        toolkit_root=aidt,
+        repo_root=repo.root,
+        toolkit_root=aidt.root,
         runs_root=runs_root,
         state=state,
         logger=logger,
         agents=agents,
     )
-    print_stage(rec2, repo_root=repo)
+    print_stage(rec2, repo_root=repo.root)
     if rec2.status != SUCCEEDED:
         print(f"stage {R2} failed: {rec2.error}", file=sys.stderr)
         state.status = FAILED

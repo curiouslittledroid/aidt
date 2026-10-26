@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 from aidw import git, state
-from aidw.paths import toolkit_root, repo_root
+from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths, repo_root
 from aidw.workflows import prompt as prompt_workflow
 
 #: Test-only run label. It keeps test-created runs identifiable and lets the session
@@ -16,6 +16,26 @@ RUN_LABEL = "pytest"
 
 #: Isolated run-state root, matching where the fake stages below write their output.
 RUNS_DIRNAME = Path("aidt") / "runs"
+
+
+def _roots(repo: Path) -> dict:
+    """Typed roots for a direct workflow call, isolated under ``repo/RUNS_DIRNAME``.
+
+    ``WorkspacePaths.resolve`` appends the repo slug, so the runs root is
+    ``workspace.state_root / "runs"`` — under the override, never at it.
+    """
+    target = TargetRepo.resolve(repo)
+    return {
+        "repo": target,
+        "aidt": ToolkitPaths.resolve(),
+        "workspace": WorkspacePaths.resolve(
+            target, state_dir_override=repo / RUNS_DIRNAME
+        ),
+    }
+
+
+def _runs_root(repo: Path) -> Path:
+    return _roots(repo)["workspace"].state_root / "runs"
 
 
 def test_git_helpers_types() -> None:
@@ -33,14 +53,12 @@ def test_prompt_workflow_dry_run(tmp_path: Path, monkeypatch) -> None:
         phase="03",
         epic="E4",
         task="E4.1",
-        repo=tmp_path,
-        aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME,
+        **_roots(tmp_path),
         label=RUN_LABEL,
         dry_run=True,
     )
     assert code == 0
-    latest = state.list_runs(tmp_path / RUNS_DIRNAME)[-1]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.run_id.endswith("-pytest-prompt")
     assert latest.workflow == "prompt"
     assert [s.name for s in latest.stages] == ["task-prompt", "task-review-1"]
@@ -53,9 +71,7 @@ def test_prompt_workflow_unknown_task(tmp_path: Path, monkeypatch) -> None:
         phase="99",
         epic="Z",
         task="Z9",
-        repo=tmp_path,
-        aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME,
+        **_roots(tmp_path),
         label=RUN_LABEL,
         dry_run=True,
     )
@@ -69,9 +85,7 @@ def test_prompt_workflow_requires_main_for_real_run(tmp_path: Path, monkeypatch)
         phase="03",
         epic="E4",
         task="E4.1",
-        repo=tmp_path,
-        aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME,
+        **_roots(tmp_path),
         label=RUN_LABEL,
         dry_run=False,
     )
@@ -86,9 +100,7 @@ def test_prompt_workflow_requires_clean_tree(tmp_path: Path, monkeypatch) -> Non
         phase="03",
         epic="E4",
         task="E4.1",
-        repo=tmp_path,
-        aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME,
+        **_roots(tmp_path),
         label=RUN_LABEL,
         dry_run=False,
     )
@@ -209,7 +221,7 @@ def _fake_stages(review_body: str, *, fix_status: str = "succeeded", approve_rev
     def fake_run_stage(spec, **kwargs):
         repo = kwargs["repo_root"]
         state = kwargs["state"]
-        directory = run_dir(repo / RUNS_DIRNAME, state.run_id)
+        directory = run_dir(kwargs["runs_root"], state.run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
 
@@ -293,12 +305,11 @@ def test_approval_gate_defaults_to_not_required(
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", repo=tmp_path, aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME, label=RUN_LABEL, approve_all=False
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=False
     )
 
     assert code == 0
-    latest = state.list_runs(tmp_path / RUNS_DIRNAME)[-1]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
     gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
     assert gate.decision == "approved"
     assert gate.mechanism == "optional (default)"
@@ -318,16 +329,14 @@ def test_approval_gate_can_be_required(
         phase="03",
         epic="E4",
         task="E4.1",
-        repo=tmp_path,
-        aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME,
+        **_roots(tmp_path),
         label=RUN_LABEL,
         approve_all=False,
         require_approval=True,
     )
 
     assert code == 3
-    latest = state.list_runs(tmp_path / RUNS_DIRNAME)[-1]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
     gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
     assert gate.decision == "denied"
 
@@ -340,8 +349,7 @@ def test_review_fix_loop_fixes_blocking_individually_and_batches_could_fix(
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", repo=tmp_path, aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME, label=RUN_LABEL, approve_all=True
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
     )
 
     assert code == 0
@@ -381,8 +389,7 @@ def test_multiple_could_fix_findings_share_one_stage(
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", repo=tmp_path, aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME, label=RUN_LABEL, approve_all=True
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
     )
 
     assert code == 0
@@ -414,8 +421,7 @@ def test_could_fix_only_review_still_runs_one_combined_stage(
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", repo=tmp_path, aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME, label=RUN_LABEL, approve_all=True
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
     )
 
     assert code == 0
@@ -437,8 +443,7 @@ def test_review_fix_loop_falls_back_to_one_combined_stage(
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", repo=tmp_path, aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME, label=RUN_LABEL, approve_all=True
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
     )
 
     assert code == 0
@@ -461,8 +466,7 @@ def test_bold_review_drives_per_finding_fixes(tmp_path: Path, monkeypatch, capsy
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", repo=tmp_path, aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME, label=RUN_LABEL, approve_all=True
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
     )
 
     assert code == 0
@@ -488,8 +492,7 @@ def test_failed_fix_stage_stops_the_run(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", repo=tmp_path, aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME, label=RUN_LABEL, approve_all=True
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
     )
 
     assert code == 1
@@ -525,8 +528,7 @@ def test_three_review_rounds_then_accept_without_another_review(
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", repo=tmp_path, aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME, label=RUN_LABEL, approve_all=True
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
     )
 
     assert code == 0
@@ -549,7 +551,7 @@ def test_three_review_rounds_then_accept_without_another_review(
         "task-review-fixes-3-3",
     ]
 
-    latest = state.list_runs(tmp_path / RUNS_DIRNAME)[-1]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.SUCCEEDED
     gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
     assert "assumed_ok=True" in gate.detail
@@ -568,8 +570,7 @@ def test_a_blocked_final_review_still_fails_closed(
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", repo=tmp_path, aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME, label=RUN_LABEL, approve_all=False
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=False
     )
 
     assert code == 3
@@ -633,7 +634,7 @@ def test_review_uses_resolved_path_and_commits(tmp_path: Path, monkeypatch) -> N
     def fake_run_stage(spec, **kwargs):
         repo = kwargs["repo_root"]
         state = kwargs["state"]
-        directory = run_dir(repo / RUNS_DIRNAME, state.run_id)
+        directory = run_dir(kwargs["runs_root"], state.run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
 
@@ -665,9 +666,7 @@ def test_review_uses_resolved_path_and_commits(tmp_path: Path, monkeypatch) -> N
         phase="03",
         epic="E4",
         task="E4.1",
-        repo=tmp_path,
-        aidt=toolkit_root(),
-        runs_root=tmp_path / RUNS_DIRNAME,
+        **_roots(tmp_path),
         label=RUN_LABEL,
         approve_all=True,
     )
