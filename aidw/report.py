@@ -55,6 +55,39 @@ def throughput(record: StageRecord) -> str | None:
     return f"{value:.1f} out-tok/s"
 
 
+def timing_line(record: StageRecord) -> str:
+    """``"ai=176.5s tools=183.2s"`` — stage wall time split by activity (design §9.2).
+
+    ``tools`` is ``tool_seconds`` (time Pi spent executing tool calls). ``ai`` is the
+    complement of the stage's ``duration_seconds``: model prefill, generation and
+    provider wait, plus subprocess startup. The two terms therefore account for the whole
+    stage, which is more useful than the narrower ``generation_seconds`` (streaming only,
+    prefill excluded). When ``tool_seconds`` was not measured the tools term is omitted
+    and ``ai`` falls back to ``generation_seconds``, so a record without either field
+    yields an empty line rather than a fabricated split.
+    """
+    tools = record.tool_seconds
+    parts = []
+    if tools is not None and record.duration_seconds is not None:
+        parts.append(f"ai={max(0.0, record.duration_seconds - tools):g}s")
+    elif record.generation_seconds is not None:
+        parts.append(f"ai={record.generation_seconds:g}s")
+    if tools is not None:
+        parts.append(f"tools={tools:g}s")
+    return " ".join(parts)
+
+
+def tool_breakdown_line(breakdown: dict[str, float] | None) -> str:
+    """``"bash=95.2s read=60.1s edit=20s"`` — per-tool shares of stage tool time.
+
+    Names arrive longest-first from :func:`aidw.pi.tool_breakdown`; the empty string is
+    returned for a stage that made no tool calls, so a caller can skip the line.
+    """
+    if not breakdown:
+        return ""
+    return " ".join(f"{name}={seconds:g}s" for name, seconds in breakdown.items())
+
+
 def cost_note(model: str, usage: dict[str, Any] | None) -> str | None:
     """Warn about token spend with no recorded cost (design §9.2).
 

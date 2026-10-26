@@ -17,7 +17,14 @@ from typing import Optional
 
 import typer
 
-from aidw import __version__, git, inventory, runner as runner_mod, state as state_mod
+from aidw import (
+    __version__,
+    git,
+    inventory,
+    pi as pi_mod,
+    runner as runner_mod,
+    state as state_mod,
+)
 from aidw import verification
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.doctor import run_doctor
@@ -33,7 +40,14 @@ from aidw.paths import (
     WorkspacePaths,
 )
 from aidw.roadmap import filter_tasks, find_task, load_tasks, next_todo
-from aidw.report import rel_to, stage_lines, throughput, usage_line
+from aidw.report import (
+    rel_to,
+    stage_lines,
+    throughput,
+    timing_line,
+    tool_breakdown_line,
+    usage_line,
+)
 from aidw.runner import StageSpec, resolve_prompt, run_stage
 from aidw.workflows import approve as approve_workflow
 from aidw.workflows import fix as fix_workflow
@@ -699,7 +713,21 @@ def runs(
         typer.echo(f"workflow: {loaded.workflow}")
         typer.echo(f"status:   {loaded.status}")
         typer.echo(f"branch:   {loaded.git.get('branch') or '-'}")
+        run_directory = state_mod.run_dir(runs_root, loaded.run_id)
         for stage in loaded.stages:
+            # A run recorded before these fields existed still has Pi's per-call
+            # ``durationMs`` in its stage log, so recover the split rather than hiding
+            # it. Display-only: ``state.json`` is left untouched by a read command. The
+            # log is parsed once and both the total and the per-tool split come from it.
+            if (stage.tool_seconds is None or not stage.tool_breakdown) and stage.log:
+                recovered = pi_mod.tool_breakdown_from_log(run_directory / stage.log)
+                if recovered:
+                    if stage.tool_seconds is None:
+                        stage = dataclasses.replace(
+                            stage, tool_seconds=round(sum(recovered.values()), 3)
+                        )
+                    if not stage.tool_breakdown:
+                        stage = dataclasses.replace(stage, tool_breakdown=recovered)
             detail = f"{stage.status} ({stage.agent}, {stage.model})"
             if stage.duration_seconds is not None:
                 detail += f", {stage.duration_seconds:g}s"
@@ -712,6 +740,12 @@ def runs(
             measured = usage_line(stage.usage)
             if measured:
                 typer.echo(f"          usage: {measured}")
+            timing = timing_line(stage)
+            if timing:
+                typer.echo(f"          timing: {timing}")
+            breakdown = tool_breakdown_line(stage.tool_breakdown)
+            if breakdown:
+                typer.echo(f"          tools:  {breakdown}")
             out = stage.artifacts.get("out")
             if out:
                 typer.echo(f"          out:   {rel_to(Path(loaded.repo_root), out)}")

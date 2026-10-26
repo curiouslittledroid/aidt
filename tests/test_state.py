@@ -179,6 +179,8 @@ def test_stage_throughput_round_trips_without_a_schema_bump(tmp_path: Path) -> N
             agent="a",
             model="m",
             generation_seconds=4.0,
+            tool_seconds=9.0,
+            tool_breakdown={"read": 6.0, "bash": 3.0},
             output_tokens_per_second=25.0,
         )
     )
@@ -187,6 +189,8 @@ def test_stage_throughput_round_trips_without_a_schema_bump(tmp_path: Path) -> N
     loaded = load(tmp_path / run.run_id)
     assert loaded.schema_version == state.SCHEMA_VERSION
     assert loaded.stages[0].generation_seconds == 4.0
+    assert loaded.stages[0].tool_seconds == 9.0
+    assert loaded.stages[0].tool_breakdown == {"read": 6.0, "bash": 3.0}
     assert loaded.stages[0].output_tokens_per_second == 25.0
 
 
@@ -209,4 +213,6 @@ def test_old_state_without_throughput_still_loads(tmp_path: Path) -> None:
     )
     loaded = load(directory)
     assert loaded.stages[0].generation_seconds is None
+    assert loaded.stages[0].tool_seconds is None
+    assert loaded.stages[0].tool_breakdown is None
     assert loaded.stages[0].output_tokens_per_second is None

@@ -207,6 +207,8 @@ def run_stage(
     record.cost_usd = result.usage.cost_usd
     record.usage = asdict(result.usage)
     record.generation_seconds = result.generation_seconds
+    record.tool_seconds = result.tool_seconds
+    record.tool_breakdown = result.tool_breakdown or None
     record.output_tokens_per_second = result.output_tokens_per_second
     record.log = f"stages/{spec.name}.jsonl"
     record.artifacts["out"] = result.out_path

@@ -18,6 +18,10 @@ from aidw.pi import (
     is_transient,
     parse_events,
     parse_json_lines,
+    tool_breakdown,
+    tool_breakdown_from_log,
+    tool_execution_seconds,
+    tool_seconds_from_log,
     write_meta,
 )
 
@@ -321,6 +325,147 @@ def test_generation_seconds_ignores_non_assistant_and_malformed() -> None:
     assert generation_seconds(lines) == 0.0
 
 
+def test_tool_execution_seconds_prefers_pi_duration_ms() -> None:
+    """Each call's recorded elapsed time is summed; generation gaps are excluded."""
+    lines = [
+        _timed(0.0, {"type": "message_update", "usage": {"output": 0}}),
+        _timed(1.0, {"type": "tool_execution_start", "toolCallId": "a", "toolName": "read"}),
+        _timed(
+            3.5,
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "a",
+                "toolName": "read",
+                "durationMs": 2500,
+                "isError": False,
+            },
+        ),
+        _timed(9.0, {"type": "tool_execution_start", "toolCallId": "b", "toolName": "bash"}),
+        _timed(
+            9.5,
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "b",
+                "toolName": "bash",
+                "durationMs": 500,
+                "isError": False,
+            },
+        ),
+    ]
+    assert tool_execution_seconds(lines) == pytest.approx(3.0)
+
+
+def test_tool_execution_seconds_falls_back_to_arrival_windows() -> None:
+    """A stream without ``durationMs`` is measured between start and end per call."""
+    lines = [
+        _timed(1.0, {"type": "tool_execution_start", "toolCallId": "a", "toolName": "read"}),
+        _timed(3.5, {"type": "tool_execution_end", "toolCallId": "a", "toolName": "read"}),
+        _timed(4.0, {"type": "tool_execution_start", "toolCallId": "b", "toolName": "bash"}),
+        _timed(4.5, {"type": "tool_execution_end", "toolCallId": "b", "toolName": "bash"}),
+    ]
+    assert tool_execution_seconds(lines) == pytest.approx(3.0)
+
+
+def test_tool_execution_seconds_ignores_unterminated_and_malformed() -> None:
+    lines = [
+        _timed(0.0, {"type": "tool_execution_start", "toolCallId": "a", "toolName": "read"}),
+        (1.0, "{not json"),
+        (2.0, ""),
+    ]
+    assert tool_execution_seconds(lines) == 0.0
+
+
+def test_tool_seconds_from_log_recovers_a_persisted_run(tmp_path: Path) -> None:
+    """A stage log recorded before ``tool_seconds`` existed still yields tool time."""
+    log = tmp_path / "s.jsonl"
+    log.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "tool_execution_end", "toolCallId": "a", "durationMs": 1500}),
+                json.dumps({"type": "tool_execution_end", "toolCallId": "b", "durationMs": 2500}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert tool_seconds_from_log(log) == pytest.approx(4.0)
+    assert tool_seconds_from_log(tmp_path / "missing.jsonl") is None
+
+
+def test_tool_breakdown_groups_by_name_longest_first() -> None:
+    """Per-tool seconds are summed by name and ordered longest-first."""
+    lines = [
+        _timed(0.0, {"type": "tool_execution_start", "toolCallId": "a", "toolName": "read"}),
+        _timed(
+            2.5,
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "a",
+                "toolName": "read",
+                "durationMs": 2500,
+            },
+        ),
+        _timed(3.0, {"type": "tool_execution_start", "toolCallId": "b", "toolName": "bash"}),
+        _timed(
+            10.0,
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "b",
+                "toolName": "bash",
+                "durationMs": 7000,
+            },
+        ),
+        _timed(11.0, {"type": "tool_execution_start", "toolCallId": "c", "toolName": "read"}),
+        _timed(
+            12.0,
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "c",
+                "toolName": "read",
+                "durationMs": 1000,
+            },
+        ),
+    ]
+    assert tool_breakdown(lines) == {"bash": 7.0, "read": 3.5}
+    # The total is exactly the sum of the parts, so a display can never disagree.
+    assert tool_execution_seconds(lines) == pytest.approx(10.5)
+
+
+def test_tool_breakdown_from_log_ignores_missing_read_times(tmp_path: Path) -> None:
+    """A persisted log has no arrival times, so only ``durationMs`` is trusted."""
+    log = tmp_path / "s.jsonl"
+    log.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "tool_execution_start", "toolCallId": "a", "toolName": "read"}),
+                json.dumps({"type": "tool_execution_end", "toolCallId": "a", "toolName": "read"}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolCallId": "b",
+                        "toolName": "bash",
+                        "durationMs": 1500,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert tool_breakdown_from_log(log) == {"bash": 1.5}
+    assert tool_breakdown_from_log(tmp_path / "missing.jsonl") == {}
+
+
+def test_tool_seconds_from_log_is_none_when_unmeasurable(tmp_path: Path) -> None:
+    """No ``durationMs`` and no read times must not masquerade as zero tool time."""
+    log = tmp_path / "s.jsonl"
+    log.write_text(
+        json.dumps({"type": "tool_execution_end", "toolCallId": "a"}) + "\n",
+        encoding="utf-8",
+    )
+    assert tool_seconds_from_log(log) is None
+
+
 def test_output_tokens_per_second_rounds_and_guards_zero() -> None:
     assert _pi_result(
         usage=Usage(output_tokens=100), generation_seconds=4.0
@@ -337,6 +482,8 @@ def test_write_meta_records_generation_and_throughput(tmp_path: Path) -> None:
     write_meta(path, result, ["pi", "-p"], model="m", stage="s")
     meta = json.loads(path.read_text(encoding="utf-8"))
     assert meta["generation_seconds"] == 4.0
+    assert meta["tool_seconds"] is None
+    assert meta["tool_breakdown"] == {}
     assert meta["output_tokens_per_second"] == 25.0
 
 

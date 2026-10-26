@@ -426,8 +426,12 @@ def test_stage_record_carries_generation_speed(tmp_path: Path, monkeypatch) -> N
     result = _result(0.01, tokens=100)
     result.usage.output_tokens = 100
     result.generation_seconds = 2.0
+    result.tool_seconds = 7.5
+    result.tool_breakdown = {"read": 7.5}
 
     record, _log = _run_with_result(tmp_path, monkeypatch, result)
 
     assert record.generation_seconds == 2.0
+    assert record.tool_seconds == 7.5
+    assert record.tool_breakdown == {"read": 7.5}
     assert record.output_tokens_per_second == 50.0

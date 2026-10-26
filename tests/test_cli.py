@@ -120,6 +120,8 @@ def test_runs_list_and_show_resolve_the_state_root(tmp_path: Path) -> None:
             model="openrouter/z-ai/glm-5.3",
             status="succeeded",
             duration_seconds=10.0,
+            generation_seconds=4.0,
+            tool_seconds=6.0,
             output_tokens_per_second=42.5,
         )
     )
@@ -135,6 +137,59 @@ def test_runs_list_and_show_resolve_the_state_root(tmp_path: Path) -> None:
     assert f"run:      {created.run_id}" in shown.stdout
     assert "workflow: implement" in shown.stdout
     assert "42.5 out-tok/s" in shown.stdout
+    assert "timing: ai=4s tools=6s" in shown.stdout
+
+
+def test_runs_show_recovers_tool_time_from_an_old_stage_log(tmp_path: Path) -> None:
+    """A record written before ``tool_seconds`` existed still shows a tools figure."""
+    _init_repo(tmp_path)
+    runs_root = _runs_root(tmp_path)
+    created = state_mod.create_run(
+        runs_root, tmp_path, "implement", label="03-E4.2", branch="03-E4.2"
+    )
+    created.record_stage(
+        state_mod.StageRecord(
+            name="test",
+            agent="tester",
+            model="openrouter/openai/gpt-5.6-luna",
+            status="succeeded",
+            duration_seconds=100.0,
+            generation_seconds=10.0,
+            log="stages/test.jsonl",
+        )
+    )
+    state_mod.save(runs_root / created.run_id, created)
+    stages = runs_root / created.run_id / "stages"
+    stages.mkdir(parents=True)
+    (stages / "test.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolCallId": "a",
+                        "toolName": "read",
+                        "durationMs": 42000,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolCallId": "b",
+                        "toolName": "bash",
+                        "durationMs": 8000,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    shown = runner.invoke(app, ["--repo", str(tmp_path), "runs", "show", created.run_id])
+    assert shown.exit_code == 0
+    assert "timing: ai=50s tools=50s" in shown.stdout
+    assert "tools:  read=42s bash=8s" in shown.stdout
 
 
 def test_exec_dry_run_writes_one_run_under_the_state_root(tmp_path: Path) -> None:

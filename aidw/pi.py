@@ -79,6 +79,10 @@ class PiResult:
     error_message: str | None = None
     #: Seconds Pi spent generating assistant messages (tool execution excluded).
     generation_seconds: float | None = None
+    #: Seconds Pi spent executing tool calls (assistant generation excluded).
+    tool_seconds: float | None = None
+    #: Seconds per tool name, longest first (``{"bash": 12.3, "read": 4.5}``).
+    tool_breakdown: dict[str, float] = field(default_factory=dict)
 
     @property
     def output_tokens_per_second(self) -> float | None:
@@ -256,6 +260,87 @@ def generation_seconds(timed_lines: Iterable[tuple[float, str]]) -> float:
     return round(total, 3)
 
 
+def tool_breakdown(
+    timed_lines: Iterable[tuple[float, str]],
+    *,
+    arrival_fallback: bool = True,
+) -> dict[str, float]:
+    """Seconds spent in each tool, keyed by tool name, longest first.
+
+    Pi records each call's elapsed time as ``durationMs`` on ``tool_execution_end``, so
+    that is preferred: the persisted JSONL alone recovers the breakdown later, which is
+    what lets ``runs show`` attribute tool time for a run recorded before the fields
+    existed. When a ``tool_execution_end`` carries no ``durationMs``, the call's window is
+    measured instead from ``timed_lines`` — each raw line paired with the monotonic time
+    AIDW read it (the same read that feeds the progress indicator) — opening at
+    ``tool_execution_start`` and closing at the matching end. Set ``arrival_fallback`` to
+    ``False`` when reading a persisted log, which carries no read times and would report a
+    bogus zero for every call. An unterminated call contributes nothing, and prompt
+    prefill and the gap before the next model response are excluded.
+    """
+    totals: dict[str, float] = {}
+    opened: dict[object, tuple[str, float]] = {}
+    for at, raw in timed_lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        key = event.get("toolCallId")
+        name = str(event.get("toolName") or "unknown")
+        if kind == "tool_execution_start":
+            opened.setdefault(key, (name, at))
+        elif kind == "tool_execution_end":
+            duration_ms = event.get("durationMs")
+            if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
+                seconds = max(0.0, float(duration_ms)) / 1000.0
+                opened.pop(key, None)
+            elif arrival_fallback and key in opened:
+                seconds = max(0.0, at - opened.pop(key)[1])
+            else:
+                continue
+            totals[name] = totals.get(name, 0.0) + seconds
+    return {
+        name: round(value, 3)
+        for name, value in sorted(totals.items(), key=lambda item: item[1], reverse=True)
+    }
+
+
+def tool_execution_seconds(timed_lines: Iterable[tuple[float, str]]) -> float:
+    """Seconds Pi spent executing tool calls, excluding assistant generation."""
+    return round(sum(tool_breakdown(timed_lines).values()), 3)
+
+
+def tool_breakdown_from_log(path: Path) -> dict[str, float]:
+    """Per-tool seconds recoverable from a persisted stage JSONL, else ``{}``.
+
+    A run recorded before these fields existed still carries Pi's per-call ``durationMs``,
+    so a read-only command can attribute its tool time without re-running anything.
+    """
+    if not path.is_file():
+        return {}
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return tool_breakdown(
+                ((0.0, line) for line in handle), arrival_fallback=False
+            )
+    except OSError:
+        return {}
+
+
+def tool_seconds_from_log(path: Path) -> float | None:
+    """Total tool seconds recoverable from a persisted stage JSONL, or ``None``."""
+    breakdown = tool_breakdown_from_log(path)
+    if not breakdown:
+        return None
+    return round(sum(breakdown.values()), 3)
+
+
 def is_transient(stderr: str, exit_code: int) -> bool:
     if exit_code == 0:
         return False
@@ -417,6 +502,10 @@ def execute(
     # nothing), so prefill and tool execution are excluded. ``arrivals`` belongs to the
     # last attempt: a retry overwrites the transcript, which is accepted.
     generation = generation_seconds(zip(arrivals, lines)) or None
+    # One parse feeds both the total and the per-tool split; the total is the sum of the
+    # (already rounded) parts so ``runs show`` can never print parts that disagree with it.
+    breakdown = tool_breakdown(zip(arrivals, lines))
+    tool_time = round(sum(breakdown.values()), 3) or None
     if parsed.final_message:
         out_path.write_text(parsed.final_message + "\n", encoding="utf-8")
         final_out: str | None = str(out_path)
@@ -453,6 +542,8 @@ def execute(
         out_path=final_out,
         error_message=parsed.error_message,
         generation_seconds=generation,
+        tool_seconds=tool_time,
+        tool_breakdown=breakdown,
     )
 
 
@@ -492,6 +583,8 @@ def write_meta(
         "tool_errors": result.tool_errors,
         "event_count": result.event_count,
         "generation_seconds": result.generation_seconds,
+        "tool_seconds": result.tool_seconds,
+        "tool_breakdown": result.tool_breakdown,
         "output_tokens_per_second": result.output_tokens_per_second,
         "usage": asdict(result.usage),
     }

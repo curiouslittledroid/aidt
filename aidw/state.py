@@ -79,6 +79,10 @@ class StageRecord:
     usage: dict[str, Any] | None = None
     #: Seconds Pi spent generating assistant text (tool execution excluded).
     generation_seconds: float | None = None
+    #: Seconds Pi spent executing tool calls (assistant generation excluded).
+    tool_seconds: float | None = None
+    #: Seconds per tool name, longest first; sums to ``tool_seconds`` (design §9.2).
+    tool_breakdown: dict[str, float] | None = None
     #: Output tokens per second of generation time (design §9.2).
     output_tokens_per_second: float | None = None
     log: str | None = None

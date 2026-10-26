@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aidw.report import cost_note, rel_to, short_count, stage_lines, throughput, usage_line
+from aidw.report import (
+    cost_note,
+    rel_to,
+    short_count,
+    stage_lines,
+    throughput,
+    timing_line,
+    tool_breakdown_line,
+    usage_line,
+)
 from aidw.state import FAILED, PLANNED, SUCCEEDED, StageRecord
 
 USAGE = {
@@ -133,6 +142,28 @@ def test_stage_lines_omit_throughput_when_unmeasured() -> None:
     lines = stage_lines(_record(), repo_root=Path("/repo"))
     assert "out-tok/s" not in lines[0]
     assert throughput(_record()) is None
+
+
+def test_timing_line_partitions_duration_into_ai_and_tools() -> None:
+    """``ai`` is the duration complement of tool time, so both terms add up."""
+    assert timing_line(_record(generation_seconds=2.5, tool_seconds=9.0)) == (
+        "ai=60.1s tools=9s"
+    )
+    assert timing_line(_record(tool_seconds=9.0)) == "ai=60.1s tools=9s"
+
+
+def test_timing_line_falls_back_to_generation_without_tool_time() -> None:
+    assert timing_line(_record(generation_seconds=2.5)) == "ai=2.5s"
+    assert timing_line(_record(generation_seconds=2.5, duration_seconds=None)) == "ai=2.5s"
+    assert timing_line(_record()) == ""
+
+
+def test_tool_breakdown_line_lists_tools_in_order() -> None:
+    assert tool_breakdown_line({"bash": 95.2, "read": 60.1, "edit": 20.0}) == (
+        "bash=95.2s read=60.1s edit=20s"
+    )
+    assert tool_breakdown_line({}) == ""
+    assert tool_breakdown_line(None) == ""
 
 
 def test_rel_to_falls_back_outside_the_base() -> None:

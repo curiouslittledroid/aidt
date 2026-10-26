@@ -602,6 +602,8 @@ aidt/runs/<utc-stamp>-<task-or-pr>-<workflow>/
       "exit_code": 0,
       "duration_seconds": 812.4,
       "generation_seconds": 0.5,
+      "tool_seconds": 780.1,
+      "tool_breakdown": { "bash": 700.0, "read": 60.1, "edit": 20.0 },
       "output_tokens_per_second": 32.0,
       "cost_usd": 1.23,
       "usage": { "input_tokens": 193, "output_tokens": 16, "cache_read": 50432,
@@ -628,9 +630,18 @@ The per-stage throughput fields are stored, not aggregated: two stages of the sa
 run stay separate. `generation_seconds` is the time Pi spent generating assistant messages,
 measured from the monotonic instant AIDW read each event (Pi timestamps nothing itself); prompt
 prefill and every tool call fall outside it, so `output_tokens_per_second` is generation speed
-rather than effective wall-clock throughput. Both are `null` when the stage produced no output or
-the stream carried no measurable window. They are additive to the existing schema —
-`schema_version` does not move — so runs written before the fields existed still load.
+rather than effective wall-clock throughput. `tool_seconds` is the complementary measure: the sum of
+Pi's per-call `durationMs` recorded on `tool_execution_end`, or, for a stream that predates that
+field, the interval between each `tool_execution_start` and its end; prompt prefill and assistant
+generation are excluded. `aidw runs show` prints a `timing:` line per stage that attributes the
+whole stage wall time: `tools` is `tool_seconds` and `ai` is the remainder — model prefill,
+generation, provider wait and subprocess startup — so the two figures add up to `duration_seconds`
+instead of leaving the reader to wonder where the rest went. A `tools:` line then breaks `tools` down
+by name (longest first, summed from the same calls, so the parts add up to the total), showing which
+tool actually consumed the time. Because the persisted JSONL carries `durationMs`, the show command
+recovers both figures for a run recorded before the fields existed (display-only; the run is not
+rewritten). Each field is `null` when its window was not measured; they are additive to the existing
+schema — `schema_version` does not move — so runs written before the fields existed still load.
 
 A stage that records token spend at a zero cost is a **pricing gap, not a free run**: Pi computes
 cost from the resolved model's price table, so a `models.json` `models` entry that shadows a
@@ -898,6 +909,7 @@ Exit codes: `0` success/approved, `1` stage or gate failure, `2` usage/config er
 | F5 | `pytest` locally; not part of the product's pnpm CI. |
 | F6 | Auto-detect repo root from any cwd; absolute paths internally. |
 | F7 | AIDT = AI Developer Tools; AIDW = AI Developer Workflows. |
+| G1 | Stage wall time is attributed as `generation_seconds` (streaming the model) and `tool_seconds` (sum of Pi's per-call `durationMs`, or start/end intervals when that field is absent), with `tool_breakdown` splitting tool time by name. `runs show` displays a `timing:` line whose `tools` term is `tool_seconds` and whose `ai` term is the `duration_seconds` remainder, so the two add up, then a `tools:` line listing the per-name split. It recovers both from the stage JSONL for records written before the fields existed. None is aggregated, and the fields are additive at the same `schema_version`. |
 
 ---
 
