@@ -672,3 +672,331 @@ def test_review_uses_resolved_path_and_commits(tmp_path: Path, monkeypatch) -> N
     assert code == 0
     assert captured == [["docs/task-prompts/03-E4.1.md"]]
     assert git.status_short(tmp_path, paths=["docs/task-prompts/03-E4.1.md"]) == ""
+
+
+# ---------------------------------------------------------------------------
+# L1.1 — fetch and require the base branch to be current (design §8.1, §13)
+# ---------------------------------------------------------------------------
+
+
+def _run_git(args: list[str], cwd: Path) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _explode_stage(*args: object, **kwargs: object) -> object:
+    raise AssertionError("no stage may run when the preflight refuses")
+
+
+def _origin_and_clone(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a bare ``origin`` and a clone whose ``main`` carries the roadmap fixture.
+
+    The clone is the target repo the workflow drives; ``origin/main`` tracks it. The
+    roadmap fixture is committed and pushed so both the base branch and its remote-tracking
+    ref resolve from the first run.
+    """
+    origin = tmp_path / "origin.git"
+    clone = tmp_path / "clone"
+    _run_git(["init", "-q", "--bare", "-b", "main", str(origin)], tmp_path)
+    _run_git(["clone", "-q", str(origin), str(clone)], tmp_path)
+    tasks_dir = clone / "docs" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    (tasks_dir / "03 - Test Phase.md").write_text(ROADMAP_FIXTURE, encoding="utf-8")
+    _run_git(["add", "."], clone)
+    _run_git(["commit", "-qm", "init"], clone)
+    _run_git(["push", "-q", "-u", "origin", "main"], clone)
+    return origin, clone
+
+
+def _advance_origin(tmp_path: Path, origin: Path, name: str) -> str:
+    """Push a new commit to ``origin/main`` from a throwaway clone; return its sha."""
+    pusher = tmp_path / f"pusher-{name}"
+    _run_git(["clone", "-q", str(origin), str(pusher)], tmp_path)
+    (pusher / f"{name}.txt").write_text(f"{name}\n", encoding="utf-8")
+    _run_git(["add", f"{name}.txt"], pusher)
+    _run_git(["commit", "-qm", f"advance {name}"], pusher)
+    _run_git(["push", "-q", "origin", "main"], pusher)
+    return git.rev_parse(pusher, "HEAD") or ""
+
+
+def _local_commit(clone: Path, name: str) -> str:
+    """Commit a local-only change on ``main`` in the clone; return its sha."""
+    (clone / f"{name}.txt").write_text(f"{name}\n", encoding="utf-8")
+    _run_git(["add", f"{name}.txt"], clone)
+    _run_git(["commit", "-qm", f"local {name}"], clone)
+    return git.rev_parse(clone, "HEAD") or ""
+
+
+def _break_origin(clone: Path, url: str = "https://user:token@127.0.0.1:1/nope.git") -> None:
+    _run_git(["remote", "set-url", "origin", url], clone)
+
+
+def _approve_first_review():
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    return seen, fake
+
+
+def test_fetch_is_noninteractive_and_bounded(tmp_path: Path, monkeypatch) -> None:
+    """The spawn reaches subprocess with ``GIT_TERMINAL_PROMPT=0`` and the timeout."""
+    captured: dict = {}
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return _Result()
+
+    monkeypatch.setattr(git.subprocess, "run", fake_run)
+    ok, reason = git.fetch(tmp_path, timeout=7)
+
+    assert ok is True and reason == ""
+    assert captured["cmd"] == ["git", "fetch", "origin"]
+    assert captured["kwargs"]["timeout"] == 7
+    assert captured["kwargs"]["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_fetch_default_timeout_is_thirty_seconds(tmp_path: Path, monkeypatch) -> None:
+    captured: dict = {}
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        captured["kwargs"] = kwargs
+        return _Result()
+
+    monkeypatch.setattr(git.subprocess, "run", fake_run)
+    assert git.fetch(tmp_path) == (True, "")
+    assert captured["kwargs"]["timeout"] == 30
+
+
+def test_fetch_timeout_counts_as_failure(tmp_path: Path, monkeypatch) -> None:
+    def fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    monkeypatch.setattr(git.subprocess, "run", fake_run)
+    ok, reason = git.fetch(tmp_path, timeout=1)
+
+    assert ok is False
+    assert "timed out" in reason
+
+
+def test_is_ancestor_is_tristate(tmp_path: Path) -> None:
+    _run_git(["init", "-q", "-b", "main", str(tmp_path)], tmp_path)
+    (tmp_path / "a.txt").write_text("a\n", encoding="utf-8")
+    _run_git(["add", "a.txt"], tmp_path)
+    _run_git(["commit", "-qm", "a"], tmp_path)
+    parent = git.rev_parse(tmp_path, "HEAD")
+    (tmp_path / "b.txt").write_text("b\n", encoding="utf-8")
+    _run_git(["add", "b.txt"], tmp_path)
+    _run_git(["commit", "-qm", "b"], tmp_path)
+    child = git.rev_parse(tmp_path, "HEAD")
+
+    assert git.is_ancestor(tmp_path, parent or "", child or "") is True
+    assert git.is_ancestor(tmp_path, child or "", parent or "") is False
+    assert git.is_ancestor(tmp_path, "0" * 40, child or "") is None
+
+
+def test_preflight_equal_base_proceeds_silently(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _origin, clone = _origin_and_clone(tmp_path)
+    _seen, fake = _approve_first_review()
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    err = capsys.readouterr().err
+    assert err == ""
+
+
+def test_preflight_behind_refuses_before_writing(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    origin, clone = _origin_and_clone(tmp_path)
+    remote_sha = _advance_origin(tmp_path, origin, "upstream")
+    local_sha = git.rev_parse(clone, "main") or ""
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert local_sha in err and remote_sha in err
+    assert "behind" in err
+    assert "git pull --ff-only" in err
+    # A refusal leaves no run directory, no ``{phase}-{task}`` branch and no prompt file.
+    assert state.list_runs(_runs_root(clone)) == []
+    assert git.current_branch(clone) == "main"
+    assert git.rev_parse(clone, "03-E4.1") is None
+    assert not (clone / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
+
+
+def test_preflight_diverged_refuses_without_a_destructive_command(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    origin, clone = _origin_and_clone(tmp_path)
+    remote_sha = _advance_origin(tmp_path, origin, "upstream")
+    local_sha = _local_commit(clone, "local")
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert local_sha in err and remote_sha in err
+    assert "diverged" in err
+    assert "reset" not in err.lower()
+    assert "force" not in err.lower()
+    assert state.list_runs(_runs_root(clone)) == []
+
+
+def test_preflight_ahead_warns_and_proceeds(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _origin, clone = _origin_and_clone(tmp_path)
+    _local_commit(clone, "local")
+    _seen, fake = _approve_first_review()
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    assert "ahead" in capsys.readouterr().err
+
+
+def test_preflight_without_origin_warns_and_proceeds(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    repo = tmp_path / "plain"
+    _run_git(["init", "-q", "-b", "main", str(repo)], tmp_path)
+    tasks_dir = repo / "docs" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    (tasks_dir / "03 - Test Phase.md").write_text(ROADMAP_FIXTURE, encoding="utf-8")
+    _run_git(["add", "."], repo)
+    _run_git(["commit", "-qm", "init"], repo)
+    _seen, fake = _approve_first_review()
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(repo), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "cannot verify" in err
+
+
+def test_preflight_stale_cache_still_refuses_when_fetch_fails(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A failed fetch does not decide the verdict: the cached ref still refuses."""
+    origin, clone = _origin_and_clone(tmp_path)
+    _advance_origin(tmp_path, origin, "upstream")
+    _run_git(["fetch", "origin"], clone)  # cache origin/main ahead of the local branch
+    _break_origin(clone)
+    remote_sha = git.rev_parse(clone, "origin/main") or ""
+    local_sha = git.rev_parse(clone, "main") or ""
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert "could not fetch" in err
+    assert local_sha in err and remote_sha in err
+    assert "git pull --ff-only" in err
+    assert state.list_runs(_runs_root(clone)) == []
+
+
+def test_preflight_fetch_warning_redacts_credentials(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _origin, clone = _origin_and_clone(tmp_path)
+    _break_origin(clone)
+    _seen, fake = _approve_first_review()
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "could not fetch" in err
+    assert "token" not in err
+    assert "user:token@" not in err
+    assert "127.0.0.1" in err  # the host survives; only the userinfo is removed
+
+
+def test_no_fetch_warns_and_skips_the_stale_check(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    origin, clone = _origin_and_clone(tmp_path)
+    _advance_origin(tmp_path, origin, "upstream")
+    _seen, fake = _approve_first_review()
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    monkeypatch.setattr(git, "fetch", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("--no-fetch must not fetch")
+    ))
+    monkeypatch.setattr(git, "rev_parse", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("--no-fetch must not compare revisions")
+    ))
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(clone),
+        label=RUN_LABEL,
+        approve_all=True,
+        no_fetch=True,
+    )
+
+    assert code == 0
+    assert "--no-fetch" in capsys.readouterr().err
+
+
+def test_dry_run_never_fetches_with_an_unreachable_origin(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _origin, clone = _origin_and_clone(tmp_path)
+    _break_origin(clone)
+    calls: list[tuple] = []
+    comparisons: list[tuple] = []
+
+    def spy_fetch(*args, **kwargs):
+        calls.append(args)
+        return True, ""
+
+    def spy_rev_parse(*args, **kwargs):
+        comparisons.append(args)
+        return None
+
+    monkeypatch.setattr(git, "fetch", spy_fetch)
+    monkeypatch.setattr(git, "rev_parse", spy_rev_parse)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL, dry_run=True
+    )
+
+    assert code == 0
+    assert calls == []
+    assert comparisons == []
+    assert "[dry-run] a real run will fetch and verify the base branch" in capsys.readouterr().out

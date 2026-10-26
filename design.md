@@ -435,7 +435,7 @@ these serially by default; the design allows `--parallel`).
 ### 8.1 `aidw prompt <phase> <epic> <task>`
 
 ```
-preflight (clean tree, on main)
+preflight (clean tree, on main; fetch and refuse when the base branch is behind origin)
   → P1 task-prompt        (agent task-author)      writes docs/task-prompts/<id>-prompt.md, commits it
   → P2 task-review-1..N   (agent task-reviewer)    read-only verdict
   ⟳  if Request changes: P2a task-prompt-fixes (agent task-fixer; one stage per finding)
@@ -443,6 +443,7 @@ preflight (clean tree, on main)
   ◇  approve-task-prompt        (optional; off unless --require-approval)
 ```
 
+- The preflight fetches `origin` and refuses (exit 4) when the local base branch is behind or diverged from `origin/<base>`; `--no-fetch` skips the fetch and the comparison.
 - `P1` receives `$1=phase`, `$2=epic`, `$3=task`. The prompt itself creates the `{phase}-{task}`
   branch and commits the prompt.
 - `P2` receives `$1=<task-prompt-file>`.
@@ -808,7 +809,7 @@ aidw --help
 aidw doctor
 
 # workflows
-aidw prompt    <phase> <epic> <task> [--require-approval] [--yes] [--skip-gates ...]
+aidw prompt    <phase> <epic> <task> [--require-approval] [--yes] [--no-fetch] [--skip-gates ...]
               [--deny-gates ...] [--gate-default approve|deny] [--strict] [--dry-run]
 aidw implement <task-prompt-path> [--pr <n>] [--resume] [--from <stage>] [--parallel]
               [--yes] [--skip-gates ...] [--deny-gates ...] [--gate-default approve|deny]

@@ -260,6 +260,11 @@ def prompt(
     ),
     strict: bool = typer.Option(False, "--strict", help="Fail on config warnings."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Plan only; no writes."),
+    no_fetch: bool = typer.Option(
+        False,
+        "--no-fetch",
+        help="Skip fetching and the base-branch freshness check (offline runs).",
+    ),
 ) -> None:
     """Generate and review a task prompt (workflow group 1)."""
     repo, aidt, workspace = _roots()
@@ -277,6 +282,7 @@ def prompt(
         require_approval=require_approval,
         strict=strict,
         dry_run=dry_run,
+        no_fetch=no_fetch,
         stream=bool(_state["verbose"]),
     )
     raise typer.Exit(code)
