@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 from aidw import git, state
 from aidw.cli import app
 from aidw.paths import ToolkitPaths, TargetRepo, WorkspacePaths, repo_root, toolkit_root
-from aidw.prompts import render_prompt_file
+from aidw.prompts import PromptError, render_prompt_file
 from aidw.workflows import prompt as prompt_workflow
 
 #: Test-only run label. It keeps test-created runs identifiable and lets the session
@@ -1809,3 +1809,56 @@ def test_l21_rendered_reviewer_prompt_states_dependency_and_blocked_rules() -> N
     }
     assert "Priority: Blocked" not in rendered
     assert "End with exactly one of `Approve`, `Request changes`, or `Blocked`" in rendered
+
+
+def test_l22_rendered_reviewer_prompt_requires_verified_revision() -> None:
+    """L2.2: `Where:` carries the file/symbol and the revision/command it was verified at."""
+    prompt_path = toolkit_root() / "prompts" / "task-review.md"
+    rendered = render_prompt_file(
+        prompt_path, ["docs/task-prompts/03-E4.1-prompt.md"]
+    )
+
+    where_lines = [line for line in rendered.splitlines() if line.startswith("Where:")]
+    assert len(where_lines) == 1, "the `Where:` finding label must appear once"
+    added_line = where_lines[0]
+
+    for phrase in (
+        "name the file or symbol the finding was verified against",
+        "the revision or command used to verify it",
+        "nothing could be verified",
+    ):
+        assert phrase in added_line, phrase
+
+    # Neutrality is asserted on the added line only: the pre-existing Scope bullet
+    # already names `Design 21`, and bucket (i) ships as-is (EXTRACTION.md §4.2).
+    for forbidden in ("pnpm", "Design 21", "docs/task-prompts", "origin/00-E1.5"):
+        assert forbidden not in added_line, forbidden
+    assert not re.search(r"\b0[0-9]-E[0-9]", added_line), "no product task-id example"
+
+    # Format unchanged: the seven finding labels and the three verdict tokens are
+    # byte-stable, so `aidw/findings.py:_LABELS` and `aidw/verdict.py` still parse.
+    format_block = rendered.split("```text", 1)[1].split("```", 1)[0]
+    assert [
+        f"{line.split(':', 1)[0]}:"
+        for line in format_block.splitlines()
+        if ":" in line
+    ] == [
+        "Priority:",
+        "Confidence:",
+        "What I found:",
+        "Why it matters:",
+        "Trigger and effect:",
+        "Where:",
+        "Suggested fix:",
+    ]
+    assert "Revision:" not in format_block
+    assert "Evidence:" not in format_block
+    assert "Priority: Must fix / Should fix / Could fix" in rendered
+    assert "Confidence: 0 to 5" in rendered
+    for token in ("`Approve`", "`Request changes`", "`Blocked`"):
+        assert token in rendered, token
+    assert "End with exactly one of `Approve`, `Request changes`, or `Blocked`" in rendered
+
+    # Rendering contract: the prompt references exactly `$1`.
+    with pytest.raises(PromptError):
+        render_prompt_file(prompt_path, [])
