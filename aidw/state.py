@@ -72,6 +72,10 @@ class StageRecord:
     cost_usd: float | None = None
     #: Token/cost counters from the stage's ``.meta.json`` (``aidw.pi.Usage`` as a dict).
     usage: dict[str, Any] | None = None
+    #: Seconds Pi spent generating assistant text (tool execution excluded).
+    generation_seconds: float | None = None
+    #: Output tokens per second of generation time (design §9.2).
+    output_tokens_per_second: float | None = None
     log: str | None = None
     rendered_prompt: str | None = None
     artifacts: dict[str, Any] = field(default_factory=dict)

@@ -601,6 +601,8 @@ aidt/runs/<utc-stamp>-<task-or-pr>-<workflow>/
       "started_at": "...", "ended_at": "...",
       "exit_code": 0,
       "duration_seconds": 812.4,
+      "generation_seconds": 0.5,
+      "output_tokens_per_second": 32.0,
       "cost_usd": 1.23,
       "usage": { "input_tokens": 193, "output_tokens": 16, "cache_read": 50432,
                  "cache_write": 0, "reasoning": 0, "total_tokens": 50641, "cost_usd": 1.23 },
@@ -622,6 +624,14 @@ aidt/runs/<utc-stamp>-<task-or-pr>-<workflow>/
 stage's `cost_usd` as the fallback when a record has no `usage`), giving the run's combined
 input tokens, output tokens, and cost.
 
+The per-stage throughput fields are stored, not aggregated: two stages of the same model in one
+run stay separate. `generation_seconds` is the time Pi spent generating assistant messages,
+measured from the monotonic instant AIDW read each event (Pi timestamps nothing itself); prompt
+prefill and every tool call fall outside it, so `output_tokens_per_second` is generation speed
+rather than effective wall-clock throughput. Both are `null` when the stage produced no output or
+the stream carried no measurable window. They are additive to the existing schema —
+`schema_version` does not move — so runs written before the fields existed still load.
+
 A stage that records token spend at a zero cost is a **pricing gap, not a free run**: Pi computes
 cost from the resolved model's price table, so a `models.json` `models` entry that shadows a
 catalog model without carrying `cost` (the fix is a `modelOverrides` entry, which merges instead of
@@ -630,7 +640,8 @@ unenforceable. AIDW warns once per such stage — `WARN stage <name>: …` in `r
 it as a `note:` line in the stage block (§9.3). Local providers (`ollama`) are exempt, because
 there zero is the truth.
 
-`stages/<name>.meta.json` carries the same counters plus the prompt provenance — `stage`, `agent`,
+`stages/<name>.meta.json` carries the same counters — including `generation_seconds` and
+`output_tokens_per_second` — plus the prompt provenance — `stage`, `agent`,
 `prompt_source` (the prompt file the stage was rendered from: an `aidt/prompts/*.md` file, or an
 absolute path when `aidw exec` was given one) and `rendered_prompt` — so "which prompt did this
 stage actually use?" is answerable from the stage's own metadata.
@@ -641,10 +652,14 @@ Every stage prints a block to stdout when it finishes, derived from the stage re
 output and the recorded evidence cannot drift apart:
 
 ```text
-stage:  task-review-1 [succeeded] model=openrouter/meta/muse-spark-1.3 132.3s cost=$0.0287
+stage:  task-review-1 [succeeded] model=openrouter/meta/muse-spark-1.3 132.3s cost=$0.0287 32.0 out-tok/s
         usage: total=50.6k in=193 out=16 cache_read=50.4k cache_write=0 reasoning=0 cost=$0.0287
         out:   aidt/runs/<run-id>/stages/task-review-1.out.txt
 ```
+
+The head line's `out-tok/s` is `usage.output_tokens` divided by `generation_seconds`, the time Pi
+spent generating assistant text with prefill and tool execution excluded; it is omitted for a
+stage that generated nothing. `aidw runs show` prints the same value from `state.json`.
 
 An unpriced stage (tokens recorded, cost `$0.0000`) adds a `note:` line so the gap is explained
 next to the zero that hides it:

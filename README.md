@@ -286,14 +286,19 @@ Run artifacts land under `aidt/runs/<utc-stamp>-<task-or-pr>-<workflow>/` (gitig
 `.out.txt` and `.meta.json` siblings, and `artifacts/`. `state.json` starts with a `totals`
 section — the combined input tokens, output tokens, and cost across every stage in the run.
 
-Each finished stage also prints a report block — model, duration, cost, usage counters, and the
-`stages/<stage>.out.txt` path:
+Each finished stage also prints a report block — model, duration, cost, generation speed, usage
+counters, and the `stages/<stage>.out.txt` path:
 
 ```text
-stage:  task-review-1 [succeeded] model=openrouter/meta/muse-spark-1.3 132.3s cost=$0.0287
+stage:  task-review-1 [succeeded] model=openrouter/meta/muse-spark-1.3 132.3s cost=$0.0287 32.0 out-tok/s
         usage: total=50.6k in=193 out=16 cache_read=50.4k cache_write=0 reasoning=0 cost=$0.0287
         out:   aidt/runs/<run-id>/stages/task-review-1.out.txt
 ```
+
+Every stage also records `generation_seconds` and `output_tokens_per_second`: the time Pi spent
+generating assistant messages (prompt prefill and tool execution excluded) and the output tokens
+divided by it. The rate is stored per stage, not aggregated by model, and is `null` when the stage
+produced no output or carried no measurable generation window.
 
 `stages/<stage>.meta.json` records the same counters plus the prompt the stage used
 (`prompt_source`, `rendered_prompt`), the argv, model, session id, attempts, and exit code.

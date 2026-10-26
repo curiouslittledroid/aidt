@@ -168,3 +168,45 @@ def test_from_dict_ignores_unknown_fields() -> None:
     data = {"run_id": "x", "workflow": "w", "created_at": "t", "repo_root": "/", "future": 1}
     loaded = RunState.from_dict(data)
     assert loaded.run_id == "x"
+
+
+def test_stage_throughput_round_trips_without_a_schema_bump(tmp_path: Path) -> None:
+    """Output tokens per second is additive: old runs still load at the same version."""
+    run = create_run(tmp_path, tmp_path, "stage", label="t")
+    run.record_stage(
+        StageRecord(
+            name="s",
+            agent="a",
+            model="m",
+            generation_seconds=4.0,
+            output_tokens_per_second=25.0,
+        )
+    )
+    save(tmp_path / run.run_id, run)
+
+    loaded = load(tmp_path / run.run_id)
+    assert loaded.schema_version == state.SCHEMA_VERSION
+    assert loaded.stages[0].generation_seconds == 4.0
+    assert loaded.stages[0].output_tokens_per_second == 25.0
+
+
+def test_old_state_without_throughput_still_loads(tmp_path: Path) -> None:
+    """A run written before the fields existed loads with ``None``, not an error."""
+    directory = tmp_path / "run"
+    directory.mkdir()
+    (directory / "state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": state.SCHEMA_VERSION,
+                "run_id": "x",
+                "workflow": "w",
+                "created_at": "t",
+                "repo_root": "/",
+                "stages": [{"name": "s", "agent": "a", "model": "m"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load(directory)
+    assert loaded.stages[0].generation_seconds is None
+    assert loaded.stages[0].output_tokens_per_second is None

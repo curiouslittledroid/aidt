@@ -351,3 +351,15 @@ def test_under_cost_ceiling_succeeds(tmp_path: Path, monkeypatch) -> None:
     )
 
     assert record.status == SUCCEEDED
+
+
+def test_stage_record_carries_generation_speed(tmp_path: Path, monkeypatch) -> None:
+    """The runner copies the stream-derived rate onto the record that state.json keeps."""
+    result = _result(0.01, tokens=100)
+    result.usage.output_tokens = 100
+    result.generation_seconds = 2.0
+
+    record, _log = _run_with_result(tmp_path, monkeypatch, result)
+
+    assert record.generation_seconds == 2.0
+    assert record.output_tokens_per_second == 50.0

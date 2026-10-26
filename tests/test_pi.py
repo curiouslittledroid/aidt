@@ -14,11 +14,34 @@ from aidw.pi import (
     PiResult,
     Usage,
     _invoke,
+    generation_seconds,
     is_transient,
     parse_events,
     parse_json_lines,
     write_meta,
 )
+
+
+def _pi_result(**overrides: object) -> PiResult:
+    """A minimal successful :class:`PiResult` for tests that vary one field."""
+    values: dict[str, object] = {
+        "exit_code": 0,
+        "session_id": None,
+        "final_message": "",
+        "usage": Usage(),
+        "duration_seconds": 0.0,
+        "event_count": 0,
+        "tool_calls": 0,
+        "tool_errors": 0,
+        "stop_reason": "stop",
+        "stderr": "",
+        "timed_out": False,
+        "attempts": 1,
+        "jsonl_path": "",
+        "out_path": None,
+    }
+    values.update(overrides)
+    return PiResult(**values)  # type: ignore[arg-type]
 
 
 def _events() -> list[dict]:
@@ -252,6 +275,71 @@ def test_write_meta_records_model_usage_and_prompt_provenance(tmp_path: Path) ->
     assert meta["usage"]["input_tokens"] == 5
 
 
+# ── generation timing: output tokens per second ─────────────────────────── #
+
+
+def _timed(at: float, event: dict) -> tuple[float, str]:
+    return at, json.dumps(event)
+
+
+def test_generation_seconds_counts_only_streaming_time() -> None:
+    """Prefill and tool execution fall outside a message's window; thinking is inside."""
+    lines = [
+        _timed(0.0, {"type": "message_start", "message": {"role": "assistant"}}),
+        _timed(0.2, {"type": "message_update", "usage": {"output": 0}}),
+        _timed(0.4, {"type": "message_update", "usage": {"output": 5}}),
+        _timed(1.0, {"type": "message_end", "message": {"role": "assistant", "usage": {"output": 5}}}),
+        # An 8s tool call must not inflate generation time.
+        _timed(1.1, {"type": "tool_execution_start", "toolName": "bash"}),
+        _timed(9.0, {"type": "tool_execution_end", "toolName": "bash", "isError": False}),
+        _timed(10.0, {"type": "message_start", "message": {"role": "assistant"}}),
+        _timed(10.1, {"type": "message_update", "usage": {"output": 0}}),
+        _timed(10.4, {"type": "message_end", "message": {"role": "assistant", "usage": {"output": 2}}}),
+    ]
+    # 0.2 -> 1.0 and 10.1 -> 10.4; the 0.2s prefill and 8s tool call are excluded.
+    assert generation_seconds(lines) == pytest.approx(1.1)
+
+
+def test_generation_seconds_skips_messages_without_output() -> None:
+    """Only messages that reported output tokens contribute, matching the numerator."""
+    lines = [
+        _timed(0.0, {"type": "message_update", "usage": {"output": 0}}),
+        _timed(0.6, {"type": "message_end", "message": {"role": "assistant", "usage": {"output": 0}}}),
+        _timed(1.0, {"type": "message_update", "usage": {"output": 0}}),
+        _timed(1.5, {"type": "message_end", "message": {"role": "assistant", "usage": {"output": 7}}}),
+    ]
+    assert generation_seconds(lines) == pytest.approx(0.5)
+
+
+def test_generation_seconds_ignores_non_assistant_and_malformed() -> None:
+    lines = [
+        _timed(0.0, {"type": "message_update", "usage": {"output": 0}}),
+        _timed(0.2, {"type": "message_end", "message": {"role": "toolResult", "usage": {"output": 9}}}),
+        (0.3, "{not json"),
+        (0.4, ""),
+    ]
+    assert generation_seconds(lines) == 0.0
+
+
+def test_output_tokens_per_second_rounds_and_guards_zero() -> None:
+    assert _pi_result(
+        usage=Usage(output_tokens=100), generation_seconds=4.0
+    ).output_tokens_per_second == 25.0
+    assert _pi_result(usage=Usage(output_tokens=100)).output_tokens_per_second is None
+    assert _pi_result(
+        usage=Usage(output_tokens=0), generation_seconds=4.0
+    ).output_tokens_per_second is None
+
+
+def test_write_meta_records_generation_and_throughput(tmp_path: Path) -> None:
+    result = _pi_result(usage=Usage(output_tokens=100), generation_seconds=4.0)
+    path = tmp_path / "s.meta.json"
+    write_meta(path, result, ["pi", "-p"], model="m", stage="s")
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    assert meta["generation_seconds"] == 4.0
+    assert meta["output_tokens_per_second"] == 25.0
+
+
 # ── _invoke: streaming, prompt delivery, timeout ────────────────────────── #
 
 
@@ -319,3 +407,27 @@ def test_invoke_enforces_the_timeout(tmp_path: Path) -> None:
     assert timed_out is True
     assert time.monotonic() - start < 20
     assert code != 0
+
+
+def test_invoke_records_line_arrivals(tmp_path: Path) -> None:
+    """Pi timestamps nothing, so AIDW must time each line as it reads it."""
+    script = (
+        "import json, sys, time\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type': 'session', 'id': 's'}), flush=True)\n"
+        "time.sleep(0.15)\n"
+        "print(json.dumps({'type': 'message_end', 'message': {'role': 'assistant'}}), flush=True)\n"
+    )
+    arrivals: list[float] = []
+    code, stdout, _stderr, timed_out = _invoke(
+        [sys.executable, "-c", script],
+        "",
+        env=dict(os.environ),
+        cwd=tmp_path,
+        timeout=30.0,
+        arrivals=arrivals,
+    )
+    assert code == 0
+    assert timed_out is False
+    assert len(arrivals) == len(stdout.splitlines()) == 2
+    assert arrivals[1] - arrivals[0] >= 0.1

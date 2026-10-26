@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from aidw.report import cost_note, rel_to, short_count, stage_lines, usage_line
+from aidw.report import cost_note, rel_to, short_count, stage_lines, throughput, usage_line
 from aidw.state import FAILED, PLANNED, SUCCEEDED, StageRecord
 
 USAGE = {
@@ -120,6 +120,19 @@ def test_stage_lines_add_a_note_for_an_unpriced_stage() -> None:
 def test_stage_lines_omit_the_note_for_a_planned_stage() -> None:
     lines = stage_lines(_record(status=PLANNED, usage=dict(UNPRICED_USAGE), cost_usd=None))
     assert not any("note:" in line for line in lines)
+
+
+def test_stage_lines_show_output_tokens_per_second() -> None:
+    lines = stage_lines(
+        _record(output_tokens_per_second=47.06), repo_root=Path("/repo")
+    )
+    assert lines[0].endswith("47.1 out-tok/s")
+
+
+def test_stage_lines_omit_throughput_when_unmeasured() -> None:
+    lines = stage_lines(_record(), repo_root=Path("/repo"))
+    assert "out-tok/s" not in lines[0]
+    assert throughput(_record()) is None
 
 
 def test_rel_to_falls_back_outside_the_base() -> None:

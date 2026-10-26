@@ -77,6 +77,19 @@ class PiResult:
     jsonl_path: str
     out_path: str | None
     error_message: str | None = None
+    #: Seconds Pi spent generating assistant messages (tool execution excluded).
+    generation_seconds: float | None = None
+
+    @property
+    def output_tokens_per_second(self) -> float | None:
+        """Generated output tokens per second of generation time (design §9.2).
+
+        ``None`` when Pi generated no output or the stream carried no measurable
+        generation window, so a caller never divides by a missing or zero denominator.
+        """
+        if not self.generation_seconds or not self.usage.output_tokens:
+            return None
+        return round(self.usage.output_tokens / self.generation_seconds, 1)
 
     @property
     def provider_error(self) -> bool:
@@ -207,6 +220,42 @@ def parse_json_lines(lines: Iterable[str]) -> ParsedRun:
     return parse_events(events)
 
 
+def generation_seconds(timed_lines: Iterable[tuple[float, str]]) -> float:
+    """Seconds Pi spent generating assistant messages, excluding tool execution.
+
+    Pi timestamps nothing in its JSONL, so ``timed_lines`` pairs each raw line with the
+    monotonic time AIDW read it (the same read that feeds the progress indicator). A
+    message's window opens at its first streamed update — the first token — and closes at
+    ``message_end``; the prefill gap before it and every tool call after it fall outside.
+    Only messages that reported output tokens contribute, so the total covers exactly the
+    tokens the numerator counts.
+    """
+    total = 0.0
+    opened: float | None = None
+    for at, raw in timed_lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind == "message_update":
+            if opened is None:
+                opened = at
+        elif kind == "message_end":
+            message = event.get("message") or {}
+            if message.get("role") == "assistant":
+                usage = message.get("usage") or {}
+                if opened is not None and int(usage.get("output", 0) or 0) > 0:
+                    total += max(0.0, at - opened)
+            opened = None
+    return round(total, 3)
+
+
 def is_transient(stderr: str, exit_code: int) -> bool:
     if exit_code == 0:
         return False
@@ -236,6 +285,7 @@ def _invoke(
     cwd: Path,
     timeout: float,
     progress: ProgressIndicator | None = None,
+    arrivals: list[float] | None = None,
 ) -> tuple[int, str, str, bool]:
     """Run Pi, streaming stdout through ``progress`` and capturing everything else.
 
@@ -243,6 +293,10 @@ def _invoke(
     what makes the progress indicator live. The prompt is written and stderr drained on
     worker threads so a chatty process cannot deadlock a pipe, and a watchdog timer
     enforces the wall-clock timeout.
+
+    When ``arrivals`` is given, each stdout line's monotonic read time is appended to it,
+    in line order. Pi timestamps nothing itself, so these are the only clock the caller
+    has for measuring generation speed (see :func:`generation_seconds`).
     """
     proc = subprocess.Popen(
         argv,
@@ -290,6 +344,8 @@ def _invoke(
         if proc.stdout is not None:
             for line in proc.stdout:
                 stdout_lines.append(line)
+                if arrivals is not None:
+                    arrivals.append(time.monotonic())
                 if progress is not None:
                     progress.feed(line)
     finally:
@@ -329,8 +385,15 @@ def execute(
 
     while True:
         attempts += 1
+        arrivals: list[float] = []
         exit_code, stdout, stderr, timed_out = _invoke(
-            argv, prompt, env=env, cwd=cwd, timeout=timeout, progress=progress
+            argv,
+            prompt,
+            env=env,
+            cwd=cwd,
+            timeout=timeout,
+            progress=progress,
+            arrivals=arrivals,
         )
         jsonl_path.write_text(stdout, encoding="utf-8")
 
@@ -348,7 +411,12 @@ def execute(
         break
 
     duration = round(time.monotonic() - start, 3)
-    parsed = parse_json_lines(stdout.splitlines())
+    lines = stdout.splitlines()
+    parsed = parse_json_lines(lines)
+    # Generation time comes from when AIDW read each event, not from Pi (it timestamps
+    # nothing), so prefill and tool execution are excluded. ``arrivals`` belongs to the
+    # last attempt: a retry overwrites the transcript, which is accepted.
+    generation = generation_seconds(zip(arrivals, lines)) or None
     if parsed.final_message:
         out_path.write_text(parsed.final_message + "\n", encoding="utf-8")
         final_out: str | None = str(out_path)
@@ -384,6 +452,7 @@ def execute(
         jsonl_path=str(jsonl_path),
         out_path=final_out,
         error_message=parsed.error_message,
+        generation_seconds=generation,
     )
 
 
@@ -422,6 +491,8 @@ def write_meta(
         "tool_calls": result.tool_calls,
         "tool_errors": result.tool_errors,
         "event_count": result.event_count,
+        "generation_seconds": result.generation_seconds,
+        "output_tokens_per_second": result.output_tokens_per_second,
         "usage": asdict(result.usage),
     }
     path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")

@@ -47,6 +47,14 @@ def usage_line(usage: dict[str, Any] | None) -> str:
     return " ".join(parts)
 
 
+def throughput(record: StageRecord) -> str | None:
+    """``"47.1 out-tok/s"`` for a stage, or ``None`` when it was not measured."""
+    value = record.output_tokens_per_second
+    if value is None:
+        return None
+    return f"{value:.1f} out-tok/s"
+
+
 def cost_note(model: str, usage: dict[str, Any] | None) -> str | None:
     """Warn about token spend with no recorded cost (design §9.2).
 
@@ -93,6 +101,9 @@ def stage_lines(
         head += f" {record.duration_seconds:g}s"
     if record.cost_usd:
         head += f" cost=${record.cost_usd:.4f}"
+    speed = throughput(record)
+    if speed:
+        head += f" {speed}"
 
     lines = [head]
 

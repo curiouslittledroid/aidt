@@ -29,7 +29,7 @@ from aidw.paths import (
     WorkspacePaths,
 )
 from aidw.roadmap import filter_tasks, find_task, load_tasks, next_todo
-from aidw.report import rel_to, stage_lines, usage_line
+from aidw.report import rel_to, stage_lines, throughput, usage_line
 from aidw.runner import StageSpec, resolve_prompt, run_stage
 from aidw.workflows import approve as approve_workflow
 from aidw.workflows import fix as fix_workflow
@@ -701,6 +701,9 @@ def runs(
                 detail += f", {stage.duration_seconds:g}s"
             if stage.cost_usd:
                 detail += f", ${stage.cost_usd:.4f}"
+            speed = throughput(stage)
+            if speed:
+                detail += f", {speed}"
             typer.echo(f"  stage {stage.name}: {detail}")
             measured = usage_line(stage.usage)
             if measured:
