@@ -101,6 +101,11 @@
   - Done when: `uv run aidw tasks --phase 00` lists every §6 task (E0–E9, none collapsed), the guard above passes, and one `aidw prompt 00 E1 E1.1` run produces a prompt for review. (E1.1 rather than E0.1: E0.1 is already complete, so its prompt would be a throwaway, whereas E1.1 is the first task that actually needs the pipeline — the smoke test doubles as its real authoring step.)
   - Known frictions: `prompt.py:123` hardcodes `docs/tasks` until E3, and `_FILENAME_RE` requires a two-digit phase, so branches are named `00-E1.1` until `repo.branch_pattern` is configurable (E4).
 
+- [ ] **E0.8. Test-suite runtime budget**
+  The suite is the largest single cost in every workflow stage: `test` (I2), `record` (I5) and the implementer each re-run most of it, and §5.4 makes `uv run pytest` the verification for every task, so its runtime multiplies across E0–E9 — one E1.6 run spent ~1000s re-running it. Measure first (`--durations=0`), then cut the driver: the suite's floor is one CLI subprocess per test, so prefer in-process invocation (the `CliRunner` pattern `tests/test_cli.py` already uses) or a session-scoped CLI fixture, and add `pytest-xdist` for the remainder.
+  - Deliverable: a runtime measurement plus the changes that reduce it.
+  - Done when: full-suite wall time is measured before and after, the reduction is at least 2×, and `uv run pytest` is green with no test deselected or skipped to achieve it.
+
 ## Epic E1: Two-root core
 
 - [x] **E1.1. `TargetRepo` resolution (D19)**
@@ -236,6 +241,11 @@
   - Deliverable: the doc.
   - Done when: a reader can write a correct config for a new repo without reading the code.
 
+- [ ] **E3.7. Validate configured paths (fail closed)**
+  Classify every `paths:` entry as a **read-path** or a **write-target**. Read-paths must exist when a config or default names them — `build_results_template`, `roadmap_dir`, `task_prompts_dir`, `implementation_results_dir` — and a missing one is an error naming the field and the path, surfaced by `aidw doctor` and by the preflight of the stage that first needs it. Write-targets are outputs of a stage and may legitimately be absent (`architecture_dir` today, and any repo-added stage's dir): create them on demand and require them only when a stage that writes there is enabled. Either way there is no silent fallback and no agent-side improvisation: the record stage stops and reports a missing build-results template rather than inventing a structure (§3.4, E7.2).
+  - Deliverable: path classification (read vs write) plus existence validation and tests, wired into doctor and the stage preflight.
+  - Done when: a config naming a nonexistent read-path fails with the field and the path in the message; a config whose only absent path is a write-target for a disabled stage passes; and a config whose write-target is needed by an enabled stage is either created or fails with a message naming the stage.
+
 ## Epic E4: Config-driven stages and prompt resolution (D2, D4, D12, D13, D14)
 
 - [ ] **E4.1. Stage registry and workflow definitions as data**
@@ -281,6 +291,11 @@
   model override.
   - Deliverable: an integration test asserting resolved prompt paths, agents and argv per stage.
   - Done when: the test fails if any of the six behaviours regresses.
+
+- [ ] **E4.8. Run each whole-repo gate once per tree**
+  Today `test` (I2), `record` (I5) and the implementer each run the full suite against the same tree, and `record` re-runs subsets to fill its own rows — roughly 1000s of duplicated work in one E1.6 run. Record the gated tree identity alongside each gate outcome, and let a later stage in the same run cite that outcome for the same tree instead of re-running it. This deliberately narrows the record prompt's "never copy numbers from an earlier run": a same-run, same-tree outcome is evidence, not a stale number, and it must be cited with its origin (stage, command, timestamp). Differing trees always re-run. Depends on the identity recording in E8.2; if E8.2 has not landed, hash `HEAD` plus the working-tree state as the interim identity.
+  - Deliverable: gate-outcome recording in state plus the reuse rule and tests.
+  - Done when: a run whose `test` stage gated tree `T` performs no second full-suite run for `T` in `record`, the recorded row still carries real numbers with their origin, and a changed tree forces a fresh run.
 
 ## Epic E5: Roadmap as an AIDT-owned format (D6, D15)
 
@@ -347,9 +362,15 @@
 
 - [ ] **E7.2. Neutralise bucket (ii)**
   Replace repo-specific commands and paths with references to the target repo's conventions and the
-  config paths, per the §4.2 table. Keep the workflow semantics identical.
+  config paths, per the §4.2 table. Keep the workflow semantics identical. Gate commands move to
+  `aidw/conventions.md` by name (§3.4); the build-results template becomes the configured path; and
+  the recorder's missing-template behaviour is stated explicitly (stop and report — never invent a
+  structure, never substitute another document). While neutralising, also drop the recipes a
+  non-interactive session refuses (`rm -rf`, `git init` scratch repos) in favour of `mktemp -d` and
+  the repo's fixtures, and require each gate command to run exactly once with every results row
+  derived from that single invocation.
   - Deliverable: five edited prompts.
-  - Done when: `rg "pnpm|mythical|srd|Design [0-9]|catalog.json|vectors.ts" prompts/` returns only bucket (iii) files and intended examples.
+  - Done when: the *rendered* prompt for each of the five names no package manager, no product path and no product doc — asserted against both a Mythical-Forge-shaped config and a neutral one, not by grepping the templates — and no prompt instructs a command the non-interactive runner blocks.
 
 - [ ] **E7.3. Conventions injection (D16)**
   Define how `AGENTS.md` and optional `<target>/aidw/conventions.md` reach the four prompts that need

@@ -257,6 +257,22 @@ Precedence, highest first:
 AIDT's built-in defaults under `paths:` are Mythical Forge's current values (D17), so Mythical
 Forge's config file is close to empty and doubles as the documentation example.
 
+**Configured read-paths must exist.** Every read-path under `paths:` — `build_results_template`,
+`roadmap_dir`, `task_prompts_dir` — is validated when it is named by a config or a default. A
+resolved path that does not exist is an error naming the field and the path, reported by `aidw
+doctor` and by the stage preflight that first needs it; it is never a silent fallback and never
+something the agent improvises around. This matters precisely because the *defaults* are Mythical
+Forge's layout (D17, R7): a target repo — including AIDT's own repo — that does not have Mythical
+Forge's files must supply them or override the field, and the failure must be legible when it does
+not. Where the configured template is genuinely absent and the repo has results documents of its
+own, the repo's config points at the template it does have; the toolkit does not guess.
+
+**Gate commands come from the repo, not the toolkit.** The record stage's whole job is running the
+repo's verification gate, so the concrete commands (Mythical Forge's `pnpm -r lint|build|test` plus
+`pnpm srd:*` and `cdk synth`) travel in the target repo's `aidw/conventions.md` (D16, R10) — never
+inline in a toolkit prompt. A repo with no conventions yet gets the gates its task prompt names
+plus its stack's obvious build/test commands. A toolkit prompt must not name a package manager.
+
 ### 3.5 Stage and workflow model
 
 `build_plan()` in `workflows/implement.py:104` already returns a list of
@@ -572,6 +588,12 @@ Every task's "Done when" must be demonstrable, not asserted:
   prompts, marker strings and label definitions must be byte-identical to the `baseline-verbatim`
   tag. This is what protects D5.
 
+  **Scope:** the freeze covers the marker strings, labels and comment bodies (D5) and the bucket (i)
+  prompts. The five bucket (ii) prompts are *edited* by E7.2, so they cannot be byte-identical in
+  the toolkit; Mythical Forge keeps its exact text through same-named overrides in `aidw/prompts/`
+  (D14 precedence 2). MF.2 must deliver those overrides, or the freeze silently stops covering the
+  record stage's gate commands and template path.
+
 ### 5.5 Working method per task class
 
 Do **not** run the full `aidw prompt` → review → implement pipeline over every task in §6. The
@@ -581,7 +603,7 @@ pipeline where the doc settles *what* but not *how*, and a mistake is expensive 
 reverse; implement directly everywhere else.
 
 **Implement directly from this document:**
-E0.1–E0.7, E1.4–E1.6, E2.3, E2.7–E2.9, E3.4–E3.6, E4.4, E4.7, E5.1, E5.3, E5.4, E6.2–E6.4,
+E0.1–E0.8, E1.4–E1.6, E2.3, E2.7–E2.9, E3.4–E3.7, E4.4, E4.7, E5.1, E5.3, E5.4, E6.2–E6.4,
 E7.1, E7.4, E7.5, E8.1–E8.5, E9.1–E9.4, MF.1–MF.6.
 
 **Author a task prompt for:**
@@ -594,6 +616,7 @@ E7.1, E7.4, E7.5, E8.1–E8.5, E9.1–E9.4, MF.1–MF.6.
 | E3.1, E3.2, E3.3 | The public config contract, layered resolution, and compat refusal |
 | E4.1, E4.2, E4.3 | Stage registry, prompt resolver, porting five workflows |
 | E4.5, E4.6 | Core-vs-optional enforcement, agent overrides |
+| E4.8 | Touches state, the workflow gate contract and the record prompt's "no earlier-run numbers" rule; a wrong dedupe key would silently accept a stale gate |
 | E5.2 | Parser generalisation |
 | E6.1 | Plumbing config into the bundled scripts without breaking their standalone, stdlib-only contract — the riskiest single change in the plan |
 | E7.2, E7.3 | Neutralising five prompts, and conventions injection |
@@ -728,6 +751,17 @@ survives a copy-paste out of this indented block; it exits non-zero on a collaps
 - Known frictions: `prompt.py:123` hardcodes `docs/tasks` until E3, and `_FILENAME_RE` requires a
   two-digit phase, so branches are named `00-E1.1` until `repo.branch_pattern` is configurable
   (E4).
+
+- [ ] **E0.8 Test-suite runtime budget**
+The suite is the largest single cost in every workflow stage: `test` (I2), `record` (I5) and the
+implementer each re-run most of it, and §5.4 makes `uv run pytest` the verification for every task,
+so its runtime multiplies across E0–E9. One E1.6 run spent ~1000s re-running it. Measure first
+(`--durations=0`), then cut the driver: the suite's floor is one CLI subprocess per test, so prefer
+in-process invocation (the `CliRunner` pattern `tests/test_cli.py` already uses) or a session-scoped
+CLI fixture, and add `pytest-xdist` for the remainder.
+- Deliverable: a runtime measurement plus the changes that reduce it.
+- Done when: full-suite wall time is measured before and after, the reduction is at least 2×, and
+  `uv run pytest` is green with no test deselected or skipped to achieve it.
 
 ### E1 — Two-root core
 
@@ -882,6 +916,22 @@ worked Minimal / Typical / Full example.
 - Deliverable: the doc.
 - Done when: a reader can write a correct config for a new repo without reading the code.
 
+- [ ] **E3.7 Validate configured paths (fail closed)**
+Classify every `paths:` entry as a **read-path** or a **write-target**. Read-paths must exist when a
+config or default names them — `build_results_template`, `roadmap_dir`, `task_prompts_dir`,
+`implementation_results_dir` — and a missing one is an error naming the field and the path, surfaced
+by `aidw doctor` and by the preflight of the stage that first needs it. Write-targets are outputs of
+a stage and may legitimately be absent (`architecture_dir` today, and any repo-added stage's dir):
+they are created on demand and required only when a stage that writes there is enabled. Either way
+there is no silent fallback and no agent-side improvisation: the record stage stops and reports a
+missing build-results template rather than inventing a structure (§3.4, E7.2).
+- Deliverable: path classification (read vs write) plus existence validation and tests, wired into
+  doctor and the stage preflight.
+- Done when: a config naming a nonexistent read-path fails with the field and the path in the
+  message; a config whose only absent path is a write-target for a disabled stage passes; and a
+  config whose write-target is needed by an enabled stage is either created or fails with a message
+  naming the stage.
+
 ### E4 — Config-driven stages and prompt resolution (D2, D4, D12, D13, D14)
 
 - [ ] **E4.1 Stage registry and workflow definitions as data**
@@ -930,6 +980,20 @@ falling back to the default, one repo-optional stage disabled, one repo-added st
 model override.
 - Deliverable: an integration test asserting resolved prompt paths, agents and argv per stage.
 - Done when: the test fails if any of the six behaviours regresses.
+
+- [ ] **E4.8 Run each whole-repo gate once per tree**
+Today `test` (I2), `record` (I5) and the implementer each run the full suite against the same tree,
+and `record` re-runs subsets to fill its own rows — roughly 1000s of duplicated work in one E1.6
+run. Record the gated tree identity alongside each gate outcome, and let a later stage in the same
+run cite that outcome for the same tree instead of re-running it. This deliberately narrows the
+record prompt's "never copy numbers from an earlier run": a same-run, same-tree outcome is evidence,
+not a stale number, and it must be cited with its origin (stage, command, timestamp). Differing
+trees always re-run. Depends on the identity recording in E8.2; if E8.2 has not landed, hash `HEAD`
+plus the working-tree state as the interim identity.
+- Deliverable: gate-outcome recording in state plus the reuse rule and tests.
+- Done when: a run whose `test` stage gated tree `T` performs no second full-suite run for `T` in
+  `record`, the recorded row still carries real numbers with their origin, and a changed tree forces
+  a fresh run.
 
 ### E5 — Roadmap as an AIDT-owned format (D6, D15)
 
@@ -997,10 +1061,17 @@ intended destination in a short header note.
 
 - [ ] **E7.2 Neutralise bucket (ii)**
 Replace repo-specific commands and paths with references to the target repo's conventions and the
-config paths, per the §4.2 table. Keep the workflow semantics identical.
+config paths, per the §4.2 table. Keep the workflow semantics identical. Gate commands move to
+`aidw/conventions.md` by name (§3.4); the build-results template becomes the configured path; and
+the recorder's missing-template behaviour is stated explicitly (stop and report — never invent a
+structure, never substitute another document). While neutralising, also drop the recipes a
+non-interactive session refuses (`rm -rf`, `git init` scratch repos) in favour of `mktemp -d` and
+the repo's fixtures, and require each gate command to run exactly once with every results row
+derived from that single invocation.
 - Deliverable: five edited prompts.
-- Done when: `rg "pnpm|mythical|srd|Design [0-9]|catalog.json|vectors.ts" prompts/` returns only
-  bucket (iii) files and intended examples.
+- Done when: the *rendered* prompt for each of the five names no package manager, no product path
+  and no product doc — asserted against both a Mythical-Forge-shaped config and a neutral one, not
+  by grepping the templates — and no prompt instructs a command the non-interactive runner blocks.
 
 - [ ] **E7.3 Conventions injection (D16)**
 Define how `AGENTS.md` and optional `<target>/aidw/conventions.md` reach the four prompts that need
@@ -1095,9 +1166,15 @@ tests, `srd:*` gates, `docs/conventions/srd-traceability.md`).
 
 **MF.2 Move the product prompts**
 Move the §4.2 bucket (iii) prompts (20 files) from the toolkit into `aidw/prompts/`. Keep the
-filenames identical so stage resolution is by name.
-- Done when: every product-specific prompt resolves from Mythical Forge and none remains in the
-  toolkit.
+filenames identical so stage resolution is by name. Mythical Forge also needs same-named overrides
+for the five bucket (ii) prompts E7.2 neutralises: the toolkit default can no longer carry Mythical
+Forge's gate commands (`pnpm -r lint|build|test`, `pnpm srd:*`, `cdk synth`) or its
+`docs/implementation-results/TEMPLATE.md` reference, so Mythical Forge supplies its own text through
+`aidw/prompts/` (D14 precedence 2) — or through `aidw/conventions.md` plus the configured
+`build_results_template` — whichever keeps §5.4's freeze green.
+- Done when: every product-specific prompt resolves from Mythical Forge, the five bucket (ii)
+  prompts resolve to Mythical Forge's own text with its gate commands and template path intact,
+  none remains in the toolkit, and the §5.4 freeze test passes.
 
 **MF.3 Apply the cutover edits**
 Remove `.gitignore:44` (`aidt/runs/`); update `.pi/prompts/simplify-spec.md:26,113`, which
@@ -1144,6 +1221,9 @@ The extraction is done when **all** of these hold:
 8. The repo's own CI is green: `uv run pytest` and `uv run aidw doctor`.
 9. Mythical Forge has no `aidt/` directory and runs workflows through the installed toolkit (MF.1–MF.5).
 10. No generated file is ever written inside a target repo.
+11. A config naming a read-path that does not exist (`build_results_template`, `roadmap_dir`,
+    `task_prompts_dir`) fails fast with the field and the missing path, and never silently falls
+    back — including for AIDT's own repo, which must satisfy its own defaults.
 
 ---
 
@@ -1189,3 +1269,6 @@ these before starting E3**; several are cheap now and expensive later.
 | R10 | Repo conventions reach prompts by injection of `AGENTS.md` + `aidw/conventions.md` rather than by rewriting prompts per repo. | D16's intent; keeps bucket (i)/(ii) prompts single-sourced. |
 | R11 | `parallel_groups` is the replacement for the hardcoded safe pair; members are validated but not automatically proven safe. | The current pair is safe because of *file ownership*, which the toolkit cannot infer. |
 | R12 | Repo visibility/licence are left to the owner in E0.1 rather than assumed. | Not a technical decision, and hard to reverse for a public release. |
+| R13 | The AIDT repo carries its own `docs/implementation-results/TEMPLATE.md` (the *format*, with this repo's stack in the example rows), so dogfooding resolves the same path a target repo does instead of depending on a Mythical-Forge-shaped default it does not satisfy. AIDT needs no `aidw/config.yaml` for this: the file now sits at the default path. | Without it every AIDT run from E1.3 onward hits the missing-template path: five runs already paid for the workaround, each recording a hand-written caveat and a longer list of prior offenders. R7's defaults are deliberately not neutral, so a repo using them must supply what they name — the fix is to supply it, not to neutralise the default and break Mythical Forge. |
+| R14 | Gate commands travel in the target repo's `aidw/conventions.md` by name; no toolkit prompt names a package manager or a repo-specific validator. | Keeps D16/R10's single-sourcing and removes the last "the toolkit knows a product" coupling. A structured `gates:` config field was considered and rejected: it would be a third mechanism duplicating D16, and gate *commands* are prose the repo already owns. |
+| R15 | A configured read-path that does not exist fails closed (E3.7), and the record stage stops and reports rather than inventing a structure. Write-targets are exempt: they are created on demand and required only by the stage that writes them. | Matches E4.2's rule for prompts ("never a silent skip"). The observed alternative — each run reverse-engineering the previous documents — is unbounded work that grows with the number of runs, and it hides a real configuration error. The read/write split matters immediately: AIDT's own `docs/architecture/` does not exist, and treating it as a must-exist read-path would fail the toolkit's own repo. |
