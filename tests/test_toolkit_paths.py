@@ -23,6 +23,11 @@ def _named(checks: list[doctor.Check], name: str) -> doctor.Check:
     return next(check for check in checks if check.name == name)
 
 
+@pytest.fixture(autouse=True)
+def _stub_external_clis(fake_external_clis: None) -> None:  # noqa: ARG001
+    """The checks asserted here are about paths, not the ``pi``/``gh`` probes."""
+
+
 # ---------------------------------------------------------------------------
 # Resolution: cwd- and git-independent (Requirements 2-3)
 # ---------------------------------------------------------------------------

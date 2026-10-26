@@ -68,7 +68,7 @@ def test_dependencies_importable() -> None:
     assert check.status == OK
 
 
-def test_collect_checks_returns_results() -> None:
+def test_collect_checks_returns_results(fake_external_clis: None) -> None:  # noqa: ARG001
     checks = collect_checks()
     assert checks
     # Findings must be within the known status vocabulary.

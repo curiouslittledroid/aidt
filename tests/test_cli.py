@@ -34,8 +34,6 @@ ROADMAP_FIXTURE = """# Phase 3: Test Phase
 def _init_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
 
 
 def _init_repo_with_task(path: Path) -> Path:
@@ -101,7 +99,7 @@ def test_run_chain_requires_arguments() -> None:
     assert "requires" in result.stderr
 
 
-def test_doctor_runs() -> None:
+def test_doctor_runs(fake_external_clis: None) -> None:  # noqa: ARG001
     result = runner.invoke(app, ["doctor"])
     # Unknown environment issues are warnings; doctor fails only on FAIL checks.
     assert result.exit_code in (0, 1)

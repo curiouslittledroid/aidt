@@ -25,8 +25,12 @@ packages = ["aidw"]
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "prompts/scripts/review-followup/tests"]
-addopts = "-q"
+# The suite is dominated by per-test `git` process spawns, which parallelise cleanly. Every
+# workflow stage gates with `uv run --frozen pytest`, so the workers are the default; pass
+# `-n0` for a serial run.
+addopts = "-q -n auto"

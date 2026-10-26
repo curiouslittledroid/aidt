@@ -12,8 +12,6 @@ from aidw.workflows import run as run_workflow
 
 def _init_repo(path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
 
 
 def _roots(repo: Path) -> tuple[TargetRepo, ToolkitPaths, WorkspacePaths]:

@@ -109,8 +109,6 @@ def test_prompt_workflow_requires_clean_tree(tmp_path: Path, monkeypatch) -> Non
 
 def _init_repo(path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
 
 
 TASK_REVIEW_CHANGES = """\

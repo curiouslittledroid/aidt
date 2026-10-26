@@ -10,8 +10,6 @@ from aidw import git
 
 def _init_repo(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
 
 
 def test_commit_paths_commits_only_given_path(tmp_path: Path) -> None:

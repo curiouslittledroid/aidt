@@ -22,8 +22,6 @@ from aidw.workflows import implement as implement_workflow
 
 def _init_repo(path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
 
 
 def _make_inputs(tmp_path: Path) -> Path:

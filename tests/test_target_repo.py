@@ -32,8 +32,6 @@ def _git(directory: Path, *args: str) -> None:
 def _init_repo(directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     _git(directory, "init", "-q", "-b", "main")
-    _git(directory, "config", "user.email", "t@example.com")
-    _git(directory, "config", "user.name", "Test")
     (directory / "f.txt").write_text("x", encoding="utf-8")
     _git(directory, "add", ".")
     _git(directory, "commit", "-qm", "init")
