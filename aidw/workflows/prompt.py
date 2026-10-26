@@ -5,6 +5,9 @@ Stages:
 1. ``task-prompt``      — agent ``task-author`` creates ``docs/task-prompts/<phase>-<task>-prompt.md``
                           on branch ``<phase>-<task>`` and commits it.
 2. ``task-review-N``    — agent ``task-reviewer`` reviews the prompt (read-only); N starts at 1.
+                          Rounds 2+ receive a delta brief (``extra=``): a per-finding
+                          resolution instruction, the previous review verbatim, and a
+                          real ``git diff`` of the prompt since that review (L2.3).
 3. ``task-review-fixes`` — repeated (bounded) rework when the review requests changes. One
                           stage per blocking (must-fix/should-fix) finding, plus one combined
                           stage for the non-blocking could-fix findings; a single combined stage
@@ -29,8 +32,11 @@ The approval gate is off by default; pass ``--require-approval`` to pause for a 
 
 from __future__ import annotations
 
+import os
+import shutil
 import sys
 from pathlib import Path
+from tempfile import mkdtemp
 
 from aidw import git
 from aidw.config import ERROR, WARNING, format_issues, load_all
@@ -77,6 +83,150 @@ EXIT_REFUSED = 4
 #: A `Blocked` verdict is the exception and still fails closed, since it means a human must
 #: settle a material ambiguity.
 MAX_REVISIONS = 3
+
+#: Instruction prepended to every review round after the first (L2.3, design §8.1). The
+#: three verdict tokens are literal because the reviewer must emit one of them per prior
+#: finding before it may raise a new one. This lives here as toolkit runtime text rather
+#: than in ``prompts/task-review.md``: that prompt is bucket (i) generic and ships as-is
+#: (EXTRACTION.md §4.2), so the round-specific priming is assembly, not prompt copy.
+_DELTA_BRIEF_INSTRUCTION = """\
+## Delta brief — resolve the previous review before raising new findings
+
+This is a later review round, not the first. For **each** finding in the previous review
+below, state a per-finding resolution verdict of exactly `resolved`, `not resolved`, or
+`newly contradicted` before you raise any new finding. Judge `resolved` only from the
+current prompt and the diff that follows. New findings must be genuinely new: never
+re-litigate a finding you judged `resolved`."""
+
+#: Note used when the prompt diff cannot be produced. The brief must never present a
+#: silently empty diff section: the reviewer is told the evidence is missing instead (L2.3).
+_DIFF_UNAVAILABLE = (
+    "The prompt diff for this round is unavailable (`git diff` could not be produced); "
+    "review the prompt file itself for its current state."
+)
+
+#: Note used when the two prompt snapshots are byte-identical, so the reviewer is not left
+#: wondering whether a diff section went missing.
+_DIFF_EMPTY = "The prompt is unchanged since the previous review."
+
+#: Temp-directory prefix for the two stable-named diff snapshots. The directory is
+#: removed in a ``finally`` on every path; it is never the run directory (L3.3 owns
+#: ``stages/<stage>.prompt.md`` snapshots).
+_DIFF_TMP_PREFIX = "aidw-prompt-diff-"
+
+
+def _capture_prompt(path: Path) -> str | None:
+    """The prompt's current content, or ``None`` when it cannot be read (L2.3).
+
+    The baseline is captured in memory after a review's verdict and before that round's
+    fix stages run. ``_commit_reviewed_prompt`` runs only once after the loop, so there
+    are no per-round commits and a bare ``git diff -- <path>`` would be cumulative; a
+    capture-then-diff makes round N's diff exactly the previous fix batch's net effect.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _no_index_diff(directory: Path, name: str) -> tuple[int, str, str]:
+    """Run ``git diff --no-index`` from ``directory`` under stable relative names.
+
+    Running from the temp directory keeps both path arguments deterministic, so the
+    ``diff --git a/baseline/<name> b/current/<name>`` header is identical across rounds
+    and runs — the brief must never carry a random ``/tmp/...`` path. ``git diff``
+    reports differences as exit code 1, so callers must accept ``{0, 1}`` as success; the
+    ``code == 0`` guards in :mod:`aidw.git` (``diff_stat``/``changed_files``) would drop
+    exactly the diff this brief exists for. ``GIT_DIR``/``GIT_WORK_TREE`` are removed from
+    the environment so a caller's repository context cannot redirect the comparison.
+    """
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+    }
+    return git._git_out(
+        directory,
+        ["diff", "--no-index", f"baseline/{name}", f"current/{name}"],
+        env=environment,
+    )
+
+
+def _prompt_diff(baseline: str, current: str, *, name: str) -> str | None:
+    """A real unified diff between two prompt snapshots, or ``None`` (L2.3).
+
+    Never hand-builds a summary: both snapshots are written under stable names into a
+    ``tempfile`` directory (not the run directory) and compared with ``git diff --no-index``.
+    Exit 0 (identical) and exit 1 (differences) are both success; anything else is a failed
+    invocation, which warns on stderr and returns ``None`` so the caller degrades the
+    brief instead of failing the run. The temp directory is removed in a ``finally`` on
+    every path, so a multi-round run leaves no residue.
+    """
+    directory = Path(mkdtemp(prefix=_DIFF_TMP_PREFIX))
+    try:
+        for sub, text in (("baseline", baseline), ("current", current)):
+            (directory / sub).mkdir()
+            (directory / sub / name).write_text(text, encoding="utf-8")
+        code, out, err = _no_index_diff(directory, name)
+        if code not in (0, 1):
+            reason = next(
+                (line.strip() for line in err.splitlines() if line.strip()),
+                "git diff failed",
+            )[:300]
+            print(
+                f"warning: could not render the prompt diff for this review round "
+                f"({reason}); the delta brief names it unavailable.",
+                file=sys.stderr,
+            )
+            return None
+        if code == 0:
+            return _DIFF_EMPTY
+        return out.rstrip("\n")
+    except OSError as exc:
+        print(
+            f"warning: could not stage the prompt diff for this review round "
+            f"({exc}); the delta brief names it unavailable.",
+            file=sys.stderr,
+        )
+        return None
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _render_delta_brief(
+    *,
+    index: int,
+    previous_review: str,
+    baseline: str | None,
+    current: str | None,
+    rel: str,
+) -> str:
+    """Assemble round ``index``'s ``extra=`` (instruction, prior review, diff) (L2.3).
+
+    The previous review is passed verbatim: the roadmap says "pass them the previous
+    review", and the finding blocks are already the reviewer's own format. When the
+    baseline or the diff cannot be produced the instruction and the review still ship
+    plus an explicit unavailable note — never a silently empty diff section.
+    """
+    if baseline is None or current is None:
+        print(
+            f"warning: could not read the reviewed prompt `{rel}` to baseline review "
+            f"round {index}; the delta brief names the prompt diff unavailable.",
+            file=sys.stderr,
+        )
+        diff_text = _DIFF_UNAVAILABLE
+    else:
+        diff_text = _prompt_diff(baseline, current, name=Path(rel).name)
+        if diff_text is None:
+            diff_text = _DIFF_UNAVAILABLE
+
+    return "\n\n".join(
+        [
+            _DELTA_BRIEF_INSTRUCTION,
+            "### Previous review\n\n" + previous_review,
+            "### Prompt diff since that review\n\n" + diff_text,
+        ]
+    )
 
 
 def _read_out(record) -> str | None:
@@ -539,18 +689,38 @@ def run(
 
     verdict: str | None = None
     review_text = ""
+    # L2.3: ``previous_review_text`` and ``baseline_prompt`` are set only when the round is
+    # followed by fixes. ``review_text`` is reassigned on the next iteration, so the prior
+    # review is carried separately; the baseline is the in-memory snapshot (no per-round
+    # commits exist) taken after this verdict and before the fix stages mutate the prompt.
+    previous_review_text: str | None = None
+    baseline_prompt: str | None = None
     review_index = 0
     revisions = 0
     assumed_ok = False
     while True:
         review_index += 1
         name = f"task-review-{review_index}"
+        # Round 1 is deliberately unprimed (``extra == ""``): the independent first
+        # sample is what keeps the loop from anchoring on the previous review. Rounds 2+ get
+        # the delta brief, keyed off the stage counter rather than ``revisions`` (which is
+        # incremented later in the same iteration).
+        delta = ""
+        if review_index >= 2 and previous_review_text is not None:
+            delta = _render_delta_brief(
+                index=review_index,
+                previous_review=previous_review_text,
+                baseline=baseline_prompt,
+                current=_capture_prompt(prompt_path),
+                rel=rel,
+            )
         rec = run_stage(
             StageSpec(
                 name,
                 "task-reviewer",
                 aidt.prompts_dir / "task-review.md",
                 [rel],
+                extra=delta,
             ),
             repo_root=repo.root,
             toolkit_root=aidt.root,
@@ -605,6 +775,11 @@ def run(
             assumed_ok = verdict != VERDICT_BLOCKED
             break
 
+        # Capture after the verdict and its Blocked/MAX_REVISIONS exits, before the fix
+        # stages run, so the next round's diff is exactly this fix batch's net effect and
+        # not a cumulative diff across rounds (there is no per-round commit to diff against).
+        baseline_prompt = _capture_prompt(prompt_path)
+        previous_review_text = review_text
         revisions += 1
         if not findings or problems:
             if problems:

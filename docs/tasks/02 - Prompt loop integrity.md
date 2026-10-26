@@ -155,7 +155,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     travels inside `where`, never as a new field).
   - Tests: rendered-prompt assertion; the bundled script suite unchanged.
 
-- [ ] **L2.3. Rounds after the first get a delta brief** (Design 8.1)
+- [x] **L2.3. Rounds after the first get a delta brief** (Design 8.1)
   Rounds 2 and 3 are fresh sessions that re-derive everything and re-sample the whole space, so
   they re-find leftovers and the fixers' collateral but never confirm resolution. Pass them the
   previous review plus the prompt diff since it, and require a per-finding resolution verdict

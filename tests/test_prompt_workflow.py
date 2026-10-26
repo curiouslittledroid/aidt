@@ -231,8 +231,24 @@ def _review_index(stage_name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _fix_round(stage_name: str) -> int | None:
+    """Revision round N for a ``task-review-fixes-N[-M]`` stage, else ``None``.
+
+    The fake fixer uses it to write a round-distinct marker into the prompt, so an
+    assertion on a later round's ``extra`` can tell that round's diff from an earlier
+    round's (L2.3). Without a mutation a naive per-round diff would be empty.
+    """
+    match = re.fullmatch(r"task-review-fixes-(\d+)(?:-\d+)?", stage_name)
+    return int(match.group(1)) if match else None
+
+
 def _fake_stages(review_body: str, *, fix_status: str = "succeeded", approve_review: int | None = 2):
-    """A fake ``run_stage`` returning canned review text, approving at ``approve_review``."""
+    """A fake ``run_stage`` returning canned review text, approving at ``approve_review``.
+
+    Each fix stage appends a round-distinct marker to the prompt file (once per round), so
+    the L2.3 delta-brief tests can prove that a round's diff carries only the immediately
+    preceding fix batch's net effect, not every round's changes cumulatively.
+    """
     from aidw.state import SUCCEEDED, StageRecord, run_dir
 
     seen: list[tuple[str, list[str], str]] = []
@@ -253,8 +269,18 @@ def _fake_stages(review_body: str, *, fix_status: str = "succeeded", approve_rev
         index = _review_index(spec.name)
         if index is not None:
             body = "## Verdict\n\n**Approve**\n" if index == approve_review else review_body
+            # A round-distinct tail so a later round's "previous review" section is
+            # attributable to the round it came from (L2.3 delta-brief tests).
+            body += f"\n<!-- review round {index} -->\n"
         elif spec.name.startswith("task-review-fixes"):
             body = "fixed\n"
+            revision = _fix_round(spec.name)
+            if revision is not None:
+                prompt_file = repo / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+                marker = f"<!-- fix round {revision} -->\n"
+                text = prompt_file.read_text(encoding="utf-8")
+                if marker not in text:
+                    prompt_file.write_text(text + marker, encoding="utf-8")
         else:
             body = "prompt body\n"
 
@@ -610,6 +636,188 @@ def test_three_review_rounds_then_accept_without_another_review(
 
     out = capsys.readouterr().out
     assert "revision budget spent (3 round(s)); accepting the prompt" in out
+
+
+def _extra_for(seen: list[tuple[str, list[str], str]], name: str) -> str:
+    """The ``extra`` the workflow passed to stage ``name``."""
+    return next(extra for stage, _, extra in seen if stage == name)
+
+
+def _record_temp_dirs(monkeypatch) -> list[Path]:
+    """Record every temp directory the delta brief creates, to assert cleanup (L2.3)."""
+    created: list[Path] = []
+    real_mkdtemp = prompt_workflow.mkdtemp
+
+    def recording_mkdtemp(*args, **kwargs):
+        path = Path(real_mkdtemp(*args, **kwargs))
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(prompt_workflow, "mkdtemp", recording_mkdtemp)
+    return created
+
+
+def test_first_review_round_is_unprimed(tmp_path: Path, monkeypatch) -> None:
+    """Round 1 keeps the independent sample: variables are ``[rel]``, ``extra`` is empty."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
+    _, variables, extra = next(item for item in seen if item[0] == "task-review-1")
+    assert variables == ["docs/task-prompts/03-E4.1-prompt.md"]
+    assert extra == ""
+
+
+def test_second_round_gets_delta_brief_with_previous_review_and_diff(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Round 2 receives the resolution instruction, round 1's review, and a real diff."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    extra = _extra_for(seen, "task-review-2")
+    for token in ("`resolved`", "`not resolved`", "`newly contradicted`"):
+        assert token in extra
+    # The previous review is passed verbatim, and only then does the diff follow.
+    assert "The deliverable leaves a stale path reference." in extra
+    assert "<!-- review round 1 -->" in extra
+    assert extra.index("## Delta brief") < extra.index("### Previous review")
+    assert extra.index("### Previous review") < extra.index("### Prompt diff")
+    # A genuine unified diff for the fix round-1 marker, under stable header paths and
+    # with no random temp path in the brief.
+    assert "diff --git a/baseline/03-E4.1-prompt.md b/current/03-E4.1-prompt.md" in extra
+    assert "--- a/baseline/03-E4.1-prompt.md" in extra
+    assert "+++ b/current/03-E4.1-prompt.md" in extra
+    assert "@@" in extra
+    assert "+<!-- fix round 1 -->" in extra
+    assert "aidw-prompt-diff-" not in extra
+    assert "/tmp/" not in extra
+
+
+def test_third_round_diff_reflects_only_the_previous_fix_batch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The baseline is captured per round, so round 3's diff is not cumulative."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    extra = _extra_for(seen, "task-review-3")
+    # Round 2's review, not round 1's.
+    assert "<!-- review round 2 -->" in extra
+    assert "<!-- review round 1 -->" not in extra
+    # Only the round-2 marker is an addition; round 1's marker is at most context.
+    assert "+<!-- fix round 2 -->" in extra
+    assert "+<!-- fix round 1 -->" not in extra
+    assert "diff --git a/baseline/03-E4.1-prompt.md b/current/03-E4.1-prompt.md" in extra
+    assert "aidw-prompt-diff-" not in extra
+
+
+def test_delta_brief_temp_directories_are_removed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Every round's diff temp directory is removed, including on the success path."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    created = _record_temp_dirs(monkeypatch)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    assert len(created) == 2  # rounds 2 and 3
+    assert all(not path.exists() for path in created)
+
+
+def test_delta_brief_preserves_previous_review_verbatim(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The prior review is carried byte-for-byte, including meaningful whitespace."""
+    baseline = "prompt\n"
+    previous_review = "Review text with trailing spaces  \n"
+
+    brief = prompt_workflow._render_delta_brief(
+        index=2,
+        previous_review=previous_review,
+        baseline=baseline,
+        current=baseline,
+        rel="docs/task-prompts/03-E4.1-prompt.md",
+    )
+
+    assert previous_review in brief
+
+
+def test_unparseable_previous_review_still_primes_the_next_round(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A fallback whole-review fix still supplies a delta brief on round 2."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_UNPARSEABLE, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    extra = _extra_for(seen, "task-review-2")
+    assert "## Delta brief" in extra
+    assert "Something is wrong." in extra
+    assert "`resolved`" in extra
+    assert "+<!-- fix round 1 -->" in extra
+
+
+def test_failed_prompt_diff_degrades_brief_without_failing_the_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A non-0/1 git diff exit warns and degrades the brief; the loop still finishes."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    created = _record_temp_dirs(monkeypatch)
+
+    def failing_diff(directory: Path, name: str) -> tuple[int, str, str]:
+        return 2, "", "fatal: could not read object\n"
+
+    monkeypatch.setattr(prompt_workflow, "_no_index_diff", failing_diff)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    extra = _extra_for(seen, "task-review-2")
+    for token in ("`resolved`", "`not resolved`", "`newly contradicted`"):
+        assert token in extra
+    assert "The deliverable leaves a stale path reference." in extra
+    assert "unavailable" in extra
+    assert "diff --git" not in extra
+    # The degradation round's temp directory is cleaned up too.
+    assert len(created) == 1
+    assert all(not path.exists() for path in created)
+    err = capsys.readouterr().err
+    assert "warning:" in err
+    assert "prompt diff" in err
+    assert "fatal: could not read object" in err
 
 
 def test_a_blocked_final_review_still_fails_closed(
