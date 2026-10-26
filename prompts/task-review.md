@@ -70,7 +70,7 @@ Confidence: 0 to 5
 What I found: Describe the defect in the task prompt or its source context.
 Why it matters: Explain how an implementer could produce incorrect, unsafe, incomplete, or unverifiable work.
 Trigger and effect: State the condition under which the problem appears and the resulting implementation or review failure.
-Where: Task-prompt path and line/section; include the authoritative file and section when relevant.
+Where: Task-prompt path and line/section; name the file or symbol the finding was verified against and the revision or command used to verify it (for example a git sha, or `git show <rev>:<path>`), or state explicitly that nothing could be verified.
 Suggested fix: Give a short, practical direction for correcting the prompt, source citation, requirement, boundary, or acceptance test.
 ```
 
