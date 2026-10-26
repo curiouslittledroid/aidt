@@ -755,13 +755,21 @@ survives a copy-paste out of this indented block; it exits non-zero on a collaps
 - [ ] **E0.8 Test-suite runtime budget**
 The suite is the largest single cost in every workflow stage: `test` (I2), `record` (I5) and the
 implementer each re-run most of it, and §5.4 makes `uv run pytest` the verification for every task,
-so its runtime multiplies across E0–E9. One E1.6 run spent ~1000s re-running it. Measure first
-(`--durations=0`), then cut the driver: the suite's floor is one CLI subprocess per test, so prefer
-in-process invocation (the `CliRunner` pattern `tests/test_cli.py` already uses) or a session-scoped
-CLI fixture, and add `pytest-xdist` for the remainder.
+so its runtime multiplies across E0–E9. One E1.6 run spent ~1000s re-running it.
+
+Measure with a `subprocess` profiler before optimising — `--durations` alone misattributes this
+suite. Measured cause: 3185 process spawns accounted for 136.6s of the 145s, and the driver is
+`git`, not the CLI. `TargetRepo.resolve` ran three `git rev-parse` invocations per call (the single
+hottest path in the toolkit, not just in tests); the repo fixtures ran two `git config` spawns each
+across ~300 repositories; and the doctor tests spawned real `pi`/`gh` binaries (~25s). Fix those
+then parallelise the remainder with `pytest-xdist` (`-n auto` in `addopts`, so every stage and CI
+inherit it; `-n0` gives a serial run).
 - Deliverable: a runtime measurement plus the changes that reduce it.
 - Done when: full-suite wall time is measured before and after, the reduction is at least 2×, and
   `uv run pytest` is green with no test deselected or skipped to achieve it.
+- Measured: 129.5–150.3s serial before → 65.0s serial after (spawns 3185 → 1843) → 33.9–36.4s under
+  `-n auto`; `TargetRepo.resolve` 3 spawns/132ms → 1 spawn/37ms; 450 tests throughout, none
+  deselected or skipped.
 
 ### E1 — Two-root core
 
