@@ -368,3 +368,23 @@ def test_worktrees_metamorphic_add_then_remove(tmp_path: Path) -> None:
 
     assert git.remove_worktree(control, created) is True
     assert {entry.path for entry in git.worktrees(control)} == baseline
+
+
+def test_probe_ref_distinguishes_absent_from_unanswerable(tmp_path: Path) -> None:
+    """``probe_ref`` answers definitively for exit 0/1 and fails closed otherwise (L1.3).
+
+    Review follow-up F1 (PR #16): a rev-parse spawn failure must read as "git could not
+    answer", never as "the ref is absent" — otherwise an advisory caller mistakes a
+    transient failure for a missing branch. Exit 128 (outside any repository) is a real
+    plumbing failure git cannot answer, not a negative answer.
+    """
+    repo = tmp_path / "repo"
+    _init_committed_repo(repo)
+    sha = git.rev_parse(repo, "HEAD") or ""
+
+    assert git.probe_ref(repo, "refs/heads/main") == (True, sha)
+    assert git.probe_ref(repo, "refs/heads/absent") == (True, None)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    assert git.probe_ref(outside, "refs/heads/main") == (False, None)

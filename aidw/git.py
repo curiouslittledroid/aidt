@@ -113,6 +113,26 @@ def rev_parse(repo: Path, rev: str) -> str | None:
     return value if code == 0 and value else None
 
 
+def probe_ref(repo: Path, rev: str) -> tuple[bool, str | None]:
+    """``(answered, sha)`` for ``rev`` — "absent" is distinguished from "git failed".
+
+    ``rev-parse --verify --quiet`` exits 0 when the ref resolves and 1 when it does not;
+    every other exit (git missing, a timeout, a fatal plumbing error such as a missing
+    repository) means git could not answer and maps to ``(False, None)``. Without this
+    distinction an advisory probe reading :func:`rev_parse` would collapse a failed
+    spawn into ``None`` and mistake "git could not answer" for "the ref is absent"
+    (L1.3, design §13 — a blocked run must never blame the run for a branch it did not
+    create). Never raises: :func:`_git_out` reports spawn failures as exit codes.
+    """
+    code, out, _ = _git_out(repo, ["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"])
+    if code == 1:
+        return True, None
+    value = out.strip()
+    if code == 0 and value:
+        return True, value
+    return False, None
+
+
 def changed_paths(repo: Path, base: str = "main") -> list[str] | None:
     """Paths whose content differs between ``base`` and the working tree.
 
