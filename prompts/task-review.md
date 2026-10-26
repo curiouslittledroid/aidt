@@ -43,7 +43,7 @@ The verdict is independent agent evidence. It is not approval of an implementati
 ## Review order
 
 1. **Set the frame.** Record the prompt path, task identifier, source roadmap entry, cited specs, intended deliverable, acceptance criteria, and explicit non-goals. State who or what will be affected by the implementation.
-2. **Trace the authority chain.** Confirm that the prompt's requirements are derived from the roadmap and cited specs. Read the relevant spec sections in full, including referenced conventions or analysis documents. Report conflicts, unsupported inventions, stale citations, and missing source material before reviewing wording details.
+2. **Trace the authority chain.** Confirm that the prompt's requirements are derived from the roadmap and cited specs. Read the relevant spec sections in full, including referenced conventions or analysis documents. Report conflicts, unsupported inventions, stale citations, and missing source material before reviewing wording details. When the prompt depends on a task whose code is not on the base branch, inspect the branch that implements that dependency — `git log <base>..origin/<id>` and `git show origin/<id>:<path>`, where `<base>` is the base branch — and state the revision you verified. Never resolve a conflict between a roadmap summary and the branch that implements the dependency in favour of the roadmap summary: the roadmap entry is a planning index, and the branch is the authority for the shape of the code it implements.
 3. **Check repository fit.** Inspect the current tree and nearby code/configuration. Verify package names, file paths, exports, handler contracts, schema conventions, tenancy scope, dependency versions, infrastructure ownership, test placement, scripts, and the claimed state of prerequisite tasks. A prompt may be defective even when its proposed behavior is sensible if its assumptions do not hold in this repository.
 4. **Review the requested behavior.** Check the main flow and all specified failure paths. Look for missing validation, authorization, tenant isolation, idempotency, error handling, retries, timeouts, concurrency behavior, compatibility requirements, migration/rollback behavior, observability, and operational consequences. Follow data from input through persistence, external calls, and output.
 5. **Check internal consistency.** Compare requirements, non-goals, deliverables, done-when criteria, examples, test cases, and verification commands. Find contradictions such as a required artifact also being forbidden, a test that cannot observe the required behavior, a schema that cannot represent the stated result, or a command that cannot run with the requested package layout.
@@ -74,6 +74,8 @@ Where: Task-prompt path and line/section; include the authoritative file and sec
 Suggested fix: Give a short, practical direction for correcting the prompt, source citation, requirement, boundary, or acceptance test.
 ```
 
+A `Suggested fix` is a direction, not a decision: when two readings both satisfy the cited sources, mark the finding `Blocked` and name the choice in the finding body instead of prescribing one reading.
+
 Keep the labels plain — exactly as shown above, with no bold or backticks around `Priority:` /
 `Confidence:` and a bare value after the colon. AIDT parses these blocks to count the findings and
 fix them one at a time; a bolded label (`**Priority: Should fix**`) defeats that.
@@ -91,7 +93,7 @@ Confidence means:
 - **3:** Probable, but some repository or runtime evidence is unavailable.
 - **0 to 2:** Do not report. Investigate further or mark the area unverified.
 
-Use plain words. State what an implementer would do wrong, when the problem occurs, and who or what is affected. Cite exact sections, paths, symbols, commands, or prompt lines where possible. Do not disguise an unresolved design choice as a definite bug: mark it as `Blocked` when it requires an owner decision.
+Use plain words. State what an implementer would do wrong, when the problem occurs, and who or what is affected. Cite exact sections, paths, symbols, commands, or prompt lines where possible. Do not disguise an unresolved design choice as a definite bug: mark it as `Blocked` when it requires an owner decision. When the resolution of a finding depends on another task's unmerged implementation, report the finding as `Blocked`, naming the dependency — never a `Must fix` or `Should fix` finding with a `Suggested fix`.
 
 ## Verdict
 

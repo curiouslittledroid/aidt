@@ -537,6 +537,38 @@ Suggested fix: The owner must decide it.
 Blocked — a human must settle the schema decision.
 """
 
+#: A `Blocked` verdict reporting a dependency-branch conflict (L2.1). It carries a
+#: parseable finding block on purpose: the short-circuit must hold with findings too.
+TASK_REVIEW_BLOCKED_DEPENDENCY = """\
+## What I verified
+
+The prompt depends on a task whose implementation is not on the base branch.
+
+## Findings
+
+```text
+Priority: Could fix
+Confidence: 4
+What I found: The dependency's shape is unmerged and the roadmap summary disagrees with it.
+Why it matters: Prescribing one shape would settle the conflict without authority.
+Trigger and effect: The implementer follows a prescription the dependency branch does not support.
+Where: the dependency branch, inspected at its current revision.
+Suggested fix: Do not prescribe a shape; the owner must decide which authority governs.
+```
+
+## Verdict
+
+Blocked — the dependency branch is the authority and a human must settle the conflict.
+"""
+
+#: A Blocked verdict without a parseable findings block must not fall through to the
+#: single whole-review fallback fixer (L2.1).
+TASK_REVIEW_BLOCKED_NO_FINDINGS = """\
+## Verdict
+
+Blocked — the dependency implementation is unmerged and requires an owner decision.
+"""
+
 
 def test_three_review_rounds_then_accept_without_another_review(
     tmp_path: Path, monkeypatch, capsys
@@ -583,7 +615,7 @@ def test_three_review_rounds_then_accept_without_another_review(
 def test_a_blocked_final_review_still_fails_closed(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """A Blocked verdict is the one exception: it always needs a human."""
+    """A Blocked verdict always needs a human: no fix stage, no commit, exit 3."""
     _patch_prompt_repo(tmp_path, monkeypatch)
     seen, fake = _fake_stages(TASK_REVIEW_BLOCKED, approve_review=None)
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
@@ -594,11 +626,83 @@ def test_a_blocked_final_review_still_fails_closed(
 
     assert code == 3
     names = [name for name, _, _ in seen]
-    assert "task-review-4" not in names
-    assert "task-review-fixes-3-1" in names
+    assert names == ["task-prompt", "task-review-1"]
+    assert not any(name.startswith("task-review-fixes") for name in names)
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
     captured = capsys.readouterr()
-    assert "did not approve within the revision budget" in captured.err
+    assert "A material ambiguity the prompt cannot settle." in captured.err
     assert "revision budget spent" not in captured.out
+
+
+def test_blocked_dependency_verdict_short_circuits_before_any_fix(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A dependency-branch conflict reported as Blocked ends the run with no fix round."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_BLOCKED_DEPENDENCY, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=False
+    )
+
+    assert code == 3
+    names = [name for name, _, _ in seen]
+    assert names == ["task-prompt", "task-review-1"]
+    assert not any(name.startswith("task-review-fixes") for name in names)
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    assert "the dependency branch is the authority" in capsys.readouterr().err
+    # Fail closed at the git level too: the prompt is still uncommitted.
+    assert (
+        git.status_short(tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
+    )
+
+
+def test_blocked_verdict_overrides_approve_all(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """approve_all must not carry a Blocked verdict past the short-circuit to commit."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_BLOCKED_DEPENDENCY, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 3
+    names = [name for name, _, _ in seen]
+    assert not any(name.startswith("task-review-fixes") for name in names)
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    assert "the dependency branch is the authority" in capsys.readouterr().err
+    assert (
+        git.status_short(tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
+    )
+
+
+def test_blocked_without_findings_does_not_run_fallback_fix(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Blocked short-circuits before the no-findings fallback fixer as well."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_BLOCKED_NO_FINDINGS, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=False
+    )
+
+    assert code == 3
+    assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    assert "requires an owner decision" in capsys.readouterr().err
+    assert (
+        git.status_short(tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
+    )
 
 
 def test_commit_reviewed_prompt_commits_changes(tmp_path: Path) -> None:
@@ -1658,3 +1762,50 @@ def test_l13_rendered_author_prompt_and_agent_context_state_the_contract() -> No
     assert "blocked: <reason>" in author_md
     assert "stop and report" in author_md
     assert "Before creating or switching to the `{phase}-{task}` branch" in author_md
+
+
+def test_l21_rendered_reviewer_prompt_states_dependency_and_blocked_rules() -> None:
+    """The rendered reviewer prompt carries L2.1's three rules, product-neutrally."""
+    rendered = render_prompt_file(
+        toolkit_root() / "prompts" / "task-review.md",
+        ["docs/task-prompts/03-E4.1-prompt.md"],
+    )
+
+    rules = {
+        "dependency branch": "state the revision you verified",
+        "blocked not a prescription": "depends on another task's unmerged implementation",
+        "suggested fix direction": "A `Suggested fix` is a direction, not a decision",
+    }
+    for label, phrase in rules.items():
+        assert phrase in rendered, label
+
+    # Neutrality is asserted on the added rule lines only: the pre-existing Scope
+    # bullet already names `Design 21`, and bucket (i) ships as-is (EXTRACTION.md §4.2).
+    added_lines = [
+        line
+        for line in rendered.splitlines()
+        if any(phrase in line for phrase in rules.values())
+    ]
+    assert added_lines, "the rule phrases must be locatable as whole lines"
+    for line in added_lines:
+        assert "pnpm" not in line
+        assert "Design 21" not in line
+        assert "docs/task-prompts" not in line
+        assert "origin/00-E1.5" not in line
+
+    # Format unchanged: the finding labels, priorities and verdict tokens are byte-stable.
+    assert "Priority: Must fix / Should fix / Could fix" in rendered
+    assert "Confidence: 0 to 5" in rendered
+    for label in (
+        "What I found:",
+        "Why it matters:",
+        "Trigger and effect:",
+        "Where:",
+        "Suggested fix:",
+    ):
+        assert label in rendered
+    assert set(re.findall(r"^Priority: (.+)$", rendered, re.MULTILINE)) == {
+        "Must fix / Should fix / Could fix"
+    }
+    assert "Priority: Blocked" not in rendered
+    assert "End with exactly one of `Approve`, `Request changes`, or `Blocked`" in rendered
