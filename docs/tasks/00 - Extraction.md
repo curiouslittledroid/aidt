@@ -137,7 +137,7 @@
   - Deliverable: CLI + workflow changes.
   - Done when: every workflow has a test asserting it operates on the target from `--repo`/`AIDW_REPO` while prompts resolve from the toolkit root, **including when the two are different directories**.
 
-- [ ] **E1.6. `aidw config show` (skeleton)**
+- [x] **E1.6. `aidw config show` (skeleton)**
   Print toolkit root, version, target root, workspace root, state root, and the config file found
   (or none), each with provenance.
   - Deliverable: the subcommand plus `--json`.
