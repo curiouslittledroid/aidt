@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from typer.testing import CliRunner
 
 from aidw import __version__, github
 from aidw import state as state_mod
-from aidw.cli import EXIT_REFUSED, app
+from aidw.cli import EXIT_REFUSED, EXIT_USAGE, app
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths, toolkit_root
 from aidw.workflows import (
     approve as approve_workflow,
@@ -449,3 +450,393 @@ def test_exec_resolves_prompts_from_toolkit_and_state_from_target(
     assert resolved == [toolkit_root()]
     _assert_two_roots(calls, target)
     assert len(list(_runs_root(target).iterdir())) == 1
+
+
+# --------------------------------------------------------------------------- #
+# `config show` — six values with provenance (EXTRACTION.md §3.3/§3.4)
+# --------------------------------------------------------------------------- #
+
+CONFIG_KEYS = {
+    "toolkit_root",
+    "version",
+    "target_root",
+    "workspace_root",
+    "state_root",
+    "config_file",
+}
+
+
+def _config_lines(stdout: str) -> list[str]:
+    """The non-empty human-mode lines, each ``label: value (source)``."""
+    return [line for line in stdout.splitlines() if line.strip()]
+
+
+def _line_source(line: str) -> str:
+    """Extract the trailing ``(source)`` from a human-mode line."""
+    _head, sep, tail = line.rpartition(" (")
+    assert sep, f"line has no source suffix: {line!r}"
+    assert tail.endswith(")"), line
+    return tail[:-1]
+
+
+def _expected_state(repo: Path) -> Path:
+    return WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root
+
+
+def _config_show_json(*args: str):
+    return runner.invoke(app, [*args, "config", "show", "--json"])
+
+
+def test_config_show_resolves_target_and_workspace_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The command consumes the three roots threaded by ``_roots``."""
+    from aidw import cli
+
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+
+    real_target_resolve = cli.TargetRepo.resolve
+    real_workspace_resolve = cli.WorkspacePaths.resolve
+    target_calls = 0
+    workspace_calls = 0
+
+    def target_resolve(cls, *args, **kwargs):
+        nonlocal target_calls
+        target_calls += 1
+        return real_target_resolve(*args, **kwargs)
+
+    def workspace_resolve(cls, *args, **kwargs):
+        nonlocal workspace_calls
+        workspace_calls += 1
+        return real_workspace_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(cli.TargetRepo, "resolve", classmethod(target_resolve))
+    monkeypatch.setattr(cli.WorkspacePaths, "resolve", classmethod(workspace_resolve))
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    assert target_calls == 1
+    assert workspace_calls == 1
+
+
+def test_config_show_human_single_checkout(tmp_path: Path, monkeypatch) -> None:
+    """Six ``label: value (source)`` lines; sources identical to JSON mode."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+
+    result = runner.invoke(app, ["config", "show"])
+
+    assert result.exit_code == 0, result.output
+    lines = _config_lines(result.stdout)
+    assert len(lines) == 6
+    # Exactly the six pinned source strings, no display-label wording pinned.
+    assert sorted(_line_source(line) for line in lines) == [
+        "cwd",
+        "defaults",
+        "package",
+        "package",
+        "workspace",
+        "workspace",
+    ]
+    assert f"{ToolkitPaths.resolve().root} (package)" in result.stdout
+    assert f"{__version__} (package)" in result.stdout
+    assert f"{tmp_path.resolve()} (cwd)" in result.stdout
+    assert f"{tmp_path.resolve()} (workspace)" in result.stdout
+    assert f"{_expected_state(tmp_path)} (workspace)" in result.stdout
+
+    defaults_line = [
+        line for line in lines if _line_source(line) == "defaults"
+    ]
+    assert len(defaults_line) == 1
+    assert "none" in defaults_line[0]
+
+
+def test_config_show_json_single_checkout(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert set(payload) == CONFIG_KEYS
+    for entry in payload.values():
+        assert set(entry) == {"value", "source"}
+
+    assert payload["toolkit_root"] == {
+        "value": str(ToolkitPaths.resolve().root),
+        "source": "package",
+    }
+    assert payload["version"] == {"value": __version__, "source": "package"}
+    assert payload["target_root"] == {
+        "value": str(tmp_path.resolve()),
+        "source": "cwd",
+    }
+    assert payload["workspace_root"] == {
+        "value": str(tmp_path.resolve()),
+        "source": "workspace",
+    }
+    assert payload["state_root"] == {
+        "value": str(_expected_state(tmp_path)),
+        "source": "workspace",
+    }
+    assert payload["config_file"] == {"value": None, "source": "defaults"}
+
+
+def test_config_show_detects_the_target_config_file(tmp_path: Path, monkeypatch) -> None:
+    """A regular ``<target>/aidw/config.yaml`` becomes a resolved path, not parsed."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+    config_path = tmp_path / "aidw" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text("schema_version: 1\n", encoding="utf-8")
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["config_file"] == {
+        "value": str(config_path.resolve()),
+        "source": "target repo",
+    }
+
+
+def test_config_show_config_file_directory_is_not_a_config(tmp_path: Path, monkeypatch) -> None:
+    """Detection is ``is_file``: a directory named config.yaml is ``none``."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+    (tmp_path / "aidw" / "config.yaml").mkdir(parents=True)
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["config_file"] == {
+        "value": None,
+        "source": "defaults",
+    }
+
+
+def test_config_show_config_file_detection_does_not_parse_yaml(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An invalid regular file is still detected; parsing belongs to E3.1/E3.5."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+    config_path = tmp_path / "aidw" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text("{{ not yaml: [", encoding="utf-8")
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["config_file"] == {
+        "value": str(config_path.resolve()),
+        "source": "target repo",
+    }
+
+
+def test_config_show_broken_config_symlink_uses_defaults(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A broken config symlink is not a regular file and is treated as absent."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+    config_path = tmp_path / "aidw" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.symlink_to(tmp_path / "missing-config.yaml")
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["config_file"] == {
+        "value": None,
+        "source": "defaults",
+    }
+
+
+def test_config_show_target_provenance(tmp_path: Path, monkeypatch) -> None:
+    """``--repo`` > ``$AIDW_REPO`` > cwd, labelled with the actual winner."""
+    flag_repo = tmp_path / "flag"
+    env_repo = tmp_path / "env"
+    cwd_repo = tmp_path / "cwd"
+    _init_repo(flag_repo)
+    _init_repo(env_repo)
+    _init_repo(cwd_repo)
+    monkeypatch.chdir(cwd_repo)
+    monkeypatch.setenv("AIDW_REPO", str(env_repo))
+
+    flagged = _config_show_json("--repo", str(flag_repo))
+    assert flagged.exit_code == 0, flagged.output
+    assert json.loads(flagged.stdout)["target_root"] == {
+        "value": str(flag_repo.resolve()),
+        "source": "--repo",
+    }
+
+    env_only = _config_show_json()
+    assert env_only.exit_code == 0, env_only.output
+    assert json.loads(env_only.stdout)["target_root"] == {
+        "value": str(env_repo.resolve()),
+        "source": "AIDW_REPO",
+    }
+
+    monkeypatch.delenv("AIDW_REPO")
+    from_cwd = _config_show_json()
+    assert from_cwd.exit_code == 0, from_cwd.output
+    assert json.loads(from_cwd.stdout)["target_root"] == {
+        "value": str(cwd_repo.resolve()),
+        "source": "cwd",
+    }
+
+
+def test_config_show_whitespace_aidw_repo_falls_to_cwd(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A blank ``AIDW_REPO`` is normalised to unset by the shared helper."""
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+    monkeypatch.setenv("AIDW_REPO", "   ")
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["target_root"] == {
+        "value": str(tmp_path.resolve()),
+        "source": "cwd",
+    }
+
+
+def test_config_show_state_provenance_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+    env_dir = tmp_path / "env-state"
+    monkeypatch.setenv("AIDW_STATE_DIR", str(env_dir))
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["state_root"] == {
+        "value": str(_expected_state(tmp_path)),
+        "source": "AIDW_STATE_DIR",
+    }
+
+
+def test_config_show_state_provenance_whitespace_env(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Unlike ``AIDW_REPO``, a whitespace ``AIDW_STATE_DIR`` is *set* (§3.10 bare truthiness)."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+    monkeypatch.setenv("AIDW_STATE_DIR", "   ")
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["state_root"]["source"] == "AIDW_STATE_DIR"
+    assert Path(payload["state_root"]["value"]).parent == Path("   ").resolve()
+
+
+def test_config_show_state_provenance_home(tmp_path: Path, monkeypatch) -> None:
+    """An unwritable workspace root falls through to the ``home`` tier label."""
+    workspace = tmp_path / "ws"
+    _init_repo(workspace)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    original_mode = workspace.stat().st_mode
+    try:
+        workspace.chmod(0o500)
+        result = _config_show_json()
+    finally:
+        workspace.chmod(original_mode)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["state_root"] == {
+        "value": str(home.resolve() / ".aidw" / "state" / workspace.name),
+        "source": "home",
+    }
+
+
+def test_config_show_wrong_target_refuses_human(tmp_path: Path, monkeypatch) -> None:
+    """Human mode prints toolkit + version first, then refuses with the path."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    bad = tmp_path / "not-a-repo"
+    bad.mkdir()
+
+    result = runner.invoke(app, ["--repo", str(bad), "config", "show"])
+
+    assert result.exit_code == EXIT_REFUSED
+    assert str(bad.resolve()) in result.stderr
+    assert "Traceback" not in result.output
+    assert f"{ToolkitPaths.resolve().root} (package)" in result.stdout
+    assert f"{__version__} (package)" in result.stdout
+
+
+def test_config_show_bare_target_refuses(tmp_path: Path) -> None:
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+
+    result = runner.invoke(app, ["--repo", str(bare), "config", "show"])
+
+    assert result.exit_code == EXIT_REFUSED
+    assert "bare repository" in result.stderr
+    assert str(bare.resolve()) in result.stderr
+
+
+def test_config_show_wrong_target_json_leaves_stdout_empty(tmp_path: Path) -> None:
+    """``--json`` is all-or-nothing: no partial JSON, no human lines."""
+    bad = tmp_path / "not-a-repo"
+    bad.mkdir()
+
+    result = runner.invoke(app, ["--repo", str(bad), "config", "show", "--json"])
+
+    assert result.exit_code == EXIT_REFUSED
+    assert result.stdout == ""
+    assert str(bad.resolve()) in result.stderr
+
+
+def test_config_unknown_action_beats_a_bad_target(tmp_path: Path) -> None:
+    """Action validation runs before ``_roots()``: usage error wins over refusal."""
+    bad = tmp_path / "not-a-repo"
+    bad.mkdir()
+
+    result = runner.invoke(app, ["--repo", str(bad), "config", "bogus"])
+
+    assert result.exit_code == EXIT_USAGE
+    assert result.stdout == ""
+    assert "unknown action" in result.stderr
+    assert str(bad.resolve()) not in result.stderr
+
+
+def test_config_show_writes_no_state_dir(tmp_path: Path, monkeypatch) -> None:
+    """Resolution is read-only: it must not create the state root (R8)."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / ".aidw").exists()

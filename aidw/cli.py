@@ -9,6 +9,7 @@ Design reference: ``aidt/design.md`` §14 (CLI reference), §16 (build plan).
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,7 @@ from aidw.doctor import run_doctor
 from aidw.gates import GateDefault
 from aidw.log import RunLogger
 from aidw.paths import (
+    STATE_DIR_ENV_VAR,
     RepoNotFoundError,
     TargetRepo,
     ToolkitPaths,
@@ -56,25 +58,38 @@ AIDW_REPO_ENV_VAR = "AIDW_REPO"
 _state: dict[str, object] = {"repo": None, "verbose": False}
 
 
+def _resolve_target_selection() -> tuple[Optional[Path], str]:
+    """Return ``(explicit target override, winning provenance label)``.
+
+    Precedence is ``--repo`` > ``$AIDW_REPO`` > cwd (EXTRACTION.md §3.3/D19),
+    mirroring ``aidw/gates.py`` (``--gate-default`` > ``$AIDW_GATE_DEFAULT``).
+    ``--repo`` is validated by Typer; ``AIDW_REPO`` is raw environment text
+    normalised here — stripped, with an empty/whitespace-only value treated as
+    unset — so a blank value never becomes ``Path("")``. The label is one of
+    ``--repo`` | ``AIDW_REPO`` | ``cwd`` and is shared by :func:`_roots` and
+    ``config show`` so the environment is read in exactly one place.
+    """
+    override = _state.get("repo")
+    if override:
+        return Path(override), "--repo"
+    raw = (os.environ.get(AIDW_REPO_ENV_VAR) or "").strip()
+    if raw:
+        return Path(raw), AIDW_REPO_ENV_VAR
+    return None, "cwd"
+
+
 def _roots() -> tuple[TargetRepo, ToolkitPaths, WorkspacePaths]:
     """Resolve ``(target repo, toolkit, workspace)`` once for a command.
 
-    Target selection precedence is ``--repo`` > ``$AIDW_REPO`` > cwd (EXTRACTION.md
-    §3.3/D19), mirroring ``aidw/gates.py`` (``--gate-default`` > ``$AIDW_GATE_DEFAULT``).
-    ``--repo`` is validated by Typer; ``AIDW_REPO`` is raw environment text normalised
-    here — stripped, with an empty/whitespace-only value treated as unset — and passed
-    as ``explicit=`` so an invalid override refuses rather than falling back to cwd.
-    The toolkit root always comes from the installed package location, so no flag can
-    point the toolkit at a checkout. This is the single ``TargetRepo``/
-    ``WorkspacePaths`` resolution site: ``run.py`` and the workflows receive the typed
-    objects and pass those same objects on.
+    Target selection comes from :func:`_resolve_target_selection` (``--repo`` >
+    ``$AIDW_REPO`` > cwd); the chosen override is passed as ``explicit=`` so an
+    invalid one refuses rather than falling back to cwd. The toolkit root always
+    comes from the installed package location, so no flag can point the toolkit at
+    a checkout. This is the single ``TargetRepo``/``WorkspacePaths`` resolution
+    site: ``run.py`` and the workflows receive the typed objects and pass those
+    same objects on.
     """
-    override = _state.get("repo")
-    explicit = Path(override) if override else None
-    if explicit is None:
-        raw = (os.environ.get(AIDW_REPO_ENV_VAR) or "").strip()
-        if raw:
-            explicit = Path(raw)
+    explicit, _source = _resolve_target_selection()
     try:
         target = TargetRepo.resolve(explicit=explicit)
     except RepoNotFoundError as exc:
@@ -84,6 +99,30 @@ def _roots() -> tuple[TargetRepo, ToolkitPaths, WorkspacePaths]:
         typer.echo(str(exc), err=True)
         raise typer.Exit(EXIT_REFUSED)
     return target, ToolkitPaths.resolve(), WorkspacePaths.resolve(target)
+
+
+def _state_root_source(workspace: WorkspacePaths) -> str:
+    """Label which ``_state_base`` tier produced ``workspace.state_root``.
+
+    ``config show`` gets its workspace from :func:`_roots` with
+    ``state_dir_override`` at its ``None`` default, so only three tiers are
+    reachable: ``$AIDW_STATE_DIR``, ``<workspace_root>/.aidw/state``, else
+    ``~/.aidw/state``. The already-resolved ``state_root`` encodes which one won,
+    so compare its parent to the candidates in ``_state_base``'s post-override
+    order instead of re-running the usability walk (which could disagree).
+
+    The env candidate mirrors ``_state_base`` exactly — a bare truthiness test and
+    ``Path(env).resolve()``, no strip — so a whitespace-only value counts as "set".
+    Both candidates are resolved before comparison because ``state_root.parent`` is
+    already resolved (``WorkspacePaths.resolve`` resolves every tier).
+    """
+    parent = workspace.state_root.parent
+    env = os.environ.get(STATE_DIR_ENV_VAR)
+    if env and Path(env).resolve() == parent:
+        return STATE_DIR_ENV_VAR
+    if (workspace.workspace_root / ".aidw" / "state").resolve() == parent:
+        return "workspace"
+    return "home"
 
 
 def _gate_default_value(value: Optional[GateDefault]) -> Optional[str]:
@@ -716,6 +755,71 @@ def prompts(
 
     typer.echo(f"unknown action: {action} (expected list | check)", err=True)
     raise typer.Exit(EXIT_USAGE)
+
+
+@app.command()
+def config(
+    action: str = typer.Argument("show", help="show"),
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit one JSON object with per-value provenance."
+    ),
+) -> None:
+    """Show the resolved roots and the target config file, with provenance.
+
+    Skeleton only (EXTRACTION.md §3.3): every value is resolved, but the target
+    ``aidw/config.yaml`` is detected with ``is_file()`` and never parsed — loading
+    and validating it is E3.1/E3.2 scope. The action is validated before any
+    printing or resolution so a doubly-bad invocation (unknown action plus a bad
+    target) exits ``EXIT_USAGE`` with empty stdout; a bad target still refuses via
+    :func:`_roots`'s ``RepoNotFoundError`` -> ``EXIT_REFUSED`` path.
+    """
+    if action != "show":
+        typer.echo(f"unknown action: {action} (expected show)", err=True)
+        raise typer.Exit(EXIT_USAGE)
+
+    if not json_output:
+        # Human-mode debug aid: these two resolve with no repo, so a wrong target
+        # still shows them before the refusal below. JSON buffers all six values and
+        # emits nothing until resolution succeeds, so a refusal leaves stdout empty.
+        typer.echo(f"toolkit root: {ToolkitPaths.resolve().root} (package)")
+        typer.echo(f"version: {__version__} (package)")
+
+    # Do not catch _roots()'s RepoNotFoundError: a bad --repo/AIDW_REPO, a non-repo
+    # cwd or a bare target must still refuse with EXIT_REFUSED naming the path.
+    target, _toolkit, workspace = _roots()
+    _explicit, target_source = _resolve_target_selection()
+    state_source = _state_root_source(workspace)
+
+    config_path = target.root / "aidw" / "config.yaml"
+    if config_path.is_file():
+        config_value: Optional[str] = str(config_path.resolve())
+        config_source = "target repo"
+    else:
+        config_value = None
+        config_source = "defaults"
+
+    if json_output:
+        payload = {
+            "toolkit_root": {
+                "value": str(ToolkitPaths.resolve().root),
+                "source": "package",
+            },
+            "version": {"value": __version__, "source": "package"},
+            "target_root": {"value": str(target.root), "source": target_source},
+            "workspace_root": {
+                "value": str(workspace.workspace_root),
+                "source": "workspace",
+            },
+            "state_root": {"value": str(workspace.state_root), "source": state_source},
+            "config_file": {"value": config_value, "source": config_source},
+        }
+        typer.echo(json.dumps(payload))
+        return
+
+    typer.echo(f"target root: {target.root} ({target_source})")
+    typer.echo(f"workspace root: {workspace.workspace_root} (workspace)")
+    typer.echo(f"state root: {workspace.state_root} ({state_source})")
+    typer.echo(f"config file: {config_value or 'none'} ({config_source})")
 
 
 def main() -> None:
