@@ -14,4 +14,10 @@ Never settle a material ambiguity. A finding that needs an owner decision (secur
 schema, data loss, hard-to-reverse) is never settled by guessing: state the options and stop,
 leaving it a `Blocked` escalation.
 
+After the edit, end the stage with a consistency sweep: re-read the whole prompt under
+revision and repair what the edit made stale. Every section must still agree with the change
+you made. Walk the six sections — `Requirements`, `Traps / prior review findings`,
+`Explicit non-goals`, `Tests`, `Done when`, and the closing prompt-fixed/ambiguity list — and
+repair any contradiction the edit introduced, even in a section the finding did not name.
+
 Edit only `$1`. Do not implement the task the prompt describes, and do not change unrelated files.
