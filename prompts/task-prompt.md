@@ -157,4 +157,23 @@ State the convention in one line per prompt ("pnpm, `workspace:*` internal, `cat
 The roadmap's own "Done when" line is usually already close to right — make it executable with 3–6 task-specific checks (a test file passing, a router call working end-to-end, a frame asserting). If the roadmap's condition is already concrete, copy it as-is. Never include the per-package `build/lint/test` matrix or the `srd:*` validator list here — `record-implementation-results.md` and `update-traceability.md` own generic verification.
 
 ### Ask-if-ambiguous clause
-Always include it, but scope it: 2–4 task-specific risks named inline (e.g. DC source, budget transition, queue ownership, opposed cross-skill support) plus the generic guard (security-sensitive, cost-committing, hard-to-reverse: cross-account trust, schema changes, billing logic, data deletion). A bare verbatim clause with no task-specific risks is a sign the prompt author didn't read the spec.
+Always include it, but scope it: 2–4 task-specific risks named inline (e.g. DC source, budget transition, queue ownership, opposed cross-skill support) plus the generic guard (security-sensitive, cost-committing, hard-to-reverse: cross-account trust, schema changes, billing logic, data deletion). A bare verbatim clause with no task-specific risks is a sign the prompt author didn't read the spec. Before returning the prompt, run the pre-submit self-check below; it is where the `prompt-fixed` label defined here is applied.
+
+## Pre-submit self-check
+
+Before you return the prompt, walk the same ground as the reviewer's `## Review order` in
+`task-review.md` — read it, do not transcribe it. Each numbered check below shadows one
+review-order step. Where the cited spec is silent, make the decision explicit and label it
+`prompt-fixed` with its rationale, and name the ambiguity in the ask-if-ambiguous clause — the one
+label that clause already defines; do not invent a second. If a check would force bloat, cut
+context and keep traps (Conciseness budget).
+
+1. **Set the frame** — task id, cited specs, deliverable, acceptance checks and non-goals, and who or what the change affects.
+2. **Trace the authority chain** — every requirement cites the roadmap entry or spec section that fixes it; where new shared code lives is decided from the repository conventions, and labelled `prompt-fixed` if the spec is silent.
+3. **Check repository fit** — paths, names and dependencies exist in the current tree; the claimed prerequisite state is true.
+4. **Review the requested behavior** — failure-path precedence when two failures are possible, and per-mode output contracts on the failure path, are each decided and labelled `prompt-fixed` if the spec is silent.
+5. **Check internal consistency** — the complete label/key vocabulary, why the enumerated set is complete, and exact comparison semantics are all decided; requirements, non-goals, deliverables and Done-when do not contradict.
+6. **Check task boundaries and dependencies** — one coherent task, adjacent work named as a non-goal, no missing prerequisite.
+7. **Check the proof** — one proof per requirement: every numbered requirement maps to at least one Tests or Done-when assertion that would fail under a broken implementation.
+8. **Check ambiguity severity** — every material ambiguity the spec leaves open is visibly labelled `prompt-fixed` with its rationale and named in the ask-if-ambiguous clause, not left implicit.
+9. **Report findings** — the ask-if-ambiguous clause names its task-specific risks and the generic guard.

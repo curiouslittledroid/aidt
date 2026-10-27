@@ -282,7 +282,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
 
 ## Epic L5: Author upstream quality — fewer findings to fix
 
-- [ ] **L5.1. Give the author the reviewer's rubric before it submits** (Design 8.1)
+- [x] **L5.1. Give the author the reviewer's rubric before it submits** (Design 8.1)
   The reviewer has a nine-step review order; the author has a format and a conciseness budget.
   Round 1 therefore always carries material findings — in E1.6, half of them were contract
   decisions the author left open (provenance labels for two of six values, the fourth state

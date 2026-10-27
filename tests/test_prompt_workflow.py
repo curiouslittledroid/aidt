@@ -3624,3 +3624,150 @@ def test_l43_nonpositive_budget_is_a_usage_error_before_any_run(
     # No run directory was created and nothing was authored.
     assert not _runs_root(tmp_path).exists()
     assert not (tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# L5.1 — give the author the reviewer's rubric before it submits (design §8.1)
+# ---------------------------------------------------------------------------
+
+#: The seven decisions L5.1 requires the author to settle before submitting, each
+#: with a stable key phrase the rendered self-check must carry.
+L51_DECISIONS = (
+    "failure-path precedence when two failures are possible",
+    "per-mode output contracts on the failure path",
+    "the complete label/key vocabulary",
+    "why the enumerated set is complete",
+    "exact comparison semantics",
+    "where new shared code lives",
+    "one proof per requirement",
+)
+
+#: The self-check is a compact shadow of the reviewer's nine-step review order, not a
+#: transcription of it. The review order plus its sub-bullets is far longer, so this
+#: bound fails a copy while leaving room for the intro and the nine checks.
+L51_SECTION_LINE_BOUND = 30
+
+#: Package managers, product tokens, product paths and brand/task-id shapes that must
+#: never appear in the *added* lines (EXTRACTION.md §3.8 / §4.2 bucket (iii)).
+L51_FORBIDDEN_PACKAGE_MANAGERS = re.compile(r"\b(pnpm|npm|yarn|uv)\b")
+L51_FORBIDDEN_TOKENS = (
+    "Design 21",
+    "Zod",
+    "fast-check",
+    "catalog",
+    "vectors",
+    "@mythical-forge",
+)
+L51_FORBIDDEN_PATHS = (
+    "docs/task-prompts",
+    "docs/specs/",
+    "infra/",
+    "apps/",
+    "packages/",
+)
+
+
+def _l51_review_order_steps() -> list[str]:
+    """The bolded lead of each ordered item in ``task-review.md``'s review order."""
+    reviewer = (toolkit_root() / "prompts" / "task-review.md").read_text(
+        encoding="utf-8"
+    )
+    section = reviewer.split("## Review order", 1)[1].split("\n## ", 1)[0]
+    # The bolded lead carries a trailing period; drop it so the bare step name is
+    # what the self-check lines must name.
+    return [
+        match.group(1).rstrip(".")
+        for match in re.finditer(r"^\d+\.\s+\*\*(.+?)\*\*", section, re.MULTILINE)
+    ]
+
+
+def _l51_self_check_lines(rendered: str) -> list[str]:
+    """The ``## Pre-submit self-check`` section, from its heading to the next heading."""
+    rest = rendered[rendered.index("## Pre-submit self-check") :]
+    end = rest.find("\n## ", 1)
+    return (rest if end == -1 else rest[:end]).splitlines()
+
+
+#: The pointer L5.1 adds to the ask-if-ambiguous clause, located by this phrase.
+L51_POINTER_PHRASE = "Before returning the prompt, run the pre-submit"
+
+
+def test_l51_rendered_author_prompt_carries_the_review_order_self_check() -> None:
+    """L5.1: the rendered author prompt carries the compact pre-submit self-check."""
+    prompt_path = toolkit_root() / "prompts" / "task-prompt.md"
+    rendered = render_prompt_file(prompt_path, ["02", "L5", "L5.1"])
+    normalized = " ".join(rendered.split())
+
+    assert "## Pre-submit self-check" in rendered
+    # The checklist follows the final subsection of the section-by-section guidance.
+    assert rendered.index("## Pre-submit self-check") > rendered.index(
+        "### Ask-if-ambiguous clause"
+    )
+    for phrase in L51_DECISIONS:
+        assert phrase in rendered, phrase
+
+    # It walks the reviewer's review order and reuses that clause's `prompt-fixed`
+    # contract instead of defining a second label.
+    assert "walk the same ground as the reviewer's `## Review order`" in normalized
+    assert "`task-review.md`" in rendered
+    assert "`prompt-fixed`" in rendered
+    assert (
+        "the one label that clause already defines; do not invent a second"
+        in normalized
+    )
+    # The pointer from the ask-if-ambiguous clause back to the self-check.
+    assert "run the pre-submit self-check below" in rendered
+
+    # L1.3's blocked/feasibility contract still renders (its own test stays green).
+    assert "blocked: <reason>" in rendered
+    assert "before creating or switching to the `{phase}-{task}` branch" in rendered
+
+    lines = _l51_self_check_lines(rendered)
+    # Heading, setup and the nine checks — never a transcription of the review order
+    # (nine steps plus their sub-bullets).
+    assert len(lines) <= L51_SECTION_LINE_BOUND, len(lines)
+
+    # Each check is exactly one line and names the review-order step it shadows.
+    checks = [line for line in lines if re.match(r"^\d+\.\s+\*\*", line)]
+    assert len(checks) == 9, checks
+    first_check = lines.index(checks[0])
+    check_block = lines[first_check:]
+    # A wrapped continuation would otherwise be invisible to the numbered-line
+    # filter above; every nonblank line in the check block must itself be a check.
+    assert all(
+        not line.strip() or re.match(r"^\d+\.\s+\*\*", line)
+        for line in check_block
+    ), check_block
+    order_steps = _l51_review_order_steps()
+    assert len(order_steps) == 9, order_steps
+    for step in order_steps:
+        assert any(step in line for line in checks), step
+
+    # No self-check line appears verbatim in the reviewer's review order.
+    reviewer = (toolkit_root() / "prompts" / "task-review.md").read_text(
+        encoding="utf-8"
+    )
+    review_order = reviewer.split("## Review order", 1)[1].split("\n## ", 1)[0]
+    self_check = {line.strip() for line in lines if line.strip()}
+    review_lines = {line.strip() for line in review_order.splitlines() if line.strip()}
+    assert not (self_check & review_lines)
+
+    # Neutrality is asserted on the added lines only: the prompt is ~100%
+    # product-specific today and stays that way until E7.1 (EXTRACTION.md §3.8).
+    pointer_start = rendered.index(L51_POINTER_PHRASE)
+    pointer_end = rendered.index("\n", pointer_start)
+    added_lines = [rendered[pointer_start:pointer_end], *lines]
+    assert added_lines
+    for line in added_lines:
+        assert not L51_FORBIDDEN_PACKAGE_MANAGERS.search(line), line
+        for token in L51_FORBIDDEN_TOKENS:
+            assert token not in line, (token, line)
+        for path in L51_FORBIDDEN_PATHS:
+            assert path not in line, (path, line)
+        assert not re.search(r"\b0[0-9]-E[0-9]", line), "no product task-id example"
+
+    # Rendering contract: `$1`/`$2`/`$3`; fewer than three args raises, extras are
+    # ignored (aidw/prompts.py raises only when the highest index exceeds the count).
+    with pytest.raises(PromptError):
+        render_prompt_file(prompt_path, ["02", "L5"])
+    assert render_prompt_file(prompt_path, ["02", "L5", "L5.1", "extra"])
