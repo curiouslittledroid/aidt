@@ -212,7 +212,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     the fixer to state which sections it re-checked and which it changed because of the sweep.
   - Tests: rendered-prompt/agent-context assertion.
 
-- [ ] **L3.3. Snapshot the prompt at every fix stage** (Design 9.1)
+- [x] **L3.3. Snapshot the prompt at every fix stage** (Design 9.1)
   Only the final state is committed, so fixers cannot tell their own diff from their
   predecessors' — three reported exactly that. Write a copy of the prompt into the run directory
   before each fix stage (`stages/<stage>.prompt.md`) so every stage's input is recoverable and
