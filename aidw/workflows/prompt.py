@@ -19,7 +19,11 @@ Stages:
                           fix stage also receives a pointer to its own evidence bundle (L2.4),
                           and its input prompt is snapshotted to
                           ``<run_dir>/stages/<stage>.prompt.md`` before it runs (L3.3).
-4. optional gate ``approve-task-prompt``.
+4. ``task-review-reconcile-N`` — one stage per fix batch, after the batch and before the
+                          next review (or the terminal acceptance). It uses the ``task-fixer``
+                          agent with ``prompts/task-review-fixes.md`` and an ``extra=`` that
+                          carries the whole review plus that batch's combined diff (L3.4).
+5. optional gate ``approve-task-prompt``.
 
 A real run requires ``main`` and a clean working tree, because the ``task-prompt`` prompt
 requires it. It then refuses (exit 4) when an earlier task in the same ``docs/tasks/*.md``
@@ -114,6 +118,25 @@ _DIFF_UNAVAILABLE = (
 #: Note used when the two prompt snapshots are byte-identical, so the reviewer is not left
 #: wondering whether a diff section went missing.
 _DIFF_EMPTY = "The prompt is unchanged since the previous review."
+
+#: Instruction prepended to the single reconcile stage that follows a fix batch (L3.4,
+#: design §8.1). A fix batch edits the prompt one finding at a time (or one combined batch
+#: of non-blocking findings) and is told to prefer the smallest edit, so the batch can end
+#: internally inconsistent: a fix can leave a neighbouring section stale or leave a finding
+#: unaddressed. This stage compares the fixed prompt against the full review text and the
+#: combined diff and repairs both. It is deliberately *not* :data:`_DELTA_BRIEF_INSTRUCTION`:
+#: that orders the *reviewer* to emit a ``resolved``/``not resolved``/``newly contradicted``
+#: verdict per prior finding; the fixer must reconcile, not review. Like the delta brief it
+#: lives here as toolkit runtime text rather than in ``prompts/task-review-fixes.md``, which
+#: is bucket (i) generic and ships as-is (EXTRACTION.md §4.2).
+_RECONCILE_INSTRUCTION = """\
+## Reconcile the fix batch
+
+One or more fix stages have just edited this prompt in isolation. Compare the fixed
+prompt against the full review text and the combined diff below. Repair every
+cross-section contradiction the edits introduced and address any finding the batch left
+unaddressed. Do not review or re-litigate the findings; make the prompt internally
+consistent with the review."""
 
 #: Temp-directory prefix for the two stable-named diff snapshots. The directory is
 #: removed in a ``finally`` on every path; it is never the run directory (L3.3 owns
@@ -231,6 +254,43 @@ def _render_delta_brief(
             _DELTA_BRIEF_INSTRUCTION,
             "### Previous review\n\n" + previous_review,
             "### Prompt diff since that review\n\n" + diff_text,
+        ]
+    )
+
+
+def _render_reconcile(
+    *,
+    index: int,
+    review_text: str,
+    baseline: str | None,
+    current: str | None,
+    rel: str,
+) -> str:
+    """Assemble a reconcile stage's ``extra=`` (instruction, whole review, diff) (L3.4).
+
+    Mirrors :func:`_render_delta_brief`: the full review is passed verbatim, and when the
+    baseline or the diff cannot be produced the instruction and the review still ship with
+    an explicit unavailable note — never a silently empty diff section. The diff is the fix
+    batch's net effect: ``baseline`` is the in-memory capture taken before the fix stages
+    and ``current`` is captured before this stage edits anything.
+    """
+    if baseline is None or current is None:
+        print(
+            f"warning: could not read the reviewed prompt `{rel}` to reconcile review "
+            f"round {index}; the reconcile brief names the prompt diff unavailable.",
+            file=sys.stderr,
+        )
+        diff_text = _DIFF_UNAVAILABLE
+    else:
+        diff_text = _prompt_diff(baseline, current, name=Path(rel).name)
+        if diff_text is None:
+            diff_text = _DIFF_UNAVAILABLE
+
+    return "\n\n".join(
+        [
+            _RECONCILE_INSTRUCTION,
+            "### Full review\n\n" + review_text,
+            "### Combined diff for this fix batch\n\n" + diff_text,
         ]
     )
 
@@ -1336,6 +1396,55 @@ def run(
                     state.status = FAILED
                     save(directory, state)
                     return 1
+
+        # L3.4: one reconcile stage per fix batch, after the batch and before the next
+        # review (or the terminal acceptance). The fixers work one finding at a time and
+        # prefer the smallest edit, so the batch can end internally inconsistent. It sits
+        # before the ``MAX_REVISIONS`` break on purpose: pre-L4.1 the final round's fixes
+        # are otherwise never reviewed, and reconcile is the cheapest available check on
+        # them (L4.1 later removes that final fix batch). ``review_index`` is the round
+        # number, so the name matches neither ``task-review-N`` nor
+        # ``task-review-fixes-*`` — the L3.3 snapshot writer, the ``_fix_round`` regex and
+        # the harness's ``fix_status`` branch all leave it alone.
+        reconcile_name = f"task-review-reconcile-{review_index}"
+        rec_reconcile = run_stage(
+            StageSpec(
+                reconcile_name,
+                "task-fixer",
+                aidt.prompts_dir / "task-review-fixes.md",
+                [rel],
+                extra=_with_evidence(
+                    _stage_evidence_pointer(
+                        stage=reconcile_name,
+                        directory=directory,
+                        repo=repo,
+                        entry=entry,
+                        entries=entries,
+                        rel=rel,
+                    ),
+                    _render_reconcile(
+                        index=review_index,
+                        review_text=review_text,
+                        baseline=baseline_prompt,
+                        # Captured here, before run_stage: this is the fix batch's net
+                        # effect, not a diff polluted by the reconcile edit itself.
+                        current=_capture_prompt(prompt_path),
+                        rel=rel,
+                    ),
+                ),
+            ),
+            repo_root=repo.root,
+            toolkit_root=aidt.root,
+            runs_root=runs_root,
+            state=state,
+            logger=logger,
+            agents=agents,
+        )
+        print_stage(rec_reconcile, repo_root=repo.root)
+        if rec_reconcile.status != SUCCEEDED:
+            state.status = FAILED
+            save(directory, state)
+            return 1
 
         if revisions >= MAX_REVISIONS:
             # The final round's fixes are done. Do not review again: the reviewer has had

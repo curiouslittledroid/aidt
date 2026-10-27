@@ -242,12 +242,20 @@ def _fix_round(stage_name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _fake_stages(review_body: str, *, fix_status: str = "succeeded", approve_review: int | None = 2):
+def _fake_stages(
+    review_body: str,
+    *,
+    fix_status: str = "succeeded",
+    reconcile_status: str = "succeeded",
+    approve_review: int | None = 2,
+):
     """A fake ``run_stage`` returning canned review text, approving at ``approve_review``.
 
     Each fix stage appends a round-distinct marker to the prompt file (once per round), so
     the L2.3 delta-brief tests can prove that a round's diff carries only the immediately
-    preceding fix batch's net effect, not every round's changes cumulatively.
+    preceding fix batch's net effect, not every round's changes cumulatively. ``fix_status``
+    and ``reconcile_status`` are separate knobs so a failing reconcile stage can be injected
+    without special-casing its name in the workflow (L3.4).
     """
     from aidw.state import SUCCEEDED, StageRecord, run_dir
 
@@ -287,6 +295,8 @@ def _fake_stages(review_body: str, *, fix_status: str = "succeeded", approve_rev
         status = SUCCEEDED
         if spec.name.startswith("task-review-fixes") and fix_status != SUCCEEDED:
             status = fix_status
+        if spec.name.startswith("task-review-reconcile") and reconcile_status != SUCCEEDED:
+            status = reconcile_status
         out = stages / f"{spec.name}.out.txt"
         out.write_text(body, encoding="utf-8")
         record = StageRecord(
@@ -404,6 +414,7 @@ def test_review_fix_loop_fixes_blocking_individually_and_batches_could_fix(
         "task-review-fixes-1-1",
         "task-review-fixes-1-2",
         "task-review-fixes-1-3",
+        "task-review-reconcile-1",
         "task-review-2",
     ]
     fixes = [item for item in seen if item[0].startswith("task-review-fixes")]
@@ -445,6 +456,7 @@ def test_multiple_could_fix_findings_share_one_stage(
         "task-review-1",
         "task-review-fixes-1-1",
         "task-review-fixes-1-2",
+        "task-review-reconcile-1",
         "task-review-2",
     ]
     combined = seen[3][2]
@@ -476,6 +488,7 @@ def test_could_fix_only_review_still_runs_one_combined_stage(
         "task-prompt",
         "task-review-1",
         "task-review-fixes-1-1",
+        "task-review-reconcile-1",
         "task-review-2",
     ]
     out = capsys.readouterr().out
@@ -498,6 +511,7 @@ def test_review_fix_loop_falls_back_to_one_combined_stage(
         "task-prompt",
         "task-review-1",
         "task-review-fixes-1",
+        "task-review-reconcile-1",
         "task-review-2",
     ]
     combined = seen[2][2]
@@ -526,6 +540,7 @@ def test_bold_review_drives_per_finding_fixes(tmp_path: Path, monkeypatch, capsy
         "task-review-1",
         "task-review-fixes-1-1",
         "task-review-fixes-1-2",
+        "task-review-reconcile-1",
         "task-review-2",
     ]
     out = capsys.readouterr().out
@@ -633,6 +648,25 @@ def test_three_review_rounds_then_accept_without_another_review(
         "task-review-fixes-3-2",
         "task-review-fixes-3-3",
     ]
+    # Exactly one reconcile per fix batch, each after its batch and before the next
+    # review. The final one sits before the terminal acceptance (there is no review 4),
+    # so the last round's fixes are not accepted unreconciled (L3.4, req 7).
+    reconciles = [name for name in names if name.startswith("task-review-reconcile")]
+    assert reconciles == [
+        "task-review-reconcile-1",
+        "task-review-reconcile-2",
+        "task-review-reconcile-3",
+    ]
+    assert names.index("task-review-fixes-1-3") < names.index(
+        "task-review-reconcile-1"
+    ) < names.index("task-review-2")
+    assert names.index("task-review-fixes-2-3") < names.index(
+        "task-review-reconcile-2"
+    ) < names.index("task-review-3")
+    assert names.index("task-review-fixes-3-3") < names.index(
+        "task-review-reconcile-3"
+    )
+    assert names[-1] == "task-review-reconcile-3"
 
     latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.SUCCEEDED
@@ -761,7 +795,9 @@ def test_delta_brief_temp_directories_are_removed(
     )
 
     assert code == 0
-    assert len(created) == 2  # rounds 2 and 3
+    # Three reconcile diffs (after each fix batch) plus the two review delta briefs
+    # (rounds 2 and 3).
+    assert len(created) == 5
     assert all(not path.exists() for path in created)
 
 
@@ -828,8 +864,9 @@ def test_failed_prompt_diff_degrades_brief_without_failing_the_run(
     assert "The deliverable leaves a stale path reference." in extra
     assert "unavailable" in extra
     assert "diff --git" not in extra
-    # The degradation round's temp directory is cleaned up too.
-    assert len(created) == 1
+    # Both degraded diffs (the round-1 reconcile and the round-2 delta brief) still
+    # clean up their temp directory.
+    assert len(created) == 2
     assert all(not path.exists() for path in created)
     err = capsys.readouterr().err
     assert "warning:" in err
@@ -2349,6 +2386,7 @@ def test_l24_every_review_and_fix_stage_has_its_own_evidence_file(
         "task-review-fixes-1-1",
         "task-review-fixes-1-2",
         "task-review-fixes-1-3",
+        "task-review-reconcile-1",
         "task-review-2",
     ]
     for name in names[1:]:  # every review and fix stage, not the author
@@ -2616,6 +2654,7 @@ def test_l33_every_fix_stage_gets_a_snapshot_in_stage_order(
         "task-review-1",
         "task-review-fixes-1-1",
         "task-review-fixes-1-2",
+        "task-review-reconcile-1",
         "task-review-2",
     ]
     run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
@@ -2671,6 +2710,7 @@ def test_l33_fallback_whole_review_fix_also_gets_a_snapshot(
         "task-prompt",
         "task-review-1",
         "task-review-fixes-1",
+        "task-review-reconcile-1",
         "task-review-2",
     ]
     run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
@@ -2773,3 +2813,169 @@ def test_l33_snapshot_writer_copies_the_prompt_verbatim(tmp_path: Path) -> None:
     assert destination.read_text(encoding="utf-8") == body
     # Read-only: the writer never rewrites the source prompt.
     assert prompt.read_text(encoding="utf-8") == body
+
+
+# ---------------------------------------------------------------------------
+# L3.4 — reconcile after each fix batch (design §8.1)
+# ---------------------------------------------------------------------------
+
+
+def test_l34_approve_runs_no_reconcile(tmp_path: Path, monkeypatch) -> None:
+    """An approving first review has no fix batch, so it must add no reconcile stage."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    names = [name for name, _, _ in seen]
+    assert names == ["task-prompt", "task-review-1"]
+    assert not any(name.startswith("task-review-reconcile") for name in names)
+
+
+def test_l34_blocked_runs_no_reconcile(tmp_path: Path, monkeypatch) -> None:
+    """A Blocked verdict short-circuits before any fix or reconcile stage (req 6)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_BLOCKED, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=False
+    )
+
+    assert code == 3
+    names = [name for name, _, _ in seen]
+    assert names == ["task-prompt", "task-review-1"]
+    assert not any(name.startswith("task-review-reconcile") for name in names)
+
+
+def test_l34_reconcile_extra_carries_instruction_review_diff_and_pointer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Reconcile ``extra`` = instruction + whole review + batch diff, pointer prepended."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES)
+    reconcile_specs = []
+
+    def record_reconcile_spec(spec, **kwargs):
+        if spec.name == "task-review-reconcile-1":
+            reconcile_specs.append(spec)
+        return fake(spec, **kwargs)
+
+    monkeypatch.setattr(prompt_workflow, "run_stage", record_reconcile_spec)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    names = [name for name, _, _ in seen]
+    assert names.index("task-review-fixes-1-3") < names.index(
+        "task-review-reconcile-1"
+    ) < names.index("task-review-2")
+    extra = _extra_for(seen, "task-review-reconcile-1")
+    # The evidence pointer is prepended, exactly as every review and fix stage (L2.4).
+    assert extra.startswith("## Evidence bundle"), extra
+    # A reconcile-specific instruction, never the reviewer's delta brief (L3.4 trap).
+    assert prompt_workflow._RECONCILE_INSTRUCTION in extra
+    assert "## Reconcile the fix batch" in extra
+    assert "## Delta brief" not in extra
+    # The *whole* review is passed verbatim, including its trailing round marker, not one
+    # finding's block.
+    assert (TASK_REVIEW_CHANGES + "\n<!-- review round 1 -->\n") in extra
+    for title in (
+        "The deliverable leaves a stale path reference.",
+        "The prompt is silent on matrix coverage.",
+        "The annotations contradict the import strategy.",
+    ):
+        assert title in extra
+    assert "<!-- review round 1 -->" in extra
+    # The combined diff is the whole batch's net effect: baseline (authored prompt)
+    # against current (after every fix stage), with the round marker as an addition.
+    assert "### Full review" in extra
+    assert "### Combined diff for this fix batch" in extra
+    assert "diff --git a/baseline/03-E4.1-prompt.md b/current/03-E4.1-prompt.md" in extra
+    assert "+<!-- fix round 1 -->" in extra
+    assert "aidw-prompt-diff-" not in extra
+    # Ordering: instruction, then the review, then the diff.
+    assert extra.index("## Reconcile the fix batch") < extra.index("### Full review")
+    assert extra.index("### Full review") < extra.index(
+        "### Combined diff for this fix batch"
+    )
+    # The stage reuses the task-fixer agent and the existing fix prompt.
+    assert len(reconcile_specs) == 1
+    assert reconcile_specs[0].agent_id == "task-fixer"
+    assert reconcile_specs[0].prompt == (
+        ToolkitPaths.resolve().prompts_dir / "task-review-fixes.md"
+    )
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    reconcile = next(
+        s
+        for s in state.list_runs(_runs_root(tmp_path))[-1].stages
+        if s.name == "task-review-reconcile-1"
+    )
+    assert reconcile.agent == "task-fixer"
+    # L3.3's snapshot writer is scoped to ``task-review-fixes-*``; reconcile gets none.
+    assert not (
+        _runs_root(tmp_path) / run_id / "stages" / "task-review-reconcile-1.prompt.md"
+    ).exists()
+
+
+def test_l34_reconcile_failure_stops_the_run(tmp_path: Path, monkeypatch) -> None:
+    """A reconcile stage that does not succeed fails the run, like a fix-stage failure."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    from aidw.state import FAILED
+
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, reconcile_status=FAILED)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 1
+    names = [name for name, _, _ in seen]
+    # The whole fix batch ran before the reconcile; nothing followed the failure.
+    assert "task-review-fixes-1-3" in names
+    assert "task-review-reconcile-1" in names
+    assert "task-review-2" not in names
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.FAILED
+
+
+def test_l34_render_reconcile_is_pure_and_degrades_when_unreadable(
+    tmp_path: Path,
+) -> None:
+    """``_render_reconcile`` never mutates its inputs and degrades, not raises (req 3)."""
+    baseline = "prompt\n"
+    current = "prompt\n<!-- fix round 1 -->\n"
+    review = "Review text with trailing spaces  \n"
+
+    brief = prompt_workflow._render_reconcile(
+        index=1,
+        review_text=review,
+        baseline=baseline,
+        current=current,
+        rel="docs/task-prompts/03-E4.1-prompt.md",
+    )
+
+    assert prompt_workflow._RECONCILE_INSTRUCTION in brief
+    assert review in brief
+    assert "+<!-- fix round 1 -->" in brief
+    # Purity: the caller's strings are untouched.
+    assert baseline == "prompt\n"
+    assert current == "prompt\n<!-- fix round 1 -->\n"
+    # An unreadable prompt degrades to the explicit unavailable note, never an empty diff.
+    degraded = prompt_workflow._render_reconcile(
+        index=1,
+        review_text=review,
+        baseline=None,
+        current=None,
+        rel="docs/task-prompts/03-E4.1-prompt.md",
+    )
+    assert prompt_workflow._DIFF_UNAVAILABLE in degraded
+    assert review in degraded
+    assert "diff --git" not in degraded
