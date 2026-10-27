@@ -3102,7 +3102,9 @@ def test_l34_reconcile_extra_carries_instruction_review_diff_and_pointer(
     ).exists()
 
 
-def test_l34_reconcile_failure_stops_the_run(tmp_path: Path, monkeypatch) -> None:
+def test_l34_reconcile_failure_stops_the_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
     """A reconcile stage that does not succeed fails the run, like a fix-stage failure."""
     _patch_prompt_repo(tmp_path, monkeypatch)
     from aidw.state import FAILED
@@ -3122,6 +3124,10 @@ def test_l34_reconcile_failure_stops_the_run(tmp_path: Path, monkeypatch) -> Non
     assert "task-review-2" not in names
     latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.FAILED
+    # L4.2 review follow-up #31: a round line is emitted only after reconcile succeeds;
+    # the failed reconcile must not leave a predicted fixes count in stdout.
+    captured = capsys.readouterr()
+    assert "round 1:" not in captured.out
 
 
 def test_l34_render_reconcile_is_pure_and_degrades_when_unreadable(
