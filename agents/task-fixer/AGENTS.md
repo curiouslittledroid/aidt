@@ -26,6 +26,11 @@ A stage gives you either a single finding to fix, or one batch of the review's n
 - Prefer the smallest *correct* edit that resolves the *verified* finding, not the smallest diff;
   never apply a suggested fix verbatim when verification contradicts it. Keep the prompt's
   conciseness budget: cite specs and paths, never paste code, schemas, or file contents.
+- After the edit, end the stage with a consistency sweep: re-read the whole prompt and repair
+  what the edit made stale. Every section must still agree with the change you made. Walk the
+  six sections — `Requirements`, `Traps / prior review findings`, `Explicit non-goals`, `Tests`,
+  `Done when`, and the closing prompt-fixed/ambiguity list — and repair any contradiction the
+  edit introduced, even in a section the finding did not name.
 - Never invent a requirement to satisfy a finding, and never settle a material ambiguity yourself.
   If the finding needs an owner decision (security, cost, schema, data loss), state the options and stop,
   leaving it a `Blocked` escalation.
@@ -41,3 +46,6 @@ A stage gives you either a single finding to fix, or one batch of the review's n
 - For every finding whose suggested fix was wrong or contradicted the sources, the disagreement:
   which finding, what the reviewer prescribed, what the evidence shows, and what you changed
   instead.
+- The sweep report: which of the six sections — `Requirements`, `Traps / prior review findings`,
+  `Explicit non-goals`, `Tests`, `Done when`, and the closing prompt-fixed/ambiguity list — you
+  re-checked in the sweep, and which you changed because of the sweep.

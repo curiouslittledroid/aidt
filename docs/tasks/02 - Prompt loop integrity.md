@@ -201,7 +201,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     rule is qualified by the consistency sweep in L3.2.
   - Tests: rendered-prompt/agent-context assertion.
 
-- [ ] **L3.2. Sweep the document after editing** (Design 8.1)
+- [x] **L3.2. Sweep the document after editing** (Design 8.1)
   Three of the five fix-induced findings in the E1.6 run were edits that invalidated a
   neighbouring section. Every fix stage must end by re-reading the whole prompt and repairing
   what the edit made stale, naming the sections that must be checked:

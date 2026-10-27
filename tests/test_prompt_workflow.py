@@ -2157,6 +2157,88 @@ def test_l31_rendered_fixer_prompt_and_agent_context_state_verify_and_pushback()
         render_prompt_file(prompt_path, [])
 
 
+#: The exact six prompt-format sections L3.2's sweep must cover, in roadmap
+#: order. ``Deliverables`` and the spec-citations preamble are deliberately
+#: absent: L3.2 names six, and a seventh would be a roadmap deviation.
+L32_SWEPT_SECTIONS = (
+    "`Requirements`",
+    "`Traps / prior review findings`",
+    "`Explicit non-goals`",
+    "`Tests`",
+    "`Done when`",
+    "the closing prompt-fixed/ambiguity list",
+)
+L32_SECTION_LIST = (
+    "`Requirements`, `Traps / prior review findings`, `Explicit non-goals`, "
+    "`Tests`, `Done when`, and the closing prompt-fixed/ambiguity list"
+)
+
+
+def test_l32_fixer_sweeps_the_document_and_names_the_six_sections() -> None:
+    """L3.2: the fixer ends by sweeping the prompt and names exactly six sections."""
+    prompt_path = toolkit_root() / "prompts" / "task-review-fixes.md"
+    rendered = render_prompt_file(
+        prompt_path, ["docs/task-prompts/03-E4.1-prompt.md"]
+    )
+
+    # The sweep is appended after L3.1's verify-then-fix text: verification stays
+    # the first act and the edit still precedes the sweep, which is the last act.
+    assert "re-read the whole prompt" in rendered
+    assert "repair what the edit made stale" in rendered
+    assert rendered.index("Your first act is verification") < rendered.index(
+        "Before making any edit"
+    )
+    assert rendered.index("Before making any edit") < rendered.index(
+        "re-read the whole prompt"
+    )
+
+    # L3.1's verify-then-fix and push-back text is unchanged.
+    for phrase in (
+        "verify the finding against the repository and the cited sources",
+        "state the options and stop",
+        "`Blocked` escalation",
+    ):
+        assert phrase in rendered, phrase
+    assert "Fix the issues as you suggest" not in rendered
+
+    # Both files list the same six sections and only those six.
+    fixer_md = (toolkit_root() / "agents" / "task-fixer" / "AGENTS.md").read_text(
+        encoding="utf-8"
+    )
+    for section in L32_SWEPT_SECTIONS:
+        assert section in rendered, section
+        assert section in fixer_md, section
+    # Match the complete comma-separated list, not merely six substrings: this
+    # makes an added seventh swept section fail even if it is not Deliverables.
+    assert " ".join(rendered.split()).count(L32_SECTION_LIST) == 1
+    assert " ".join(fixer_md.split()).count(L32_SECTION_LIST) == 2
+    assert "Deliverables" not in rendered
+    assert "Deliverables" not in fixer_md
+
+    # The report contract travels in `## Output`, never a new finding field.
+    output = fixer_md.split("## Output", 1)[1]
+    assert "re-checked in the sweep" in output
+    assert "changed because of the sweep" in output
+
+    # Neutrality is asserted on the added block only: bucket (i) ships as-is
+    # (EXTRACTION.md §4.2), so a whole-file absence check would over-reach.
+    sweep_start = rendered.index(
+        "After the edit, end the stage with a consistency sweep"
+    )
+    sweep_end = rendered.index("the finding did not name.", sweep_start)
+    added_lines = rendered[sweep_start:sweep_end].splitlines()
+    assert added_lines, "the L3.2 sweep text must be locatable"
+    for line in added_lines:
+        assert "pnpm" not in line
+        assert "Design 21" not in line
+        assert "docs/task-prompts" not in line
+        assert not re.search(r"\b0[0-9]-E[0-9]", line), "no product task-id example"
+
+    # Rendering contract: the prompt still references exactly `$1`.
+    with pytest.raises(PromptError):
+        render_prompt_file(prompt_path, [])
+
+
 # ---------------------------------------------------------------------------
 # L2.4 — hand the agents an evidence bundle (design §8.1; EXTRACTION.md §3.8 / D16)
 # ---------------------------------------------------------------------------
