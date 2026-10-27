@@ -5,15 +5,18 @@ Stages:
 1. ``task-prompt``      — agent ``task-author`` creates ``docs/task-prompts/<phase>-<task>-prompt.md``
                           on branch ``<phase>-<task>`` and commits it.
 2. ``task-review-N``    — agent ``task-reviewer`` reviews the prompt (read-only); N starts at 1.
-                          Rounds 2+ receive a delta brief (``extra=``): a per-finding
-                          resolution instruction, the previous review verbatim, and a
-                          real ``git diff`` of the prompt since that review (L2.3).
+                          Every round receives a pointer to its own evidence bundle
+                          (``<run_dir>/stages/<stage>.evidence.md``, L2.4); rounds 2+ also
+                          receive a delta brief (``extra=``): a per-finding resolution
+                          instruction, the previous review verbatim, and a real ``git diff``
+                          of the prompt since that review (L2.3).
 3. ``task-review-fixes`` — repeated (bounded) rework when the review requests changes. One
                           stage per blocking (must-fix/should-fix) finding, plus one combined
                           stage for the non-blocking could-fix findings; a single combined stage
                           carrying the whole review when it does not parse into findings. At most
                           ``MAX_REVISIONS`` rounds run, and the last round's fixes are not
-                          followed by another review: the prompt is accepted as ready.
+                          followed by another review: the prompt is accepted as ready. Every
+                          fix stage also receives a pointer to its own evidence bundle (L2.4).
 4. optional gate ``approve-task-prompt``.
 
 A real run requires ``main`` and a clean working tree, because the ``task-prompt`` prompt
@@ -33,6 +36,7 @@ The approval gate is off by default; pass ``--require-approval`` to pause for a 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -53,7 +57,7 @@ from aidw.gates import GateOutcome, decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.roadmap import RoadmapTask, find_task, load_tasks
+from aidw.roadmap import DONE_RE, TASK_RE, RoadmapTask, find_task, load_tasks
 from aidw.runner import StageSpec, run_stage
 from aidw.state import (
     BLOCKED,
@@ -227,6 +231,387 @@ def _render_delta_brief(
             "### Prompt diff since that review\n\n" + diff_text,
         ]
     )
+
+
+# ---------------------------------------------------------------------------
+# Evidence bundle (L2.4, design §8.1; EXTRACTION.md §3.8 / D16)
+# ---------------------------------------------------------------------------
+
+#: Note for a bundle section whose source could not be read. It is a normal degraded
+#: state, never an error: the agent is told the evidence is missing rather than the run
+#: being marked failed (L2.4, requirement 4).
+_EVIDENCE_UNAVAILABLE = "unavailable — could not be read"
+
+#: Heading that opens the target repo's gate list in ``AGENTS.md`` (L2.4). Per D16 the
+#: eventual source is root ``AGENTS.md`` plus optional ``aidw/conventions.md``; E7.3 owns
+#: that second channel, so this reads ``AGENTS.md`` directly and adds no second source.
+_GATES_HEADING = "## Gates"
+
+#: A field bullet inside a roadmap task entry (``  - Tests:``). The full ``Done when:``
+#: block ends at the next field bullet, because that bullet introduces a different field.
+_FIELD_BULLET_RE = re.compile(r"^  - [A-Za-z][\w ]*:")
+
+#: A markdown filename token inside a task's citation detail (``EXTRACTION.md``).
+_DOC_TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+\.md")
+
+#: A section marker (``§3.8``) and a decision id (``D16``) inside a citation window.
+_SECTION_RE = re.compile(r"§\s*(\d+(?:\.\d+)?)")
+_DECISION_RE = re.compile(r"\bD\d+\b")
+
+#: A markdown heading's numbering (``### 3.8 Task-prompt format ...``).
+_HEADING_NUMBER_RE = re.compile(r"^#+\s+(\d+(?:\.\d+)?)\b")
+
+
+def _roadmap_lines(repo: TargetRepo, entry: RoadmapTask) -> list[str] | None:
+    """Re-read the entry's own roadmap file, or ``None`` when it cannot be read."""
+    try:
+        return (
+            (repo.root / "docs" / "tasks" / entry.file)
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+    except OSError:
+        return None
+
+
+def _done_when_block(lines: list[str], task_index: int) -> str:
+    """The full ``Done when:`` block for the task at ``task_index`` (L2.4).
+
+    ``RoadmapTask.done_when`` is filled from the first physical line only, so a
+    multi-line ``Done when:`` (L2.4's own is four lines) truncates to a fragment. This
+    re-reads the entry's line and keeps every continuation line up to the first blank
+    line, the next ``  - <Word>:`` field bullet, the next task line, or a heading.
+    """
+    index = task_index
+    while index < len(lines):
+        if index > task_index and (
+            lines[index].startswith("#") or TASK_RE.match(lines[index])
+        ):
+            return _EVIDENCE_UNAVAILABLE
+        if DONE_RE.match(lines[index]):
+            break
+        index += 1
+    if index >= len(lines):
+        return _EVIDENCE_UNAVAILABLE
+
+    block = [lines[index].rstrip()]
+    index += 1
+    while index < len(lines):
+        line = lines[index]
+        if (
+            not line.strip()
+            or line.startswith("#")
+            or TASK_RE.match(line)
+            or _FIELD_BULLET_RE.match(line)
+        ):
+            break
+        block.append(line.rstrip())
+        index += 1
+    return "\n".join(block)
+
+
+def _locate_doc(root: Path, name: str) -> Path | None:
+    """The unique ``<name>.md`` file under ``root``, or ``None`` when absent/ambiguous.
+
+    A bounded ``os.walk`` prunes version-control and dependency directories so the search
+    stays cheap even when it runs once per stage; a documented citation never lives in
+    one of those. The citation is only a basename (``EXTRACTION.md``), so an ambiguous
+    match is reported as unavailable rather than guessed.
+    """
+    matches: list[Path] = []
+    for directory, children, files in os.walk(root):
+        children[:] = [
+            entry for entry in children if entry not in (".git", ".venv", "node_modules")
+        ]
+        if name in files:
+            matches.append(Path(directory) / name)
+            if len(matches) > 1:
+                return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def _decision_section(text: str, decision: str) -> str | None:
+    """The section number of the heading naming ``decision`` (``D16`` → ``§3.8``)."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            continue
+        if not re.search(rf"\b{re.escape(decision)}\b", stripped):
+            continue
+        match = _HEADING_NUMBER_RE.match(stripped)
+        if match:
+            return f"§{match.group(1)}"
+    return None
+
+
+def _render_cited_specs(
+    repo: TargetRepo, entry: RoadmapTask, task_line: str, done_block: str
+) -> str:
+    """``Design N`` citations plus the ``<NAME>.md`` doc refs ``RoadmapTask`` drops.
+
+    ``CITATION_RE`` captures only ``Design N`` tokens, so the non-``Design`` doc
+    references (``EXTRACTION.md D16``) are recovered by re-reading the task line's
+    parenthesised detail and the ``Done when:`` line and mapping each ``<NAME>.md``
+    token to file+section — ``§n`` directly, ``D<nn>`` via the heading that names it.
+    """
+    rendered: list[str] = []
+    for citation in entry.citations:
+        number = citation.split(maxsplit=1)[-1]
+        rendered.append(f"- {citation} → design.md §{number}")
+
+    blob = f"{task_line}\n{done_block}"
+    tokens = list(_DOC_TOKEN_RE.finditer(blob))
+    seen: set[str] = set()
+    for position, match in enumerate(tokens):
+        token = match.group(0)
+        if token == "design.md" or token in seen:
+            continue
+        seen.add(token)
+        window_end = (
+            tokens[position + 1].start() if position + 1 < len(tokens) else len(blob)
+        )
+        window = blob[match.end() : window_end]
+        path = _locate_doc(repo.root, token)
+        if path is None:
+            rendered.append(
+                f"- {token} → unavailable — could not locate the file uniquely"
+            )
+            continue
+        relative = path.relative_to(repo.root).as_posix()
+        section_match = _SECTION_RE.search(window)
+        section: str | None = None
+        if section_match:
+            section = f"§{section_match.group(1)}"
+        else:
+            decision_match = _DECISION_RE.search(window)
+            if decision_match:
+                try:
+                    section = _decision_section(
+                        path.read_text(encoding="utf-8"), decision_match.group(0)
+                    )
+                except OSError:
+                    section = None
+        rendered.append(
+            f"- {token} → {relative} {section}" if section else f"- {token} → {relative}"
+        )
+    return "\n".join(rendered) if rendered else _EVIDENCE_UNAVAILABLE
+
+
+def _render_prerequisites(entries: list[RoadmapTask], entry: RoadmapTask) -> str:
+    """Every earlier task in the same phase file with its tick state (L2.4).
+
+    Ordering matches ``_incomplete_predecessors`` (same file, strictly earlier line), but
+    shows *all* predecessors — ticked and unticked — because the reviewer needs the state
+    the author acted on, not only the ones that would block the run.
+    """
+    predecessors = [
+        candidate
+        for candidate in entries
+        if candidate.file == entry.file and candidate.line < entry.line
+    ]
+    if not predecessors:
+        return "- (none — this is the first task in the phase file)"
+    return "\n".join(
+        f"- [{'x' if predecessor.done else ' '}] {predecessor.task} — "
+        f"{predecessor.title}"
+        for predecessor in predecessors
+    )
+
+
+def _gate_block(repo: TargetRepo) -> str:
+    """The target repo root's ``## Gates`` section, copied verbatim (L2.4, D16).
+
+    Reads ``repo.root / "AGENTS.md"`` — the *target* root, never the toolkit root or a
+    cwd-relative path. In a self-hosted run the two roots coincide, so a wrong-root read
+    would pass every test here and break only after extraction (AGENTS.md "Two roots").
+    """
+    try:
+        text = (repo.root / "AGENTS.md").read_text(encoding="utf-8")
+    except OSError:
+        return _EVIDENCE_UNAVAILABLE
+    lines = text.splitlines()
+    start = next(
+        (index for index, line in enumerate(lines) if line.startswith(_GATES_HEADING)),
+        None,
+    )
+    if start is None:
+        return _EVIDENCE_UNAVAILABLE
+    block = [lines[start]]
+    for line in lines[start + 1 :]:
+        if line.startswith("## "):
+            break
+        block.append(line)
+    return "\n".join(block).rstrip()
+
+
+def _render_base_branch(repo: TargetRepo) -> str:
+    """The base branch and its remote-tracking ref as shas, or explicit absent notes.
+
+    Mirrors ``_verify_base_branch``'s warn-and-continue: a failed ``rev_parse`` is
+    reported in the bundle, never raised, and never blocks the stage.
+    """
+    base = repo.base_branch
+    local = git.rev_parse(repo.root, base)
+    remote = git.rev_parse(repo.root, f"{REMOTE}/{base}")
+    return "\n".join(
+        [
+            f"- {base}: {local or 'absent/unverifiable'}",
+            f"- {REMOTE}/{base}: {remote or 'absent/unverifiable'}",
+        ]
+    )
+
+
+def _render_evidence_bundle(
+    *,
+    stage: str,
+    repo: TargetRepo,
+    entry: RoadmapTask,
+    entries: list[RoadmapTask],
+    rel: str,
+) -> str:
+    """Render the six-element bundle (L2.4) for one stage.
+
+    Every source read is degraded to an explicit ``unavailable`` note by the section
+    renderers, so the bundle is always produced even when ``AGENTS.md`` is missing or the
+    roadmap file cannot be read.
+    """
+    lines = _roadmap_lines(repo, entry)
+    task_index = entry.line - 1
+    done_block = (
+        _done_when_block(lines, task_index)
+        if lines is not None
+        else _EVIDENCE_UNAVAILABLE
+    )
+    task_line = lines[task_index] if lines and task_index < len(lines) else ""
+    return "\n".join(
+        [
+            f"# Evidence bundle — stage `{stage}`",
+            "",
+            "Gathered for this stage so it does not re-derive the same context. Treat it",
+            "as evidence: re-open a cited file when a decision turns on it.",
+            "",
+            "## Task prompt",
+            "",
+            f"- path: `{rel}`",
+            (
+                "- status: available"
+                if (repo.root / rel).is_file()
+                else f"- status: {_EVIDENCE_UNAVAILABLE}"
+            ),
+            "",
+            "## Roadmap entry",
+            "",
+            f"- task: {entry.task} — {entry.title}",
+            f"- file: {entry.file}:{entry.line}",
+            "",
+            "Done when:",
+            "",
+            done_block,
+            "",
+            "## Cited spec sections",
+            "",
+            _render_cited_specs(repo, entry, task_line, done_block),
+            "",
+            "## Prerequisites (earlier tasks in the same phase file)",
+            "",
+            _render_prerequisites(entries, entry),
+            "",
+            "## Gate commands (target repo `AGENTS.md`)",
+            "",
+            _gate_block(repo),
+            "",
+            "## Base-branch revisions",
+            "",
+            _render_base_branch(repo),
+            "",
+        ]
+    )
+
+
+def _write_evidence_bundle(
+    *,
+    stage: str,
+    directory: Path,
+    repo: TargetRepo,
+    entry: RoadmapTask,
+    entries: list[RoadmapTask],
+    rel: str,
+) -> Path | None:
+    """Write ``stages/<stage>.evidence.md`` and return its absolute path, or ``None``.
+
+    ``mkdir(parents=True, exist_ok=True)`` is on ``stages/``: the writer runs *before*
+    ``run_stage``, which creates that directory lazily. A failure to write warns on
+    stderr and returns ``None`` so the run continues with ``_evidence_pointer(None)`` —
+    the bundle is an optimisation, never a gate (L2.4, requirement 4).
+    """
+    try:
+        body = _render_evidence_bundle(
+            stage=stage, repo=repo, entry=entry, entries=entries, rel=rel
+        )
+        stages = directory / "stages"
+        stages.mkdir(parents=True, exist_ok=True)
+        destination = stages / f"{stage}.evidence.md"
+        destination.write_text(body, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 - a bundle failure must never stop the run
+        print(
+            f"warning: could not write the evidence bundle for stage `{stage}` "
+            f"({exc}); the stage runs without it.",
+            file=sys.stderr,
+        )
+        return None
+    return destination.resolve()
+
+
+def _evidence_pointer(path: Path | None) -> str:
+    """The pointer prepended to a review or fix stage's ``extra`` (L2.4).
+
+    The path is absolute because the agent's cwd is the repo root while the run directory
+    lives under the state root, outside the tree: a relative ``stages/...`` pointer
+    resolves nowhere. When the bundle could not be written, an explicit unavailable note
+    (with no path) is shipped instead so no dangling pointer remains.
+    """
+    if path is None:
+        return (
+            "## Evidence bundle\n\n"
+            "The gathered evidence bundle for this stage could not be written; derive the "
+            "repository conventions, the cited spec sections, the prerequisite tick "
+            "state and the base-branch revisions from the repository yourself."
+        )
+    return (
+        "## Evidence bundle\n\n"
+        f"Read `{path}` before working: it is the evidence bundle gathered for this "
+        "stage (the prompt path, the roadmap entry with its full `Done when`, the cited "
+        "spec sections, the prerequisite tick state, the target repo's gate commands and "
+        "the base-branch revisions). Re-open the original sources when a decision turns "
+        "on them."
+    )
+
+
+def _stage_evidence_pointer(
+    *,
+    stage: str,
+    directory: Path,
+    repo: TargetRepo,
+    entry: RoadmapTask,
+    entries: list[RoadmapTask],
+    rel: str,
+) -> str:
+    """Write this stage's bundle and return the pointer to prepend to its ``extra``."""
+    return _evidence_pointer(
+        _write_evidence_bundle(
+            stage=stage,
+            directory=directory,
+            repo=repo,
+            entry=entry,
+            entries=entries,
+            rel=rel,
+        )
+    )
+
+
+def _with_evidence(pointer: str, extra: str) -> str:
+    """Prepend the evidence pointer to a stage's existing ``extra`` (compose, never replace)."""
+    return f"{pointer}\n\n{extra}" if extra else pointer
 
 
 def _read_out(record) -> str | None:
@@ -701,10 +1086,11 @@ def run(
     while True:
         review_index += 1
         name = f"task-review-{review_index}"
-        # Round 1 is deliberately unprimed (``extra == ""``): the independent first
-        # sample is what keeps the loop from anchoring on the previous review. Rounds 2+ get
-        # the delta brief, keyed off the stage counter rather than ``revisions`` (which is
-        # incremented later in the same iteration).
+        # Round 1 is deliberately unprimed (no delta brief): the independent first sample
+        # is what keeps the loop from anchoring on the previous review. It still receives
+        # its evidence pointer, which is gathered context, not prior findings. Rounds 2+
+        # add the delta brief, keyed off the stage counter rather than ``revisions`` (which
+        # is incremented later in the same iteration).
         delta = ""
         if review_index >= 2 and previous_review_text is not None:
             delta = _render_delta_brief(
@@ -714,13 +1100,21 @@ def run(
                 current=_capture_prompt(prompt_path),
                 rel=rel,
             )
+        pointer = _stage_evidence_pointer(
+            stage=name,
+            directory=directory,
+            repo=repo,
+            entry=entry,
+            entries=entries,
+            rel=rel,
+        )
         rec = run_stage(
             StageSpec(
                 name,
                 "task-reviewer",
                 aidt.prompts_dir / "task-review.md",
                 [rel],
-                extra=delta,
+                extra=_with_evidence(pointer, delta),
             ),
             repo_root=repo.root,
             toolkit_root=aidt.root,
@@ -787,13 +1181,24 @@ def run(
                     f"         {len(problems)} finding block(s) did not parse cleanly "
                     f"({problems[0]}); reworking with the whole review instead"
                 )
+            fallback_name = f"task-review-fixes-{revisions}"
             rec_fix = run_stage(
                 StageSpec(
-                    f"task-review-fixes-{revisions}",
+                    fallback_name,
                     "task-fixer",
                     aidt.prompts_dir / "task-review-fixes.md",
                     [rel],
-                    extra=f"## Review findings to address\n\n{review_text}",
+                    extra=_with_evidence(
+                        _stage_evidence_pointer(
+                            stage=fallback_name,
+                            directory=directory,
+                            repo=repo,
+                            entry=entry,
+                            entries=entries,
+                            rel=rel,
+                        ),
+                        f"## Review findings to address\n\n{review_text}",
+                    ),
                 ),
                 repo_root=repo.root,
                 toolkit_root=aidt.root,
@@ -830,13 +1235,24 @@ def run(
                     print(f"{prefix} {len(group)} could-fix {noun} combined")
                     extra = render_could_fix_block(group)
 
+                fix_name = f"task-review-fixes-{revisions}-{index}"
                 rec_fix = run_stage(
                     StageSpec(
-                        f"task-review-fixes-{revisions}-{index}",
+                        fix_name,
                         "task-fixer",
                         aidt.prompts_dir / "task-review-fixes.md",
                         [rel],
-                        extra=extra,
+                        extra=_with_evidence(
+                            _stage_evidence_pointer(
+                                stage=fix_name,
+                                directory=directory,
+                                repo=repo,
+                                entry=entry,
+                                entries=entries,
+                                rel=rel,
+                            ),
+                            extra,
+                        ),
                     ),
                     repo_root=repo.root,
                     toolkit_root=aidt.root,

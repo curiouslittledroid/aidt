@@ -412,7 +412,9 @@ def test_review_fix_loop_fixes_blocking_individually_and_batches_could_fix(
     assert "Review finding 2 of 3 to address" in fixes[1][2]
     assert "Suggested fix: Add one line recording the out-of-scope decision." in fixes[1][2]
     # The non-blocking could-fix finding is batched into a single stage of its own.
-    assert fixes[2][2].startswith(
+    # L2.4 prepends the evidence pointer, so the combined block follows it.
+    assert "## Non-blocking (could-fix) review finding to address together" in fixes[2][2]
+    assert fixes[2][2].index("## Evidence bundle") < fixes[2][2].index(
         "## Non-blocking (could-fix) review finding to address together"
     )
     assert "Suggested fix: Pick one consumer-import strategy and align them." in fixes[2][2]
@@ -499,7 +501,11 @@ def test_review_fix_loop_falls_back_to_one_combined_stage(
         "task-review-2",
     ]
     combined = seen[2][2]
-    assert combined.startswith("## Review findings to address")
+    # L2.4 prepends the evidence pointer, so the whole-review block follows it.
+    assert "## Review findings to address" in combined
+    assert combined.index("## Evidence bundle") < combined.index(
+        "## Review findings to address"
+    )
     out = capsys.readouterr().out
     assert "did not parse cleanly" in out
 
@@ -658,7 +664,11 @@ def _record_temp_dirs(monkeypatch) -> list[Path]:
 
 
 def test_first_review_round_is_unprimed(tmp_path: Path, monkeypatch) -> None:
-    """Round 1 keeps the independent sample: variables are ``[rel]``, ``extra`` is empty."""
+    """Round 1 stays findings-unprimed; it still receives its evidence pointer (L2.4).
+
+    L2.3's "unprimed" guarantee is about *prior findings*, not the gathered context the
+    reviewer already reads through its Scope step, so the evidence pointer is allowed.
+    """
     _patch_prompt_repo(tmp_path, monkeypatch)
     seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
@@ -671,7 +681,14 @@ def test_first_review_round_is_unprimed(tmp_path: Path, monkeypatch) -> None:
     assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
     _, variables, extra = next(item for item in seen if item[0] == "task-review-1")
     assert variables == ["docs/task-prompts/03-E4.1-prompt.md"]
-    assert extra == ""
+    # No prior-findings priming on the first round.
+    assert "## Delta brief" not in extra
+    assert "### Previous review" not in extra
+    assert "### Prompt diff" not in extra
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    evidence = _runs_root(tmp_path) / run_id / "stages" / "task-review-1.evidence.md"
+    assert extra == prompt_workflow._evidence_pointer(evidence.resolve())
+    assert str(evidence) in extra
 
 
 def test_second_round_gets_delta_brief_with_previous_review_and_diff(
@@ -2070,3 +2087,340 @@ def test_l22_rendered_reviewer_prompt_requires_verified_revision() -> None:
     # Rendering contract: the prompt references exactly `$1`.
     with pytest.raises(PromptError):
         render_prompt_file(prompt_path, [])
+
+
+# ---------------------------------------------------------------------------
+# L2.4 — hand the agents an evidence bundle (design §8.1; EXTRACTION.md §3.8 / D16)
+# ---------------------------------------------------------------------------
+
+#: Target ``E4.1`` has two earlier tasks, a multi-line ``Done when`` (whose late
+#: continuation line only a full-block reader keeps) and two cited sources.
+ROADMAP_EVIDENCE = """# Phase 3: Test Phase
+
+## Epic E3: Earlier Epic
+
+- [x] **E3.1. An earlier ticked task** per Design 09..
+  - Done when: it is ticked.
+
+- [ ] **E3.2. An earlier unticked task** per Design 09..
+  - Done when: it is unticked.
+
+## Epic E4: Defensive Combat
+
+- [ ] **E4.1. Implement Total Defense** (Design 8.1, EXTRACTION.md D16).
+  - Done when: the writer emits the six elements of the bundle,
+    including a later continuation line that a first-line-only parser would drop.
+  - Tests: the evidence assertions below.
+"""
+
+AGENTS_EVIDENCE_FIXTURE = """# AGENTS.md
+
+Intro prose.
+
+## Gates — run exactly these, and only these
+
+```bash
+uv sync --frozen
+uv run --frozen pytest
+uv run aidw doctor
+uv run aidw agents validate --strict
+uv run aidw prompts check
+target-repo-only gate --check
+```
+
+CI runs the frozen commands.
+
+## Tests
+
+This heading ends the gate section and must not be copied.
+"""
+
+EXTRACTION_EVIDENCE_FIXTURE = """# Extraction
+
+## 3.8 Task-prompt format and repo conventions (D16)
+
+The conventions channel.
+"""
+
+
+def _evidence_repo(
+    tmp_path: Path, monkeypatch, *, agents_md: str | None = AGENTS_EVIDENCE_FIXTURE
+) -> Path:
+    """A committed repo (no ``origin``) with a multi-line Done when and a ``D16`` doc.
+
+    Committed so the local base branch resolves to a real sha while ``origin/main``
+    stays absent — the no-origin fixture the base-branch assertion needs.
+    """
+    _run_git(["init", "-q", "-b", "main", str(tmp_path)], tmp_path)
+    tasks_dir = tmp_path / "docs" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    (tasks_dir / "03 - Test Phase.md").write_text(ROADMAP_EVIDENCE, encoding="utf-8")
+    (tmp_path / "docs" / "migration").mkdir(parents=True)
+    (tmp_path / "docs" / "migration" / "EXTRACTION.md").write_text(
+        EXTRACTION_EVIDENCE_FIXTURE, encoding="utf-8"
+    )
+    if agents_md is not None:
+        (tmp_path / "AGENTS.md").write_text(agents_md, encoding="utf-8")
+    _run_git(["add", "."], tmp_path)
+    _run_git(["commit", "-qm", "init"], tmp_path)
+    monkeypatch.setattr(git, "current_branch", lambda repo: "main")
+    monkeypatch.setattr(git, "is_clean", lambda repo: True)
+    return tmp_path
+
+
+def _evidence_path(repo: Path, run_id: str, stage: str) -> Path:
+    return _runs_root(repo) / run_id / "stages" / f"{stage}.evidence.md"
+
+
+def test_l24_every_review_and_fix_stage_has_its_own_evidence_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Each review/fix stage writes and points at its own *absolute* evidence file."""
+    _evidence_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        allow_incomplete_prereqs=True,
+    )
+
+    assert code == 0
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    names = [name for name, _, _ in seen]
+    assert names == [
+        "task-prompt",
+        "task-review-1",
+        "task-review-fixes-1-1",
+        "task-review-fixes-1-2",
+        "task-review-fixes-1-3",
+        "task-review-2",
+    ]
+    for name in names[1:]:  # every review and fix stage, not the author
+        evidence = _evidence_path(tmp_path, run_id, name)
+        assert evidence.is_file(), name
+        pointer = evidence.resolve()
+        assert pointer.is_absolute()
+        extra = _extra_for(seen, name)
+        assert f"`{pointer}`" in extra, name
+        # The pointer is prepended, never a replacement for the stage's own content.
+        assert extra.startswith("## Evidence bundle"), name
+
+
+def test_l24_fallback_whole_review_fix_also_has_its_own_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The unparseable-review fallback fix is the easiest ``extra`` site to miss."""
+    _evidence_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_UNPARSEABLE, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        allow_incomplete_prereqs=True,
+    )
+
+    assert code == 0
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    evidence = _evidence_path(tmp_path, run_id, "task-review-fixes-1")
+    assert evidence.is_file()
+    extra = _extra_for(seen, "task-review-fixes-1")
+    assert f"`{evidence.resolve()}`" in extra
+    assert "## Review findings to address" in extra
+    assert extra.index("## Evidence bundle") < extra.index(
+        "## Review findings to address"
+    )
+
+
+def test_l24_bundle_contains_the_six_elements(tmp_path: Path, monkeypatch) -> None:
+    """One bundle carries all six elements, including the full multi-line Done when."""
+    _evidence_repo(tmp_path, monkeypatch)
+    # Capture the base revision before the run: the reviewed-prompt commit at the end
+    # advances `main`, but the bundle records the revision the stage started from.
+    base_sha = git.rev_parse(tmp_path, "main")
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        allow_incomplete_prereqs=True,
+    )
+
+    assert code == 0
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    bundle = _evidence_path(tmp_path, run_id, "task-review-1").read_text(
+        encoding="utf-8"
+    )
+
+    # 1. prompt path (repo-relative).
+    assert "docs/task-prompts/03-E4.1-prompt.md" in bundle
+    # 2. roadmap entry + full Done when (a late continuation line must survive; a
+    #    first-line-only read of `RoadmapTask.done_when` would truncate it).
+    assert "E4.1 — Implement Total Defense" in bundle
+    assert "03 - Test Phase.md:13" in bundle
+    assert (
+        "including a later continuation line that a first-line-only parser would drop."
+        in bundle
+    )
+    # 3. cited spec sections: `entry.citations` plus the non-`Design` doc ref.
+    assert "design.md §8.1" in bundle
+    assert "docs/migration/EXTRACTION.md §3.8" in bundle
+    # 4. every predecessor's tick state, not just the unticked subset.
+    assert "- [x] E3.1 — An earlier ticked task" in bundle
+    assert "- [ ] E3.2 — An earlier unticked task" in bundle
+    # 5. gate commands from the target repo root's AGENTS.md, bounded by `## Tests`.
+    assert "uv run --frozen pytest" in bundle
+    assert "uv run aidw prompts check" in bundle
+    assert "target-repo-only gate --check" in bundle
+    assert "This heading ends the gate section" not in bundle
+    # 6. base-branch revisions: the local sha and the explicit absent remote note.
+    assert base_sha and base_sha in bundle
+    assert "origin/main: absent/unverifiable" in bundle
+
+
+def test_l24_dry_run_writes_no_evidence_bundle(tmp_path: Path, monkeypatch) -> None:
+    """The dry-run path returns before the loop: no evidence file, no pointer."""
+    _evidence_repo(tmp_path, monkeypatch)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, dry_run=True
+    )
+
+    assert code == 0
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    assert not _evidence_path(tmp_path, run_id, "task-review-1").exists()
+
+
+def test_l24_unwritable_bundle_degrades_without_a_dangling_pointer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A writer failure is a warn-and-continue: normal exit, no path pointer."""
+    _evidence_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    monkeypatch.setattr(
+        prompt_workflow, "_write_evidence_bundle", lambda **kwargs: None
+    )
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        allow_incomplete_prereqs=True,
+    )
+
+    assert code == 0
+    for name, _, extra in seen[1:]:
+        assert ".evidence.md" not in extra, name
+        assert extra.startswith("## Evidence bundle"), name
+        assert "could not be written" in extra, name
+
+
+def test_l24_unreadable_prompt_is_explicitly_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A prompt path the writer cannot read must not look like usable evidence."""
+    _evidence_repo(tmp_path, monkeypatch)
+    repo = TargetRepo.resolve(tmp_path)
+    entries = prompt_workflow.load_tasks(tmp_path / "docs" / "tasks")
+    entry = next(candidate for candidate in entries if candidate.task == "E4.1")
+    directory = tmp_path / "state" / "run"
+
+    path = prompt_workflow._write_evidence_bundle(
+        stage="task-review-1",
+        directory=directory,
+        repo=repo,
+        entry=entry,
+        entries=entries,
+        rel="docs/task-prompts/missing-prompt.md",
+    )
+
+    assert path is not None
+    bundle = path.read_text(encoding="utf-8")
+    prompt_section = bundle.split("## Task prompt", 1)[1].split(
+        "## Roadmap entry", 1
+    )[0]
+    assert "unavailable" in prompt_section
+
+
+def test_l24_writer_failure_returns_none_and_warns(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The writer itself never raises; it warns on stderr and returns ``None``."""
+    _evidence_repo(tmp_path, monkeypatch)
+    repo = TargetRepo.resolve(tmp_path)
+    directory = tmp_path / "state" / "run"
+    directory.mkdir(parents=True)
+    # A file where the `stages/` directory must be makes the mkdir fail.
+    (directory / "stages").write_text("blocked", encoding="utf-8")
+    entries = prompt_workflow.load_tasks(tmp_path / "docs" / "tasks")
+    entry = next(candidate for candidate in entries if candidate.task == "E4.1")
+
+    path = prompt_workflow._write_evidence_bundle(
+        stage="task-review-1",
+        directory=directory,
+        repo=repo,
+        entry=entry,
+        entries=entries,
+        rel="docs/task-prompts/03-E4.1-prompt.md",
+    )
+
+    assert path is None
+    err = capsys.readouterr().err
+    assert "could not write the evidence bundle" in err
+    assert "task-review-1" in err
+
+
+@pytest.mark.parametrize(
+    "agents_md",
+    [
+        None,  # missing AGENTS.md
+        "# AGENTS.md\n\n## Tests\n\nNo gate section here.\n",  # missing `## Gates`
+    ],
+)
+def test_l24_missing_gate_source_notes_the_section_unavailable(
+    tmp_path: Path, monkeypatch, agents_md
+) -> None:
+    """A missing file or gate section degrades the section, never the run."""
+    _evidence_repo(tmp_path, monkeypatch, agents_md=agents_md)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        allow_incomplete_prereqs=True,
+    )
+
+    assert code == 0
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    bundle = _evidence_path(tmp_path, run_id, "task-review-1").read_text(
+        encoding="utf-8"
+    )
+    gate_section = bundle.split("## Gate commands", 1)[1].split("## Base-branch", 1)[0]
+    assert "unavailable" in gate_section
+    # The rest of the bundle is still present and usable.
+    assert "docs/task-prompts/03-E4.1-prompt.md" in bundle
+    assert "design.md §8.1" in bundle
