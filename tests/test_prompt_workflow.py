@@ -248,6 +248,7 @@ def _fake_stages(
     fix_status: str = "succeeded",
     reconcile_status: str = "succeeded",
     approve_review: int | None = 2,
+    blocked_review: int | None = None,
 ):
     """A fake ``run_stage`` returning canned review text, approving at ``approve_review``.
 
@@ -276,7 +277,10 @@ def _fake_stages(
         seen.append((spec.name, list(spec.variables), spec.extra))
         index = _review_index(spec.name)
         if index is not None:
-            body = "## Verdict\n\n**Approve**\n" if index == approve_review else review_body
+            if index == blocked_review:
+                body = TASK_REVIEW_BLOCKED_DEPENDENCY
+            else:
+                body = "## Verdict\n\n**Approve**\n" if index == approve_review else review_body
             # A round-distinct tail so a later round's "previous review" section is
             # attributable to the round it came from (L2.3 delta-brief tests).
             body += f"\n<!-- review round {index} -->\n"
@@ -617,10 +621,11 @@ Blocked — the dependency implementation is unmerged and requires an owner deci
 """
 
 
-def test_three_review_rounds_then_accept_without_another_review(
+def test_third_review_is_terminal_and_residual_request_changes_fails_closed(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """The budget is 3 rounds; the third round's fixes end the loop with no review 4."""
+    """`MAX_REVISIONS` is 3 review rounds; the third is review-only, so a residual
+    `Request changes` fails closed with review-3's findings and no round-3 fixes."""
     _patch_prompt_repo(tmp_path, monkeypatch)
     seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
@@ -629,53 +634,81 @@ def test_three_review_rounds_then_accept_without_another_review(
         phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
     )
 
-    assert code == 0
+    assert code == 3
     names = [name for name, _, _ in seen]
-    assert "task-review-4" not in names
-    assert names.count("task-review-2") == 1
-    assert names.count("task-review-3") == 1
-    assert names[0] == "task-prompt"
-    # Three rounds of (2 individual blocking + 1 combined could-fix) fixes.
-    fixes = [name for name in names if name.startswith("task-review-fixes")]
-    assert fixes == [
+    # Two fix batches (rounds 1 and 2) + two reconciles, then the terminal review-3:
+    # no `task-review-fixes-3-*`, no `task-review-reconcile-3`, no review-4.
+    assert names == [
+        "task-prompt",
+        "task-review-1",
         "task-review-fixes-1-1",
         "task-review-fixes-1-2",
         "task-review-fixes-1-3",
+        "task-review-reconcile-1",
+        "task-review-2",
         "task-review-fixes-2-1",
         "task-review-fixes-2-2",
         "task-review-fixes-2-3",
-        "task-review-fixes-3-1",
-        "task-review-fixes-3-2",
-        "task-review-fixes-3-3",
-    ]
-    # Exactly one reconcile per fix batch, each after its batch and before the next
-    # review. The final one sits before the terminal acceptance (there is no review 4),
-    # so the last round's fixes are not accepted unreconciled (L3.4, req 7).
-    reconciles = [name for name in names if name.startswith("task-review-reconcile")]
-    assert reconciles == [
-        "task-review-reconcile-1",
         "task-review-reconcile-2",
-        "task-review-reconcile-3",
+        "task-review-3",
     ]
+    assert not any(name.startswith("task-review-fixes-3") for name in names)
+    assert "task-review-reconcile-3" not in names
+    assert "task-review-4" not in names
+    # The two keeps: review-1's batch sits before review-2, review-2's before review-3.
     assert names.index("task-review-fixes-1-3") < names.index(
         "task-review-reconcile-1"
     ) < names.index("task-review-2")
     assert names.index("task-review-fixes-2-3") < names.index(
         "task-review-reconcile-2"
     ) < names.index("task-review-3")
-    assert names.index("task-review-fixes-3-3") < names.index(
-        "task-review-reconcile-3"
+
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    # Req 7: a terminal `Request changes` records `BLOCKED` with no gate record at all.
+    assert not any(g.name == "approve-task-prompt" for g in latest.gates)
+
+    captured = capsys.readouterr()
+    # The terminal review itself, rather than an earlier round, is the residual evidence
+    # shown to the human; the old unreviewed-acceptance line is gone.
+    assert "The deliverable leaves a stale path reference." in captured.err
+    assert "<!-- review round 3 -->" in captured.err
+    assert "revision budget spent" not in captured.out
+    # Fixes from rounds 1 and 2 remain as uncommitted human-review material, but no
+    # round-3 fix was applied before the fail-closed return (design §8.1, G2).
+    prompt_path = tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+    prompt = prompt_path.read_text(encoding="utf-8")
+    assert "<!-- fix round 1 -->" in prompt
+    assert "<!-- fix round 2 -->" in prompt
+    assert "<!-- fix round 3 -->" not in prompt
+    assert git.status_short(tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
+
+
+def test_approve_on_the_terminal_review_succeeds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`Approve` on review-3 (after two fix batches) still succeeds, review-3 last."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=3)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
     )
-    assert names[-1] == "task-review-reconcile-3"
+
+    assert code == 0
+    names = [name for name, _, _ in seen]
+    assert names[-1] == "task-review-3"
+    assert not any(name.startswith("task-review-fixes-3") for name in names)
+    assert "task-review-4" not in names
 
     latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.SUCCEEDED
     gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
-    assert "assumed_ok=True" in gate.detail
-    assert "revisions=3" in gate.detail
-
-    out = capsys.readouterr().out
-    assert "revision budget spent (3 round(s)); accepting the prompt" in out
+    assert "verdict=Approve" in gate.detail
+    # ``revisions`` counts fix batches, so a 3-review success reports 2.
+    assert "revisions=2" in gate.detail
+    assert "assumed_ok" not in gate.detail
 
 
 def _extra_for(seen: list[tuple[str, list[str], str]], name: str) -> str:
@@ -762,7 +795,7 @@ def test_third_round_diff_reflects_only_the_previous_fix_batch(
 ) -> None:
     """The baseline is captured per round, so round 3's diff is not cumulative."""
     _patch_prompt_repo(tmp_path, monkeypatch)
-    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=3)
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
@@ -786,7 +819,7 @@ def test_delta_brief_temp_directories_are_removed(
 ) -> None:
     """Every round's diff temp directory is removed, including on the success path."""
     _patch_prompt_repo(tmp_path, monkeypatch)
-    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=3)
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
     created = _record_temp_dirs(monkeypatch)
 
@@ -795,9 +828,9 @@ def test_delta_brief_temp_directories_are_removed(
     )
 
     assert code == 0
-    # Three reconcile diffs (after each fix batch) plus the two review delta briefs
-    # (rounds 2 and 3).
-    assert len(created) == 5
+    # Two reconcile diffs (after each of the two fix batches) plus the two review delta
+    # briefs (rounds 2 and 3); the terminal review-3 has no fix batch to reconcile.
+    assert len(created) == 4
     assert all(not path.exists() for path in created)
 
 
@@ -895,6 +928,37 @@ def test_a_blocked_final_review_still_fails_closed(
     captured = capsys.readouterr()
     assert "A material ambiguity the prompt cannot settle." in captured.err
     assert "revision budget spent" not in captured.out
+
+
+def test_blocked_terminal_review_keeps_human_escalation_path(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A Blocked verdict on review 3 wins over the terminal Request-changes branch."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(
+        TASK_REVIEW_CHANGES, approve_review=None, blocked_review=3
+    )
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 3
+    names = [name for name, _, _ in seen]
+    assert names[-1] == "task-review-3"
+    assert not any(name.startswith("task-review-fixes-3") for name in names)
+    assert "task-review-reconcile-3" not in names
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    assert not any(g.name == "approve-task-prompt" for g in latest.gates)
+    captured = capsys.readouterr()
+    assert "a human must settle it" in captured.err
+    assert "the dependency branch is the authority" in captured.err
+    assert "task review did not approve within the revision budget" not in captured.err
+    assert git.status_short(
+        tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]
+    ) != ""
 
 
 def test_blocked_dependency_verdict_short_circuits_before_any_fix(

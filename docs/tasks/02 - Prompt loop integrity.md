@@ -239,7 +239,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
 
 ## Epic L4: Termination honesty
 
-- [ ] **L4.1. Spend the last revision slot on a review, not a fix** (Design 8.1)
+- [x] **L4.1. Spend the last revision slot on a review, not a fix** (Design 8.1)
   Today the final round's fixes are applied and *never reviewed*, and the run then records
   `approved` — the E1.6 gate record reads `verdict=Request changes; revisions=3;
   assumed_ok=True`. Reserve the budget so a review is always the last stage for a non-approving

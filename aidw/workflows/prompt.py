@@ -13,16 +13,17 @@ Stages:
 3. ``task-review-fixes`` — repeated (bounded) rework when the review requests changes. One
                           stage per blocking (must-fix/should-fix) finding, plus one combined
                           stage for the non-blocking could-fix findings; a single combined stage
-                          carrying the whole review when it does not parse into findings. At most
-                          ``MAX_REVISIONS`` rounds run, and the last round's fixes are not
-                          followed by another review: the prompt is accepted as ready. Every
-                          fix stage also receives a pointer to its own evidence bundle (L2.4),
+                          carrying the whole review when it does not parse into findings. Fix
+                          batches run for the first ``MAX_REVISIONS - 1`` review rounds; the
+                          ``MAX_REVISIONS``-th round is review-only (the terminal review), so a
+                          review is always the last stage for a non-approving prompt. Every fix
+                          stage also receives a pointer to its own evidence bundle (L2.4),
                           and its input prompt is snapshotted to
                           ``<run_dir>/stages/<stage>.prompt.md`` before it runs (L3.3).
 4. ``task-review-reconcile-N`` — one stage per fix batch, after the batch and before the
-                          next review (or the terminal acceptance). It uses the ``task-fixer``
-                          agent with ``prompts/task-review-fixes.md`` and an ``extra=`` that
-                          carries the whole review plus that batch's combined diff (L3.4).
+                          next review. It uses the ``task-fixer`` agent with
+                          ``prompts/task-review-fixes.md`` and an ``extra=`` that carries the
+                          whole review plus that batch's combined diff (L3.4).
 5. optional gate ``approve-task-prompt``.
 
 A real run requires ``main`` and a clean working tree, because the ``task-prompt`` prompt
@@ -86,12 +87,14 @@ REMOTE = "origin"
 #: Exit code for a preflight/safety refusal (design §14).
 EXIT_REFUSED = 4
 
-#: Review rounds. Each round reviews the prompt and, unless it approves, one round of fixes
-#: follows (one stage per blocking finding, one combined stage for the could-fix findings).
-#: After the **last** round's fixes AIDW does not review again — the prompt is accepted as
-#: ready, because a reviewer that keeps requesting changes would otherwise block forever.
-#: A `Blocked` verdict is the exception and still fails closed, since it means a human must
-#: settle a material ambiguity.
+#: Number of review rounds, and the number of revision slots. ``MAX_REVISIONS - 1`` fix
+#: batches run (one stage per blocking finding, one combined stage for the could-fix
+#: findings); the ``MAX_REVISIONS``-th round is review-only so a review is always the last
+#: stage for a non-approving prompt. A residual `Request changes` after that terminal review
+#: fails closed (``BLOCKED``, exit 3) with the findings on stderr — a reviewer that keeps
+#: requesting changes must not have its last fixes accepted unreviewed. A `Blocked` verdict
+#: short-circuits earlier and still fails closed, since it means a human must settle a
+#: material ambiguity.
 MAX_REVISIONS = 3
 
 #: Instruction prepended to every review round after the first (L2.3, design §8.1). The
@@ -1206,7 +1209,6 @@ def run(
     baseline_prompt: str | None = None
     review_index = 0
     revisions = 0
-    assumed_ok = False
     while True:
         review_index += 1
         name = f"task-review-{review_index}"
@@ -1288,12 +1290,22 @@ def run(
             )
             print(review_text, file=sys.stderr)
             return 3
-        if revisions >= MAX_REVISIONS:
-            # No round left to run (MAX_REVISIONS is zero): accept what is already reviewed.
-            assumed_ok = verdict != VERDICT_BLOCKED
-            break
+        if revisions >= MAX_REVISIONS - 1:
+            # The fix budget is spent: the terminal review has now run. There is no further
+            # revision slot, so a residual `Request changes` fails closed rather than being
+            # applied unreviewed — the prompt is left uncommitted for a human to settle, with
+            # this review's findings on stderr. `Blocked` short-circuited above, so it keeps
+            # its own "a human must settle it" message.
+            state.status = BLOCKED
+            save(directory, state)
+            print(
+                "task review did not approve within the revision budget; failing closed.",
+                file=sys.stderr,
+            )
+            print(review_text, file=sys.stderr)
+            return 3
 
-        # Capture after the verdict and its Blocked/MAX_REVISIONS exits, before the fix
+        # Capture after the verdict and its Blocked/terminal exits, before the fix
         # stages run, so the next round's diff is exactly this fix batch's net effect and
         # not a cumulative diff across rounds (there is no per-round commit to diff against).
         baseline_prompt = _capture_prompt(prompt_path)
@@ -1398,12 +1410,11 @@ def run(
                     return 1
 
         # L3.4: one reconcile stage per fix batch, after the batch and before the next
-        # review (or the terminal acceptance). The fixers work one finding at a time and
-        # prefer the smallest edit, so the batch can end internally inconsistent. It sits
-        # before the ``MAX_REVISIONS`` break on purpose: pre-L4.1 the final round's fixes
-        # are otherwise never reviewed, and reconcile is the cheapest available check on
-        # them (L4.1 later removes that final fix batch). ``review_index`` is the round
-        # number, so the name matches neither ``task-review-N`` nor
+        # review. The fixers work one finding at a time and prefer the smallest edit, so the
+        # batch can end internally inconsistent. After L4.1 there is no final fix batch to
+        # reconcile: a review is always the last stage for a non-approving prompt, and
+        # ``MAX_REVISIONS`` counts review rounds with the last one review-only. ``review_index``
+        # is the round number, so the name matches neither ``task-review-N`` nor
         # ``task-review-fixes-*`` — the L3.3 snapshot writer, the ``_fix_round`` regex and
         # the harness's ``fix_status`` branch all leave it alone.
         reconcile_name = f"task-review-reconcile-{review_index}"
@@ -1446,33 +1457,7 @@ def run(
             save(directory, state)
             return 1
 
-        if revisions >= MAX_REVISIONS:
-            # The final round's fixes are done. Do not review again: the reviewer has had
-            # MAX_REVISIONS chances and the prompt is accepted as ready.
-            assumed_ok = verdict != VERDICT_BLOCKED
-            break
-
-    if assumed_ok:
-        print(
-            f"revision budget spent ({revisions} round(s)); accepting the prompt "
-            "without a further review"
-        )
-
-    if verdict != APPROVE and not assumed_ok and not approve_all:
-        state.status = BLOCKED
-        save(directory, state)
-        print(
-            "task review did not approve within the revision budget; failing closed.",
-            file=sys.stderr,
-        )
-        print(review_text, file=sys.stderr)
-        return 3
-
     verdict_line = f"Review verdict: {verdict or 'ambiguous'}"
-    if assumed_ok:
-        verdict_line += (
-            f" ({revisions} revision round(s) applied; no further review — accepted)"
-        )
     summary = "\n".join(
         [
             f"Task: {phase} {epic} {task} — {entry.title}",
@@ -1499,7 +1484,7 @@ def run(
             decision=outcome.decision,
             mechanism=outcome.mechanism,
             at=utcnow_iso(),
-            detail=f"verdict={verdict}; revisions={revisions}; assumed_ok={assumed_ok}",
+            detail=f"verdict={verdict}; revisions={revisions}",
         )
     )
     if not outcome.approved:
