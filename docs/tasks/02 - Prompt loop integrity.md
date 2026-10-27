@@ -253,7 +253,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
   - Tests: rewrite `tests/test_prompt_workflow.py::test_three_review_rounds_then_accept_without_another_review`
     (it pins the current behaviour) and keep `::test_a_blocked_final_review_still_fails_closed`.
 
-- [ ] **L4.2. Record what was accepted and what it cost** (Design 9.2, Design 9.3)
+- [x] **L4.2. Record what was accepted and what it cost** (Design 9.2, Design 9.3)
   A run that ends `BLOCKED` must say so in the gate record and the run log, and the run should
   carry the per-round evidence a human needs to judge the loop without reading 21 stage files.
   - Deliverable: `state.json` gate detail and run-log lines for rounds run, findings per round,

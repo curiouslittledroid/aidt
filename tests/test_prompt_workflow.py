@@ -372,7 +372,23 @@ def test_approval_gate_defaults_to_not_required(
     gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
     assert gate.decision == "approved"
     assert gate.mechanism == "optional (default)"
-    assert "gate approve-task-prompt denied" not in capsys.readouterr().err
+    # L4.2: approve on review 1 records the full summary (one round, no fix batch).
+    # The fake's approving round carries no findings block, so ``len(findings)`` is 0.
+    for token in (
+        "verdict=Approve",
+        "rounds=1",
+        "revisions=0",
+        "findings=0",
+        "fixes=0",
+        "approved=yes",
+        "fixes_after_last_review=no",
+    ):
+        assert token in gate.detail
+    captured = capsys.readouterr()
+    assert "gate approve-task-prompt denied" not in captured.err
+    # The per-round count line reaches stdout, not only run.log.
+    assert "round 1: findings=0 fixes=0" in captured.out
+    assert "verdict=Approve" in _run_log(tmp_path, latest.run_id)
 
 
 def test_approval_gate_can_be_required(
@@ -568,6 +584,45 @@ def test_failed_fix_stage_stops_the_run(tmp_path: Path, monkeypatch) -> None:
     assert code == 1
     assert "task-review-fixes-1-1" in [name for name, _, _ in seen]
     assert "task-review-fixes-1-2" not in [name for name, _, _ in seen]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.FAILED
+    # A verdict-less failure exit records no gate and writes no summary line (Req 3).
+    assert not any(g.name == "approve-task-prompt" for g in latest.gates)
+    log = _run_log(tmp_path, latest.run_id)
+    assert "approved=" not in log
+    assert "fixes_after_last_review" not in log
+
+
+def test_failed_fix_round_prints_no_predicted_round_line(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A fixing round's stdout line waits for its fix batch (review follow-up #31).
+
+    ``fixes=`` is predicted before the batch runs; printed there it would overstate a
+    run that dies mid-batch — ``state.json`` would hold fewer ``task-review-fixes-*``
+    stages than the line claims. Recorded after the batch (and its reconcile) instead,
+    a FAILED exit prints no round line at all, like every other verdict-less exit.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    from aidw.state import FAILED
+
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, fix_status=FAILED)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    # TASK_REVIEW_CHANGES plans three fix stages (2 blocking + 1 combined); the first
+    # fails, so the run stops before the second and never reaches the reconcile.
+    names = [name for name, _, _ in seen]
+    assert "task-review-fixes-1-1" in names
+    assert "task-review-fixes-1-2" not in names
+    # The predicted count must not reach stdout: no round line on the FAILED path.
+    assert "round 1: findings=3 fixes=3" not in captured.out
+    assert "round 1:" not in captured.out
 
 
 TASK_REVIEW_BLOCKED = """\
@@ -665,10 +720,30 @@ def test_third_review_is_terminal_and_residual_request_changes_fails_closed(
 
     latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.BLOCKED
-    # Req 7: a terminal `Request changes` records `BLOCKED` with no gate record at all.
-    assert not any(g.name == "approve-task-prompt" for g in latest.gates)
+    # L4.2 reverses L4.1's "no gate record": the terminal `Request changes` records
+    # `approve-task-prompt` with `decision=denied` and the full per-round summary, so the
+    # verdict is readable from state.json without opening any stage `.out.txt`.
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    for token in (
+        "verdict=Request changes",
+        "rounds=3",
+        "revisions=2",
+        "findings=3/3/3",
+        "fixes=3/3/0",
+        "approved=no",
+        "fixes_after_last_review=no",
+    ):
+        assert token in gate.detail
+    log = _run_log(tmp_path, latest.run_id)
+    assert "findings=3/3/3" in log
+    assert "fixes=3/3/0" in log
+    assert "run BLOCKED" in log
 
     captured = capsys.readouterr()
+    # Per-round counts reach stdout, not only run.log.
+    assert "round 1: findings=3 fixes=3" in captured.out
+    assert "round 3: findings=3 fixes=0" in captured.out
     # The terminal review itself, rather than an earlier round, is the residual evidence
     # shown to the human; the old unreviewed-acceptance line is gone.
     assert "The deliverable leaves a stale path reference." in captured.err
@@ -705,10 +780,22 @@ def test_approve_on_the_terminal_review_succeeds(
     latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.SUCCEEDED
     gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "approved"
     assert "verdict=Approve" in gate.detail
     # ``revisions`` counts fix batches, so a 3-review success reports 2.
     assert "revisions=2" in gate.detail
     assert "assumed_ok" not in gate.detail
+    # Rounds 1-2 fix the three-finding review; the approving review-3 body carries no
+    # findings block, so its count is 0 (Req 1: 0 only when nothing parsed).
+    for token in (
+        "rounds=3",
+        "findings=3/3/0",
+        "fixes=3/3/0",
+        "approved=yes",
+        "fixes_after_last_review=no",
+    ):
+        assert token in gate.detail
+    assert "verdict=Approve" in _run_log(tmp_path, latest.run_id)
 
 
 def _extra_for(seen: list[tuple[str, list[str], str]], name: str) -> str:
@@ -925,6 +1012,21 @@ def test_a_blocked_final_review_still_fails_closed(
     assert not any(name.startswith("task-review-fixes") for name in names)
     latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.BLOCKED
+    # L4.2: a Blocked verdict also records the gate, so the outcome is visible from
+    # state.json (decision=denied; the verdict travels in the summary).
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    for token in (
+        "verdict=Blocked",
+        "rounds=1",
+        "revisions=0",
+        "findings=1",
+        "fixes=0",
+        "approved=no",
+        "fixes_after_last_review=no",
+    ):
+        assert token in gate.detail
+    assert "run BLOCKED" in _run_log(tmp_path, latest.run_id)
     captured = capsys.readouterr()
     assert "A material ambiguity the prompt cannot settle." in captured.err
     assert "revision budget spent" not in captured.out
@@ -951,7 +1053,19 @@ def test_blocked_terminal_review_keeps_human_escalation_path(
     assert "task-review-reconcile-3" not in names
     latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.BLOCKED
-    assert not any(g.name == "approve-task-prompt" for g in latest.gates)
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    for token in (
+        "verdict=Blocked",
+        "rounds=3",
+        "revisions=2",
+        "findings=3/3/1",
+        "fixes=3/3/0",
+        "approved=no",
+        "fixes_after_last_review=no",
+    ):
+        assert token in gate.detail
+    assert "run BLOCKED" in _run_log(tmp_path, latest.run_id)
     captured = capsys.readouterr()
     assert "a human must settle it" in captured.err
     assert "the dependency branch is the authority" in captured.err
@@ -3043,3 +3157,184 @@ def test_l34_render_reconcile_is_pure_and_degrades_when_unreadable(
     assert prompt_workflow._DIFF_UNAVAILABLE in degraded
     assert review in degraded
     assert "diff --git" not in degraded
+
+
+# ---------------------------------------------------------------------------
+# L4.2 — record what was accepted and what it cost (design §9.2, §9.3)
+# ---------------------------------------------------------------------------
+
+
+def test_l42_loop_summary_renders_ambiguous_and_derives_fixes_after() -> None:
+    """`_loop_summary` is pure, renders `verdict=ambiguous`, and derives
+    `fixes_after_last_review` from the last round (never a hardcoded constant)."""
+    rounds = [(1, 3, 3), (2, 3, 0)]
+
+    summary = prompt_workflow._loop_summary(verdict=None, revisions=1, rounds=rounds)
+
+    assert summary == (
+        "verdict=ambiguous; revisions=1; rounds=2; findings=3/3; fixes=3/0; "
+        "approved=no; fixes_after_last_review=no"
+    )
+    # Purity: the caller's list is untouched.
+    assert rounds == [(1, 3, 3), (2, 3, 0)]
+    # A last round that ran fixes would be flagged — the field is derived, not fixed.
+    assert "fixes_after_last_review=yes" in prompt_workflow._loop_summary(
+        verdict="Approve", revisions=1, rounds=[(1, 3, 3)]
+    )
+    # Approve on round 1: one round, no fix batch, reviewer approved.
+    assert "rounds=1; findings=3; fixes=0; approved=yes" in prompt_workflow._loop_summary(
+        verdict="Approve", revisions=0, rounds=[(1, 3, 0)]
+    )
+
+
+def test_l42_partial_parse_fallback_keeps_findings_count(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A malformed block among clean ones still counts as a finding, and the round runs
+    one whole-review fallback stage (Req 1: 2 clean + 1 malformed records findings=3,
+    fixes=1)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    partial = TASK_REVIEW_CHANGES.replace("Priority: Could fix", "Priority: Eventually")
+    assert partial.count("Priority: Eventually") == 1
+    seen, fake = _fake_stages(partial, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    names = [name for name, _, _ in seen]
+    # The malformed priority forces the whole-review fallback: one stage, not three.
+    assert names == [
+        "task-prompt",
+        "task-review-1",
+        "task-review-fixes-1",
+        "task-review-reconcile-1",
+        "task-review-2",
+    ]
+    captured = capsys.readouterr()
+    assert "round 1: findings=3 fixes=1" in captured.out
+
+
+def test_l42_human_denial_keeps_reviewer_verdict_and_denied_decision(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`approved=yes` (the reviewer approved) sits beside `decision=denied` (the human
+    refused): each keeps its own field (Req 2)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv("AIDW_NONINTERACTIVE", "1")
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=False,
+        require_approval=True,
+    )
+
+    assert code == 3
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    assert "verdict=Approve" in gate.detail
+    assert "approved=yes" in gate.detail
+    assert "fixes_after_last_review=no" in gate.detail
+
+
+def test_l42_run_log_carries_the_per_round_summary_and_blocked_line(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The terminal `Request changes` run logs the summary and says BLOCKED (Req 4)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 3
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    log = _run_log(tmp_path, latest.run_id)
+    assert "approve-task-prompt denied; run BLOCKED" in log
+    for token in ("rounds=3", "findings=3/3/3", "fixes=3/3/0", "approved=no"):
+        assert token in log
+
+
+def test_l42_terminal_round_without_a_verdict_records_ambiguous(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A terminal round that parsed no verdict renders `verdict=ambiguous` (Req 2)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    no_verdict = TASK_REVIEW_CHANGES.split("## Verdict")[0]
+    seen, fake = _fake_stages(no_verdict, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 3
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    assert "verdict=ambiguous" in gate.detail
+    assert "rounds=3" in gate.detail
+    assert "findings=3/3/3" in gate.detail
+    assert "fixes=3/3/0" in gate.detail
+    assert "approved=no" in gate.detail
+    assert "fixes_after_last_review=no" in gate.detail
+
+
+def test_l42_empty_review_exit_stays_gate_less(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An empty review message is a verdict-less failure: no gate, no summary (Req 3)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    from aidw.state import SUCCEEDED, StageRecord, run_dir
+
+    def fake_run_stage(spec, **kwargs):
+        repo = kwargs["repo_root"]
+        state = kwargs["state"]
+        directory = run_dir(kwargs["runs_root"], state.run_id)
+        stages = directory / "stages"
+        stages.mkdir(parents=True, exist_ok=True)
+        if spec.name == "task-prompt":
+            created = repo / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+            created.parent.mkdir(parents=True, exist_ok=True)
+            created.write_text("prompt body\n", encoding="utf-8")
+        out = stages / f"{spec.name}.out.txt"
+        # The author's report resolves the prompt path; only the review is empty.
+        body = "prompt body\n" if spec.name == "task-prompt" else "   \n"
+        out.write_text(body, encoding="utf-8")
+        record = StageRecord(
+            name=spec.name,
+            agent=spec.agent_id,
+            model="test-model",
+            status=SUCCEEDED,
+            artifacts={"out": str(out)},
+        )
+        state.record_stage(record)
+        return record
+
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake_run_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 1
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.FAILED
+    assert not any(g.name == "approve-task-prompt" for g in latest.gates)
+    log = _run_log(tmp_path, latest.run_id)
+    assert "produced no final message" in log
+    assert "approved=" not in log
+    assert "fixes_after_last_review" not in log
