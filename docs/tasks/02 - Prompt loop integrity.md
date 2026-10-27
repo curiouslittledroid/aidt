@@ -171,7 +171,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     unprimed and by L6.1's content assertions; if anchoring shows up in practice, add a second
     independent review at the end rather than reverting this.
 
-- [ ] **L2.4. Hand the agents an evidence bundle** (Design 8.1, EXTRACTION.md D16)
+- [x] **L2.4. Hand the agents an evidence bundle** (Design 8.1, EXTRACTION.md D16)
   Each review round spends ~150k input tokens and 18–20 tool calls re-deriving conventions,
   spec sections and prerequisite state that the author already gathered. Write
   `stages/<stage>.evidence.md` into the run directory and point the reviewer and fixers at it.
