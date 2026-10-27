@@ -24,7 +24,13 @@ Stages:
                           next review. It uses the ``task-fixer`` agent with
                           ``prompts/task-review-fixes.md`` and an ``extra=`` that carries the
                           whole review plus that batch's combined diff (L3.4).
-5. optional gate ``approve-task-prompt``.
+5. optional gate ``approve-task-prompt``. Every verdict-bearing exit — approve,
+                          human-deny, terminal ``Request changes`` and ``Blocked`` —
+                          records that gate (``decision`` stays ``approved``/``denied``)
+                          with a per-round ``key=value`` summary in ``detail``, writes
+                          the same summary to ``run.log`` and stdout, and prints one
+                          per-round findings/fixes line (L4.2, design §9.2/§9.3).
+                          Verdict-less exits record no gate and no summary.
 
 A real run requires ``main`` and a clean working tree, because the ``task-prompt`` prompt
 requires it. It then refuses (exit 4) when an earlier task in the same ``docs/tasks/*.md``
@@ -71,6 +77,7 @@ from aidw.state import (
     FAILED,
     SUCCEEDED,
     GateRecord,
+    RunState,
     create_run,
     run_dir,
     save,
@@ -1008,6 +1015,94 @@ def _warn_incomplete_predecessors(
     print(_render_predecessors(predecessors), file=sys.stderr)
 
 
+#: One review round's telemetry (L4.2, design §9.2):
+#: ``(review_index, findings_count, fix_stage_count)``.
+ReviewRound = tuple[int, int, int]
+
+
+def _record_round(
+    rounds: list[ReviewRound],
+    review_index: int,
+    findings_count: int,
+    fix_stage_count: int,
+) -> None:
+    """Append one round's telemetry and print its stdout stage-report line (L4.2).
+
+    ``fix_stage_count`` is the number of ``task-review-fixes-*`` stages the round
+    actually ran: ``0`` for the approve, ``Blocked`` and terminal-review exits, and the
+    in-loop count for a fixing round (the authoritative source — counting the stage
+    names after the fact would undercount the fallback round, which runs one stage for
+    the whole review).
+    """
+    rounds.append((review_index, findings_count, fix_stage_count))
+    print(f"round {review_index}: findings={findings_count} fixes={fix_stage_count}")
+
+
+def _loop_summary(
+    *,
+    verdict: str | None,
+    revisions: int,
+    rounds: list[ReviewRound],
+) -> str:
+    """One named ``key=value`` summary of the review loop (L4.2, design §9.2, §9.3).
+
+    The single source for the gate ``detail``, the ``run.log`` line and the stdout line,
+    so the three cannot drift. ``findings``/``fixes`` are the per-round counts joined by
+    ``/``; ``approved=yes`` iff the final verdict is ``Approve`` (a human denial still
+    reports the reviewer's verdict here, and its refusal in the gate ``decision``); and
+    ``fixes_after_last_review`` is derived from the last round's fix-stage count, never a
+    constant — after L4.1 the terminal review runs no fix stage, so a ``yes`` would prove
+    an unreviewed fix shipped.
+    """
+    findings = "/".join(str(count) for _, count, _ in rounds)
+    fixes = "/".join(str(count) for _, _, count in rounds)
+    approved = "yes" if verdict == APPROVE else "no"
+    fixes_after = "yes" if rounds and rounds[-1][2] > 0 else "no"
+    return (
+        f"verdict={verdict or 'ambiguous'}; revisions={revisions}; "
+        f"rounds={len(rounds)}; findings={findings}; fixes={fixes}; "
+        f"approved={approved}; fixes_after_last_review={fixes_after}"
+    )
+
+
+def _record_review_outcome(
+    state: RunState,
+    logger: RunLogger,
+    *,
+    verdict: str | None,
+    revisions: int,
+    rounds: list[ReviewRound],
+    decision: str,
+    mechanism: str,
+) -> str:
+    """Record and log one verdict-bearing review-loop exit (L4.2).
+
+    Writes the ``approve-task-prompt`` gate record (``detail`` is the summary), a
+    ``run.log`` line carrying the same summary, and the stdout line. ``decision`` stays
+    ``approved``/``denied`` — the verdict travels in the summary, never as new gate
+    vocabulary. Verdict-less exits must not call this: a ``denied`` would claim a review
+    outcome that never happened.
+    """
+    summary = _loop_summary(verdict=verdict, revisions=revisions, rounds=rounds)
+    state.record_gate(
+        GateRecord(
+            name=GATE,
+            decision=decision,
+            mechanism=mechanism,
+            at=utcnow_iso(),
+            detail=summary,
+        )
+    )
+    if decision == "denied":
+        # A denied gate ends the run BLOCKED, so run.log says so explicitly; the terminal
+        # `Request changes` branch used to print to stderr only (L4.2).
+        logger.error(f"{GATE} denied; run BLOCKED: {summary}")
+    else:
+        logger.info(f"{GATE} approved: {summary}")
+    print(f"{GATE}: {summary}")
+    return summary
+
+
 def run(
     *,
     phase: str,
@@ -1209,6 +1304,10 @@ def run(
     baseline_prompt: str | None = None
     review_index = 0
     revisions = 0
+    # L4.2: per-round ``(review_index, findings_count, fix_stage_count)`` telemetry,
+    # accumulated in the loop so the gate detail and run.log carry the real per-round
+    # counts rather than a number reconstructed from stage names.
+    rounds: list[ReviewRound] = []
     while True:
         review_index += 1
         name = f"task-review-{review_index}"
@@ -1267,12 +1366,15 @@ def run(
 
         verdict = parse_verdict(review_text)
         findings, problems = parse_review_findings(review_text)
+        findings_count = len(findings)
         if verdict == APPROVE:
             print(f"verdict: {verdict}")
         else:
             print(f"verdict: {verdict or 'ambiguous'} — {findings_summary(findings)}")
 
         if verdict == APPROVE:
+            # L4.2: an approving round ran no fix stage, so its fix count is 0.
+            _record_round(rounds, review_index, findings_count, 0)
             break
         if verdict == VERDICT_BLOCKED:
             # A `Blocked` verdict means a material ambiguity only a human can settle, so
@@ -1281,7 +1383,17 @@ def run(
             # uncommitted and the run fails closed (design §8.1/§8.3, L2.1). This runs
             # before ``revisions += 1`` so a Blocked review never spawns a fixer, with or
             # without parsed findings.
+            _record_round(rounds, review_index, findings_count, 0)
             logger.error("task review returned Blocked; failing closed.")
+            _record_review_outcome(
+                state,
+                logger,
+                verdict=verdict,
+                revisions=revisions,
+                rounds=rounds,
+                decision="denied",
+                mechanism="review-loop",
+            )
             state.status = BLOCKED
             save(directory, state)
             print(
@@ -1295,7 +1407,21 @@ def run(
             # revision slot, so a residual `Request changes` fails closed rather than being
             # applied unreviewed — the prompt is left uncommitted for a human to settle, with
             # this review's findings on stderr. `Blocked` short-circuited above, so it keeps
-            # its own "a human must settle it" message.
+            # its own "a human must settle it" message. L4.2 records the gate and the
+            # summary here too: run.log used to stay silent on exactly this symptom.
+            _record_round(rounds, review_index, findings_count, 0)
+            logger.error(
+                "task review did not approve within the revision budget; run BLOCKED"
+            )
+            _record_review_outcome(
+                state,
+                logger,
+                verdict=verdict,
+                revisions=revisions,
+                rounds=rounds,
+                decision="denied",
+                mechanism="review-loop",
+            )
             state.status = BLOCKED
             save(directory, state)
             print(
@@ -1304,6 +1430,15 @@ def run(
             )
             print(review_text, file=sys.stderr)
             return 3
+
+        # L4.2: a fixing round's fix count comes from the in-loop partition, not from the
+        # stage names: the whole-review fallback runs one stage while a parsed review runs
+        # one per blocking finding plus one combined could-fix stage.
+        blocking, could_fix = partition_findings(findings)
+        fix_stage_count = (
+            1 if (not findings or problems) else len(blocking) + (1 if could_fix else 0)
+        )
+        _record_round(rounds, review_index, findings_count, fix_stage_count)
 
         # Capture after the verdict and its Blocked/terminal exits, before the fix
         # stages run, so the next round's diff is exactly this fix batch's net effect and
@@ -1354,8 +1489,8 @@ def run(
         else:
             # Blocking findings are fixed one at a time so progress is visible per change;
             # the non-blocking could-fix findings share a single stage, so they cost one
-            # invocation instead of one each.
-            blocking, could_fix = partition_findings(findings)
+            # invocation instead of one each. ``blocking``/``could_fix`` were partitioned
+            # above for the L4.2 round telemetry.
             steps: list[tuple[str, list[ParsedFinding]]] = [
                 ("finding", [finding]) for finding in blocking
             ]
@@ -1478,14 +1613,14 @@ def run(
         # The prompt is verified by the reviewer above; the human gate is optional and
         # off by default. Record the auto-decision so state still shows what happened.
         outcome = GateOutcome(GATE, True, "optional (default)")
-    state.record_gate(
-        GateRecord(
-            name=GATE,
-            decision=outcome.decision,
-            mechanism=outcome.mechanism,
-            at=utcnow_iso(),
-            detail=f"verdict={verdict}; revisions={revisions}",
-        )
+    _record_review_outcome(
+        state,
+        logger,
+        verdict=verdict,
+        revisions=revisions,
+        rounds=rounds,
+        decision=outcome.decision,
+        mechanism=outcome.mechanism,
     )
     if not outcome.approved:
         state.status = BLOCKED
