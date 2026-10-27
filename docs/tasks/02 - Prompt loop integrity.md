@@ -189,7 +189,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
 
 ## Epic L3: Fixer integrity — stop the churn
 
-- [ ] **L3.1. The fixer verifies the finding before applying it** (Design 8.1)
+- [x] **L3.1. The fixer verifies the finding before applying it** (Design 8.1)
   `prompts/task-review-fixes.md` opens with *"Fix the issues as you suggest"*, which converted a
   wrong reviewer prescription into a Must-fix regression that cost a full round.
   - Deliverable: rewrite that line in `prompts/task-review-fixes.md` and
