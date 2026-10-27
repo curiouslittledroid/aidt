@@ -270,8 +270,23 @@ def prompt(
         "--allow-incomplete-prereqs",
         help="Author even when earlier tasks in the same phase file are unticked.",
     ),
+    max_revisions: Optional[int] = typer.Option(
+        None,
+        "--max-revisions",
+        help=(
+            "Review-round budget (default 3); the last round is review-only. "
+            "Must be >= 1."
+        ),
+    ),
 ) -> None:
     """Generate and review a task prompt (workflow group 1)."""
+    # Usage error before any work: a sub-review budget (0 or negative) is meaningless, so
+    # refuse it here rather than after the author has written and committed a prompt (L4.3).
+    if max_revisions is not None and max_revisions < 1:
+        typer.echo(
+            f"--max-revisions must be >= 1 (got {max_revisions}).", err=True
+        )
+        raise typer.Exit(EXIT_USAGE)
     repo, aidt, workspace = _roots()
     code = prompt_workflow.run(
         phase=phase,
@@ -289,6 +304,7 @@ def prompt(
         dry_run=dry_run,
         no_fetch=no_fetch,
         allow_incomplete_prereqs=allow_incomplete_prereqs,
+        max_revisions=max_revisions,
         stream=bool(_state["verbose"]),
     )
     raise typer.Exit(code)

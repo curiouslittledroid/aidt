@@ -267,7 +267,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     latency acceptance criterion; the operator judges from these numbers. Do not turn it into a
     gate.
 
-- [ ] **L4.3. Make the revision budget configurable** (Design 12, Design 8.1)
+- [x] **L4.3. Make the revision budget configurable** (Design 12, Design 8.1)
   Three is a guess. Expose it as `max_revisions` with precedence CLI flag > target config >
   default 3, and keep the toolkit default at 3.
   - Deliverable: `--max-revisions <n>` on `aidw prompt`; the `max_revisions` key documented in

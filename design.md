@@ -439,9 +439,9 @@ preflight (clean tree, on main; fetch and refuse when the base branch is behind 
   → P1 task-prompt        (agent task-author)      writes docs/task-prompts/<id>-prompt.md, commits it
   → P2 task-review-1..N   (agent task-reviewer)    read-only verdict
   ⟳  if Request changes: P2a task-prompt-fixes (agent task-fixer; one stage per finding)
-                          then P2 again — fixes run only for the first MAX_REVISIONS-1
-                          rounds; the MAX_REVISIONS-th review is review-only
-                          (max 3 review rounds; a residual Request changes exits 3)
+                          then P2 again — fixes run only for the first max_revisions-1
+                          rounds; the max_revisions-th review is review-only
+                          (default 3, `--max-revisions`; a residual Request changes exits 3)
   ◇  approve-task-prompt        (optional; off unless --require-approval)
 ```
 
@@ -463,8 +463,10 @@ preflight (clean tree, on main; fetch and refuse when the base branch is behind 
   batches every non-blocking `could-fix` finding into a single stage so those cost one invocation
   instead of one each. When the review does not parse into findings — or any block is malformed — it
   falls back to a single stage carrying the whole review text.
-- At most `MAX_REVISIONS` (3) review rounds run, and fix batches run only for the first
-  `MAX_REVISIONS - 1` (2) of them. The **last** round is review-only — the terminal review — so a
+- At most `max_revisions` review rounds run (default 3, overridable per run with
+  `--max-revisions <n>`; precedence CLI flag > target config `max_revisions` > 3), and fix
+  batches run only for the first `max_revisions - 1` of them. The **last** round is
+  review-only — the terminal review — so a
   review is always the last stage for a non-approving prompt and no fix is ever accepted without
   being reviewed. A residual `Request changes` after the terminal review fails closed: the run is
   `BLOCKED` (exit 3), the last review's findings are printed for a human to settle, and no gate is
@@ -780,6 +782,13 @@ roadmap.
 
 - Non-secret toolkit config lives in `aidt/agent-configs/` and optionally `aidt/aidt.toml`
   (defaults: repo root discovery, run retention, default models per role).
+- `aidw prompt`'s revision budget is the target repo's `<target>/aidw/config.yaml` key
+  `max_revisions` (default `3`). Precedence is the CLI flag `--max-revisions` > config
+  `max_revisions` > `3`; the toolkit default lives in `aidw/workflows/prompt.py`
+  (`DEFAULT_MAX_REVISIONS`). Reading the key from `<target>/aidw/config.yaml` is the E3.1
+  config loader — no loader exists yet, so the flag and the default are the working surface
+  until it lands, with E3.6 owning the `docs/target-repo-config.md` contract and E3.1 the
+  `docs/schema/aidw-config.schema.json` schema that carry this key forward.
 - Secrets/credentials are **never** stored in `aidt/`: Pi provider credentials come from Pi's own
   auth store or environment (`pi auth`), GitHub from `gh auth`, AWS from `AWS_PROFILE` in
   `.mcp.json`'s env.
@@ -825,7 +834,7 @@ aidw doctor
 
 # workflows
 aidw prompt    <phase> <epic> <task> [--require-approval] [--yes] [--no-fetch]
-              [--allow-incomplete-prereqs] [--skip-gates ...]
+              [--allow-incomplete-prereqs] [--max-revisions <n>] [--skip-gates ...]
               [--deny-gates ...] [--gate-default approve|deny] [--strict] [--dry-run]
 aidw implement <task-prompt-path> [--pr <n>] [--resume] [--from <stage>] [--parallel]
               [--yes] [--skip-gates ...] [--deny-gates ...] [--gate-default approve|deny]

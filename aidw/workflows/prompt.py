@@ -13,10 +13,11 @@ Stages:
 3. ``task-review-fixes`` — repeated (bounded) rework when the review requests changes. One
                           stage per blocking (must-fix/should-fix) finding, plus one combined
                           stage for the non-blocking could-fix findings; a single combined stage
-                          carrying the whole review when it does not parse into findings. Fix
-                          batches run for the first ``MAX_REVISIONS - 1`` review rounds; the
-                          ``MAX_REVISIONS``-th round is review-only (the terminal review), so a
-                          review is always the last stage for a non-approving prompt. Every fix
+                          carrying the whole review when it does not parse into findings. The
+                          budget is ``max_revisions`` (CLI ``--max-revisions``, default 3);
+                          ``max_revisions - 1`` fix batches run and the ``max_revisions``-th
+                          review is review-only (the terminal review), so a review is always the
+                          last stage for a non-approving prompt. Every fix
                           stage also receives a pointer to its own evidence bundle (L2.4),
                           and its input prompt is snapshotted to
                           ``<run_dir>/stages/<stage>.prompt.md`` before it runs (L3.3).
@@ -94,15 +95,17 @@ REMOTE = "origin"
 #: Exit code for a preflight/safety refusal (design §14).
 EXIT_REFUSED = 4
 
-#: Number of review rounds, and the number of revision slots. ``MAX_REVISIONS - 1`` fix
-#: batches run (one stage per blocking finding, one combined stage for the could-fix
-#: findings); the ``MAX_REVISIONS``-th round is review-only so a review is always the last
-#: stage for a non-approving prompt. A residual `Request changes` after that terminal review
-#: fails closed (``BLOCKED``, exit 3) with the findings on stderr — a reviewer that keeps
-#: requesting changes must not have its last fixes accepted unreviewed. A `Blocked` verdict
-#: short-circuits earlier and still fails closed, since it means a human must settle a
-#: material ambiguity.
-MAX_REVISIONS = 3
+#: Default review-round budget, and the number of revision slots (design §12).
+#: ``max_revisions`` (CLI ``--max-revisions``, default 3); ``max_revisions - 1`` fix batches
+#: run (one stage per blocking finding, one combined stage for the could-fix findings) and
+#: the ``max_revisions``-th review is review-only (the terminal review), so a review is always
+#: the last stage for a non-approving prompt. A residual `Request changes` after that terminal
+#: review fails closed (``BLOCKED``, exit 3) with the findings on stderr — a reviewer that
+#: keeps requesting changes must not have its last fixes accepted unreviewed. A `Blocked`
+#: verdict short-circuits earlier and still fails closed, since it means a human must settle
+#: a material ambiguity. This is the floor default only; the effective value is
+#: ``max_revisions`` in :func:`run`, resolved CLI flag > target config > this default.
+DEFAULT_MAX_REVISIONS = 3
 
 #: Instruction prepended to every review round after the first (L2.3, design §8.1). The
 #: three verdict tokens are literal because the reviewer must emit one of them per prior
@@ -1045,6 +1048,7 @@ def _loop_summary(
     *,
     verdict: str | None,
     revisions: int,
+    max_revisions: int,
     rounds: list[ReviewRound],
 ) -> str:
     """One named ``key=value`` summary of the review loop (L4.2, design §9.2, §9.3).
@@ -1063,7 +1067,8 @@ def _loop_summary(
     fixes_after = "yes" if rounds and rounds[-1][2] > 0 else "no"
     return (
         f"verdict={verdict or 'ambiguous'}; revisions={revisions}; "
-        f"rounds={len(rounds)}; findings={findings}; fixes={fixes}; "
+        f"max_revisions={max_revisions}; rounds={len(rounds)}; "
+        f"findings={findings}; fixes={fixes}; "
         f"approved={approved}; fixes_after_last_review={fixes_after}"
     )
 
@@ -1074,6 +1079,7 @@ def _record_review_outcome(
     *,
     verdict: str | None,
     revisions: int,
+    max_revisions: int,
     rounds: list[ReviewRound],
     decision: str,
     mechanism: str,
@@ -1086,7 +1092,12 @@ def _record_review_outcome(
     vocabulary. Verdict-less exits must not call this: a ``denied`` would claim a review
     outcome that never happened.
     """
-    summary = _loop_summary(verdict=verdict, revisions=revisions, rounds=rounds)
+    summary = _loop_summary(
+        verdict=verdict,
+        revisions=revisions,
+        max_revisions=max_revisions,
+        rounds=rounds,
+    )
     state.record_gate(
         GateRecord(
             name=GATE,
@@ -1124,10 +1135,17 @@ def run(
     dry_run: bool = False,
     no_fetch: bool = False,
     allow_incomplete_prereqs: bool = False,
+    max_revisions: int | None = None,
     stream: bool = False,
 ) -> int:
     skip = set(skip_gates or [])
     deny = set(deny_gates or [])
+    # Resolution precedence (design §12): CLI `--max-revisions` > target config
+    # `<target>/aidw/config.yaml:max_revisions` > `DEFAULT_MAX_REVISIONS`. The config read is
+    # E3.1's work — no loader exists yet; insert it on the line below when it lands (E3.1).
+    max_revisions = (
+        max_revisions if max_revisions is not None else DEFAULT_MAX_REVISIONS
+    )
     # ``aidt`` locates the toolkit's assets (prompts, agent configs); run state lives
     # under the per-repo state root (EXTRACTION.md §3.10), resolved once by ``_roots``
     # and threaded in as ``workspace`` so no workflow re-resolves it.
@@ -1393,6 +1411,7 @@ def run(
                 logger,
                 verdict=verdict,
                 revisions=revisions,
+                max_revisions=max_revisions,
                 rounds=rounds,
                 decision="denied",
                 mechanism="review-loop",
@@ -1405,7 +1424,7 @@ def run(
             )
             print(review_text, file=sys.stderr)
             return 3
-        if revisions >= MAX_REVISIONS - 1:
+        if revisions >= max_revisions - 1:
             # The fix budget is spent: the terminal review has now run. There is no further
             # revision slot, so a residual `Request changes` fails closed rather than being
             # applied unreviewed — the prompt is left uncommitted for a human to settle, with
@@ -1421,6 +1440,7 @@ def run(
                 logger,
                 verdict=verdict,
                 revisions=revisions,
+                max_revisions=max_revisions,
                 rounds=rounds,
                 decision="denied",
                 mechanism="review-loop",
@@ -1550,7 +1570,7 @@ def run(
         # review. The fixers work one finding at a time and prefer the smallest edit, so the
         # batch can end internally inconsistent. After L4.1 there is no final fix batch to
         # reconcile: a review is always the last stage for a non-approving prompt, and
-        # ``MAX_REVISIONS`` counts review rounds with the last one review-only. ``review_index``
+        # ``max_revisions`` counts review rounds with the last one review-only. ``review_index``
         # is the round number, so the name matches neither ``task-review-N`` nor
         # ``task-review-fixes-*`` — the L3.3 snapshot writer, the ``_fix_round`` regex and
         # the harness's ``fix_status`` branch all leave it alone.
@@ -1626,6 +1646,7 @@ def run(
         logger,
         verdict=verdict,
         revisions=revisions,
+        max_revisions=max_revisions,
         rounds=rounds,
         decision=outcome.decision,
         mechanism=outcome.mechanism,

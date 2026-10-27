@@ -679,8 +679,8 @@ Blocked — the dependency implementation is unmerged and requires an owner deci
 def test_third_review_is_terminal_and_residual_request_changes_fails_closed(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """`MAX_REVISIONS` is 3 review rounds; the third is review-only, so a residual
-    `Request changes` fails closed with review-3's findings and no round-3 fixes."""
+    """The default `max_revisions` (3) runs three review rounds; the third is review-only,
+    so a residual `Request changes` fails closed with review-3's findings and no round-3 fixes."""
     _patch_prompt_repo(tmp_path, monkeypatch)
     seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
@@ -729,6 +729,7 @@ def test_third_review_is_terminal_and_residual_request_changes_fails_closed(
         "verdict=Request changes",
         "rounds=3",
         "revisions=2",
+        "max_revisions=3",
         "findings=3/3/3",
         "fixes=3/3/0",
         "approved=no",
@@ -3175,21 +3176,23 @@ def test_l42_loop_summary_renders_ambiguous_and_derives_fixes_after() -> None:
     `fixes_after_last_review` from the last round (never a hardcoded constant)."""
     rounds = [(1, 3, 3), (2, 3, 0)]
 
-    summary = prompt_workflow._loop_summary(verdict=None, revisions=1, rounds=rounds)
+    summary = prompt_workflow._loop_summary(
+        verdict=None, revisions=1, max_revisions=3, rounds=rounds
+    )
 
     assert summary == (
-        "verdict=ambiguous; revisions=1; rounds=2; findings=3/3; fixes=3/0; "
-        "approved=no; fixes_after_last_review=no"
+        "verdict=ambiguous; revisions=1; max_revisions=3; rounds=2; findings=3/3; "
+        "fixes=3/0; approved=no; fixes_after_last_review=no"
     )
     # Purity: the caller's list is untouched.
     assert rounds == [(1, 3, 3), (2, 3, 0)]
     # A last round that ran fixes would be flagged — the field is derived, not fixed.
     assert "fixes_after_last_review=yes" in prompt_workflow._loop_summary(
-        verdict="Approve", revisions=1, rounds=[(1, 3, 3)]
+        verdict="Approve", revisions=1, max_revisions=3, rounds=[(1, 3, 3)]
     )
     # Approve on round 1: one round, no fix batch, reviewer approved.
     assert "rounds=1; findings=3; fixes=0; approved=yes" in prompt_workflow._loop_summary(
-        verdict="Approve", revisions=0, rounds=[(1, 3, 0)]
+        verdict="Approve", revisions=0, max_revisions=3, rounds=[(1, 3, 0)]
     )
 
 
@@ -3344,3 +3347,280 @@ def test_l42_empty_review_exit_stays_gate_less(
     assert "produced no final message" in log
     assert "approved=" not in log
     assert "fixes_after_last_review" not in log
+
+
+# ---------------------------------------------------------------------------
+# L4.3 — configurable revision budget (design §8.1, §12)
+# ---------------------------------------------------------------------------
+
+
+def test_l43_budget_two_ends_at_review_two(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """`run(max_revisions=2)` runs one fix batch + reconcile, then the review-2 terminal:
+    `code == 3`, no round-2 fixes/reconcile/round-3, and `max_revisions=2` in the summary."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        max_revisions=2,
+    )
+
+    assert code == 3
+    names = [name for name, _, _ in seen]
+    assert names == [
+        "task-prompt",
+        "task-review-1",
+        "task-review-fixes-1-1",
+        "task-review-fixes-1-2",
+        "task-review-fixes-1-3",
+        "task-review-reconcile-1",
+        "task-review-2",
+    ]
+    assert not any(name.startswith("task-review-fixes-2") for name in names)
+    assert "task-review-reconcile-2" not in names
+    assert "task-review-3" not in names
+
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    for token in ("max_revisions=2", "rounds=2", "revisions=1", "approved=no"):
+        assert token in gate.detail
+    assert "max_revisions=2" in _run_log(tmp_path, latest.run_id)
+    # The effective value is visible on stdout as well as in the gate detail/run.log.
+    assert "max_revisions=2" in capsys.readouterr().out
+
+
+def test_l43_budget_four_runs_four_reviews(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`run(max_revisions=4)` approving at review-4 runs three fix batches + four reviews,
+    succeeds, and reports `max_revisions=4`, `revisions=3`, `rounds=4` (Req 1)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=4)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        max_revisions=4,
+    )
+
+    assert code == 0
+    names = [name for name, _, _ in seen]
+    assert names[-1] == "task-review-4"
+    # Three fix batches (rounds 1-3), each with its reconcile, then the approving review-4.
+    for round_n in (1, 2, 3):
+        assert f"task-review-fixes-{round_n}-1" in names
+        assert f"task-review-reconcile-{round_n}" in names
+    assert not any(name.startswith("task-review-fixes-4") for name in names)
+    assert "task-review-5" not in names
+
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.SUCCEEDED
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "approved"
+    for token in (
+        "verdict=Approve",
+        "max_revisions=4",
+        "revisions=3",
+        "rounds=4",
+        "approved=yes",
+    ):
+        assert token in gate.detail
+    assert "max_revisions=4" in _run_log(tmp_path, latest.run_id)
+
+
+def test_l43_budget_one_is_review_only_from_the_start(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`run(max_revisions=1)` makes review-1 terminal: `code == 3`, no fix/reconcile stage
+    at all (the `- 1` bound holds at the floor)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        max_revisions=1,
+    )
+
+    assert code == 3
+    names = [name for name, _, _ in seen]
+    assert names == ["task-prompt", "task-review-1"]
+    assert not any(name.startswith("task-review-fixes") for name in names)
+    assert not any(name.startswith("task-review-reconcile") for name in names)
+    assert "task-review-2" not in names
+
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    for token in ("max_revisions=1", "rounds=1", "revisions=0"):
+        assert token in gate.detail
+    assert "max_revisions=1" in _run_log(tmp_path, latest.run_id)
+
+
+def test_l43_effective_budget_is_reported_on_approve_exit(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """An approved review reports the effective budget in every summary sink."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        max_revisions=4,
+    )
+
+    assert code == 0
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "approved"
+    assert "max_revisions=4" in gate.detail
+    assert "max_revisions=4" in _run_log(tmp_path, latest.run_id)
+    assert "max_revisions=4" in capsys.readouterr().out
+
+
+def test_l43_effective_budget_is_reported_for_blocked_exit(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A Blocked verdict reports the effective budget in every summary sink."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_BLOCKED_DEPENDENCY, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        max_revisions=4,
+    )
+
+    assert code == 3
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    assert "max_revisions=4" in gate.detail
+    assert "max_revisions=4" in _run_log(tmp_path, latest.run_id)
+    assert "max_revisions=4" in capsys.readouterr().out
+
+
+def test_l43_effective_budget_is_reported_on_human_gate_denial(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A reviewer-approved result that the human gate denies still reports the budget."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv("AIDW_NONINTERACTIVE", "1")
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        require_approval=True,
+        max_revisions=2,
+    )
+
+    assert code == 3
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    assert "verdict=Approve" in gate.detail
+    assert "max_revisions=2" in gate.detail
+    assert "max_revisions=2" in _run_log(tmp_path, latest.run_id)
+    assert "max_revisions=2" in capsys.readouterr().out
+
+
+def test_l43_cli_flag_is_forwarded_to_prompt_workflow(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`--max-revisions 5` reaches `prompt_workflow.run(max_revisions=5)`."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(prompt_workflow, "run", fake_run)
+    result = runner.invoke(
+        app,
+        [
+            "--repo",
+            str(tmp_path),
+            "prompt",
+            "03",
+            "E4",
+            "E4.1",
+            "--max-revisions",
+            "5",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["max_revisions"] == 5
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_l43_nonpositive_budget_is_a_usage_error_before_any_run(
+    tmp_path: Path, monkeypatch, value: str
+) -> None:
+    """`--max-revisions 0`/negative exits 2 in the CLI and never starts the workflow."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    called: list[dict] = []
+
+    def fake_run(**kwargs):
+        called.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(prompt_workflow, "run", fake_run)
+    result = runner.invoke(
+        app,
+        [
+            "--repo",
+            str(tmp_path),
+            "prompt",
+            "03",
+            "E4",
+            "E4.1",
+            "--max-revisions",
+            value,
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "must be >= 1" in result.output
+    assert called == []
+    # No run directory was created and nothing was authored.
+    assert not _runs_root(tmp_path).exists()
+    assert not (tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
