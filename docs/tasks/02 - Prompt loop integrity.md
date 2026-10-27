@@ -223,7 +223,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     order, they are not tracked by git, and the final prompt is still the single commit.
   - Tests: `tests/test_prompt_workflow.py`.
 
-- [ ] **L3.4. Reconcile after each fix batch** (Design 8.1)
+- [x] **L3.4. Reconcile after each fix batch** (Design 8.1)
   One stage per finding is kept for per-change visibility, but the batch can end internally
   inconsistent. Add one cheap stage after the batch (before the next review) whose instruction
   is to compare the fixed prompt against the full review text and the combined diff, and repair
