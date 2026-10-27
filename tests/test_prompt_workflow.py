@@ -2574,3 +2574,202 @@ def test_l24_missing_gate_source_notes_the_section_unavailable(
     # The rest of the bundle is still present and usable.
     assert "docs/task-prompts/03-E4.1-prompt.md" in bundle
     assert "design.md §8.1" in bundle
+
+
+# ---------------------------------------------------------------------------
+# L3.3 — snapshot the prompt at every fix stage (design §9.1)
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_path(repo: Path, run_id: str, stage: str) -> Path:
+    return _runs_root(repo) / run_id / "stages" / f"{stage}.prompt.md"
+
+
+def _committed_paths(repo: Path) -> list[str]:
+    """The paths in ``HEAD`` — the run's single reviewed-prompt commit."""
+    result = subprocess.run(
+        ["git", "show", "--name-only", "--format=", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def test_l33_every_fix_stage_gets_a_snapshot_in_stage_order(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A two-fix-stage run leaves both snapshots under ``stages/``, in stage order."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_BOLD, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    names = [name for name, _, _ in seen]
+    assert names == [
+        "task-prompt",
+        "task-review-1",
+        "task-review-fixes-1-1",
+        "task-review-fixes-1-2",
+        "task-review-2",
+    ]
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    snapshots = sorted((_runs_root(tmp_path) / run_id / "stages").glob("*.prompt.md"))
+    assert [path.name for path in snapshots] == [
+        "task-review-fixes-1-1.prompt.md",
+        "task-review-fixes-1-2.prompt.md",
+    ]
+
+
+def test_l33_snapshot_is_the_input_to_its_fix_stage(tmp_path: Path, monkeypatch) -> None:
+    """snapshot(i) carries earlier fix mutations but not its own (capture-before-run)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_BOLD, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    first = _snapshot_path(tmp_path, run_id, "task-review-fixes-1-1").read_text(
+        encoding="utf-8"
+    )
+    second = _snapshot_path(tmp_path, run_id, "task-review-fixes-1-2").read_text(
+        encoding="utf-8"
+    )
+    # Stage 1-1's input is the authored prompt, before any fix marker.
+    assert first == "prompt body\n"
+    assert "<!-- fix round 1 -->" not in first
+    # Stage 1-2's input is the prompt after stage 1-1's mutation — the fake fixer
+    # appends its marker inside the stage, so capture-before-run is observable.
+    assert second == "prompt body\n<!-- fix round 1 -->\n"
+    # The consecutive-snapshot delta is exactly the immediately preceding stage's change.
+    assert second[len(first):] == "<!-- fix round 1 -->\n"
+
+
+def test_l33_fallback_whole_review_fix_also_gets_a_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The unparseable-review fallback fix is the second snapshot call site (L3.3)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_UNPARSEABLE, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    assert [name for name, _, _ in seen] == [
+        "task-prompt",
+        "task-review-1",
+        "task-review-fixes-1",
+        "task-review-2",
+    ]
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    snapshot = _snapshot_path(tmp_path, run_id, "task-review-fixes-1")
+    assert snapshot.is_file()
+    # Captured before the fallback fix stage's own marker.
+    assert snapshot.read_text(encoding="utf-8") == "prompt body\n"
+
+
+def test_l33_snapshots_are_not_tracked_and_not_committed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The snapshots stay run-dir artifacts: untracked, absent from the single commit."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_BOLD, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    snapshot = _snapshot_path(tmp_path, run_id, "task-review-fixes-1-1")
+    rel = snapshot.relative_to(tmp_path).as_posix()
+    assert rel in git.untracked_paths(tmp_path)
+    # The reviewed-prompt commit is a single, path-scoped commit: no snapshot, no
+    # per-stage commits. `.prompt.md` never appears in it (the owned prompt is
+    # `03-E4.1-prompt.md`, which ends in `-prompt.md`).
+    committed = _committed_paths(tmp_path)
+    assert committed == ["docs/task-prompts/03-E4.1-prompt.md"]
+    assert all(not path.endswith(".prompt.md") for path in committed)
+    # Snapshots are plain run-directory artifacts, not a new state-schema field.
+    state_json = (_runs_root(tmp_path) / run_id / "state.json").read_text(
+        encoding="utf-8"
+    )
+    assert ".prompt.md" not in state_json
+
+
+def test_l33_snapshot_write_failure_is_warn_only(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A raising snapshot writer must not stop the fix stages or the run (L3.3)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_BOLD, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    def exploding_writer(**kwargs: object) -> Path:
+        raise OSError("read-only run directory")
+
+    monkeypatch.setattr(prompt_workflow, "_write_prompt_snapshot", exploding_writer)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    names = [name for name, _, _ in seen]
+    assert "task-review-fixes-1-1" in names
+    assert "task-review-fixes-1-2" in names
+    assert "task-review-2" in names
+    err = capsys.readouterr().err
+    assert "could not write the prompt snapshot" in err
+    assert "read-only run directory" in err
+
+
+def test_l33_unreadable_prompt_skips_the_snapshot_with_a_warning(
+    tmp_path: Path, capsys
+) -> None:
+    """A missing prompt file warns and returns ``None`` instead of raising (L3.3)."""
+    directory = tmp_path / "run"
+
+    result = prompt_workflow._write_prompt_snapshot(
+        stage="task-review-fixes-1-1",
+        directory=directory,
+        prompt_path=tmp_path / "docs" / "missing-prompt.md",
+    )
+
+    assert result is None
+    assert not (directory / "stages").exists()
+    err = capsys.readouterr().err
+    assert "could not read the prompt" in err
+    assert "task-review-fixes-1-1" in err
+
+
+def test_l33_snapshot_writer_copies_the_prompt_verbatim(tmp_path: Path) -> None:
+    """The snapshot is the prompt bytes, and the source is not mutated (purity)."""
+    prompt = tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+    prompt.parent.mkdir(parents=True)
+    body = "prompt body\n\nsecond line\n"
+    prompt.write_text(body, encoding="utf-8")
+
+    destination = prompt_workflow._write_prompt_snapshot(
+        stage="task-review-fixes-1-1",
+        directory=tmp_path / "run",
+        prompt_path=prompt,
+    )
+
+    assert destination == (tmp_path / "run" / "stages" / "task-review-fixes-1-1.prompt.md").resolve()
+    assert destination.read_text(encoding="utf-8") == body
+    # Read-only: the writer never rewrites the source prompt.
+    assert prompt.read_text(encoding="utf-8") == body

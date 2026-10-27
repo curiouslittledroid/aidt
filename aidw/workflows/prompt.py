@@ -16,7 +16,9 @@ Stages:
                           carrying the whole review when it does not parse into findings. At most
                           ``MAX_REVISIONS`` rounds run, and the last round's fixes are not
                           followed by another review: the prompt is accepted as ready. Every
-                          fix stage also receives a pointer to its own evidence bundle (L2.4).
+                          fix stage also receives a pointer to its own evidence bundle (L2.4),
+                          and its input prompt is snapshotted to
+                          ``<run_dir>/stages/<stage>.prompt.md`` before it runs (L3.3).
 4. optional gate ``approve-task-prompt``.
 
 A real run requires ``main`` and a clean working tree, because the ``task-prompt`` prompt
@@ -614,6 +616,68 @@ def _with_evidence(pointer: str, extra: str) -> str:
     return f"{pointer}\n\n{extra}" if extra else pointer
 
 
+# ---------------------------------------------------------------------------
+# Prompt snapshot (L3.3, design §9.1)
+# ---------------------------------------------------------------------------
+
+#: Suffix of a fix stage's prompt snapshot. Distinct from the L2.4 ``.evidence.md``
+#: bundle, the stage ``.jsonl``/``.out.txt``/``.meta.json`` files, and the L2.3
+#: ``baseline/``/``current/`` diff names, so no two writers share a path (L3.3, req 5).
+_SNAPSHOT_SUFFIX = ".prompt.md"
+
+
+def _write_prompt_snapshot(
+    *, stage: str, directory: Path, prompt_path: Path
+) -> Path | None:
+    """Write ``stages/<stage>.prompt.md`` from the prompt's on-disk content (L3.3).
+
+    Called *before* a fix stage's ``run_stage``, so ``snapshot(i)`` is exactly stage
+    ``i``'s input: it already carries every earlier fix stage's mutation and none of
+    this stage's. The snapshot lives under the run directory — never the L2.3
+    ``_DIFF_TMP_PREFIX`` temp directory, which ``_prompt_diff`` deletes in a
+    ``finally`` — and is a plain run-dir artifact, so ``state.json`` gains no field.
+
+    ``stages.mkdir(parents=True, exist_ok=True)`` creates the directory lazily, exactly
+    as :func:`_write_evidence_bundle` does. A write failure raises; the caller
+    :func:`_snapshot_fix_stage` turns it into the warn-and-continue a fix stage needs.
+    """
+    text = _capture_prompt(prompt_path)
+    if text is None:
+        print(
+            f"warning: could not read the prompt `{prompt_path}` to snapshot it for "
+            f"stage `{stage}`; the stage runs without a snapshot.",
+            file=sys.stderr,
+        )
+        return None
+    stages = directory / "stages"
+    stages.mkdir(parents=True, exist_ok=True)
+    destination = stages / f"{stage}{_SNAPSHOT_SUFFIX}"
+    destination.write_text(text, encoding="utf-8")
+    return destination.resolve()
+
+
+def _snapshot_fix_stage(
+    *, stage: str, directory: Path, prompt_path: Path
+) -> Path | None:
+    """Warn-and-continue guard around :func:`_write_prompt_snapshot` (L3.3, req 3).
+
+    Mirrors :func:`_write_evidence_bundle`: a snapshot failure — an unreadable prompt,
+    a read-only or odd run directory — is a stderr warning that lets the fix stage run.
+    The snapshot is recoverability, never a gate, so it must not fail a run.
+    """
+    try:
+        return _write_prompt_snapshot(
+            stage=stage, directory=directory, prompt_path=prompt_path
+        )
+    except Exception as exc:  # noqa: BLE001 - a snapshot failure must never stop the run
+        print(
+            f"warning: could not write the prompt snapshot for stage `{stage}` "
+            f"({exc}); the stage runs without it.",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _read_out(record) -> str | None:
     out = record.artifacts.get("out")
     if out and Path(out).is_file():
@@ -1182,6 +1246,9 @@ def run(
                     f"({problems[0]}); reworking with the whole review instead"
                 )
             fallback_name = f"task-review-fixes-{revisions}"
+            _snapshot_fix_stage(
+                stage=fallback_name, directory=directory, prompt_path=prompt_path
+            )
             rec_fix = run_stage(
                 StageSpec(
                     fallback_name,
@@ -1236,6 +1303,9 @@ def run(
                     extra = render_could_fix_block(group)
 
                 fix_name = f"task-review-fixes-{revisions}-{index}"
+                _snapshot_fix_stage(
+                    stage=fix_name, directory=directory, prompt_path=prompt_path
+                )
                 rec_fix = run_stage(
                     StageSpec(
                         fix_name,
