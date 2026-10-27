@@ -2089,6 +2089,74 @@ def test_l22_rendered_reviewer_prompt_requires_verified_revision() -> None:
         render_prompt_file(prompt_path, [])
 
 
+def test_l31_rendered_fixer_prompt_and_agent_context_state_verify_and_pushback() -> None:
+    """L3.1: the fixer verifies the finding, may push back, and never guesses an ambiguity."""
+    prompt_path = toolkit_root() / "prompts" / "task-review-fixes.md"
+    rendered = render_prompt_file(
+        prompt_path, ["docs/task-prompts/03-E4.1-prompt.md"]
+    )
+
+    assert "Fix the issues as you suggest" not in rendered
+    phrases = (
+        "verify the finding against the repository and the cited sources",
+        "make the correction the evidence supports and report the disagreement",
+        "state the options and stop",
+        "`Blocked` escalation",
+    )
+    for phrase in phrases:
+        assert phrase in rendered, phrase
+
+    # Verification must precede the edit instruction, rather than merely appearing
+    # somewhere in the prompt.
+    assert rendered.index("Your first act is verification") < rendered.index(
+        "Before making any edit"
+    )
+    normalized = " ".join(rendered.split())
+    for source in (
+        "the prompt under revision",
+        "its roadmap entry",
+        "the spec sections it cites",
+        "the files the finding names",
+    ):
+        assert source in normalized, source
+
+    # Neutrality is asserted on the added lines only: bucket (i) ships as-is
+    # (EXTRACTION.md §4.2), so a whole-file absence check would over-reach.
+    added_lines = [
+        line for line in rendered.splitlines() if any(p in line for p in phrases)
+    ]
+    assert added_lines, "the L3.1 phrases must be locatable as whole lines"
+    for line in added_lines:
+        assert "pnpm" not in line
+        assert "Design 21" not in line
+        assert "docs/task-prompts" not in line
+        assert not re.search(r"\b0[0-9]-E[0-9]", line), "no product task-id example"
+
+    fixer_md = (toolkit_root() / "agents" / "task-fixer" / "AGENTS.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Fix the issues as you suggest" not in fixer_md
+    assert "verify the finding against the repository and the cited sources" in fixer_md
+    assert (
+        "make the correction the evidence supports and report the disagreement"
+        in fixer_md
+    )
+    assert "state the options and stop" in fixer_md
+    assert "`Blocked` escalation" in fixer_md
+    output = fixer_md.split("## Output", 1)[1]
+    assert "For every finding whose suggested fix was wrong or contradicted the sources" in output
+    assert "which finding, what the reviewer prescribed, what the evidence shows, and what you changed" in output
+    # The smallest-edit rule is qualified by correctness and verification, not a
+    # bare tiniest-diff mandate (L3.2 appends the consistency sweep later).
+    assert "Prefer the smallest edit that satisfies the finding." not in fixer_md
+    assert "smallest *correct* edit" in fixer_md
+    assert "*verified* finding" in fixer_md
+
+    # Rendering contract: the prompt references exactly `$1`.
+    with pytest.raises(PromptError):
+        render_prompt_file(prompt_path, [])
+
+
 # ---------------------------------------------------------------------------
 # L2.4 — hand the agents an evidence bundle (design §8.1; EXTRACTION.md §3.8 / D16)
 # ---------------------------------------------------------------------------
