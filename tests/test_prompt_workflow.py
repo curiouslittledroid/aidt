@@ -593,6 +593,38 @@ def test_failed_fix_stage_stops_the_run(tmp_path: Path, monkeypatch) -> None:
     assert "fixes_after_last_review" not in log
 
 
+def test_failed_fix_round_prints_no_predicted_round_line(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A fixing round's stdout line waits for its fix batch (review follow-up #31).
+
+    ``fixes=`` is predicted before the batch runs; printed there it would overstate a
+    run that dies mid-batch — ``state.json`` would hold fewer ``task-review-fixes-*``
+    stages than the line claims. Recorded after the batch (and its reconcile) instead,
+    a FAILED exit prints no round line at all, like every other verdict-less exit.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    from aidw.state import FAILED
+
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, fix_status=FAILED)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    # TASK_REVIEW_CHANGES plans three fix stages (2 blocking + 1 combined); the first
+    # fails, so the run stops before the second and never reaches the reconcile.
+    names = [name for name, _, _ in seen]
+    assert "task-review-fixes-1-1" in names
+    assert "task-review-fixes-1-2" not in names
+    # The predicted count must not reach stdout: no round line on the FAILED path.
+    assert "round 1: findings=3 fixes=3" not in captured.out
+    assert "round 1:" not in captured.out
+
+
 TASK_REVIEW_BLOCKED = """\
 ## Findings
 

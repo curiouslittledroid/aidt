@@ -1032,7 +1032,10 @@ def _record_round(
     actually ran: ``0`` for the approve, ``Blocked`` and terminal-review exits, and the
     in-loop count for a fixing round (the authoritative source — counting the stage
     names after the fact would undercount the fallback round, which runs one stage for
-    the whole review).
+    the whole review). A fixing round is recorded only after its fix batch and
+    reconcile succeeded (review follow-up #31): the count is a prediction made before
+    the batch, so printing it there would overstate a run that dies mid-batch —
+    stdout would claim more fix stages than the stage list in ``state.json`` holds.
     """
     rounds.append((review_index, findings_count, fix_stage_count))
     print(f"round {review_index}: findings={findings_count} fixes={fix_stage_count}")
@@ -1438,7 +1441,6 @@ def run(
         fix_stage_count = (
             1 if (not findings or problems) else len(blocking) + (1 if could_fix else 0)
         )
-        _record_round(rounds, review_index, findings_count, fix_stage_count)
 
         # Capture after the verdict and its Blocked/terminal exits, before the fix
         # stages run, so the next round's diff is exactly this fix batch's net effect and
@@ -1591,6 +1593,12 @@ def run(
             state.status = FAILED
             save(directory, state)
             return 1
+
+        # L4.2 (review follow-up #31): recorded only now that the whole fix batch and
+        # its reconcile ran — ``fix_stage_count`` is predicted above, and a round line
+        # printed before the batch would outlive a mid-batch ``return 1`` above and
+        # overstate the stages the run actually completed.
+        _record_round(rounds, review_index, findings_count, fix_stage_count)
 
     verdict_line = f"Review verdict: {verdict or 'ambiguous'}"
     summary = "\n".join(
