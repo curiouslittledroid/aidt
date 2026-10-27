@@ -439,7 +439,9 @@ preflight (clean tree, on main; fetch and refuse when the base branch is behind 
   → P1 task-prompt        (agent task-author)      writes docs/task-prompts/<id>-prompt.md, commits it
   → P2 task-review-1..N   (agent task-reviewer)    read-only verdict
   ⟳  if Request changes: P2a task-prompt-fixes (agent task-fixer; one stage per finding)
-                          then P2 again (skip the last P2)         (max 3 rounds)
+                          then P2 again — fixes run only for the first MAX_REVISIONS-1
+                          rounds; the MAX_REVISIONS-th review is review-only
+                          (max 3 review rounds; a residual Request changes exits 3)
   ◇  approve-task-prompt        (optional; off unless --require-approval)
 ```
 
@@ -461,10 +463,14 @@ preflight (clean tree, on main; fetch and refuse when the base branch is behind 
   batches every non-blocking `could-fix` finding into a single stage so those cost one invocation
   instead of one each. When the review does not parse into findings — or any block is malformed — it
   falls back to a single stage carrying the whole review text.
-- At most `MAX_REVISIONS` (3) rounds run. The **last** round's fixes are not followed by another
-  review: the reviewer has had its chances, so the prompt is accepted as ready and the gate summary
-  says so (`no further review — accepted`). A final `Blocked` verdict is the exception — it means a
-  human must settle a material ambiguity, so the run still fails closed with the residual findings.
+- At most `MAX_REVISIONS` (3) review rounds run, and fix batches run only for the first
+  `MAX_REVISIONS - 1` (2) of them. The **last** round is review-only — the terminal review — so a
+  review is always the last stage for a non-approving prompt and no fix is ever accepted without
+  being reviewed. A residual `Request changes` after the terminal review fails closed: the run is
+  `BLOCKED` (exit 3), the last review's findings are printed for a human to settle, and no gate is
+  recorded (the old `assumed_ok` / `no further review — accepted` acceptance path is gone). A
+  `Blocked` verdict short-circuits earlier with the same exit-3 outcome and its own "a human must
+  settle it" message. *(Provisional — E9.1 owns the design.md rewrite.)*
 - Output artifacts: `task_prompt_path`, `branch`, `task_review_verdict`, `task_review_findings`.
 
 ### 8.2 `aidw implement <task-prompt-path> [--pr <n>]`
@@ -921,6 +927,7 @@ Exit codes: `0` success/approved, `1` stage or gate failure, `2` usage/config er
 | F6 | Auto-detect repo root from any cwd; absolute paths internally. |
 | F7 | AIDT = AI Developer Tools; AIDW = AI Developer Workflows. |
 | G1 | Stage wall time is attributed as `generation_seconds` (streaming the model) and `tool_seconds` (sum of Pi's per-call `durationMs`, or start/end intervals when that field is absent), with `tool_breakdown` splitting tool time by name. `runs show` displays a `timing:` line whose `tools` term is `tool_seconds` and whose `ai` term is the `duration_seconds` remainder, so the two add up, then a `tools:` line listing the per-name split. It recovers both from the stage JSONL for records written before the fields existed. None is aggregated, and the fields are additive at the same `schema_version`. |
+| G2 | The `aidw prompt` revision budget spends its last slot on a review, not a fix. At `MAX_REVISIONS=3` the loop runs two fix batches plus three reviews, the third review review-only, so a review is always the last stage for a non-approving prompt. A residual `Request changes` after that terminal review fails closed (`BLOCKED`, exit 3) with the last review's findings on stderr and **no** `approve-task-prompt` gate recorded; the old `assumed_ok` / `no further review — accepted` unreviewed-acceptance path is removed. `revisions` in a recorded gate detail counts fix batches (2 on a three-review success), not review rounds. |
 
 ---
 
