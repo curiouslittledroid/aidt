@@ -99,6 +99,18 @@ def test_run_chain_requires_arguments() -> None:
     assert "requires" in result.stderr
 
 
+def test_run_chain_prompt_to_fix_requires_arguments() -> None:
+    result = runner.invoke(app, ["run", "prompt-to-fix"])
+    assert result.exit_code == 2
+    assert "prompt-to-fix requires" in result.stderr
+
+
+def test_run_chain_rejects_unknown_name() -> None:
+    result = runner.invoke(app, ["run", "unknown-chain"])
+    assert result.exit_code == 2
+    assert "prompt-to-fix" in result.stderr
+
+
 def test_doctor_runs(fake_external_clis: None) -> None:  # noqa: ARG001
     result = runner.invoke(app, ["doctor"])
     # Unknown environment issues are warnings; doctor fails only on FAIL checks.

@@ -574,6 +574,18 @@ preflight (PR exists)
 convenience chain `aidw run task-to-pr <phase> <epic> <task>` runs `prompt` then `implement`, and
 `aidw run review-and-fix --pr <n>` runs `review` then `fix`, failing forward per §10.
 
+`aidw run prompt-to-fix <phase> <epic> <task> [--pr <n>]` runs the whole cycle in the same
+order those four orchestrators already define — `prompt` → `implement` → `review` →
+`approve-followups` → `fix` — so each stage keeps its own preflight, gates, state and
+resumability, and the chain stops at the first non-zero exit. The PR number comes from the
+newest `implement` run's recorded state (`pr.number`), with `--pr <n>` as an override and
+`0` as the planned placeholder under `--dry-run` (a dry run opens no PR). To make the cycle
+unattended, the chain adds `approve-followups` to the `fix` stage's skip set and announces
+it (`chain:  auto-approving \`approve-followups\` …`, decision I1). That is the only gate it
+auto-approves: `approve-implementation-pr` and `approve-fix-pr` keep normal
+`--yes`/`--gate-default`/interactive semantics, and `--deny-gates approve-followups` still
+refuses the auto-approval because `deny` is checked before `skip` in §6.
+
 ---
 
 ## 9. Run state, artifacts, and resumability
@@ -850,7 +862,10 @@ aidw fix       --pr <n> [--max-iterations N] [--yes] [--skip-gates ...] [--deny-
               [--dry-run] [--force-model]
 aidw approve-followups --pr <n> [--yes] [--skip-gates ...] [--deny-gates ...]
               [--gate-default approve|deny] [--strict] [--dry-run]
-aidw run       task-to-pr <phase> <epic> <task> | review-and-fix --pr <n>
+aidw run       task-to-pr <phase> <epic> <task> | prompt-to-fix <phase> <epic> <task> [--pr <n>]
+               | review-and-fix --pr <n>
+               [--yes] [--skip-gates ...] [--deny-gates ...] [--gate-default approve|deny]
+               [--strict] [--dry-run] [--parallel] [--force-model] [--max-iterations N]
 
 # inspection
 aidw tasks     [--todo] [--phase NN] [--epic X] [--show "03 E2 E2.9"] [--next]
@@ -954,6 +969,7 @@ Exit codes: `0` success/approved, `1` stage or gate failure, `2` usage/config er
 | H10 | The author reconciles its done-condition with the target repo's gate list, read from the root `AGENTS.md` and optional `<target>/aidw/conventions.md`, and names a "Gate impact:" line whenever a task touches a checker, status vocabulary or CI gate. (L5.2, EXTRACTION.md §3.4, D16/D17) |
 | H11 | The workflow measures a produced prompt against the conciseness budget (80–120 lines, <15KB; ~150 lines for larger tasks), warns with a `budget:` count naming the offending requirement, and refuses under `--strict`. (L5.3, design §8.1) |
 | H12 | `tests/test_prompt_workflow.py` pins the new loop contract on a synthesized fixture with no real model and no network: the L1.1/L1.2 refusals, the L1.3 blocked path, the L3.4 reconcile stage, the L3.3 snapshots, the L4.1 terminal review, the L2.3 delta brief, the L4.2 recording, and the L2.1/L2.2/L3.1/L3.2/L5.1 instruction clauses. (L6.1, design §15) |
+| I1 | `aidw run prompt-to-fix <phase> <epic> <task> [--pr <n>]` is the whole cycle — `prompt` → `implement` → `review` → `approve-followups` → `fix` — composed from the four existing orchestrators, so each keeps its own preflight, gates, state and resumability and the chain stops at the first non-zero exit. The PR number is read from the newest `implement` run's recorded `pr.number` (`--pr <n>` overrides it; `0` is the `--dry-run` placeholder, since a dry run opens no PR) instead of a new `gh` query. The chain auto-approves exactly one gate: it adds `approve-followups` to the `fix` stage's skip set and prints the mechanism. `approve-implementation-pr` and `approve-fix-pr` keep their normal `--yes`/`--gate-default`/interactive semantics, and `--deny-gates approve-followups` still refuses the auto-approval (`deny` is checked before `skip`, §6). `aidw run` also gains `--skip-gates` and `--force-model` for every chain. (design §8.6; §14 CLI reference; `aidw/workflows/run.py`) |
 
 ---
 

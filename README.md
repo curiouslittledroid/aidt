@@ -259,12 +259,27 @@ Approval flow: after `review` publishes children, review them on GitHub and reco
 
 ```bash
 uv run aidw run task-to-pr 03 E4 E4.1       # prompt, then implement
+uv run aidw run prompt-to-fix 03 E4 E4.1    # prompt, implement, review, follow-ups, fix
 uv run aidw run review-and-fix --pr 42      # review, then fix
 ```
 
 A chain stops at the first non-zero exit and returns that code. For `review-and-fix`, the
 `fix` approval gate still enforces the human GitHub decision; do **not** pass `--yes`
 unless the decisions are already on GitHub.
+
+`prompt-to-fix` is the whole cycle, in the four orchestrators' own order:
+
+```text
+prompt → implement → review → approve-followups (auto-approved) → fix
+```
+
+It discovers the PR number from the `implement` run's state (`--pr <n>` overrides, and a
+`--dry-run` uses a placeholder). Because `approve-followups` would otherwise stop an
+unattended chain, this chain adds it to the `fix` stage's skip set and prints
+`chain:  auto-approving \`approve-followups\` …` when it does. That is the **only**
+gate the chain approves for you: `approve-implementation-pr` and `approve-fix-pr` keep
+their normal `--yes`/interactive behaviour, and `--deny-gates approve-followups` refuses
+the auto-approval (deny wins over skip), so the fix loop stops at the gate instead.
 
 ### Roadmap inspection
 
@@ -463,8 +478,10 @@ aidw fix       --pr <n> [--max-iterations N] [--dry-run]
               [--gate-default approve|deny] [--skip-gates ...] [--deny-gates ...]
 aidw approve-followups --pr <n> [--dry-run] [--yes] [--strict]
               [--gate-default approve|deny] [--skip-gates ...] [--deny-gates ...]
-aidw run       task-to-pr <phase> <epic> <task> | review-and-fix --pr <n>
-              [--dry-run] [--yes] [--strict] [--parallel] [--max-iterations N]
+aidw run       task-to-pr <phase> <epic> <task> | prompt-to-fix <phase> <epic> <task> [--pr <n>]
+               | review-and-fix --pr <n>
+              [--dry-run] [--yes] [--strict] [--parallel] [--force-model]
+              [--max-iterations N] [--skip-gates ...]
               [--gate-default approve|deny] [--deny-gates ...]
 aidw tasks     [--todo] [--phase NN] [--epic X] [--next]
 aidw agents    list | show <id> | validate
@@ -492,7 +509,7 @@ verification gate runs a command. Both record their decisions in `state.json`.
 |---|---|---|
 | `approve-task-prompt` | prompt | Optional (off by default; enable with `--require-approval`). On approval, commits the reviewed task prompt on the task branch |
 | `approve-implementation-pr` | implement | Allows `/pr` to commit, push, and open the PR |
-| `approve-followups` | fix, approve-followups | Runs `/approve-review-followups` (applies GitHub decisions) |
+| `approve-followups` | fix, approve-followups, prompt-to-fix (auto-approved) | Runs `/approve-review-followups` (applies GitHub decisions) |
 | `approve-fix-pr` | fix | Records a clean re-review for one fixed child |
 
 Every gate is skippable (`--yes`, or `--skip-gates <name>`), refusable (`--deny-gates <name>`,
