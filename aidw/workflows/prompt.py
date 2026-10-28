@@ -813,10 +813,17 @@ def _budget_counts(text: str) -> tuple[int, int]:
 def _requirement_items(text: str) -> list[tuple[int, str]]:
     """The numbered items under ``Requirements:`` as ``(number, body)`` (L5.3).
 
-    Reads the section that starts at a ``Requirements:`` heading and ends at the next
-    heading; a continuation line joins the item above it. An empty list means the section
-    is absent or holds no numbered item, so the caller degrades to a totals-only message.
-    Never raises: a parse failure is a warning, never a failed run or check.
+    Reads the section that starts at a ``Requirements:`` heading and ends at the
+    next heading or at the first column-0 line that is not a numbered item: the
+    task-prompt format's trailing sections (``Traps / prior review findings:``,
+    ``Explicit non-goals``, ``Deliverables:``, ``Tests``, ``Done when:``) are
+    plain-text labels and bullets, never ``#`` headings, so folding them into the
+    last item would misattribute the over-budget message (review follow-up #38,
+    PR #36 finding F1). Only an indented line continues the item above it; a
+    blank line separates entries without ending the list. An empty list means the
+    section is absent or holds no numbered item, so the caller degrades to a
+    totals-only message. Never raises: a parse failure is a warning, never a
+    failed run or check.
     """
     lines = text.splitlines()
     start: int | None = None
@@ -834,8 +841,19 @@ def _requirement_items(text: str) -> list[tuple[int, str]]:
         match = _NUMBERED_ITEM_RE.match(line)
         if match:
             items.append((int(match.group(1)), [match.group(2).strip()]))
-        elif items and line.strip():
-            items[-1][1].append(line.strip())
+        elif not line.strip():
+            # A blank line separates entries; it does not end the section, so a
+            # blank-separated numbered item below still parses.
+            continue
+        elif line.startswith((" ", "\t")):
+            # Only an indented line continues the item above it: wrapped item
+            # text is indented, trailing-section labels and bullets are not.
+            if items:
+                items[-1][1].append(line.strip())
+        else:
+            # Column-0 prose that is neither a heading nor a numbered item opens
+            # a trailing section, so the Requirements list ends here.
+            break
     return [(number, " ".join(parts)) for number, parts in items]
 
 

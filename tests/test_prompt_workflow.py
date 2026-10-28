@@ -3907,6 +3907,63 @@ L53_IN_BUDGET_PROMPT = "Requirements:\n1. alpha beta gamma\n2. short one\n"
 #: Over the byte budget with no `Requirements:` section, so attribution degrades to totals.
 L53_NO_REQUIREMENTS_PROMPT = "## Context\n" + "x" * 16000 + "\n"
 
+#: The standard task-prompt shape (`prompts/task-prompt.md`): numbered `Requirements:`
+#: items with indented continuations, then the trailing sections (Traps / Non-goals /
+#: Deliverables / Tests / Done-when) as plain column-0 labels and bullets — no `#`
+#: heading ends the list (review follow-up #38, PR #36 finding F1).
+L53_TRAILING_SECTIONS_PROMPT = (
+    "Task: Check the conciseness budget in the workflow (Design 8.1)\n"
+    "\n"
+    "Requirements:\n"
+    "1. First requirement, short.\n"
+    "2. Second requirement with an indented\n"
+    "   continuation line.\n"
+    "3. Third requirement that is the truly longest one by word count.\n"
+    "\n"
+    "Traps / prior review findings:\n"
+    "- A trap bullet with several words that must not fold into requirement 3.\n"
+    "\n"
+    "Explicit non-goals — do NOT do these in this task:\n"
+    "- Another plain-label trailing section with more words.\n"
+    "\n"
+    "Deliverables:\n"
+    "- aidw/workflows/prompt.py\n"
+    "\n"
+    "Tests (what to prove, not the literal expects):\n"
+    "- tests/test_prompt_workflow.py\n"
+    "\n"
+    "Done when:\n"
+    "- uv run --frozen pytest is green.\n"
+)
+
+#: Over the byte budget in the standard task-prompt shape (review follow-up #38, PR #36
+#: finding F1): requirement 2 is padded truly longest, and the Traps bullet is padded
+#: longer still, so folding the trailing sections into requirement 3 would name the
+#: wrong requirement with an inflated word count.
+L53_STANDARD_OVER_BYTES_PROMPT = (
+    "Task: Pad a prompt over the budget\n"
+    "\n"
+    "Requirements:\n"
+    "1. alpha beta\n"
+    f"2. gamma {'pad ' * L53_OVER_BYTES_PAD_WORDS}delta\n"
+    "3. short tail item\n"
+    "\n"
+    "Traps / prior review findings:\n"
+    f"- {'trap ' * (L53_OVER_BYTES_PAD_WORDS + 100)}bullet\n"
+    "\n"
+    "Explicit non-goals — do NOT do these in this task:\n"
+    "- non-goal bullet\n"
+    "\n"
+    "Deliverables:\n"
+    "- aidw/workflows/prompt.py\n"
+    "\n"
+    "Tests (what to prove, not the literal expects):\n"
+    "- tests/test_prompt_workflow.py\n"
+    "\n"
+    "Done when:\n"
+    "- uv run --frozen pytest is green.\n"
+)
+
 #: Matches the count line the workflow prints on stdout for every produced prompt.
 L53_BUDGET_LINE_RE = re.compile(r"budget: \d+ lines / [\d.]+KB")
 
@@ -4010,6 +4067,10 @@ def test_l53_strict_over_budget_refuses_before_review(
     ), captured.err
     # No review stage ran: the author is the only stage the fake saw.
     assert [name for name, _, _ in seen] == ["task-prompt"]
+    # The author output remains in place after refusal; strict mode does not undo its
+    # committed/agent-owned prompt (design §13, L5.3 trap).
+    generated = tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+    assert generated.read_text(encoding="utf-8") == L53_OVER_BYTES_PROMPT
     # A verdict-less exit records no gate and no new gate-decision vocabulary (L4.2).
     assert latest.gates == []
 
@@ -4149,3 +4210,48 @@ def test_l53_equal_longest_requirements_are_all_named(
     assert latest.status == state.SUCCEEDED
     assert "requirement 1 (2000 words)" in captured.err
     assert "requirement 2 (2000 words)" in captured.err
+
+
+def test_l53_trailing_sections_end_the_requirements_list() -> None:
+    """L5.3 (review follow-up #38): plain-label trailing sections are not item text.
+
+    The task-prompt format separates Traps / Non-goals / Deliverables / Tests /
+    Done-when with column-0 labels and bullets, not `#` headings; folding them into
+    the last numbered item inflates its word count and misattributes the warning.
+    """
+    items = prompt_workflow._requirement_items(L53_TRAILING_SECTIONS_PROMPT)
+
+    assert [number for number, _ in items] == [1, 2, 3]
+    # The last item's word count excludes the trailing sections.
+    assert items[-1] == (
+        3,
+        "Third requirement that is the truly longest one by word count.",
+    )
+    # An indented continuation line still joins its own item.
+    assert items[1] == (2, "Second requirement with an indented continuation line.")
+    # The longest is the truly longest item, not the last one inflated by the fold.
+    assert prompt_workflow._longest_requirements(items) == [(3, 11)]
+
+
+def test_l53_standard_format_over_budget_names_the_true_longest_requirement(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L5.3 (review follow-up #38): a standard-format over-budget prompt warns truthfully.
+
+    A prompt in the repo's standard shape (trailing sections after the list) that
+    trips the byte budget must name requirement 2, the truly longest item, with its
+    own word count — not the last item inflated by the folded Traps/Non-goals text.
+    """
+    code, _seen, latest = _run_l53_case(
+        tmp_path, monkeypatch, body=L53_STANDARD_OVER_BYTES_PROMPT
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert latest.status == state.SUCCEEDED
+    assert "over the conciseness budget" in captured.err
+    assert (
+        f"requirement 2 ({2 + L53_OVER_BYTES_PAD_WORDS} words)" in captured.err
+    ), captured.err
+    # The last item keeps its own word count, so it is never named here.
+    assert "requirement 3 (" not in captured.err, captured.err
