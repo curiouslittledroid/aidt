@@ -337,7 +337,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     real model.
   - Tests: `tests/test_prompt_workflow.py`.
 
-- [ ] **L6.2. Re-baseline the extraction tasks this phase moves** (Design 8.1)
+- [x] **L6.2. Re-baseline the extraction tasks this phase moves** (Design 8.1)
   Record the decisions and hand the baselines over, so E4.1/E4.3 do not fail against a chain
   that changed deliberately.
   - Deliverable: `design.md` §17 decision log entries (preflight refusals, reviewer authority,

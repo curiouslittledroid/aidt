@@ -252,7 +252,10 @@
 - [ ] **E4.1. Stage registry and workflow definitions as data**
   Turn the current hardcoded chains (`implement.py:104-148`, `prompt.py:170+`, `review.py:135`,
   `fix.py`, `approve.py:150`) into declarative defaults keyed by workflow and stage id, keeping the
-  existing ids (`I1`…`I6`, `P1`, `R1`, `R2`).
+  existing ids (`I1`…`I6`, `P1`, `R1`, `R2`). The `prompt.py` chain it converts is the
+  **post-phase-02** shape: the loop runs one `task-review-reconcile-N` stage per fix batch (after
+  the batch, before the next review, on the `task-fixer` agent), and the final round is the
+  review-only **terminal review**. The registry defaults must reproduce both.
   - Deliverable: a registry module plus a test asserting the default chains match today's order exactly.
   - Done when: the default resolution reproduces the current six-stage implement chain, byte for byte, including prompt filenames and agents.
 
@@ -266,7 +269,7 @@
 - [ ] **E4.3. Config-driven plans**
   Port `build_plan` and the other workflows to build their stage lists from the registry.
   - Deliverable: `implement`, `prompt`, `review`, `fix`, `approve` all config-driven.
-  - Done when: `--dry-run` output for each workflow is unchanged against the baseline with the Mythical-Forge-shaped config.
+  - Done when: `--dry-run` output for each workflow is unchanged against the baseline with the Mythical-Forge-shaped config. The `--dry-run` baseline for `prompt` is taken **after phase 02**: it includes the `task-review-reconcile-N` stage (one per fix batch) and the review-only **terminal review**, so "unchanged against the baseline" compares the post-phase-02 chain, not a pre-phase-02 one.
 
 - [ ] **E4.4. `parallel_groups`**
   Replace the hardcoded `[test, update-architecture]` pair. Validate members exist and are not
