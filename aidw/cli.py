@@ -614,6 +614,151 @@ def tasks(
 
 
 @app.command()
+def worktree(
+    action: str = typer.Argument("list", help="add | list | remove"),
+    branch: Optional[str] = typer.Argument(
+        None, help="Branch for `add` (created) or `remove` (removed)."
+    ),
+    base: Optional[str] = typer.Option(
+        None,
+        "--base",
+        help="Base branch for `add` (default: the target's base branch, currently main).",
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit `list` as a JSON array of path/branch/detached."
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="`remove`: override the dirty-tree and unmerged-branch refusals.",
+    ),
+) -> None:
+    """Add, list, or remove the task worktree (EXTRACTION.md §3.3).
+
+    A thin, safe wrapper over the E2.1 primitives: every git call happens inside this
+    command body, so resolving the roots gains no spawn, and the only mutating calls
+    are git's own worktree add and worktree remove. Remove takes a branch and resolves
+    it to a path first — passing the branch name to git as a path would fail opaquely,
+    or target an unrelated same-named directory.
+
+    Remove refuses a dirty tree or an unmerged branch (checked here because git's own
+    worktree remove accepts a clean-but-unmerged branch), reporting the dirty cause
+    first; --force is the only override. Unmerged is is_ancestor(branch,
+    target.base_branch) and anything but True fails closed, including None (git could
+    not answer), so a missing base branch can never pass the check.
+    """
+    if action not in {"add", "list", "remove"}:
+        typer.echo(f"unknown action: {action} (expected add | list | remove)", err=True)
+        raise typer.Exit(EXIT_USAGE)
+    if action != "list" and not branch:
+        typer.echo(f"usage: aidw worktree {action} <branch>", err=True)
+        raise typer.Exit(EXIT_USAGE)
+    if action == "list" and branch is not None:
+        typer.echo("usage: aidw worktree list [--json]", err=True)
+        raise typer.Exit(EXIT_USAGE)
+    if action == "add" and (json_output or force):
+        typer.echo("usage: aidw worktree add <branch> [--base <branch>]", err=True)
+        raise typer.Exit(EXIT_USAGE)
+    if action == "remove" and base is not None:
+        typer.echo("usage: aidw worktree remove <branch> [--force]", err=True)
+        raise typer.Exit(EXIT_USAGE)
+
+    target, _toolkit, _workspace = _roots()
+
+    if action == "list":
+        entries = git.worktrees(target.root)
+        if json_output:
+            # One object per worktree, never a {branch: path} mapping: a detached HEAD
+            # has no branch, and a dict would silently drop it. ``str(Path)`` is
+            # required because ``json.dumps`` rejects Path objects.
+            typer.echo(
+                json.dumps(
+                    [
+                        {
+                            "path": str(entry.path),
+                            "branch": entry.branch,
+                            "detached": entry.detached,
+                        }
+                        for entry in entries
+                    ]
+                )
+            )
+            return
+        for entry in entries:
+            label = entry.branch if entry.branch is not None else "<detached>"
+            typer.echo(f"{label}  {entry.path}")
+        return
+
+    if action == "add":
+        existing = git.worktree_for_branch(target.root, branch)
+        if existing is not None:
+            # §3.2 one-branch-one-worktree: git would refuse this second checkout too,
+            # but the pre-check names the branch and the path instead of relaying an
+            # opaque failure.
+            typer.echo(
+                f"refusing to add worktree for '{branch}': already checked out at "
+                f"{existing} (one branch, one worktree)",
+                err=True,
+            )
+            raise typer.Exit(EXIT_REFUSED)
+        base_branch = base or target.base_branch
+        created = git.add_worktree(target.root, branch, base_branch=base_branch)
+        if created is None:
+            # ``add_worktree`` discards git's stderr, so only an actionable generic
+            # refusal can be emitted here.
+            typer.echo(
+                f"refusing to add worktree for '{branch}' from '{base_branch}': git "
+                "declined (does the branch already exist, or is the target path "
+                "occupied?)",
+                err=True,
+            )
+            raise typer.Exit(EXIT_REFUSED)
+        typer.echo(str(created))
+        return
+
+    # remove — resolve branch -> path before touching anything.
+    path = git.worktree_for_branch(target.root, branch)
+    if path is None:
+        typer.echo(f"unknown worktree branch: {branch}", err=True)
+        raise typer.Exit(EXIT_USAGE)
+
+    if not force:
+        # Dirty first: "never delete uncommitted work" is the headline invariant, so it
+        # wins when both unsafe cases hold.
+        if not git.is_clean(path):
+            typer.echo(
+                f"refusing to remove worktree '{branch}' at {path}: it has uncommitted "
+                "changes (re-run with --force to discard them)",
+                err=True,
+            )
+            raise typer.Exit(EXIT_REFUSED)
+        merged = git.is_ancestor(target.root, branch, target.base_branch)
+        if merged is not True:
+            if merged is False:
+                cause = f"is not merged into '{target.base_branch}'"
+            else:
+                cause = (
+                    "has an unverifiable merge state against "
+                    f"'{target.base_branch}' (git could not answer)"
+                )
+            typer.echo(
+                f"refusing to remove worktree '{branch}' at {path}: the branch {cause} "
+                "(re-run with --force to discard it)",
+                err=True,
+            )
+            raise typer.Exit(EXIT_REFUSED)
+
+    if not git.remove_worktree(target.root, path, force=force):
+        typer.echo(
+            f"refusing to remove worktree '{branch}' at {path}: git declined "
+            "(re-run with --force to retry)",
+            err=True,
+        )
+        raise typer.Exit(EXIT_REFUSED)
+    typer.echo(str(path))
+
+
+@app.command()
 def agents(
     action: str = typer.Argument("list", help="list | show | validate"),
     agent_id: Optional[str] = typer.Argument(None, help="Agent id for `show`."),

@@ -165,7 +165,7 @@
   - Deliverable: guards plus tests reproducing both rejected layouts.
   - Done when: each failure prints the cause and the corrective command.
 
-- [ ] **E2.3. `aidw worktree add|list|remove`**
+- [x] **E2.3. `aidw worktree add|list|remove`**
   Thin, safe wrappers over the primitives. `remove` refuses a dirty tree or an unmerged branch
   unless `--force` is explicit. Never `reset --hard`, never delete uncommitted work.
   - Deliverable: the subcommands plus tests.
