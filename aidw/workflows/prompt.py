@@ -3,7 +3,13 @@
 Stages:
 
 1. ``task-prompt``      — agent ``task-author`` creates ``docs/task-prompts/<phase>-<task>-prompt.md``
-                          on branch ``<phase>-<task>`` and commits it.
+                          on branch ``<phase>-<task>`` and commits it. Immediately after,
+                          the workflow measures that just-generated file against the
+                          conciseness budget (``prompts/task-prompt.md``): every produced
+                          prompt gets a ``budget:`` count line, an over-budget prompt warns
+                          and names its longest requirement, and ``--strict`` refuses
+                          (exit 1, ``FAILED``, no gate) before the review loop (L5.3,
+                          design §8.1/§14).
 2. ``task-review-N``    — agent ``task-reviewer`` reviews the prompt (read-only); N starts at 1.
                           Every round receives a pointer to its own evidence bundle
                           (``<run_dir>/stages/<stage>.evidence.md``, L2.4); rounds 2+ also
@@ -778,6 +784,133 @@ def _resolve_prompt_path(
     return fallback if fallback.is_file() else None
 
 
+# ---------------------------------------------------------------------------
+# Conciseness budget (L5.3, design §8.1; prompts/task-prompt.md §Conciseness budget)
+# ---------------------------------------------------------------------------
+
+#: A generated task prompt's byte budget. Decimal 15KB = 15000 bytes, matching the
+#: roadmap's own decimal KB (L5.3: "17.9KB" = 17855 bytes); a binary 15360 budget would
+#: shift every boundary by 360 bytes.
+PROMPT_BYTE_BUDGET = 15000
+
+#: A generated task prompt's line budget — the larger-task ceiling in the budget text.
+PROMPT_LINE_BUDGET = 150
+
+#: Heading that opens the numbered requirement list the over-budget message attributes
+#: the size to (``Requirements:`` or a ``#### Requirements`` variant).
+_REQUIREMENTS_HEADING_RE = re.compile(r"^#{0,6}\s*Requirements\s*:?\s*$")
+
+#: A numbered requirement item (``1. ...`` / ``12) ...``). A nested ordered list reads
+#: as further items, which is harmless because the check only names the longest one(s).
+_NUMBERED_ITEM_RE = re.compile(r"^\s*(\d+)[.)]\s+(.*)$")
+
+
+def _budget_counts(text: str) -> tuple[int, int]:
+    """``(bytes, lines)`` of the prompt text — UTF-8 bytes and physical lines (L5.3)."""
+    return len(text.encode("utf-8")), len(text.splitlines())
+
+
+def _requirement_items(text: str) -> list[tuple[int, str]]:
+    """The numbered items under ``Requirements:`` as ``(number, body)`` (L5.3).
+
+    Reads the section that starts at a ``Requirements:`` heading and ends at the next
+    heading; a continuation line joins the item above it. An empty list means the section
+    is absent or holds no numbered item, so the caller degrades to a totals-only message.
+    Never raises: a parse failure is a warning, never a failed run or check.
+    """
+    lines = text.splitlines()
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if _REQUIREMENTS_HEADING_RE.match(line.strip()):
+            start = index + 1
+            break
+    if start is None:
+        return []
+
+    items: list[tuple[int, list[str]]] = []
+    for line in lines[start:]:
+        if line.lstrip().startswith("#"):
+            break
+        match = _NUMBERED_ITEM_RE.match(line)
+        if match:
+            items.append((int(match.group(1)), [match.group(2).strip()]))
+        elif items and line.strip():
+            items[-1][1].append(line.strip())
+    return [(number, " ".join(parts)) for number, parts in items]
+
+
+def _longest_requirements(items: list[tuple[int, str]]) -> list[tuple[int, int]]:
+    """The ``(number, word count)`` for the longest requirement item(s) (L5.3).
+
+    Ties are all returned so the message names every equally long offender. The word
+    count is whitespace-separated tokens, the same reading the budget text uses.
+    """
+    if not items:
+        return []
+    counted = [(number, len(body.split())) for number, body in items]
+    longest = max(words for _, words in counted)
+    return [entry for entry in counted if entry[1] == longest]
+
+
+def _budget_reason(
+    rel: str,
+    *,
+    byte_count: int,
+    line_count: int,
+    items: list[tuple[int, str]],
+) -> str:
+    """The one-line over-budget reason, with the longest requirement when parseable (L5.3).
+
+    The totals are always named; the attribution is appended only when the requirements
+    parsed, so a prompt without a parseable ``Requirements:`` section still warns with
+    totals only instead of crashing or staying silent.
+    """
+    reason = (
+        f"task prompt {rel} is over the conciseness budget: "
+        f"{byte_count / 1000:.1f}KB, {line_count} lines "
+        f"(limits {PROMPT_BYTE_BUDGET / 1000:.1f}KB / {PROMPT_LINE_BUDGET})"
+    )
+    longest = _longest_requirements(items)
+    if longest:
+        named = ", ".join(
+            f"requirement {number} ({words} words)" for number, words in longest
+        )
+        reason = f"{reason}; longest: {named}"
+    return reason
+
+
+def _check_conciseness(prompt_path: Path, rel: str) -> str | None:
+    """Count the just-generated prompt, warn when over budget, return the reason (L5.3).
+
+    Reads exactly ``prompt_path`` — never a scan of ``docs/task-prompts/``. Prints the
+    ``budget:`` count line on stdout for every produced prompt, independently of the
+    outcome. Returns ``None`` when within budget, else the one-line reason for the
+    ``--strict`` refusal (the default caller instead prints it as a warning and reviews).
+    A read failure degrades to a warning and ``None``: a measurement failure cannot fail
+    a run.
+    """
+    try:
+        text = prompt_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(
+            f"warning: could not read the task prompt `{rel}` to check the conciseness "
+            f"budget ({exc}); skipping the check.",
+            file=sys.stderr,
+        )
+        return None
+
+    byte_count, line_count = _budget_counts(text)
+    print(f"budget: {line_count} lines / {byte_count / 1000:.1f}KB")
+    if byte_count <= PROMPT_BYTE_BUDGET and line_count <= PROMPT_LINE_BUDGET:
+        return None
+    return _budget_reason(
+        rel,
+        byte_count=byte_count,
+        line_count=line_count,
+        items=_requirement_items(text),
+    )
+
+
 #: Directory the author owns. A blocked run reports uncommitted changes here and never
 #: commits or removes them (design §13, L1.3).
 _PROMPTS_DIR = "docs/task-prompts"
@@ -1312,6 +1445,18 @@ def run(
         return 1
     rel = prompt_path.relative_to(repo.root).as_posix()
     print(f"prompt: {rel}")
+    budget_reason = _check_conciseness(prompt_path, rel)
+    if budget_reason is not None:
+        # L5.3: a workflow-level quality bound, not a gate. At the default it warns and
+        # the review loop still runs; `--strict` refuses with the stage-failure exit 1,
+        # records FAILED and no gate, and leaves the committed prompt/branch as-is
+        # (design §13/§14; no new gate-decision vocabulary, L4.2).
+        if strict:
+            print(f"refusing (--strict): {budget_reason}", file=sys.stderr)
+            state.status = FAILED
+            save(directory, state)
+            return 1
+        print(f"warning: {budget_reason}", file=sys.stderr)
     state.git["branch"] = f"{phase}-{task}"
     save(directory, state)
 

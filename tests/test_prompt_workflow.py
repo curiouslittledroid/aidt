@@ -52,7 +52,7 @@ def test_git_helpers_types() -> None:
     assert isinstance(git.status_short(repo), str)
 
 
-def test_prompt_workflow_dry_run(tmp_path: Path, monkeypatch) -> None:
+def test_prompt_workflow_dry_run(tmp_path: Path, monkeypatch, capsys) -> None:
     _patch_prompt_repo(tmp_path, monkeypatch)
     code = prompt_workflow.run(
         phase="03",
@@ -68,6 +68,8 @@ def test_prompt_workflow_dry_run(tmp_path: Path, monkeypatch) -> None:
     assert latest.workflow == "prompt"
     assert [s.name for s in latest.stages] == ["task-prompt", "task-review-1"]
     assert all(s.status == state.SUCCEEDED for s in latest.stages)
+    # L5.3 is post-author only; a dry-run never produces a prompt to measure.
+    assert "budget:" not in capsys.readouterr().out
 
 
 def test_prompt_workflow_unknown_task(tmp_path: Path, monkeypatch) -> None:
@@ -249,6 +251,7 @@ def _fake_stages(
     reconcile_status: str = "succeeded",
     approve_review: int | None = 2,
     blocked_review: int | None = None,
+    prompt_body: str = "prompt body\n",
 ):
     """A fake ``run_stage`` returning canned review text, approving at ``approve_review``.
 
@@ -256,7 +259,8 @@ def _fake_stages(
     the L2.3 delta-brief tests can prove that a round's diff carries only the immediately
     preceding fix batch's net effect, not every round's changes cumulatively. ``fix_status``
     and ``reconcile_status`` are separate knobs so a failing reconcile stage can be injected
-    without special-casing its name in the workflow (L3.4).
+    without special-casing its name in the workflow (L3.4). ``prompt_body`` is the text the
+    fake author writes, so the L5.3 budget tests can seed an over-budget fixture.
     """
     from aidw.state import SUCCEEDED, StageRecord, run_dir
 
@@ -272,7 +276,7 @@ def _fake_stages(
         if spec.name == "task-prompt":
             created = repo / "docs" / "task-prompts" / "03-E4.1-prompt.md"
             created.parent.mkdir(parents=True, exist_ok=True)
-            created.write_text("prompt body\n", encoding="utf-8")
+            created.write_text(prompt_body, encoding="utf-8")
 
         seen.append((spec.name, list(spec.variables), spec.extra))
         index = _review_index(spec.name)
@@ -3870,3 +3874,278 @@ def test_l52_rendered_author_prompt_reconciles_gates_against_the_repo() -> None:
     with pytest.raises(PromptError):
         render_prompt_file(prompt_path, ["02", "L5"])
     assert render_prompt_file(prompt_path, ["02", "L5", "L5.2", "extra"])
+
+
+# ---------------------------------------------------------------------------
+# L5.3 — check the conciseness budget in the workflow (design §8.1,
+# prompts/task-prompt.md §Conciseness budget)
+# ---------------------------------------------------------------------------
+
+#: One numbered `Requirements:` item padded past the 15000-byte budget, plus a short
+#: second item. Requirement 1 is the longest by word count, so the warning must name it.
+L53_OVER_BYTES_PAD_WORDS = 4000
+L53_OVER_BYTES_PROMPT = (
+    "Requirements:\n"
+    f"1. alpha {'pad ' * L53_OVER_BYTES_PAD_WORDS}\n"
+    "2. short one\n"
+)
+
+#: Within the byte budget but over the 150-line budget. The `## Filler` heading ends the
+#: `Requirements:` section, so the filler does not inflate a requirement's word count.
+L53_OVER_LINES_PROMPT = (
+    "Requirements:\n"
+    "1. alpha beta gamma\n"
+    "2. short one\n"
+    "## Filler\n"
+    + "\n".join(f"filler line {index}" for index in range(160))
+    + "\n"
+)
+
+#: Within both budgets.
+L53_IN_BUDGET_PROMPT = "Requirements:\n1. alpha beta gamma\n2. short one\n"
+
+#: Over the byte budget with no `Requirements:` section, so attribution degrades to totals.
+L53_NO_REQUIREMENTS_PROMPT = "## Context\n" + "x" * 16000 + "\n"
+
+#: Matches the count line the workflow prints on stdout for every produced prompt.
+L53_BUDGET_LINE_RE = re.compile(r"budget: \d+ lines / [\d.]+KB")
+
+
+def _run_l53_case(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    body: str,
+    strict: bool = False,
+    sibling_prompts: dict[str, str] | None = None,
+):
+    """Run the prompt workflow with a fake author that writes ``body`` and review 1 approving.
+
+    ``sibling_prompts`` seeds extra files under ``docs/task-prompts/`` before the run, so a
+    test can prove the check reads only the generated path and never scans the directory.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    if sibling_prompts:
+        prompts_dir = tmp_path / "docs" / "task-prompts"
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        for name, text in sibling_prompts.items():
+            (prompts_dir / name).write_text(text, encoding="utf-8")
+    seen, fake = _fake_stages(
+        "## Verdict\n\n**Approve**\n",
+        approve_review=1,
+        prompt_body=body,
+    )
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        strict=strict,
+    )
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    return code, seen, latest
+
+
+def test_l53_over_byte_budget_warns_by_requirement_and_still_approves(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L5.3: an over-byte prompt warns naming its longest requirement, then reviews on."""
+    code, seen, latest = _run_l53_case(
+        tmp_path, monkeypatch, body=L53_OVER_BYTES_PROMPT
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert latest.status == state.SUCCEEDED
+    # The default check is advisory: the review still ran and approved.
+    assert "task-review-1" in [name for name, _, _ in seen]
+    # The count line prints for every produced prompt regardless of the outcome.
+    assert L53_BUDGET_LINE_RE.search(captured.out), captured.out
+    assert captured.out.index("prompt: docs/task-prompts/03-E4.1-prompt.md") < captured.out.index(
+        "budget:"
+    )
+    # The warning names the offending requirement and its word count, not only the total.
+    assert "over the conciseness budget" in captured.err
+    assert (
+        f"requirement 1 ({1 + L53_OVER_BYTES_PAD_WORDS} words)" in captured.err
+    ), captured.err
+
+
+def test_l53_over_line_budget_warns_by_requirement_and_still_approves(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L5.3: an over-line prompt trips identically to the byte case."""
+    code, seen, latest = _run_l53_case(
+        tmp_path, monkeypatch, body=L53_OVER_LINES_PROMPT
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert latest.status == state.SUCCEEDED
+    assert "task-review-1" in [name for name, _, _ in seen]
+    assert L53_BUDGET_LINE_RE.search(captured.out), captured.out
+    assert "over the conciseness budget" in captured.err
+    assert "requirement 1 (3 words)" in captured.err, captured.err
+
+
+def test_l53_strict_over_budget_refuses_before_review(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L5.3 + Req 4: `--strict` refuses (exit 1, FAILED, no gate) before any review."""
+    code, seen, latest = _run_l53_case(
+        tmp_path, monkeypatch, body=L53_OVER_BYTES_PROMPT, strict=True
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert latest.status == state.FAILED
+    # The one-line refusal goes to stderr and names the over-budget prompt and requirement.
+    assert "refusing (--strict)" in captured.err
+    assert "docs/task-prompts/03-E4.1-prompt.md" in captured.err
+    assert (
+        f"requirement 1 ({1 + L53_OVER_BYTES_PAD_WORDS} words)" in captured.err
+    ), captured.err
+    # No review stage ran: the author is the only stage the fake saw.
+    assert [name for name, _, _ in seen] == ["task-prompt"]
+    # A verdict-less exit records no gate and no new gate-decision vocabulary (L4.2).
+    assert latest.gates == []
+
+
+def test_l53_in_budget_prompt_prints_count_without_a_warning(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L5.3: an in-budget prompt prints the count line but no size warning."""
+    code, seen, latest = _run_l53_case(
+        tmp_path, monkeypatch, body=L53_IN_BUDGET_PROMPT
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert latest.status == state.SUCCEEDED
+    assert L53_BUDGET_LINE_RE.search(captured.out), captured.out
+    assert "budget:" not in captured.err
+    assert "over the conciseness budget" not in captured.err
+
+
+def test_l53_unparseable_requirements_degrades_to_totals_only(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L5.3 Req 3: a prompt with no parseable `Requirements:` warns on totals, never crashes."""
+    code, _seen, latest = _run_l53_case(
+        tmp_path, monkeypatch, body=L53_NO_REQUIREMENTS_PROMPT
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert latest.status == state.SUCCEEDED
+    assert L53_BUDGET_LINE_RE.search(captured.out), captured.out
+    assert "over the conciseness budget" in captured.err
+    # Totals only: the attribution sentence is absent, not an error.
+    assert "longest:" not in captured.err, captured.err
+    assert "requirement" not in captured.err, captured.err
+
+
+def test_l53_check_reads_only_the_generated_prompt(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L5.3 Req 1 trap: an over-budget sibling under docs/task-prompts/ must not trip it."""
+    code, _seen, latest = _run_l53_case(
+        tmp_path,
+        monkeypatch,
+        body=L53_IN_BUDGET_PROMPT,
+        sibling_prompts={"00-OLD-prompt.md": L53_OVER_BYTES_PROMPT},
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert latest.status == state.SUCCEEDED
+    # The generated prompt is in budget, so the sibling must be ignored entirely.
+    assert L53_BUDGET_LINE_RE.search(captured.out), captured.out
+    assert "over the conciseness budget" not in captured.err, captured.err
+
+
+def test_l53_unreadable_prompt_warns_and_never_fails_the_check(
+    tmp_path: Path, capsys
+) -> None:
+    """L5.3 Req 3: a read/measure failure degrades to a warning, not a failed check."""
+    path = tmp_path / "prompt.md"
+    path.write_bytes(b"\xff\xfe not utf-8")
+
+    reason = prompt_workflow._check_conciseness(
+        path, "docs/task-prompts/00-bad-prompt.md"
+    )
+    captured = capsys.readouterr()
+
+    assert reason is None
+    assert "skipping the check" in captured.err
+    assert "budget:" not in captured.out
+
+
+def test_l53_byte_budget_boundary_is_inclusive(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L5.3: exactly 15000 UTF-8 bytes is allowed (the trip is strictly greater)."""
+    prefix = "Requirements:\n1. "
+    body = prefix + ("x" * (15000 - len(prefix.encode("utf-8")) - 1)) + "\n"
+    assert len(body.encode("utf-8")) == 15000
+    assert len(body.splitlines()) == 2
+
+    code, seen, latest = _run_l53_case(tmp_path, monkeypatch, body=body)
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert latest.status == state.SUCCEEDED
+    assert "task-review-1" in [name for name, _, _ in seen]
+    assert "over the conciseness budget" not in captured.err
+
+
+def test_l53_line_budget_boundary_is_inclusive(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L5.3: exactly 150 physical lines is allowed (the trip is strictly greater)."""
+    body = "Requirements:\n1. x\n" + ("filler\n" * 148)
+    assert len(body.splitlines()) == 150
+
+    code, seen, latest = _run_l53_case(tmp_path, monkeypatch, body=body)
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert latest.status == state.SUCCEEDED
+    assert "task-review-1" in [name for name, _, _ in seen]
+    assert "over the conciseness budget" not in captured.err
+
+
+def test_l53_strict_over_line_budget_refuses_before_review(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L5.3: strict mode refuses a line-only over-budget prompt before review."""
+    code, seen, latest = _run_l53_case(
+        tmp_path, monkeypatch, body=L53_OVER_LINES_PROMPT, strict=True
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert latest.status == state.FAILED
+    assert "refusing (--strict)" in captured.err
+    assert "requirement 1 (3 words)" in captured.err
+    assert [name for name, _, _ in seen] == ["task-prompt"]
+    assert latest.gates == []
+
+
+def test_l53_equal_longest_requirements_are_all_named(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L5.3: attribution names every requirement tied for the longest item."""
+    body = "Requirements:\n" + "\n".join(
+        [f"{number}. " + (f"word{number} " * 2000) for number in (1, 2)]
+    )
+    code, _seen, latest = _run_l53_case(tmp_path, monkeypatch, body=body)
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert latest.status == state.SUCCEEDED
+    assert "requirement 1 (2000 words)" in captured.err
+    assert "requirement 2 (2000 words)" in captured.err
