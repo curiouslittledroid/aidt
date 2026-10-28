@@ -310,7 +310,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     source; no product command name appears in the file.
   - Tests: rendered-prompt assertion; coordinate with E7.3 (D16), which owns the injection.
 
-- [ ] **L5.3. Check the conciseness budget in the workflow** (Design 8.1)
+- [x] **L5.3. Check the conciseness budget in the workflow** (Design 8.1)
   The budget is stated (80–120 lines, <15KB; ~150 lines for larger tasks) and unenforced — E1.5
   shipped 17.9KB and E1.6 14.7KB in 57 lines, with single requirements of 120–244 words. Warn
   from the workflow after the author stage; fail under `--strict`.
