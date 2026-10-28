@@ -3771,3 +3771,102 @@ def test_l51_rendered_author_prompt_carries_the_review_order_self_check() -> Non
     with pytest.raises(PromptError):
         render_prompt_file(prompt_path, ["02", "L5"])
     assert render_prompt_file(prompt_path, ["02", "L5", "L5.1", "extra"])
+
+
+# ---------------------------------------------------------------------------
+# L5.2 — tell the author to reconcile gates and verifiers (EXTRACTION.md
+# §3.4/§3.8, D16; R10/R14)
+# ---------------------------------------------------------------------------
+
+#: The injection source L5.2 names — never the commands themselves.
+L52_INJECTION_SOURCES = (
+    "root `AGENTS.md`",
+    "aidw/conventions.md",
+)
+
+#: The two neutral obligations the rewrite must keep; they are the reconciliation the
+#: roadmap's Done-when demands, so dropping them under-neutralises.
+L52_KEPT_OBLIGATIONS = (
+    "state the observable effect on existing data",
+    "fix the instruction or make the reconciliation an explicit deliverable",
+)
+
+#: Product verifier tokens and paths L5.2 removes from the reconciliation section.
+#: They remain valid elsewhere in the prompt until E7.1/E7.2 neutralise those lines.
+L52_REMOVED_VERIFIER_TOKENS = (
+    "srd:matrix-check",
+    "srd:check-tests",
+    "srd-traceability",
+    "--jest-json",
+)
+L52_REMOVED_GENERIC_VERIFIER_TOKENS = ("srd:", "catalog", "vectors", "matrix")
+L52_REMOVED_PRODUCT_PATHS = (
+    "services/",
+    "packages/",
+    "tests/integration/",
+    "docs/conventions/",
+)
+L52_PACKAGE_MANAGERS = re.compile(r"\b(pnpm|npm|yarn|uv)\b")
+
+
+def _l52_reconciliation_section(rendered: str) -> str:
+    """The ``### Gate and verifier reconciliation`` section, heading to heading."""
+    start = rendered.index("### Gate and verifier reconciliation")
+    end = rendered.index("\n### ", start + 1)
+    return rendered[start:end]
+
+
+def _l52_gate_impact_lines(rendered: str) -> str:
+    """The Prompt Format's ``Gate impact:`` clause, from its first line to its last."""
+    start = rendered.index("<If this task changes a checker")
+    end = rendered.index("stays green.>", start) + len("stays green.>")
+    return rendered[start:end]
+
+
+def test_l52_rendered_author_prompt_reconciles_gates_against_the_repo() -> None:
+    """L5.2: the rendered author prompt names the gate source and requires the commands."""
+    prompt_path = toolkit_root() / "prompts" / "task-prompt.md"
+    rendered = render_prompt_file(prompt_path, ["02", "L5", "L5.2"])
+    section = _l52_reconciliation_section(rendered)
+    normalized = " ".join(section.split())
+
+    # It requires the reconciliation and names the injection source.
+    for source in L52_INJECTION_SOURCES:
+        assert source in section, source
+    assert "the exact gate commands" in normalized
+    assert "from that source" in normalized
+    assert "gate list" in normalized
+    for obligation in L52_KEPT_OBLIGATIONS:
+        assert obligation in normalized, obligation
+
+    # No product command, verifier token, package manager or product path survives
+    # in the changed section (the same trap L5.1's added-lines pattern guards: the
+    # rest of the prompt still names them until E7.1/E7.2).
+    for token in (*L52_REMOVED_VERIFIER_TOKENS, *L52_REMOVED_GENERIC_VERIFIER_TOKENS):
+        assert token not in section, token
+    for path in L52_REMOVED_PRODUCT_PATHS:
+        assert path not in section, path
+    assert not L52_PACKAGE_MANAGERS.search(section), section
+
+    # The kept "Gate impact:" line keeps its full trigger set and no command name.
+    gate_impact = _l52_gate_impact_lines(rendered)
+    assert '"Gate impact:"' in gate_impact
+    for trigger in ("checker", "status vocabulary", "catalog reference", "CI gate"):
+        assert trigger in gate_impact, trigger
+    gate_impact_normalized = " ".join(gate_impact.split())
+    assert (
+        "naming the checker and the pre-existing entries it affects"
+        in gate_impact_normalized
+    )
+    assert (
+        "confirm against the current repo that the gate stays green"
+        in gate_impact_normalized
+    )
+    assert not L52_PACKAGE_MANAGERS.search(gate_impact), gate_impact
+    for token in (*L52_REMOVED_VERIFIER_TOKENS, "srd:", "vectors", "matrix"):
+        assert token not in gate_impact, token
+
+    # Rendering arity unchanged: three args, fewer raise, extras ignored.
+    with pytest.raises(PromptError):
+        render_prompt_file(prompt_path, ["02", "L5"])
+    assert render_prompt_file(prompt_path, ["02", "L5", "L5.2", "extra"])
