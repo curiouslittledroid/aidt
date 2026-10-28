@@ -56,12 +56,12 @@ The suite was first invoked inside this recording run's identity, which made two
 
 ### `uv run --frozen pytest` (full suite)
 
-Single clean invocation: **`3 failed, 709 passed in 101.55s`** (exit 1, 712 collected). The subset row below is derived from that same invocation (the file collected 21 tests; the three failures are all in this file, so it ran 18 passed / 3 failed); no second execution of the suite or module was made.
+An intermediate clean invocation during recording observed **`3 failed, 709 passed in 101.55s`** (exit 1, 712 collected): the three arity parametrisations of `test_action_arity_rejects_arguments_belonging_to_another_action` in `tests/test_worktree_cli.py`. The command was corrected to reject action-incompatible arguments and options, and the recorded `suite` gate is the final, passing invocation below — those three failures are not outstanding at the recorded tree. This paragraph previously labelled the pre-fix invocation as the "single clean invocation", which contradicted the passing gate row beneath it; it has been corrected to distinguish the two.
 
 | Test selection | Tests | Result |
 |----------------|-------|--------|
-| Full suite (`tests/` + `prompts/scripts/review-followup/tests/`) | 712 | ✅ Pass (`712 passed in 117.41s`, gate `suite`) |
-| `tests/test_worktree_cli.py` (within the full suite) | 21 | ❌ Fail (`18 passed, 3 failed` — the arity parametrisations below) |
+| Full suite (`tests/` + `prompts/scripts/review-followup/tests/`) | 712 | ✅ Pass (`712 passed in 117.41s`, exit 0, gate `suite`) |
+| `tests/test_worktree_cli.py` (within the full suite) | 21 | ✅ Pass (all 21 included in the 712 passing; the pre-fix failures were the arity parametrisations, corrected before the gate) |
 
 ### Task-specific verification gates
 
