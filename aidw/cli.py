@@ -442,20 +442,38 @@ def approve_followups(
 
 @app.command(name="run")
 def run_chain(
-    workflow: str = typer.Argument(..., help="task-to-pr | review-and-fix"),
-    phase: Optional[str] = typer.Argument(None, help="task-to-pr: phase, e.g. 03."),
-    epic: Optional[str] = typer.Argument(None, help="task-to-pr: epic, e.g. E4."),
-    task: Optional[str] = typer.Argument(None, help="task-to-pr: task, e.g. E4.1."),
-    pr: Optional[int] = typer.Option(None, "--pr", help="review-and-fix: PR number."),
+    workflow: str = typer.Argument(
+        ..., help="task-to-pr | prompt-to-fix | review-and-fix"
+    ),
+    phase: Optional[str] = typer.Argument(None, help="task-to-pr/prompt-to-fix: phase, e.g. 03."),
+    epic: Optional[str] = typer.Argument(None, help="task-to-pr/prompt-to-fix: epic, e.g. E4."),
+    task: Optional[str] = typer.Argument(None, help="task-to-pr/prompt-to-fix: task, e.g. E4.1."),
+    pr: Optional[int] = typer.Option(
+        None, "--pr", help="PR number (review-and-fix; prompt-to-fix: override the discovered PR)."
+    ),
     yes: bool = typer.Option(False, "--yes", help="Approve all gates."),
+    skip_gates: list[str] = typer.Option(
+        [], "--skip-gates", help="Gate name(s) to skip (repeatable)."
+    ),
     deny_gates: list[str] = _deny_gates_option(),
     gate_default: Optional[GateDefault] = _gate_default_option(),
     strict: bool = typer.Option(False, "--strict"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     parallel: bool = typer.Option(False, "--parallel"),
+    force_model: bool = typer.Option(
+        False,
+        "--force-model",
+        help="Accept the author==judge model warning in review/fix (review-and-fix, prompt-to-fix).",
+    ),
     max_iterations: int = typer.Option(10, "--max-iterations"),
 ) -> None:
-    """Run a convenience chain of workflows."""
+    """Run a convenience chain of workflows.
+
+    ``prompt-to-fix`` is the full cycle (prompt, implement, review,
+    approve-followups, fix); its ``approve-followups`` gate is auto-approved unless
+    ``--deny-gates approve-followups`` refuses it, and every other gate keeps normal
+    semantics.
+    """
     repo, aidt, workspace = _roots()
 
     if workflow == "task-to-pr":
@@ -470,11 +488,35 @@ def run_chain(
             aidt=aidt,
             workspace=workspace,
             approve_all=yes,
+            skip_gates=list(skip_gates),
             deny_gates=list(deny_gates),
             gate_default=_gate_default_value(gate_default),
             strict=strict,
             dry_run=dry_run,
             parallel=parallel,
+            stream=bool(_state["verbose"]),
+        )
+    elif workflow == "prompt-to-fix":
+        if not (phase and epic and task):
+            typer.echo("prompt-to-fix requires <phase> <epic> <task>", err=True)
+            raise typer.Exit(EXIT_USAGE)
+        code = run_workflow.prompt_to_fix(
+            phase=phase,
+            epic=epic,
+            task=task,
+            repo=repo,
+            aidt=aidt,
+            workspace=workspace,
+            pr=pr,
+            approve_all=yes,
+            skip_gates=list(skip_gates),
+            deny_gates=list(deny_gates),
+            gate_default=_gate_default_value(gate_default),
+            strict=strict,
+            dry_run=dry_run,
+            parallel=parallel,
+            force_model=force_model,
+            max_iterations=max_iterations,
             stream=bool(_state["verbose"]),
         )
     elif workflow == "review-and-fix":
@@ -487,16 +529,19 @@ def run_chain(
             aidt=aidt,
             workspace=workspace,
             approve_all=yes,
+            skip_gates=list(skip_gates),
             deny_gates=list(deny_gates),
             gate_default=_gate_default_value(gate_default),
             strict=strict,
             dry_run=dry_run,
+            force_model=force_model,
             max_iterations=max_iterations,
             stream=bool(_state["verbose"]),
         )
     else:
         typer.echo(
-            f"unknown chain: {workflow} (expected task-to-pr | review-and-fix)",
+            f"unknown chain: {workflow} "
+            "(expected task-to-pr | prompt-to-fix | review-and-fix)",
             err=True,
         )
         raise typer.Exit(EXIT_USAGE)
