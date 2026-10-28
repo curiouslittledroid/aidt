@@ -4255,3 +4255,73 @@ def test_l53_standard_format_over_budget_names_the_true_longest_requirement(
     ), captured.err
     # The last item keeps its own word count, so it is never named here.
     assert "requirement 3 (" not in captured.err, captured.err
+
+
+# ---------------------------------------------------------------------------
+# L6.1 — pin the E1.6 shape: an unticked predecessor plus a stale base (design §15)
+# ---------------------------------------------------------------------------
+
+
+def _e16_stale_base_with_unticked_predecessor(
+    tmp_path: Path,
+) -> tuple[Path, Path, str]:
+    """The E1.6 shape: a base provably behind ``origin`` *and* an unticked predecessor.
+
+    E1.6 was authored on a stale local ``main`` while its predecessor was still unticked
+    (phase 02 evidence, design §8.1). Each condition alone already refuses (L1.1, L1.2);
+    this named fixture puts both live at once so the refusal *precedence* is pinned: the
+    purely local ordering refusal must win before the network fetch is spent. Returns the
+    bare ``origin``, the clone, and the sha ``origin/main`` was advanced to.
+    """
+    origin, clone = _origin_and_clone(
+        tmp_path, roadmap=ROADMAP_INCOMPLETE_PREDECESSOR
+    )
+    remote_sha = _advance_origin(tmp_path, origin, "upstream")
+    return origin, clone, remote_sha
+
+
+def test_l61_e16_fixture_ordering_refusal_precedes_the_fetch(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The combined E1.6 fixture refuses on ordering, before any fetch, and runs nothing.
+
+    ``ROADMAP_INCOMPLETE_PREDECESSOR`` has a single predecessor, so the multi-entry
+    roadmap order stays pinned by ``test_l12_refusal_names_all_predecessors_in_roadmap_order``;
+    here the point is that the *local* refusal fires while ``origin/main`` is ahead.
+    """
+    _origin, clone, remote_sha = _e16_stale_base_with_unticked_predecessor(tmp_path)
+    local_sha = git.rev_parse(clone, "main") or ""
+    # Both refusal conditions are genuinely live: the remote moved past the local base,
+    # and the clone's ``origin/main`` is still stale — no fetch has happened yet.
+    assert remote_sha and remote_sha != local_sha
+    assert git.rev_parse(clone, "origin/main") == local_sha
+
+    fetch_calls: list[tuple] = []
+
+    def spy_fetch(*args, **kwargs):
+        fetch_calls.append(args)
+        return False, "boom"
+
+    monkeypatch.setattr(git, "fetch", spy_fetch)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 4
+    # The ordering refusal short-circuits the network: no fetch, no comparison, no stage.
+    assert fetch_calls == []
+    err = capsys.readouterr().err
+    assert "earlier tasks in the same file are incomplete" in err
+    assert "E3.1 — An earlier unticked task" in err
+    assert "Tick each predecessor once its work is merged" in err
+    assert "re-run with `--allow-incomplete-prereqs`" in err
+    # It is the ordering refusal, not the behind-origin one that a fetch would find.
+    assert "is behind" not in err
+    assert "git pull --ff-only" not in err
+    # A refusal before ``create_run`` leaves no run directory, branch or prompt behind.
+    assert state.list_runs(_runs_root(clone)) == []
+    assert git.current_branch(clone) == "main"
+    assert git.rev_parse(clone, "03-E4.1") is None
+    assert not (clone / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
