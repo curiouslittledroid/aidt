@@ -323,7 +323,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
 
 ## Epic L6: Evidence and close-out
 
-- [ ] **L6.1. Pin the new loop contract in tests** (Design 15)
+- [x] **L6.1. Pin the new loop contract in tests** (Design 15)
   A single test module addition that makes each new guarantee fail loudly if it regresses, and
   that reproduces the E1.6 shape as a deterministic fixture (a roadmap with an unticked
   predecessor, a base branch behind its `origin`) — the model-mediated claims are asserted as
