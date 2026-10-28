@@ -298,7 +298,7 @@ as-is** (EXTRACTION.md §4.2), so L2.1–L2.3 and L3.1–L3.2 are clean toolkit 
     split), and the conciseness budget still holds for the prompt itself.
   - Tests: rendered-prompt assertion; `aidw prompts check` clean.
 
-- [ ] **L5.2. Tell the author to reconcile gates and verifiers** (EXTRACTION.md §3.4, D17)
+- [x] **L5.2. Tell the author to reconcile gates and verifiers** (EXTRACTION.md §3.4, D17)
   E2.2's first review found the done-condition missing the target repo's mandated gate commands.
   The author prompt should require reading the gate list from the target repo's conventions
   (root `AGENTS.md`, optional `aidw/conventions.md`) and naming the exact commands, and should
