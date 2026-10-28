@@ -653,13 +653,13 @@ def worktree(
     if action != "list" and not branch:
         typer.echo(f"usage: aidw worktree {action} <branch>", err=True)
         raise typer.Exit(EXIT_USAGE)
-    if action == "list" and branch is not None:
+    if action == "list" and (branch is not None or base is not None or force):
         typer.echo("usage: aidw worktree list [--json]", err=True)
         raise typer.Exit(EXIT_USAGE)
     if action == "add" and (json_output or force):
         typer.echo("usage: aidw worktree add <branch> [--base <branch>]", err=True)
         raise typer.Exit(EXIT_USAGE)
-    if action == "remove" and base is not None:
+    if action == "remove" and (base is not None or json_output):
         typer.echo("usage: aidw worktree remove <branch> [--force]", err=True)
         raise typer.Exit(EXIT_USAGE)
 
@@ -749,9 +749,15 @@ def worktree(
             raise typer.Exit(EXIT_REFUSED)
 
     if not git.remove_worktree(target.root, path, force=force):
+        # ``remove_worktree`` discards git's stderr, so only a generic refusal can be
+        # emitted here. Vary the hint on ``force``: a user who already passed
+        # ``--force`` must not be told to re-run it (review follow-up #47).
+        if force:
+            hint = "even with --force (is the worktree locked or busy?)"
+        else:
+            hint = "(re-run with --force to retry)"
         typer.echo(
-            f"refusing to remove worktree '{branch}' at {path}: git declined "
-            "(re-run with --force to retry)",
+            f"refusing to remove worktree '{branch}' at {path}: git declined {hint}",
             err=True,
         )
         raise typer.Exit(EXIT_REFUSED)

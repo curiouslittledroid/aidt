@@ -330,6 +330,25 @@ def test_remove_refuses_the_generic_git_failure(
     assert (tmp_path / "task").is_dir()
 
 
+def test_remove_reports_the_generic_failure_without_resuggesting_force(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ``--force`` already given, the refusal must not tell the user to re-run it."""
+    _bare, control = _make_bare_with_control(tmp_path)
+    _add_task(control, "task")
+    monkeypatch.setattr("aidw.cli.git.remove_worktree", lambda *_args, **_kwargs: False)
+
+    forced = _invoke(control, "remove", "task", "--force")
+
+    assert forced.exit_code == EXIT_REFUSED
+    assert "git declined" in forced.stderr
+    assert "re-run with --force" not in forced.stderr
+    assert "even with --force" in forced.stderr
+    # The refusal leaves the worktree in place for manual inspection.
+    assert (tmp_path / "task").is_dir()
+    assert git.worktree_for_branch(control, "task") == (tmp_path / "task").resolve()
+
+
 def test_remove_unknown_branch_is_a_usage_error(tmp_path: Path) -> None:
     _bare, control = _make_bare_with_control(tmp_path)
 
@@ -368,8 +387,11 @@ def test_missing_branch_is_a_usage_error(tmp_path: Path, action: str) -> None:
     "args",
     [
         ("list", "extra"),
+        ("list", "--force"),
+        ("list", "--base", "dev"),
         ("add", "feat", "--json"),
         ("remove", "main", "--base", "dev"),
+        ("remove", "main", "--json"),
     ],
 )
 def test_action_arity_rejects_arguments_belonging_to_another_action(
