@@ -635,10 +635,18 @@ def _state_base(tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch) -> 
     The resolved root is ``<base>/<repo-slug>``, so it can only be computed *after* the
     environment variable is set — reading it first would silently name a different
     directory and every run lookup below would miss.
+
+    An inherited run identity is scrubbed here. When the suite is itself run as an
+    ``aidw gate`` (dogfooding), ``AIDW_RUN_ID``/``AIDW_STAGE`` are set by the parent
+    run; the ``gate run`` tests below would then record into that run instead of the
+    tmp one and fail on a leaked stage. Cases that need an identity set it explicitly
+    after this call, so clearing it first costs nothing.
     """
     base = tmp_path / "state"
     base.mkdir(exist_ok=True)
     monkeypatch.setenv(STATE_DIR_ENV_VAR, str(base))
+    monkeypatch.delenv(RUN_ID_ENV_VAR, raising=False)
+    monkeypatch.delenv(STAGE_ENV_VAR, raising=False)
     monkeypatch.chdir(repo)
     return WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root
 
@@ -685,6 +693,27 @@ def test_cli_gate_run_records_into_the_branch_run_without_an_env_identity(
     state_root = _state_base(tmp_path, repo, monkeypatch)
     state = create_run(state_root / "runs", repo, "implement", label="task", branch="task")
     monkeypatch.delenv(RUN_ID_ENV_VAR, raising=False)
+
+    result = cli.invoke(app, ["gate", "run", "suite", "--", "sh", "-c", "echo 439 passed"])
+
+    assert result.exit_code == 0, result.output
+    recorded = load(state_root / "runs" / state.run_id).gate_outcomes
+    assert len(recorded) == 1
+    assert recorded[0].stage == "cli"
+
+
+def test_cli_gate_run_ignores_a_parent_run_identity(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dogfooding: the suite run as an ``aidw gate`` inherits the parent's identity.
+
+    That identity names a run in the parent's state root, so honouring it would fail
+    with ``unknown run`` here; ``_state_base`` must scrub it.
+    """
+    monkeypatch.setenv(RUN_ID_ENV_VAR, "parent-run")
+    monkeypatch.setenv(STAGE_ENV_VAR, "pr")
+    state_root = _state_base(tmp_path, repo, monkeypatch)
+    state = create_run(state_root / "runs", repo, "implement", label="task", branch="task")
 
     result = cli.invoke(app, ["gate", "run", "suite", "--", "sh", "-c", "echo 439 passed"])
 
