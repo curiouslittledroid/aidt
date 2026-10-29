@@ -587,6 +587,66 @@ def test_from_forces_rerun(tmp_path: Path, monkeypatch) -> None:
     assert "impliment-task" not in recorder.names
 
 
+def test_unknown_from_stage_is_usage_error_before_worktree(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """F1 (PR #49 review follow-up): a typo'd ``--from`` refuses with exit 2 and
+    leaves behind neither a worktree nor a run directory — the same fail-closed
+    contract as the malformed-pattern refusal."""
+    control, prompt = _layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), from_stage="bogus"
+    )
+
+    assert code == 2
+    assert recorder.names == []
+    assert not (tmp_path / "03-E4.1").exists()
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    err = capsys.readouterr().err
+    assert "unknown stage `bogus`" in err
+    assert "impliment-task" in err  # the message lists the expected stage names
+
+
+def test_resume_declined_leaves_no_worktree(tmp_path: Path, monkeypatch, capsys) -> None:
+    """F2 (PR #49 review follow-up): declining the ``--resume`` confirmation
+    must leave no worktree behind — the confirm happens before branch setup,
+    so a refusal creates neither worktree nor run state (same fail-closed
+    contract as the still-running guard)."""
+    control, prompt = _layout(tmp_path)
+    _patch(monkeypatch)
+    runs_dir = _runs_root(control)
+    state = create_run(
+        runs_dir, control, "implement", label="03-E4.1", branch="03-E4.1"
+    )
+    directory = run_dir(runs_dir, state.run_id)
+    state.record_stage(
+        StageRecord(name="impliment-task", agent="implementer", model="m", status=SUCCEEDED)
+    )
+    state.status = FAILED
+    save(directory, state)
+
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+    # Non-interactive stdin would auto-confirm, so fake the explicit "no".
+    monkeypatch.setattr(implement_workflow, "_confirm_resume", lambda assume_yes: False)
+
+    code = implement_workflow.run(task_prompt_path=prompt, **_roots(control), resume=True)
+
+    assert code == 4
+    assert recorder.names == []
+    # Decline creates nothing: no sibling worktree in the workspace root.
+    assert not (tmp_path / "03-E4.1").exists()
+    # Exactly the pre-existing run state; no new run was written.
+    assert len(list(_runs_root(control).iterdir())) == 1
+    err = capsys.readouterr().err
+    assert "resume declined." in err
+
+
 # --------------------------------------------------------------------------- #
 # --parallel
 # --------------------------------------------------------------------------- #

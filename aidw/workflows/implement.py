@@ -345,6 +345,46 @@ def run(
         print(f"no implement run to resume for `{branch_name}`.", file=sys.stderr)
         return 2
 
+    # --- plan + --from validation (pure; before any side effects) ----------- #
+    # F1 (PR #49 review follow-up): validate `--from` against the planned stage
+    # names before branch setup and run-state creation, so a typo'd stage name
+    # refuses with exit 2 and leaves behind neither a worktree nor a run
+    # directory — the same fail-closed contract as the malformed-pattern and
+    # still-running refusals above. ``build_plan`` is pure (constants only),
+    # so this check costs no I/O.
+    plan = build_plan(
+        aidt=aidt.root,
+        prompt_rel=prompt_rel,
+        branch=branch_name,
+        task_id=task_id,
+        base_branch=repo.base_branch,
+    )
+    pre_pr = plan[:-1]
+    pr_plan = plan[-1]
+    names = [entry.name for entry in plan]
+    from_index: int | None = None
+    if from_stage is not None:
+        if from_stage not in names:
+            print(
+                f"unknown stage `{from_stage}` (expected one of {', '.join(names)})",
+                file=sys.stderr,
+            )
+            return 2
+        from_index = names.index(from_stage)
+
+    # --- resume confirmation (before any side effects) ---------------------- #
+    # F2 (PR #49 review follow-up): ask before branch setup, so a declined resume
+    # leaves behind neither worktree nor run state — the same fail-closed contract
+    # as the still-running refusal above. The confirm must precede the
+    # ``git.add_worktree`` side effect, not follow it.
+    if resume and not dry_run:
+        print(f"resume: {existing.run_id}")
+        print("completed stages:")
+        _print_completed(existing)
+        if not _confirm_resume(approve_all):
+            print("resume declined.", file=sys.stderr)
+            return 4
+
     # --- branch setup: create the task worktree (EXTRACTION.md §3.2) --------- #
     # Inline Python, not a PlanStage: I1..I6 stay the exact six stage ids (§3.5), and
     # a refusal must leave no worktree, stage record or run state behind (E2.6 owns
@@ -389,16 +429,11 @@ def run(
         agents, _ = load_all(aidt.root, target.root)
 
     # --- run state (new or resumed) ----------------------------------------- #
+    # A resumed run was confirmed above, before branch setup created the worktree.
     if resume and not dry_run:
         state = existing
         directory = run_dir(runs_root, state.run_id)
         logger = RunLogger(directory, stream=stream)
-        print(f"resume: {state.run_id}")
-        print("completed stages:")
-        _print_completed(state)
-        if not _confirm_resume(approve_all):
-            print("resume declined.", file=sys.stderr)
-            return 4
     else:
         state = create_run(
             runs_root,
@@ -419,16 +454,6 @@ def run(
     print(f"run:    {state.run_id}")
     print(f"branch: {branch_name}")
     print(f"prompt: {prompt_rel}")
-
-    plan = build_plan(
-        aidt=aidt.root,
-        prompt_rel=prompt_rel,
-        branch=branch_name,
-        task_id=task_id,
-        base_branch=repo.base_branch,
-    )
-    pre_pr = plan[:-1]
-    pr_plan = plan[-1]
 
     # --- dry run: plan every stage, no Pi, no git/GitHub writes -------------- #
     if dry_run:
@@ -452,16 +477,9 @@ def run(
         return 0
 
     # --- stage selection (resume / --from) ---------------------------------- #
-    names = [entry.name for entry in plan]
-    from_index: int | None = None
-    if from_stage is not None:
-        if from_stage not in names:
-            print(
-                f"unknown stage `{from_stage}` (expected one of {', '.join(names)})",
-                file=sys.stderr,
-            )
-            return 2
-        from_index = names.index(from_stage)
+    # ``from_index`` was validated before branch setup; the log line waits for
+    # the run's logger to exist.
+    if from_index is not None:
         logger.info(f"--from {from_stage}: re-running from {names[from_index]}")
 
     def should_run(index: int, name: str) -> bool:
