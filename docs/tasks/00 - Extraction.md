@@ -171,7 +171,7 @@
   - Deliverable: the subcommands plus tests.
   - Done when: `worktree list --json` round-trips the branch↔path mapping and `remove` refuses the two unsafe cases.
 
-- [ ] **E2.4. Branch setup becomes a Python stage, not a prompt**
+- [x] **E2.4. Branch setup becomes a Python stage, not a prompt**
   Remove the `git checkout -b` instructions from `prompts/impliment-task.md` (§4.2). AIDT creates
   the branch and its worktree before the first agent stage runs, using `repo.base_branch` and
   `repo.branch_pattern` from config.

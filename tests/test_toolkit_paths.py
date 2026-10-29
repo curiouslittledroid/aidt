@@ -140,8 +140,14 @@ def test_toolkitpaths_is_a_distinct_type_from_targetrepo() -> None:
         "agents_dir",
         "scripts_dir",
     }
-    # TargetRepo's shape is untouched by this task.
-    assert target_fields == {"root", "git_dir", "common_dir", "base_branch"}
+    # TargetRepo gained ``branch_pattern`` in E2.4 (EXTRACTION.md §3.4).
+    assert target_fields == {
+        "root",
+        "git_dir",
+        "common_dir",
+        "base_branch",
+        "branch_pattern",
+    }
     assert toolkit_fields != target_fields
 
 

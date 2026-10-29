@@ -1,13 +1,24 @@
-"""Tests for the ``aidw implement`` workflow (design §8.2, Phase 4)."""
+"""Tests for the ``aidw implement`` workflow (design §8.2, Phase 4).
+
+E2.4 makes branch setup a Python stage: ``run()`` derives the branch/worktree name from
+``repo.branch_pattern``, creates the worktree with ``git.add_worktree`` before I1, copies
+the (possibly uncommitted) task prompt into it, and re-resolves the target/agents so
+I1..I6 run in the new worktree. The harness therefore builds the real bare+control layout
+(EXTRACTION.md §3.2) and never fakes git output; only the Pi seam (``run_stage``) is mocked.
+"""
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from aidw import git
+from aidw.gates import GateOutcome
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import (
     FAILED,
@@ -20,34 +31,63 @@ from aidw.state import (
 from aidw.workflows import implement as implement_workflow
 
 
+def _git_run(directory: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=directory,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+
 def _init_repo(path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
 
 
-def _make_inputs(tmp_path: Path) -> Path:
-    """A tmp repo with a task prompt; returns the prompt path."""
-    _init_repo(tmp_path)
-    prompt = tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md"
-    prompt.parent.mkdir(parents=True)
+def _make_bare_with_control(tmp_path: Path) -> tuple[Path, Path]:
+    """Bare repo plus the ``main`` control worktree (the §3.2 bootstrap layout)."""
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git_run(seed, "init", "-q", "-b", "main")
+    (seed / "f.txt").write_text("x\n", encoding="utf-8")
+    _git_run(seed, "add", ".")
+    _git_run(seed, "commit", "-qm", "init")
+    bare = tmp_path / "bare.git"
+    _git_run(tmp_path, "clone", "--bare", "-q", str(seed), str(bare))
+    control = tmp_path / "main"
+    _git_run(bare, "worktree", "add", "-q", str(control), "main")
+    return bare, control
+
+
+def _write_prompt(control: Path, name: str = "03-E4.1-prompt.md") -> Path:
+    """Write the task prompt into the control worktree **uncommitted** (the real layout)."""
+    prompt = control / "docs" / "task-prompts" / name
+    prompt.parent.mkdir(parents=True, exist_ok=True)
     prompt.write_text("# Implement E4.1\n", encoding="utf-8")
-    (tmp_path / "aidt").mkdir()
     return prompt
 
 
-def _roots(repo: Path) -> dict:
-    target = TargetRepo.resolve(repo)
+def _layout(tmp_path: Path) -> tuple[Path, Path]:
+    _bare, control = _make_bare_with_control(tmp_path)
+    return control, _write_prompt(control)
+
+
+def _roots(control: Path) -> dict:
+    target = TargetRepo.resolve(control)
     return {
         "repo": target,
         "aidt": ToolkitPaths.resolve(),
         "workspace": WorkspacePaths.resolve(
-            target, state_dir_override=repo.parent / f"{repo.name}-state"
+            target, state_dir_override=control.parent / "aidt-state"
         ),
     }
 
 
-def _runs_root(repo: Path) -> Path:
+def _runs_root(control: Path) -> Path:
     """Where E1.4 writes run state: the per-repo state root, never the toolkit."""
-    return _roots(repo)["workspace"].state_root / "runs"
+    return _roots(control)["workspace"].state_root / "runs"
 
 
 class _Recorder:
@@ -56,11 +96,13 @@ class _Recorder:
     def __init__(self, fail: set[str] | None = None) -> None:
         self.names: list[str] = []
         self.specs = []
+        self.repo_roots: list[Path] = []
         self.fail = fail or set()
 
     def __call__(self, spec, **kwargs):
         self.names.append(spec.name)
         self.specs.append(spec)
+        self.repo_roots.append(kwargs["repo_root"])
         directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
@@ -82,9 +124,8 @@ class _Recorder:
         return record
 
 
-def _patch(monkeypatch, *, branch: str = "03-E4.1"):
+def _patch(monkeypatch) -> None:
     monkeypatch.setattr(implement_workflow, "load_all", lambda aidt, repo: ({}, []))
-    monkeypatch.setattr(git, "current_branch", lambda repo: branch)
 
 
 # --------------------------------------------------------------------------- #
@@ -105,6 +146,28 @@ def test_parse_task_id_variants() -> None:
         "02.5-B",
     )
     assert implement_workflow.parse_task_id(Path("nonsense.md")) is None
+
+
+def test_derive_branch_name_default_reproduces_the_task_id() -> None:
+    pattern = "{phase}-{task}"
+    assert implement_workflow.derive_branch_name(pattern, phase="00", task="E2.4") == "00-E2.4"
+    # The dotted-phase form must survive byte-for-byte.
+    assert implement_workflow.derive_branch_name(pattern, phase="02.5", task="B") == "02.5-B"
+
+
+def test_derive_branch_name_rejects_malformed_patterns() -> None:
+    # References only one of phase/task: a constant/partial name collides across tasks.
+    assert implement_workflow.derive_branch_name("{phase}", phase="00", task="E2.4") is None
+    assert implement_workflow.derive_branch_name("static", phase="00", task="E2.4") is None
+    # Unknown placeholder: str.format raises KeyError.
+    assert (
+        implement_workflow.derive_branch_name(
+            "{phase}-{task}-{extra}", phase="00", task="E2.4"
+        )
+        is None
+    )
+    # Unbalanced braces raise ValueError.
+    assert implement_workflow.derive_branch_name("{phase}-{task", phase="00", task="E2.4") is None
 
 
 def test_build_plan_order_and_agents() -> None:
@@ -135,19 +198,76 @@ def test_build_plan_order_and_agents() -> None:
     assert plan[5].variables == ["03-E4.1"]
 
 
+def test_build_plan_uses_the_configured_base_branch() -> None:
+    plan = implement_workflow.build_plan(
+        aidt=Path("/aidt"), prompt_rel="docs/task-prompts/03-E4.1-prompt.md",
+        branch="03-E4.1", task_id="03-E4.1", base_branch="develop",
+    )
+    assert plan[3].variables == ["03-E4.1", "develop"]
+
+
+# --------------------------------------------------------------------------- #
+# Branch-name derivation at the run seam
+# --------------------------------------------------------------------------- #
+
+
+def test_non_default_branch_pattern_names_branch_worktree_and_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, prompt = _layout(tmp_path)
+    roots = _roots(control)
+    roots["repo"] = dataclasses.replace(
+        roots["repo"], branch_pattern="{task}-{phase}"
+    )
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(task_prompt_path=prompt, **roots, approve_all=True)
+
+    assert code == 0
+    assert (tmp_path / "E4.1-03").is_dir()
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert state.git.get("branch") == "E4.1-03"
+
+
+@pytest.mark.parametrize("pattern", ["static", "{phase}", "{phase}-{task}-{extra}"])
+def test_malformed_branch_pattern_is_usage_error_before_worktree(
+    tmp_path: Path, monkeypatch, pattern: str
+) -> None:
+    control, prompt = _layout(tmp_path)
+    roots = _roots(control)
+    roots["repo"] = dataclasses.replace(roots["repo"], branch_pattern=pattern)
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(task_prompt_path=prompt, **roots)
+
+    # A pattern missing a placeholder, or naming an unknown one, is refused before
+    # branch-setup: no worktree, no stage, no run state.
+    assert code == 2
+    assert recorder.names == []
+    assert not (tmp_path / "03-E4.1").exists()
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
 # --------------------------------------------------------------------------- #
 # Dry run
 # --------------------------------------------------------------------------- #
 
 
-def test_dry_run_plans_all_six_stages(tmp_path: Path, monkeypatch) -> None:
-    prompt = _make_inputs(tmp_path)
+def test_dry_run_plans_branch_setup_and_all_six_stages(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control, prompt = _layout(tmp_path)
     _patch(monkeypatch)
     recorder = _Recorder()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
-        task_prompt_path=prompt, **_roots(tmp_path), dry_run=True
+        task_prompt_path=prompt, **_roots(control), dry_run=True
     )
 
     assert code == 0
@@ -159,67 +279,179 @@ def test_dry_run_plans_all_six_stages(tmp_path: Path, monkeypatch) -> None:
         "record-implementation-results",
         "pr",
     ]
+    out = capsys.readouterr().out
+    assert "branch-setup (planned)" in out
+    assert "worktree add -b 03-E4.1" in out
+    assert str(tmp_path / "03-E4.1") in out
+    # A dry run performs no worktree writes.
+    assert not (tmp_path / "03-E4.1").exists()
 
 
 def test_dry_run_writes_runs_under_the_state_root(tmp_path: Path, monkeypatch) -> None:
-    """E1.4: a run lives under the state root, never under ``repo/aidt/runs``.
-
-    ``_make_inputs`` pre-creates ``repo/aidt``; after the run that tree must still have
-    no ``runs/`` directory (the toolkit-root assumption is gone).
-    """
-    prompt = _make_inputs(tmp_path)
+    """E1.4: a run lives under the state root, never under ``repo/aidt/runs``."""
+    control, prompt = _layout(tmp_path)
     _patch(monkeypatch)
     monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
 
     code = implement_workflow.run(
-        task_prompt_path=prompt, **_roots(tmp_path), dry_run=True
+        task_prompt_path=prompt, **_roots(control), dry_run=True
     )
 
     assert code == 0
-    runs_root = _runs_root(tmp_path)
+    runs_root = _runs_root(control)
     run_dirs = list(runs_root.iterdir())
     assert len(run_dirs) == 1
     assert (run_dirs[0] / "state.json").is_file()
-    assert not (tmp_path / "aidt" / "runs").exists()
+    assert not (control / "aidt" / "runs").exists()
 
 
 # --------------------------------------------------------------------------- #
-# Preflight
+# Branch setup creates the worktree before I1
 # --------------------------------------------------------------------------- #
 
 
-def test_refuses_on_main(tmp_path: Path, monkeypatch) -> None:
-    prompt = _make_inputs(tmp_path)
-    _patch(monkeypatch, branch="main")
-    monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
+def test_worktree_exists_before_first_stage_and_prompt_is_copied(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, prompt = _layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
-        task_prompt_path=prompt, **_roots(tmp_path)
+        task_prompt_path=prompt, **_roots(control), approve_all=True
     )
 
-    assert code == 4
+    assert code == 0
+    worktree = (tmp_path / "03-E4.1").resolve()
+    assert worktree.is_dir()
+    # The prompt was uncommitted in the control worktree and must have been copied in.
+    copied = worktree / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+    assert copied.is_file()
+    # I1 ran after the worktree existed, with the worktree as its repo root.
+    assert recorder.names[0] == "impliment-task"
+    assert recorder.repo_roots[0] == worktree
 
 
-def test_refuses_on_branch_mismatch(tmp_path: Path, monkeypatch) -> None:
-    prompt = _make_inputs(tmp_path)
-    _patch(monkeypatch, branch="04-A1")
-    monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
+def test_base_branch_flows_through_the_whole_run(tmp_path: Path, monkeypatch) -> None:
+    bare, control = _make_bare_with_control(tmp_path)
+    # develop exists and is one commit ahead of main.
+    _git_run(bare, "branch", "develop", "main")
+    develop_wt = tmp_path / "develop"
+    _git_run(bare, "worktree", "add", "-q", str(develop_wt), "develop")
+    (develop_wt / "g.txt").write_text("g\n", encoding="utf-8")
+    _git_run(develop_wt, "add", ".")
+    _git_run(develop_wt, "commit", "-qm", "develop work")
+    _git_run(bare, "worktree", "remove", str(develop_wt))
+    prompt = _write_prompt(control)
+
+    roots = _roots(control)
+    roots["repo"] = dataclasses.replace(roots["repo"], base_branch="develop")
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+    summaries: list[str] = []
+
+    def capture_gate(_name: str, summary: str, **_kwargs) -> GateOutcome:
+        summaries.append(summary)
+        return GateOutcome(implement_workflow.GATE, True, "test")
+
+    monkeypatch.setattr(implement_workflow, "decide", capture_gate)
+
+    code = implement_workflow.run(task_prompt_path=prompt, **roots, approve_all=True)
+
+    assert code == 0
+    assert len(summaries) == 1
+    # develop contains g.txt while main does not; the gate summary must use the
+    # configured base just as the PR record does, so it must not report g.txt.
+    assert "g.txt" not in summaries[0]
+    worktree = (tmp_path / "03-E4.1").resolve()
+    assert worktree.is_dir()
+    # The worktree branches from develop, not main: g.txt is absent from main's diff base.
+    assert git.changed_files(worktree, "main") == ["g.txt"]
+    assert git.changed_files(worktree, "develop") == []
+    # state.pr.changed_files and I4's base_ref both measure against develop.
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert state.pr.get("changed_files") == []
+    arch = next(s for s in recorder.specs if s.name == "update-architecture")
+    assert arch.variables == ["03-E4.1", "develop"]
+
+
+# --------------------------------------------------------------------------- #
+# Preflight (retained still-running guard; fail-closed branch setup)
+# --------------------------------------------------------------------------- #
+
+
+def test_agents_are_reloaded_against_the_created_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, prompt = _layout(tmp_path)
+    load_roots: list[Path] = []
+
+    def record_load(_aidt: Path, repo_root: Path):
+        load_roots.append(repo_root)
+        return {}, []
+
+    monkeypatch.setattr(implement_workflow, "load_all", record_load)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
-        task_prompt_path=prompt, **_roots(tmp_path)
+        task_prompt_path=prompt, **_roots(control), approve_all=True
     )
 
-    assert code == 4
+    worktree = (tmp_path / "03-E4.1").resolve()
+    assert code == 0
+    assert load_roots == [control.resolve(), worktree]
+    assert recorder.repo_roots[0] == worktree
 
 
 def test_missing_prompt_is_usage_error(tmp_path: Path, monkeypatch) -> None:
-    _make_inputs(tmp_path)
+    control, _prompt = _layout(tmp_path)
     _patch(monkeypatch)
     code = implement_workflow.run(
-        task_prompt_path=tmp_path / "docs" / "task-prompts" / "nope.md",
-        **_roots(tmp_path),
+        task_prompt_path=control / "docs" / "task-prompts" / "nope.md",
+        **_roots(control),
     )
     assert code == 2
+
+
+def test_running_run_is_refused_without_resume(tmp_path: Path, monkeypatch) -> None:
+    control, prompt = _layout(tmp_path)
+    _patch(monkeypatch)
+    runs_root = _runs_root(control)
+    create_run(runs_root, control, "implement", label="03-E4.1", branch="03-E4.1")
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(task_prompt_path=prompt, **_roots(control))
+
+    assert code == 4
+    assert recorder.names == []
+    assert not (tmp_path / "03-E4.1").exists()
+    # No second run state was written.
+    assert len(list(_runs_root(control).iterdir())) == 1
+
+
+def test_branch_setup_fails_closed_when_branch_already_checked_out(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, prompt = _layout(tmp_path)
+    # Pre-create the task worktree with real git: git refuses the second checkout.
+    existing = git.add_worktree(control, "03-E4.1")
+    assert existing is not None
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 4
+    assert recorder.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -228,52 +460,50 @@ def test_missing_prompt_is_usage_error(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_full_run_succeeds_and_records_pr(tmp_path: Path, monkeypatch) -> None:
-    prompt = _make_inputs(tmp_path)
+    control, prompt = _layout(tmp_path)
     _patch(monkeypatch)
     monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        **_roots(tmp_path),
+        **_roots(control),
         approve_all=True,
     )
 
     assert code == 0
-    runs = list(_runs_root(tmp_path).iterdir())
-    state = implement_workflow.list_runs(_runs_root(tmp_path))[-1]
+    runs = list(_runs_root(control).iterdir())
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
     assert state.status == SUCCEEDED
     assert state.gates and state.gates[-1].name == implement_workflow.GATE
     assert state.pr.get("number") == 42
     assert len(runs) == 1
-    assert not (tmp_path / "aidt" / "runs").exists()
+    assert not (control / "aidt" / "runs").exists()
 
 
 def test_stage_failure_returns_one(tmp_path: Path, monkeypatch) -> None:
-    prompt = _make_inputs(tmp_path)
+    control, prompt = _layout(tmp_path)
     _patch(monkeypatch)
     monkeypatch.setattr(implement_workflow, "run_stage", _Recorder(fail={"test"}))
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        **_roots(tmp_path),
+        **_roots(control),
         approve_all=True,
     )
 
     assert code == 1
-    state = implement_workflow.list_runs(_runs_root(tmp_path))[-1]
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
     assert state.status == FAILED
 
 
 def test_gate_denied_returns_blocked(tmp_path: Path, monkeypatch) -> None:
-    prompt = _make_inputs(tmp_path)
+    control, prompt = _layout(tmp_path)
     _patch(monkeypatch)
     recorder = _Recorder()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     # No --yes and a non-interactive session: the gate fails closed.
-    code = implement_workflow.run(
-        task_prompt_path=prompt, **_roots(tmp_path)
-    )
+    code = implement_workflow.run(task_prompt_path=prompt, **_roots(control))
 
     assert code == 3
     # The PR stage must not have run after a denied gate.
@@ -281,13 +511,13 @@ def test_gate_denied_returns_blocked(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
-    prompt = _make_inputs(tmp_path)
+    control, prompt = _layout(tmp_path)
     _patch(monkeypatch)
-    runs_dir = _runs_root(tmp_path)
+    runs_dir = _runs_root(control)
 
     state = create_run(
         runs_dir,
-        tmp_path,
+        control,
         "implement",
         label="03-E4.1",
         task={"phase": "03", "task": "E4.1"},
@@ -310,7 +540,7 @@ def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        **_roots(tmp_path),
+        **_roots(control),
         resume=True,
         approve_all=True,
     )
@@ -327,12 +557,12 @@ def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_from_forces_rerun(tmp_path: Path, monkeypatch) -> None:
-    prompt = _make_inputs(tmp_path)
+    control, prompt = _layout(tmp_path)
     _patch(monkeypatch)
-    runs_dir = _runs_root(tmp_path)
+    runs_dir = _runs_root(control)
 
     state = create_run(
-        runs_dir, tmp_path, "implement", label="03-E4.1", branch="03-E4.1"
+        runs_dir, control, "implement", label="03-E4.1", branch="03-E4.1"
     )
     directory = run_dir(runs_dir, state.run_id)
     for name in ("impliment-task", "test", "update-traceability"):
@@ -346,7 +576,7 @@ def test_from_forces_rerun(tmp_path: Path, monkeypatch) -> None:
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        **_roots(tmp_path),
+        **_roots(control),
         resume=True,
         from_stage="test",
         approve_all=True,
@@ -355,11 +585,6 @@ def test_from_forces_rerun(tmp_path: Path, monkeypatch) -> None:
     assert code == 0
     assert recorder.names[0] == "test"
     assert "impliment-task" not in recorder.names
-
-
-# --------------------------------------------------------------------------- #
-# git.changed_files
-# --------------------------------------------------------------------------- #
 
 
 # --------------------------------------------------------------------------- #
@@ -390,14 +615,14 @@ class _TrackingStages(_Recorder):
 
 
 def test_serial_runs_the_pair_one_at_a_time(tmp_path: Path, monkeypatch) -> None:
-    prompt = _make_inputs(tmp_path)
+    control, prompt = _layout(tmp_path)
     _patch(monkeypatch)
     recorder = _TrackingStages()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        **_roots(tmp_path),
+        **_roots(control),
         approve_all=True,
     )
 
@@ -408,14 +633,14 @@ def test_serial_runs_the_pair_one_at_a_time(tmp_path: Path, monkeypatch) -> None
 def test_parallel_runs_test_and_architecture_concurrently(
     tmp_path: Path, monkeypatch
 ) -> None:
-    prompt = _make_inputs(tmp_path)
+    control, prompt = _layout(tmp_path)
     _patch(monkeypatch)
     recorder = _TrackingStages()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
         task_prompt_path=prompt,
-        **_roots(tmp_path),
+        **_roots(control),
         approve_all=True,
         parallel=True,
     )
@@ -434,6 +659,11 @@ def test_parallel_runs_test_and_architecture_concurrently(
     ]
 
 
+# --------------------------------------------------------------------------- #
+# git.changed_files
+# --------------------------------------------------------------------------- #
+
+
 def test_changed_files_lists_branch_diff(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     (tmp_path / "a.txt").write_text("a\n", encoding="utf-8")
@@ -446,3 +676,21 @@ def test_changed_files_lists_branch_diff(tmp_path: Path) -> None:
     subprocess.run(["git", "commit", "-qm", "b"], cwd=tmp_path, check=True)
 
     assert git.changed_files(tmp_path, "main") == ["b.txt"]
+
+
+# --------------------------------------------------------------------------- #
+# Prompt cleanliness
+# --------------------------------------------------------------------------- #
+
+
+def test_impliment_prompt_has_no_agent_branch_setup() -> None:
+    text = (ToolkitPaths.resolve().prompts_dir / "impliment-task.md").read_text(
+        encoding="utf-8"
+    )
+    assert "git checkout -b" not in text
+    assert "git switch -c" not in text
+    assert "git branch --list" not in text
+    assert "git ls-remote" not in text
+    assert "### Branch setup (do this first" not in text
+    # The one-line pointer that AIDT owns it stays.
+    assert "AIDT owns branch setup" in text

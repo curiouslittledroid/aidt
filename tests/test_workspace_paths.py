@@ -482,12 +482,13 @@ def test_workspacepaths_is_a_distinct_type_from_the_other_roots() -> None:
         "state_root",
         "repo_slug",
     }
-    # Neither existing type's shape is changed by this task.
+    # TargetRepo gained ``branch_pattern`` in E2.4 (EXTRACTION.md §3.4).
     assert [field.name for field in dataclasses.fields(TargetRepo)] == [
         "root",
         "git_dir",
         "common_dir",
         "base_branch",
+        "branch_pattern",
     ]
 
 

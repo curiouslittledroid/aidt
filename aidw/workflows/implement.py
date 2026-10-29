@@ -16,17 +16,22 @@ I6 pr                             agent pr-publisher (fresh)
 ``I2`` and ``I4`` touch disjoint trees and are safe to run concurrently in principle,
 but v1 runs every stage serially (``--parallel`` is accepted and deferred to Phase 7).
 
-The workflow refuses to run on ``main``, when the branch does not match the task id, or
-when another implement run for the branch is still marked ``running``.
+Branch setup is a Python stage: before I1, ``run()`` derives the branch/worktree name
+from ``repo.branch_pattern`` and creates the worktree (``git.add_worktree``), then
+re-resolves the target and agents so every stage runs in it (EXTRACTION.md §3.2). It no
+longer refuses to run on ``main`` or on a branch that does not match the task id — the
+worktree is born on ``repo.base_branch`` — but still refuses when another implement run
+for the branch is marked ``running`` unless ``--resume``.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import string
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from aidw import git
@@ -94,11 +99,12 @@ class PlanStage:
 
 
 def parse_task_id(prompt_path: Path) -> tuple[str, str, str] | None:
-    """Derive ``(phase, task, branch)`` from a task-prompt filename.
+    """Derive ``(phase, task, task_id)`` from a task-prompt filename.
 
-    Accepts the canonical ``<phase>-<task>-prompt.md`` and the bare
-    ``<phase>-<task>.md`` an author model may produce. Returns ``None`` when the
-    filename carries no task id.
+    Pure: one argument, no I/O. The third element is the task id ``f"{phase}-{task}"``;
+    the *branch* name is ``repo.branch_pattern`` applied to it by :func:`run`. Accepts the
+    canonical ``<phase>-<task>-prompt.md`` and the bare ``<phase>-<task>.md`` an author
+    model may produce. Returns ``None`` when the filename carries no task id.
     """
     match = _PROMPT_NAME.match(prompt_path.name)
     if not match:
@@ -108,10 +114,51 @@ def parse_task_id(prompt_path: Path) -> tuple[str, str, str] | None:
     return phase, task, f"{phase}-{task}"
 
 
+def _branch_pattern_fields(pattern: str) -> set[str]:
+    """Top-level replacement field names referenced by ``pattern``.
+
+    ``string.Formatter().parse`` lets :func:`derive_branch_name` check "mentions both
+    ``phase`` and ``task``" without formatting, and never raises on an arbitrary
+    placeholder (unlike ``str.format``, which would). ````phase.foo```` / ``task[0]``
+    still reference ``phase`` / ``task``.
+    """
+    fields: set[str] = set()
+    for _literal, field_name, _spec, _conversion in string.Formatter().parse(pattern):
+        if field_name:
+            fields.add(re.split(r"[.\[]", field_name, maxsplit=1)[0])
+    return fields
+
+
+def derive_branch_name(pattern: str, *, phase: str, task: str) -> str | None:
+    """Apply ``repo.branch_pattern`` to a task id (EXTRACTION.md §3.4), or ``None``.
+
+    ``None`` means the pattern is malformed — ``str.format`` cannot apply it (unknown
+    placeholder, unbalanced braces) or it does not reference both ``phase`` and
+    ``task`` (a constant/partial name would collide across tasks; §3.2 one branch, one
+    worktree). The caller turns ``None`` into a usage error (exit 2) before any worktree
+    or stage. Under the §3.4 default this reproduces the old names byte-for-byte.
+    """
+    try:
+        fields = _branch_pattern_fields(pattern)
+    except ValueError:
+        # Unbalanced braces; ``str.format`` would raise the same.
+        return None
+    if not {"phase", "task"} <= fields:
+        return None
+    try:
+        return pattern.format(phase=phase, task=task)
+    except (KeyError, IndexError, ValueError):
+        return None
+
+
 def build_plan(
-    *, aidt: Path, prompt_rel: str, branch: str, task_id: str
+    *, aidt: Path, prompt_rel: str, branch: str, task_id: str, base_branch: str = "main"
 ) -> list[PlanStage]:
-    """The six stages, in order (I6 is the ``pr`` stage)."""
+    """The six stages, in order (I6 is the ``pr`` stage).
+
+    ``base_branch`` is I4's ``$2`` (``base_ref``): the architecture stage measures
+    against the configured PR base, not a hardcoded ``main`` (EXTRACTION.md §3.4/R4).
+    """
     return [
         PlanStage("I1", "impliment-task", "implementer", "impliment-task.md", [prompt_rel]),
         PlanStage(
@@ -135,7 +182,7 @@ def build_plan(
             "update-architecture",
             "implementer",
             "update-architecture.md",
-            [branch, "main"],
+            [branch, base_branch],
         ),
         PlanStage(
             "I5",
@@ -181,11 +228,11 @@ def _print_completed(state: RunState) -> None:
         print(f"  {record.name}: {record.status}")
 
 
-def _gate_summary(state: RunState, repo: Path, branch: str, prompt_rel: str) -> str:
+def _gate_summary(state: RunState, repo: TargetRepo, branch: str, prompt_rel: str) -> str:
     lines = [f"Implementation for {branch}", f"Task prompt: {prompt_rel}", ""]
     for record in state.stages:
         lines.append(f"  {record.name}: {record.status} ({record.agent}, {record.model})")
-    files = git.changed_files(repo, "main")
+    files = git.changed_files(repo.root, repo.base_branch)
     if files:
         lines.append("")
         lines.append(f"Changed files ({len(files)}):")
@@ -193,12 +240,12 @@ def _gate_summary(state: RunState, repo: Path, branch: str, prompt_rel: str) -> 
     return "\n".join(lines)
 
 
-def _record_pr(state: RunState, repo: Path, record) -> None:
+def _record_pr(state: RunState, repo: TargetRepo, record) -> None:
     text = _read_out(record) or ""
     match = _PR_URL.search(text)
     if match:
         state.pr = {**state.pr, "number": int(match.group(1)), "url": match.group(0)}
-    state.pr["changed_files"] = git.changed_files(repo, "main")
+    state.pr["changed_files"] = git.changed_files(repo.root, repo.base_branch)
 
 
 def _write_artifacts(directory: Path, state: RunState, branch: str) -> Path:
@@ -262,8 +309,16 @@ def run(
             file=sys.stderr,
         )
         return 2
-    phase, task, branch_name = parsed
-    task_id = f"{phase}-{task}"
+    phase, task, task_id = parsed
+    branch_name = derive_branch_name(repo.branch_pattern, phase=phase, task=task)
+    if branch_name is None:
+        print(
+            f"malformed repo.branch_pattern {repo.branch_pattern!r}: it must be a "
+            "format string referencing both `{phase}` and `{task}` "
+            '(e.g. "{phase}-{task}").',
+            file=sys.stderr,
+        )
+        return 2
 
     # --- agents/config ---------------------------------------------------------- #
     agents, issues = load_all(aidt.root, repo.root)
@@ -273,34 +328,68 @@ def run(
         print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
         return 2
 
-    branch = git.current_branch(repo.root)
+    # --- retained preflight: one live run per branch ------------------------ #
+    # The old main/branch-mismatch guards are gone: branch setup *creates* the task
+    # worktree, so `aidw implement` no longer requires being on the task branch. The
+    # still-running guard stays, checked before branch-setup, so a refusal creates
+    # neither worktree nor run state.
     existing = _latest_implement_run(runs_root, branch_name)
+    if existing is not None and existing.status == RUNNING and not resume:
+        print(
+            f"another implement run for `{branch_name}` is still marked running: "
+            f"{existing.run_id}. Use --resume or finish it.",
+            file=sys.stderr,
+        )
+        return 4
+    if resume and not dry_run and existing is None:
+        print(f"no implement run to resume for `{branch_name}`.", file=sys.stderr)
+        return 2
 
-    # --- preflight ---------------------------------------------------------- #
-    if not dry_run:
-        if branch is None or branch == "main":
-            print("`aidw implement` must not run on `main`.", file=sys.stderr)
-            return 4
-        if branch != branch_name:
+    # --- branch setup: create the task worktree (EXTRACTION.md §3.2) --------- #
+    # Inline Python, not a PlanStage: I1..I6 stay the exact six stage ids (§3.5), and
+    # a refusal must leave no worktree, stage record or run state behind (E2.6 owns
+    # locating/reusing an existing worktree; this step is create-only).
+    target = repo
+    if dry_run:
+        planned_worktree = workspace.workspace_root / branch_name
+        print(
+            f"branch-setup (planned): worktree add -b {branch_name} "
+            f"{planned_worktree} {repo.base_branch}"
+        )
+    else:
+        worktree = git.add_worktree(
+            repo.root, branch_name, base_branch=repo.base_branch
+        )
+        if worktree is None:
             print(
-                f"branch mismatch: on `{branch}` but the task id says `{branch_name}`. "
-                "check out the task branch first.",
+                f"branch-setup refused: git could not create a worktree for "
+                f"`{branch_name}` from `{repo.base_branch}` at "
+                f"{workspace.workspace_root / branch_name}. The branch may already be "
+                "checked out (one branch, one worktree) or git refused for another "
+                "reason; resolve it and re-run.",
                 file=sys.stderr,
             )
             return 4
-        if existing is not None and existing.status == RUNNING and not resume:
-            print(
-                f"another implement run for `{branch_name}` is still marked running: "
-                f"{existing.run_id}. Use --resume or finish it.",
-                file=sys.stderr,
-            )
-            return 4
+        # The worktree is born at the base commit, so a task prompt still uncommitted
+        # in the control worktree (the standard authoring layout) would be absent there.
+        # Copy it so I1's `$1` and I5's relative `docs/task-prompts/<branch>-prompt.md`
+        # both resolve inside the worktree (an absolute path would break I5).
+        copied = worktree / prompt_rel
+        if not copied.is_file():
+            copied.parent.mkdir(parents=True, exist_ok=True)
+            copied.write_bytes(prompt_path.read_bytes())
+        # Re-resolve the target and agents against the worktree: agent.cwd was resolved
+        # against the control root and would silently keep I1..I6 in the wrong worktree.
+        resolved = TargetRepo.resolve(worktree)
+        target = replace(
+            resolved,
+            base_branch=repo.base_branch,
+            branch_pattern=repo.branch_pattern,
+        )
+        agents, _ = load_all(aidt.root, target.root)
 
     # --- run state (new or resumed) ----------------------------------------- #
     if resume and not dry_run:
-        if existing is None:
-            print(f"no implement run to resume for `{branch_name}`.", file=sys.stderr)
-            return 2
         state = existing
         directory = run_dir(runs_root, state.run_id)
         logger = RunLogger(directory, stream=stream)
@@ -313,7 +402,7 @@ def run(
     else:
         state = create_run(
             runs_root,
-            repo.root,
+            target.root,
             "implement",
             label=branch_name,
             task={"phase": phase, "task": task, "prompt_path": prompt_rel},
@@ -332,7 +421,11 @@ def run(
     print(f"prompt: {prompt_rel}")
 
     plan = build_plan(
-        aidt=aidt.root, prompt_rel=prompt_rel, branch=branch_name, task_id=task_id
+        aidt=aidt.root,
+        prompt_rel=prompt_rel,
+        branch=branch_name,
+        task_id=task_id,
+        base_branch=repo.base_branch,
     )
     pre_pr = plan[:-1]
     pr_plan = plan[-1]
@@ -342,7 +435,7 @@ def run(
         for entry in plan:
             record = run_stage(
                 entry.spec(aidt.root),
-                repo_root=repo.root,
+                repo_root=target.root,
                 toolkit_root=aidt.root,
                 runs_root=runs_root,
                 state=state,
@@ -385,14 +478,14 @@ def run(
             return True
         record = run_stage(
             entry.spec(aidt.root),
-            repo_root=repo.root,
+            repo_root=target.root,
             toolkit_root=aidt.root,
             runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
         )
-        print_stage(record, repo_root=repo.root, prefix=entry.id)
+        print_stage(record, repo_root=target.root, prefix=entry.id)
         if record.status != SUCCEEDED:
             print(f"stage {entry.name} failed: {record.error}", file=sys.stderr)
             state.status = FAILED
@@ -424,7 +517,7 @@ def run(
                     pool.submit(
                         run_stage,
                         entry.spec(aidt.root),
-                        repo_root=repo.root,
+                        repo_root=target.root,
                         toolkit_root=aidt.root,
                         runs_root=runs_root,
                         state=state,
@@ -436,7 +529,7 @@ def run(
                 for future in as_completed(futures):
                     entry = futures[future]
                     record = future.result()
-                    print_stage(record, repo_root=repo.root, prefix=entry.id)
+                    print_stage(record, repo_root=target.root, prefix=entry.id)
                     if record.status != SUCCEEDED:
                         print(
                             f"stage {entry.name} failed: {record.error}",
@@ -460,7 +553,7 @@ def run(
     if approved:
         print(f"gate:   {GATE} [already approved]")
     else:
-        summary = _gate_summary(state, repo.root, branch_name, prompt_rel)
+        summary = _gate_summary(state, target, branch_name, prompt_rel)
         outcome = decide(
             GATE,
             summary,
@@ -492,18 +585,18 @@ def run(
     if should_run(len(plan) - 1, pr_plan.name):
         record = run_stage(
             pr_plan.spec(aidt.root),
-            repo_root=repo.root,
+            repo_root=target.root,
             toolkit_root=aidt.root,
             runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
         )
-        print_stage(record, repo_root=repo.root, prefix=pr_plan.id)
+        print_stage(record, repo_root=target.root, prefix=pr_plan.id)
         if record.status != SUCCEEDED:
             print(f"stage {pr_plan.name} failed: {record.error}", file=sys.stderr)
             return 1
-        _record_pr(state, repo.root, record)
+        _record_pr(state, target, record)
     else:
         print(f"stage:  {pr_plan.id} {pr_plan.name} [skipped]")
 
