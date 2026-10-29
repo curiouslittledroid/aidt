@@ -2,9 +2,10 @@
 
 Stages:
 
-1. ``task-prompt``      — agent ``task-author`` creates ``docs/task-prompts/<phase>-<task>-prompt.md``
-                          on branch ``<phase>-<task>`` and commits it. Immediately after,
-                          the workflow measures that just-generated file against the
+1. ``task-prompt``      — agent ``task-author`` writes ``docs/task-prompts/<phase>-<task>-prompt.md``
+                          in the AIDT-created task worktree; AIDT commits the reviewed
+                          prompt after the loop. Immediately after the author, the
+                          workflow measures that just-generated file against the
                           conciseness budget (``prompts/task-prompt.md``): every produced
                           prompt gets a ``budget:`` count line, an over-budget prompt warns
                           and names its longest requirement, and ``--strict`` refuses
@@ -39,17 +40,21 @@ Stages:
                           per-round findings/fixes line (L4.2, design §9.2/§9.3).
                           Verdict-less exits record no gate and no summary.
 
-A real run requires ``main`` and a clean working tree, because the ``task-prompt`` prompt
-requires it. It then refuses (exit 4) when an earlier task in the same ``docs/tasks/*.md``
-phase file is unticked, unless ``--allow-incomplete-prereqs`` is given, then fetches
-``origin`` and refuses (exit 4) when the base branch is behind or diverged from
-``origin/<base>``; ``--no-fetch`` skips both the fetch and the comparison.
+A real run requires the configured base branch (``repo.base_branch``) checked out in the
+control worktree and a clean working tree. It then refuses (exit 4) when an earlier task in
+the same ``docs/tasks/*.md`` phase file is unticked, unless ``--allow-incomplete-prereqs``
+is given, then fetches ``origin`` and refuses (exit 4) when the base branch is behind or
+diverged from ``origin/<base>``; ``--no-fetch`` skips both the fetch and the comparison.
+It derives the branch/worktree name from ``repo.branch_pattern`` and creates the task
+worktree before the author stage; a malformed pattern is a usage error (exit 2) and a git
+refusal is exit 4, both before any stage or run state (EXTRACTION.md §3.2/§3.4).
 A ``--dry-run`` plans the stages without those preconditions, reports the incomplete
-predecessors, and never touches the network.
+predecessors and the planned ``worktree add``, and never touches the network or creates a
+worktree.
 When the author's first output line is ``blocked: <reason>`` the run ends ``blocked``
-(exit 3) with the reason in the run log and on stderr; the leftovers the run can see — an
-uncommitted change under ``docs/task-prompts/`` and a ``{phase}-{task}`` branch it created
-during the run — are reported, never repaired (design §13, L1.3).
+(exit 3) with the reason in the run log and on stderr; the created task worktree and any
+uncommitted change under ``docs/task-prompts/`` in it are reported, never repaired
+(design §13, L1.3).
 The approval gate is off by default; pass ``--require-approval`` to pause for a human decision.
 """
 
@@ -59,6 +64,7 @@ import os
 import re
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 from tempfile import mkdtemp
 
@@ -91,6 +97,7 @@ from aidw.state import (
     utcnow_iso,
 )
 from aidw.verdict import APPROVE, BLOCKED as VERDICT_BLOCKED, parse_verdict
+from aidw.workflows.implement import derive_branch_name
 
 GATE = "approve-task-prompt"
 
@@ -955,24 +962,11 @@ def _parse_blocked(out: str | None) -> str | None:
     return "\n".join(part.strip() for part in remainder if part.strip()).strip()
 
 
-def _probe_branch(repo: Path, name: str) -> tuple[bool, str | None]:
-    """``(answered, sha)`` for ``refs/heads/<name>`` — advisory, never raises (L1.3).
-
-    ``git.probe_ref`` distinguishes "the branch is absent" (rev-parse exit 1) from
-    "git could not answer" (any other non-zero exit — a missing git binary, a timeout,
-    a fatal plumbing error), so a transient pre-author probe failure reads as
-    unanswerable, never as "absent", and cannot yield a spurious "created branch"
-    warning for a branch that legitimately pre-existed (review follow-up F1, PR #16).
-    """
-    try:
-        return git.probe_ref(repo, f"refs/heads/{name}")
-    except Exception:  # advisory probe: it must never stop the blocked report
-        return False, None
-
-
 def _uncommitted_prompt_paths(repo: Path) -> list[str]:
     """Repo-relative paths under ``docs/task-prompts/`` with uncommitted changes.
 
+    ``repo`` is the task worktree (where the author writes), never the control root: the
+    clean-tree preflight already guaranteed the control tree had no prompt changes.
     Uncommitted changes are enumerated one file at a time. ``git status --porcelain``
     collapses a wholly-untracked directory to a single ``?? docs/task-prompts/`` line, so
     untracked paths come from :func:`aidw.git.untracked_paths` instead; a blocked run must
@@ -995,15 +989,14 @@ def _uncommitted_prompt_paths(repo: Path) -> list[str]:
     return paths
 
 
-def _report_blocked_leftovers(
-    repo: Path, *, branch: str, branch_before: tuple[bool, str | None]
-) -> None:
-    """Report — never repair — what a blocked run can see it left behind (design §13).
+def _report_blocked_leftovers(repo: Path, *, branch: str) -> None:
+    """Report — never repair — what a blocked run left behind (design §13, L1.3).
 
-    AIDT never deletes a branch and never discards work, so a blocked run leaves the tree
-    as the author left it and names it instead. The branch is only reported when the
-    pre-author probe saw it absent and the post-block probe sees it present, so a branch
-    that legitimately pre-existed is never blamed on the run.
+    Branch setup is deterministic Python, so the task worktree always exists on a blocked
+    run and is reported unconditionally; the old before/after branch probe is superseded.
+    AIDT never deletes a worktree or discards work, so the report names it instead and the
+    caller leaves it in place for a human to decide. ``repo`` is the task worktree, where
+    the author's uncommitted changes live.
     """
     for rel in _uncommitted_prompt_paths(repo):
         print(
@@ -1011,27 +1004,24 @@ def _report_blocked_leftovers(
             f"{rel} (the run neither committed nor removed it).",
             file=sys.stderr,
         )
-    answered_before, sha_before = branch_before
-    answered_after, sha_after = _probe_branch(repo, branch)
-    if (
-        answered_before
-        and answered_after
-        and sha_before is None
-        and sha_after is not None
-    ):
-        print(
-            f"warning: blocked run created branch `{branch}`; the run does not delete "
-            "it. Remove it manually if it is not wanted.",
-            file=sys.stderr,
-        )
+    print(
+        f"warning: blocked run left the task worktree `{repo}` on branch `{branch}`; the "
+        "run does not delete it. Remove it manually if it is not wanted.",
+        file=sys.stderr,
+    )
 
 
 def _commit_reviewed_prompt(repo: Path, rel: str, phase: str, task: str) -> bool:
-    """Commit the reviewed prompt when the review-fix loop changed it."""
+    """Commit the authored (initial or reviewed) prompt — the single commit point.
+
+    The author no longer commits, so this runs once after the review loop, in the task
+    worktree, on the branch it already has checked out. It skips when ``rel`` is clean.
+    Only the owned prompt path is committed (design §13).
+    """
     if not git.status_short(repo, paths=[rel]):
         return True
     return git.commit_paths(
-        repo, [rel], f"docs: revise task prompt for {phase}-{task} after review"
+        repo, [rel], f"docs: add task prompt for {phase}-{task}"
     )
 
 
@@ -1311,6 +1301,20 @@ def run(
         )
         return 2
 
+    # EXTRACTION.md §3.4: the branch/worktree name comes from `repo.branch_pattern`, not
+    # the task id. A malformed pattern is a usage error (design §14, exit 2) before any
+    # worktree or stage. `derive_branch_name` is reused from the implement workflow so
+    # both workflows share one formatter contract.
+    branch_name = derive_branch_name(repo.branch_pattern, phase=phase, task=task)
+    if branch_name is None:
+        print(
+            f"malformed repo.branch_pattern {repo.branch_pattern!r}: it must be a "
+            "format string referencing both `{phase}` and `{task}` "
+            '(e.g. "{phase}-{task}").',
+            file=sys.stderr,
+        )
+        return 2
+
     # L1.2 (design §8.1, §11): computed once, before the ``dry_run`` split, so the
     # dry-run note and the real-run refusal cannot disagree. ``entries`` already holds
     # every parsed phase file; the filter is on the target's own file and a strictly
@@ -1318,10 +1322,15 @@ def run(
     # line) and never across files (phase 00's unticked backlog must not block phase 02).
     incomplete = _incomplete_predecessors(entries, entry)
 
-    branch = git.current_branch(repo.root)
+    # R4: the control worktree is whichever worktree has `repo.base_branch` checked out;
+    # never a fixed name. The literal "main" stays out of the code.
+    control_branch = git.current_branch(repo.root)
     if dry_run:
-        if branch != "main":
-            print(f"[dry-run] a real run requires `main` (currently `{branch}`).")
+        if control_branch != repo.base_branch:
+            print(
+                "[dry-run] a real run requires the base branch "
+                f"`{repo.base_branch}` (currently `{control_branch}`)."
+            )
         if not git.is_clean(repo.root):
             print("[dry-run] a real run requires a clean working tree.")
         if incomplete:
@@ -1336,9 +1345,10 @@ def run(
             f"`{REMOTE}/{repo.base_branch}`."
         )
     else:
-        if branch != "main":
+        if control_branch != repo.base_branch:
             print(
-                f"`aidw prompt` must run on `main`; currently on `{branch}`.",
+                f"`aidw prompt` must run on the base branch `{repo.base_branch}`; "
+                f"currently on `{control_branch}`.",
                 file=sys.stderr,
             )
             return 4
@@ -1346,7 +1356,7 @@ def run(
             print("working tree is dirty; commit or stash first.", file=sys.stderr)
             return 4
         # Refuse before ``load_all``/``create_run`` so a stale base leaves no run
-        # directory, no ``{phase}-{task}`` branch and no prompt file behind. A refusal
+        # directory, no branch/worktree and no prompt file behind. A refusal
         # on roadmap ordering is deliberately checked before the network fetch: it is a
         # purely local, in-memory condition, so an unreachable ``origin`` must not be
         # spent first.
@@ -1367,14 +1377,53 @@ def run(
         return 2
 
     default_rel = f"docs/task-prompts/{phase}-{task}-prompt.md"
+
+    # --- branch setup: create the task worktree (EXTRACTION.md §3.2) --------- #
+    # Inline Python, before the author stage: P1 must run in the new worktree, and a
+    # refusal must leave no stage record or run state behind. `--dry-run` prints the
+    # plan and creates nothing. `git.add_worktree` returns None (discarding git's
+    # stderr) for a branch already checked out or any other git refusal, so the failure
+    # is a generic actionable exit 4.
+    target = repo
+    if dry_run:
+        planned_worktree = workspace.workspace_root / branch_name
+        print(
+            f"branch-setup (planned): worktree add -b {branch_name} "
+            f"{planned_worktree} {repo.base_branch}"
+        )
+    else:
+        worktree = git.add_worktree(
+            repo.root, branch_name, base_branch=repo.base_branch
+        )
+        if worktree is None:
+            print(
+                f"branch-setup refused: git could not create a worktree for "
+                f"`{branch_name}` from `{repo.base_branch}` at "
+                f"{workspace.workspace_root / branch_name}. The branch may already be "
+                "checked out (one branch, one worktree) or git refused for another "
+                "reason; resolve it and re-run.",
+                file=sys.stderr,
+            )
+            return 4
+        # Re-resolve the target and agents against the worktree: `agent.cwd` was
+        # resolved against the control root and would silently keep P1 and every review
+        # or fix stage in the wrong worktree (§3.2, E2.4's branch-setup order).
+        resolved = TargetRepo.resolve(worktree)
+        target = replace(
+            resolved,
+            base_branch=repo.base_branch,
+            branch_pattern=repo.branch_pattern,
+        )
+        agents, _ = load_all(aidt.root, target.root)
+
     state = create_run(
         runs_root,
-        repo.root,
+        target.root,
         "prompt",
         label=label or f"{phase}-{task}",
         task={"phase": phase, "epic": epic, "task": task, "title": entry.title},
         strict=strict,
-        branch=branch,
+        branch=branch_name,
     )
     directory = run_dir(runs_root, state.run_id)
     logger = RunLogger(directory, stream=stream)
@@ -1389,16 +1438,11 @@ def run(
         [phase, epic, task],
     )
 
-    # L1.3: probe for the author's branch before it runs, so a blocked run can tell a
-    # branch the author created from one that legitimately pre-existed (the author reuses
-    # one based on ``main``). ``--dry-run`` plans no branch and does no comparison.
-    branch_before: tuple[bool, str | None] | None = None
-    if not dry_run:
-        branch_before = _probe_branch(repo.root, f"{phase}-{task}")
-
+    # L1.3: the created worktree is deterministic, so the blocked report names it
+    # unconditionally and the old before/after branch probe is gone. No branch probe runs.
     rec1 = run_stage(
         author,
-        repo_root=repo.root,
+        repo_root=target.root,
         toolkit_root=aidt.root,
         runs_root=runs_root,
         state=state,
@@ -1406,7 +1450,7 @@ def run(
         agents=agents,
         dry_run=dry_run,
     )
-    print_stage(rec1, repo_root=repo.root)
+    print_stage(rec1, repo_root=target.root)
 
     if dry_run:
         rec2 = run_stage(
@@ -1416,7 +1460,7 @@ def run(
                 aidt.prompts_dir / "task-review.md",
                 [default_rel],
             ),
-            repo_root=repo.root,
+            repo_root=target.root,
             toolkit_root=aidt.root,
             runs_root=runs_root,
             state=state,
@@ -1443,16 +1487,13 @@ def run(
     if blocked_reason is not None:
         reason = blocked_reason or "no reason given"
         logger.error(f"task-prompt author reported blocked: {reason}")
-        if branch_before is not None:
-            _report_blocked_leftovers(
-                repo.root, branch=f"{phase}-{task}", branch_before=branch_before
-            )
+        _report_blocked_leftovers(target.root, branch=branch_name)
         state.status = BLOCKED
         save(directory, state)
         print(f"blocked: {reason}", file=sys.stderr)
         return 3
 
-    prompt_path = _resolve_prompt_path(repo.root, rec1, default_rel)
+    prompt_path = _resolve_prompt_path(target.root, rec1, default_rel)
     if prompt_path is None:
         print(
             f"generated task prompt not found at {default_rel}",
@@ -1461,7 +1502,7 @@ def run(
         state.status = FAILED
         save(directory, state)
         return 1
-    rel = prompt_path.relative_to(repo.root).as_posix()
+    rel = prompt_path.relative_to(target.root).as_posix()
     print(f"prompt: {rel}")
     budget_reason = _check_conciseness(prompt_path, rel)
     if budget_reason is not None:
@@ -1475,7 +1516,7 @@ def run(
             save(directory, state)
             return 1
         print(f"warning: {budget_reason}", file=sys.stderr)
-    state.git["branch"] = f"{phase}-{task}"
+    state.git["branch"] = branch_name
     save(directory, state)
 
     verdict: str | None = None
@@ -1512,7 +1553,7 @@ def run(
         pointer = _stage_evidence_pointer(
             stage=name,
             directory=directory,
-            repo=repo,
+            repo=target,
             entry=entry,
             entries=entries,
             rel=rel,
@@ -1525,14 +1566,14 @@ def run(
                 [rel],
                 extra=_with_evidence(pointer, delta),
             ),
-            repo_root=repo.root,
+            repo_root=target.root,
             toolkit_root=aidt.root,
             runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
         )
-        print_stage(rec, repo_root=repo.root)
+        print_stage(rec, repo_root=target.root)
         if rec.status != SUCCEEDED:
             state.status = FAILED
             save(directory, state)
@@ -1651,7 +1692,7 @@ def run(
                         _stage_evidence_pointer(
                             stage=fallback_name,
                             directory=directory,
-                            repo=repo,
+                            repo=target,
                             entry=entry,
                             entries=entries,
                             rel=rel,
@@ -1659,14 +1700,14 @@ def run(
                         f"## Review findings to address\n\n{review_text}",
                     ),
                 ),
-                repo_root=repo.root,
+                repo_root=target.root,
                 toolkit_root=aidt.root,
                 runs_root=runs_root,
                 state=state,
                 logger=logger,
                 agents=agents,
             )
-            print_stage(rec_fix, repo_root=repo.root)
+            print_stage(rec_fix, repo_root=target.root)
             if rec_fix.status != SUCCEEDED:
                 state.status = FAILED
                 save(directory, state)
@@ -1708,7 +1749,7 @@ def run(
                             _stage_evidence_pointer(
                                 stage=fix_name,
                                 directory=directory,
-                                repo=repo,
+                                repo=target,
                                 entry=entry,
                                 entries=entries,
                                 rel=rel,
@@ -1716,14 +1757,14 @@ def run(
                             extra,
                         ),
                     ),
-                    repo_root=repo.root,
+                    repo_root=target.root,
                     toolkit_root=aidt.root,
                     runs_root=runs_root,
                     state=state,
                     logger=logger,
                     agents=agents,
                 )
-                print_stage(rec_fix, repo_root=repo.root)
+                print_stage(rec_fix, repo_root=target.root)
                 if rec_fix.status != SUCCEEDED:
                     state.status = FAILED
                     save(directory, state)
@@ -1748,7 +1789,7 @@ def run(
                     _stage_evidence_pointer(
                         stage=reconcile_name,
                         directory=directory,
-                        repo=repo,
+                        repo=target,
                         entry=entry,
                         entries=entries,
                         rel=rel,
@@ -1764,14 +1805,14 @@ def run(
                     ),
                 ),
             ),
-            repo_root=repo.root,
+            repo_root=target.root,
             toolkit_root=aidt.root,
             runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
         )
-        print_stage(rec_reconcile, repo_root=repo.root)
+        print_stage(rec_reconcile, repo_root=target.root)
         if rec_reconcile.status != SUCCEEDED:
             state.status = FAILED
             save(directory, state)
@@ -1787,7 +1828,7 @@ def run(
     summary = "\n".join(
         [
             f"Task: {phase} {epic} {task} — {entry.title}",
-            f"Prompt: {prompt_path.relative_to(repo.root)}",
+            f"Prompt: {prompt_path.relative_to(target.root)}",
             verdict_line,
         ]
     )
@@ -1820,10 +1861,10 @@ def run(
         print(f"gate {GATE} denied ({outcome.mechanism}); stopping.", file=sys.stderr)
         return 3
 
-    # The initial task-prompt stage commits the prompt, but the review-fix loop runs
-    # afterwards. Commit the reviewed prompt so the branch is clean when the
-    # implementation workflow starts. Only the owned prompt path is committed.
-    if _commit_reviewed_prompt(repo.root, rel, phase, task):
+    # The author no longer commits: this is the single commit point for the authored
+    # (initial or reviewed) prompt, in the task worktree on the branch it already has
+    # checked out. Only the owned prompt path is committed.
+    if _commit_reviewed_prompt(target.root, rel, phase, task):
         logger.info(f"reviewed prompt committed or unchanged: {rel}")
     else:
         logger.error(f"failed to commit reviewed prompt {rel}")
@@ -1836,6 +1877,6 @@ def run(
     state.status = SUCCEEDED
     save(directory, state)
     print("prompt workflow complete")
-    print(f"branch: {phase}-{task}")
+    print(f"branch: {branch_name}")
     print(f"prompt: {rel}")
     return 0

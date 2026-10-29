@@ -11,20 +11,14 @@ epic: $2
 task: $3
 
 ## Instructions
-- Before making any file changes, inspect the current Git branch and working tree.
-- Feasibility check before branching: read the roadmap entry and every spec section it cites, and check whether what the task depends on exists. Do this before creating or switching to the `{phase}-{task}` branch. When authoring cannot proceed, output `blocked: <reason>` as the first line of your final message and change nothing — no branch, no prompt file, no commit, no other edits.
+AIDT owns branch setup (EXTRACTION.md §3.2): `aidw prompt` creates the task branch and its worktree before this stage runs. Do not create, switch, or reset branches yourself — write the prompt file and return its path; AIDT commits the reviewed prompt.
+
+- Feasibility check before writing the prompt file: read the roadmap entry and every spec section it cites, and check whether what the task depends on exists. When authoring cannot proceed, output `blocked: <reason>` as the first line of your final message and change nothing — no prompt file, no other edits.
 - Report `blocked: <reason>` for any of these reasons: a cited spec section is missing or contradicts the roadmap entry; a prerequisite the entry depends on cannot be found (not merged and no branch carrying it); an acceptance condition cannot be made executable without inventing a contract the cited sources do not fix. A `blocked:` line with an empty reason is still a blocked report.
-- The task must be created on a dedicated branch named exactly `{phase}-{task}`, where `{phase}` is the **zero-padded two-digit** form (`03`, not `3`) — e.g. `03-E2.8`. Sub-phases keep the dotted form verbatim (`03.1`, not `03` or `3.1`) — e.g. `03.1-A2`. This branch name is mandatory and must not be shortened, normalized, or replaced with a descriptive alternative. `{phase}` is also the leading token of the roadmap filename below, so the two forms must not diverge.
-- If the current branch is not `main`, stop and report that the prompt cannot proceed until the session is returned to `main`; do not create the prompt or make any other changes.
-- From `main`, create or switch to the dedicated `{phase}-{task}` branch before writing the task prompt. Never write the prompt or any implementation files on `main`.
-- After creating/switching branches, verify and retain the branch name with `git branch --show-current`; it must equal exactly `{phase}-{task}` before continuing.
-- If `{phase}-{task}` already exists, do not silently use another branch. Confirm that it is based on `main`, then use that exact branch; otherwise stop and report the conflict.
 - Read the roadmap document for the phase. It is `./docs/tasks/{phase} - *.md` — the file whose name begins with `{phase} - ` and whose title matches the task's phase (for example `./docs/tasks/03 - Single-Player Loop.md`, or `./docs/tasks/03.1 - Developer Play Tool & Scenario Registry.md` for sub-phase `03.1`). Expand Phase {phase} Epic {epic} task {task} into a full prompt using the `Prompt Format`. Store this prompt in the `docs/task-prompts` folder.
 - Replace every <placeholder> in the `Prompt Format` with specific implementation details.
 - Obey the `Conciseness budget` below. If the draft exceeds it, cut pasted content first (schemas, code, static data, test scripts) and replace with pointers — never cut traps, non-goals, or Done-when checks.
 - Do not invent a material interface the cited spec omits. If a schema field, keying convention, failure contract, or signature this task must implement is not fixed by the spec, stop and report it as a spec gap and update the spec first. A prompt-fixed decision is only acceptable when it is explicitly labelled as such, with its rationale, and the ambiguity is named in the ask-if-ambiguous clause.
-- Before finishing, run `git status --short` and confirm the new prompt is present on the dedicated `{phase}-{task}` branch and no prompt changes were made on `main`.
-- Commit the new prompt file to the `{phase}-{task}` branch with a commit message of `docs: add task prompt for {phase}-{task}`. Do not push.
 - IMPORTANT: When you finish writing the task prompt, return exclusively the path to the prompt file created — or, when blocked, `blocked: <reason>` — and nothing else.
 
 ## Conciseness budget (mandatory)

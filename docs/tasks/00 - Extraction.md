@@ -178,7 +178,7 @@
   - Deliverable: a `branch-setup` core stage + prompt edits.
   - Done when: `impliment-task.md` contains no `git checkout -b`/`git switch -c`, and a test proves the worktree exists before the implement stage starts.
 
-- [ ] **E2.5. `aidw prompt` runs in the control worktree and creates the task worktree**
+- [x] **E2.5. `aidw prompt` runs in the control worktree and creates the task worktree**
   `aidw prompt` requires the control worktree (base branch checked out, clean). It creates the task
   worktree, then runs the author/review/fix stages with `cwd` = the new worktree, and commits the
   reviewed prompt on that branch.

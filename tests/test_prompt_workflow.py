@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import subprocess
 from pathlib import Path
@@ -11,6 +12,7 @@ from typer.testing import CliRunner
 
 from aidw import git, state
 from aidw.cli import app
+from aidw.config import ERROR, Issue
 from aidw.paths import ToolkitPaths, TargetRepo, WorkspacePaths, repo_root, toolkit_root
 from aidw.prompts import PromptError, render_prompt_file
 from aidw.workflows import prompt as prompt_workflow
@@ -19,28 +21,49 @@ from aidw.workflows import prompt as prompt_workflow
 #: fixture in ``conftest.py`` delete any that slip past the isolated ``runs_root``.
 RUN_LABEL = "pytest"
 
-#: Isolated run-state root, matching where the fake stages below write their output.
-RUNS_DIRNAME = Path("aidt") / "runs"
+#: Isolated run-state root, a per-test sibling so it lives outside every worktree
+#: (EXTRACTION.md §3.1).
+_STATE_DIR_SUFFIX = "-state"
 
 
-def _roots(repo: Path) -> dict:
-    """Typed roots for a direct workflow call, isolated under ``repo/RUNS_DIRNAME``.
+def _roots(
+    repo: Path,
+    *,
+    base_branch: str | None = None,
+    branch_pattern: str | None = None,
+) -> dict:
+    """Typed roots for a direct workflow call, isolated under a per-test state dir.
 
     ``WorkspacePaths.resolve`` appends the repo slug, so the runs root is
-    ``workspace.state_root / "runs"`` — under the override, never at it.
+    ``workspace.state_root / "runs"`` — under the override, never at it. The state dir is
+    a sibling of ``repo`` so it never dirties the control worktree (design §13).
     """
     target = TargetRepo.resolve(repo)
+    if base_branch is not None or branch_pattern is not None:
+        overrides = {}
+        if base_branch is not None:
+            overrides["base_branch"] = base_branch
+        if branch_pattern is not None:
+            overrides["branch_pattern"] = branch_pattern
+        target = dataclasses.replace(target, **overrides)
     return {
         "repo": target,
         "aidt": ToolkitPaths.resolve(),
         "workspace": WorkspacePaths.resolve(
-            target, state_dir_override=repo / RUNS_DIRNAME
+            target, state_dir_override=repo.parent / f"{repo.name}{_STATE_DIR_SUFFIX}"
         ),
     }
 
 
 def _runs_root(repo: Path) -> Path:
     return _roots(repo)["workspace"].state_root / "runs"
+
+
+def _task_worktree(repo: Path, branch: str = "03-E4.1") -> Path:
+    """The task worktree AIDT creates at ``<workspace_root>/<branch>`` (EXTRACTION.md §3.2)."""
+    workspace = git.workspace_root(repo)
+    assert workspace is not None, "the fixture must build a real git repository"
+    return (workspace / branch).resolve()
 
 
 def test_git_helpers_types() -> None:
@@ -54,6 +77,7 @@ def test_git_helpers_types() -> None:
 
 def test_prompt_workflow_dry_run(tmp_path: Path, monkeypatch, capsys) -> None:
     _patch_prompt_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(git, "current_branch", lambda repo: "feature-branch")
     code = prompt_workflow.run(
         phase="03",
         epic="E4",
@@ -69,7 +93,13 @@ def test_prompt_workflow_dry_run(tmp_path: Path, monkeypatch, capsys) -> None:
     assert [s.name for s in latest.stages] == ["task-prompt", "task-review-1"]
     assert all(s.status == state.SUCCEEDED for s in latest.stages)
     # L5.3 is post-author only; a dry-run never produces a prompt to measure.
-    assert "budget:" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "budget:" not in out
+    # EXTRACTION.md §3.2: the dry run names the planned worktree and the base-branch
+    # requirement, but creates no worktree and invokes no stage.
+    assert "branch-setup (planned): worktree add -b 03-E4.1" in out
+    assert "a real run requires the base branch `main`" in out
+    assert not _task_worktree(tmp_path).exists()
 
 
 def test_prompt_workflow_unknown_task(tmp_path: Path, monkeypatch) -> None:
@@ -85,18 +115,23 @@ def test_prompt_workflow_unknown_task(tmp_path: Path, monkeypatch) -> None:
     assert code == 2
 
 
-def test_prompt_workflow_requires_main_for_real_run(tmp_path: Path, monkeypatch) -> None:
+def test_prompt_workflow_requires_base_branch_for_real_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """R4: the control guard compares against ``repo.base_branch``, not literal main."""
     _patch_prompt_repo(tmp_path, monkeypatch)
-    monkeypatch.setattr(git, "current_branch", lambda repo: "feature-branch")
     code = prompt_workflow.run(
         phase="03",
         epic="E4",
         task="E4.1",
-        **_roots(tmp_path),
+        **_roots(tmp_path, base_branch="trunk"),
         label=RUN_LABEL,
         dry_run=False,
     )
     assert code == 4
+    assert "must run on the base branch `trunk`" in capsys.readouterr().err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert not _task_worktree(tmp_path).exists()
 
 
 def test_prompt_workflow_requires_clean_tree(tmp_path: Path, monkeypatch) -> None:
@@ -112,6 +147,7 @@ def test_prompt_workflow_requires_clean_tree(tmp_path: Path, monkeypatch) -> Non
         dry_run=False,
     )
     assert code == 4
+    assert state.list_runs(_runs_root(tmp_path)) == []
 
 
 def _init_repo(path: Path) -> None:
@@ -202,29 +238,59 @@ Request changes — one should-fix item remains.
 """
 
 
+def _make_control_repo(
+    tmp_path: Path,
+    *,
+    files: dict[str, str],
+    base_branch: str = "main",
+) -> Path:
+    """Build a real bare repo plus a control worktree at ``tmp_path`` (EXTRACTION.md §3.2).
+
+    The bare repo lives in a unique workspace sibling so branch setup can create
+    ``<workspace_root>/<branch>`` outside the control tree. The control worktree is
+    ``tmp_path`` itself, keeping the existing tests' repo-relative paths valid. All files
+    are committed on ``base_branch`` so a newly created task worktree sees them.
+    """
+    workspace = tmp_path.parent / f"{tmp_path.name}-ws"
+    seed = workspace / "seed"
+    seed.mkdir(parents=True)
+    _run_git(["init", "-q", "-b", base_branch, str(seed)], workspace)
+    for rel, text in files.items():
+        path = seed / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    _run_git(["add", "."], seed)
+    _run_git(["commit", "-qm", "init"], seed)
+    bare = workspace / "bare.git"
+    _run_git(["clone", "--bare", "-q", str(seed), str(bare)], workspace)
+    _run_git(["worktree", "add", "-q", str(tmp_path), base_branch], bare)
+    return workspace
+
+
 def _patch_prompt_repo(
     tmp_path: Path,
     monkeypatch,
     *,
     roadmap: str | None = None,
     extra_files: dict[str, str] | None = None,
+    base_branch: str = "main",
 ) -> None:
-    """A lightweight fake repo (no origin) carrying ``docs/tasks/03 - Test Phase.md``.
+    """A committed bare+control repo (no origin) carrying the roadmap fixtures.
 
     ``roadmap`` defaults to :data:`ROADMAP_FIXTURE`; the default cannot be a literal
     default argument because that fixture is defined later in this module. ``extra_files``
-    adds further phase files for the ``file``-scope tests.
+    adds further phase files for the ``file``-scope tests. The files are committed so
+    branch setup really creates a task worktree from ``base_branch``; ``current_branch``
+    and ``is_clean`` are left unmocked so preflight reads real git.
     """
-    _init_repo(tmp_path)
-    tasks_dir = tmp_path / "docs" / "tasks"
-    tasks_dir.mkdir(parents=True)
-    (tasks_dir / "03 - Test Phase.md").write_text(
-        roadmap if roadmap is not None else ROADMAP_FIXTURE, encoding="utf-8"
-    )
+    files = {
+        "docs/tasks/03 - Test Phase.md": (
+            roadmap if roadmap is not None else ROADMAP_FIXTURE
+        )
+    }
     for name, text in (extra_files or {}).items():
-        (tasks_dir / name).write_text(text, encoding="utf-8")
-    monkeypatch.setattr(git, "current_branch", lambda repo: "main")
-    monkeypatch.setattr(git, "is_clean", lambda repo: True)
+        files[f"docs/tasks/{name}"] = text
+    _make_control_repo(tmp_path, files=files, base_branch=base_branch)
 
 
 def _review_index(stage_name: str) -> int | None:
@@ -265,9 +331,11 @@ def _fake_stages(
     from aidw.state import SUCCEEDED, StageRecord, run_dir
 
     seen: list[tuple[str, list[str], str]] = []
+    repo_roots: list[Path] = []
 
     def fake_run_stage(spec, **kwargs):
         repo = kwargs["repo_root"]
+        repo_roots.append(repo)
         state = kwargs["state"]
         directory = run_dir(kwargs["runs_root"], state.run_id)
         stages = directory / "stages"
@@ -317,7 +385,209 @@ def _fake_stages(
         state.record_stage(record)
         return record
 
+    fake_run_stage.repo_roots = repo_roots
     return seen, fake_run_stage
+
+
+# ---------------------------------------------------------------------------
+# Branch setup: EXTRACTION.md §3.2/§3.4 — the worktree is Python-created before P1
+# ---------------------------------------------------------------------------
+
+
+def test_full_run_creates_one_worktree_keeps_control_clean_and_commits_only_prompt(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The full run creates the task worktree, runs every stage in it, and commits once."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    base_sha = git.rev_parse(tmp_path, "main")
+    before = {worktree.path for worktree in git.worktrees(tmp_path)}
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    worktree = _task_worktree(tmp_path)
+    after = {entry.path for entry in git.worktrees(tmp_path)}
+    assert after - before == {worktree}
+    assert [entry.path for entry in git.worktrees(tmp_path) if entry.branch == "03-E4.1"] == [
+        worktree
+    ]
+    # §3.2 trap: every stage must run with cwd = the new worktree, never the control tree.
+    assert fake.repo_roots and all(root == worktree for root in fake.repo_roots)
+    # The control worktree stays on the base branch and clean; the commit is on the task
+    # branch only and touches exactly the owned prompt path (design §13).
+    assert git.current_branch(tmp_path) == "main"
+    assert git.status_short(tmp_path) == ""
+    assert git.rev_parse(tmp_path, "main") == base_sha
+    assert git.changed_files(worktree, "main") == [
+        "docs/task-prompts/03-E4.1-prompt.md"
+    ]
+    assert git.changed_files(tmp_path, "main") == []
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.git["branch"] == "03-E4.1"
+    assert "branch: 03-E4.1" in capsys.readouterr().out
+
+
+def test_non_default_base_branch_flows_through_and_worktree_branches_from_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R4: a non-``main`` base branch is preflighted and is the worktree's branch point."""
+    _patch_prompt_repo(tmp_path, monkeypatch, base_branch="trunk")
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    base_sha = git.rev_parse(tmp_path, "trunk")
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path, base_branch="trunk"),
+        label=RUN_LABEL,
+        approve_all=True,
+    )
+
+    assert code == 0
+    worktree = _task_worktree(tmp_path)
+    assert git.current_branch(worktree) == "03-E4.1"
+    assert base_sha is not None
+    head = git.rev_parse(worktree, "HEAD")
+    assert head is not None and git.is_ancestor(worktree, base_sha, head) is True
+    assert git.changed_files(worktree, "trunk") == [
+        "docs/task-prompts/03-E4.1-prompt.md"
+    ]
+    assert state.list_runs(_runs_root(tmp_path))[-1].git["branch"] == "03-E4.1"
+
+
+def test_derive_branch_name_default_reproduces_task_id_and_subphase() -> None:
+    assert (
+        prompt_workflow.derive_branch_name("{phase}-{task}", phase="00", task="E2.5")
+        == "00-E2.5"
+    )
+    assert (
+        prompt_workflow.derive_branch_name("{phase}-{task}", phase="03.1", task="A2")
+        == "03.1-A2"
+    )
+
+
+def test_non_default_branch_pattern_names_branch_worktree_and_state_consistently(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    pattern = "ai-{phase}-{task}"
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path, branch_pattern=pattern),
+        label=RUN_LABEL,
+        approve_all=True,
+    )
+
+    assert code == 0
+    branch = "ai-03-E4.1"
+    worktree = _task_worktree(tmp_path, branch)
+    assert git.current_branch(worktree) == branch
+    assert all(root == worktree for root in fake.repo_roots)
+    assert state.list_runs(_runs_root(tmp_path))[-1].git["branch"] == branch
+    assert f"branch: {branch}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["{phase}", "static", "{phase}-{task}-{extra}", "{phase}-{task"],
+)
+def test_malformed_branch_pattern_is_a_usage_error_before_any_worktree(
+    tmp_path: Path, monkeypatch, capsys, pattern: str
+) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path, branch_pattern=pattern),
+        label=RUN_LABEL,
+        approve_all=True,
+    )
+
+    assert code == 2
+    assert "malformed repo.branch_pattern" in capsys.readouterr().err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert len(git.worktrees(tmp_path)) == 1  # the control worktree only
+
+
+def test_invalid_agent_config_refuses_before_worktree_or_run_state(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Initial agent validation must fail before Python creates the task worktree."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        prompt_workflow,
+        "load_all",
+        lambda _aidt_root, _repo_root: (
+            {},
+            [Issue(ERROR, "task-author.yaml", "invalid test configuration")],
+        ),
+    )
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 2
+    assert "invalid test configuration" in capsys.readouterr().err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert len(git.worktrees(tmp_path)) == 1  # the control worktree only
+
+
+def test_branch_already_checked_out_fails_closed_before_any_stage(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """``git.add_worktree`` returns None (one branch, one worktree) → exit 4, no run state."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    existing = git.add_worktree(tmp_path, "03-E4.1")
+    assert existing is not None
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 4
+    assert "branch-setup refused" in capsys.readouterr().err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert [entry.path for entry in git.worktrees(tmp_path) if entry.branch == "03-E4.1"] == [
+        existing
+    ]
+
+
+def test_task_prompt_contains_no_branch_creation_or_commit_instructions() -> None:
+    """The author is already on AIDT's branch; it neither branches nor commits."""
+    text = (toolkit_root() / "prompts" / "task-prompt.md").read_text(encoding="utf-8")
+    for token in (
+        "git checkout -b",
+        "git switch -c",
+        "git branch --show-current",
+        "Commit the new prompt",
+        "before branching",
+        "creating or switching",
+        "must be created on",
+        "current branch is not",
+        "create or switch",
+        "verify and retain",
+    ):
+        assert token not in text, token
+    assert "AIDT owns branch setup" in text
+    assert "creates the task branch and its worktree" in text
+    assert "AIDT commits the reviewed prompt" in text
 
 
 TASK_REVIEW_MULTI_COULD = """\
@@ -454,13 +724,16 @@ def test_review_fix_loop_fixes_blocking_individually_and_batches_could_fix(
     )
     assert "Suggested fix: Pick one consumer-import strategy and align them." in fixes[2][2]
     assert "Add the path update to the deliverables." not in fixes[2][2]
+    # Every author, review, fix, and reconcile stage must stay in the created worktree.
+    worktree = _task_worktree(tmp_path)
+    assert fake.repo_roots and all(root == worktree for root in fake.repo_roots)
 
     out = capsys.readouterr().out
     assert "verdict: Request changes — 3 findings (2 should-fix, 1 could-fix)" in out
     assert "fix 1.1/3: The deliverable leaves a stale path reference [should-fix]" in out
     assert "fix 1.2/3: The prompt is silent on matrix coverage [should-fix]" in out
     assert "fix 1.3/3: 1 could-fix finding combined" in out
-    assert "out:   aidt/runs/" in out and "stages/task-review-1.out.txt" in out
+    assert "stages/task-review-1.out.txt" in out
 
 
 def test_multiple_could_fix_findings_share_one_stage(
@@ -756,12 +1029,13 @@ def test_third_review_is_terminal_and_residual_request_changes_fails_closed(
     assert "revision budget spent" not in captured.out
     # Fixes from rounds 1 and 2 remain as uncommitted human-review material, but no
     # round-3 fix was applied before the fail-closed return (design §8.1, G2).
-    prompt_path = tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+    worktree = _task_worktree(tmp_path)
+    prompt_path = worktree / "docs" / "task-prompts" / "03-E4.1-prompt.md"
     prompt = prompt_path.read_text(encoding="utf-8")
     assert "<!-- fix round 1 -->" in prompt
     assert "<!-- fix round 2 -->" in prompt
     assert "<!-- fix round 3 -->" not in prompt
-    assert git.status_short(tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
+    assert git.status_short(worktree, paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
 
 
 def test_approve_on_the_terminal_review_succeeds(
@@ -1101,7 +1375,7 @@ def test_blocked_dependency_verdict_short_circuits_before_any_fix(
     assert "the dependency branch is the authority" in capsys.readouterr().err
     # Fail closed at the git level too: the prompt is still uncommitted.
     assert (
-        git.status_short(tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
+        git.status_short(_task_worktree(tmp_path), paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
     )
 
 
@@ -1124,7 +1398,7 @@ def test_blocked_verdict_overrides_approve_all(
     assert latest.status == state.BLOCKED
     assert "the dependency branch is the authority" in capsys.readouterr().err
     assert (
-        git.status_short(tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
+        git.status_short(_task_worktree(tmp_path), paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
     )
 
 
@@ -1146,27 +1420,37 @@ def test_blocked_without_findings_does_not_run_fallback_fix(
     assert latest.status == state.BLOCKED
     assert "requires an owner decision" in capsys.readouterr().err
     assert (
-        git.status_short(tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
+        git.status_short(_task_worktree(tmp_path), paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
     )
 
 
 def test_commit_reviewed_prompt_commits_changes(tmp_path: Path) -> None:
+    """_commit_reviewed_prompt commits the prompt and leaves the tree clean.
+
+    The helper is repo-agnostic (it takes the repo it commits in), so a plain fixture
+    repo is the right unit-test seam; the cleanliness assertions must read that same
+    repo, not a task-worktree path that never exists here (#55).
+    """
     _init_repo(tmp_path)
+    rel = "docs/task-prompts/03-E4.1-prompt.md"
+    # Both status assertions read this one target: retargeting the cleanliness check to a
+    # nonexistent path made `status_short` swallow the git failure and return "" (issue
+    # #55), so the check passed whether the tree was clean or dirty. The guard below
+    # fails first if the target cannot observe the dirty prompt, keeping the final
+    # assertion non-vacuous.
+    status_target = tmp_path
     prompt = tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md"
     prompt.parent.mkdir(parents=True)
     prompt.write_text("initial\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
 
-    assert prompt_workflow._commit_reviewed_prompt(
-        tmp_path, "docs/task-prompts/03-E4.1-prompt.md", "03", "E4.1"
-    )
+    assert prompt_workflow._commit_reviewed_prompt(tmp_path, rel, "03", "E4.1")
 
     prompt.write_text("revised\n", encoding="utf-8")
-    assert prompt_workflow._commit_reviewed_prompt(
-        tmp_path, "docs/task-prompts/03-E4.1-prompt.md", "03", "E4.1"
-    )
-    assert git.status_short(tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]) == ""
+    assert git.status_short(status_target, paths=[rel]) != ""  # non-vacuity guard (#55)
+    assert prompt_workflow._commit_reviewed_prompt(tmp_path, rel, "03", "E4.1")
+    assert git.status_short(status_target, paths=[rel]) == ""
 
 
 def test_commit_reviewed_prompt_noop_when_clean(tmp_path: Path) -> None:
@@ -1186,21 +1470,17 @@ ROADMAP_FIXTURE = """# Phase 3: Test Phase
 
 
 def test_review_uses_resolved_path_and_commits(tmp_path: Path, monkeypatch) -> None:
-    """The reviewer must be pointed at the path the author actually created."""
-    _init_repo(tmp_path)
-    tasks_dir = tmp_path / "docs" / "tasks"
-    tasks_dir.mkdir(parents=True)
-    (tasks_dir / "03 - Test Phase.md").write_text(ROADMAP_FIXTURE, encoding="utf-8")
-
-    monkeypatch.setattr(git, "current_branch", lambda repo: "main")
-    monkeypatch.setattr(git, "is_clean", lambda repo: True)
+    """The reviewer is pointed at the path the author created, resolved against the worktree."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
 
     from aidw.state import SUCCEEDED, StageRecord, run_dir
 
     captured: list[list[str]] = []
+    repo_roots: list[Path] = []
 
     def fake_run_stage(spec, **kwargs):
         repo = kwargs["repo_root"]
+        repo_roots.append(repo)
         state = kwargs["state"]
         directory = run_dir(kwargs["runs_root"], state.run_id)
         stages = directory / "stages"
@@ -1240,8 +1520,11 @@ def test_review_uses_resolved_path_and_commits(tmp_path: Path, monkeypatch) -> N
     )
 
     assert code == 0
+    worktree = _task_worktree(tmp_path)
     assert captured == [["docs/task-prompts/03-E4.1.md"]]
-    assert git.status_short(tmp_path, paths=["docs/task-prompts/03-E4.1.md"]) == ""
+    assert all(root == worktree for root in repo_roots)
+    assert git.status_short(worktree, paths=["docs/task-prompts/03-E4.1.md"]) == ""
+    assert git.changed_files(worktree, "main") == ["docs/task-prompts/03-E4.1.md"]
 
 
 # ---------------------------------------------------------------------------
@@ -1260,22 +1543,34 @@ def _explode_stage(*args: object, **kwargs: object) -> object:
 def _origin_and_clone(
     tmp_path: Path, *, roadmap: str = ROADMAP_FIXTURE
 ) -> tuple[Path, Path]:
-    """Build a bare ``origin`` and a clone whose ``main`` carries the roadmap fixture.
+    """Build a bare ``origin`` and a bare+control clone carrying the roadmap fixture.
 
-    The clone is the target repo the workflow drives; ``origin/main`` tracks it. The
-    roadmap fixture is committed and pushed so both the base branch and its remote-tracking
-    ref resolve from the first run.
+    The control worktree at ``tmp_path/clone`` is the target repo the workflow drives; its
+    bare repo is ``tmp_path/clone.git`` and ``origin/main`` resolves from the first run.
+    The real bare+worktree layout lets branch setup create ``tmp_path/03-E4.1`` instead of
+    trying to nest a worktree inside the control tree (EXTRACTION.md §3.2).
     """
-    origin = tmp_path / "origin.git"
-    clone = tmp_path / "clone"
-    _run_git(["init", "-q", "--bare", "-b", "main", str(origin)], tmp_path)
-    _run_git(["clone", "-q", str(origin), str(clone)], tmp_path)
-    tasks_dir = clone / "docs" / "tasks"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _run_git(["init", "-q", "-b", "main", str(seed)], tmp_path)
+    tasks_dir = seed / "docs" / "tasks"
     tasks_dir.mkdir(parents=True)
     (tasks_dir / "03 - Test Phase.md").write_text(roadmap, encoding="utf-8")
-    _run_git(["add", "."], clone)
-    _run_git(["commit", "-qm", "init"], clone)
-    _run_git(["push", "-q", "-u", "origin", "main"], clone)
+    _run_git(["add", "."], seed)
+    _run_git(["commit", "-qm", "init"], seed)
+    origin = tmp_path / "origin.git"
+    _run_git(["clone", "--bare", "-q", str(seed), str(origin)], tmp_path)
+    bare_clone = tmp_path / "clone.git"
+    _run_git(["clone", "--bare", "-q", str(origin), str(bare_clone)], tmp_path)
+    # A bare clone maps refs/heads/* to refs/heads/*, so teach it the normal
+    # remote-tracking refspec and populate origin/main for the preflight comparison.
+    _run_git(
+        ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+        bare_clone,
+    )
+    _run_git(["fetch", "-q", "origin"], bare_clone)
+    clone = tmp_path / "clone"
+    _run_git(["worktree", "add", "-q", str(clone), "main"], bare_clone)
     return origin, clone
 
 
@@ -1454,18 +1749,12 @@ def test_preflight_ahead_warns_and_proceeds(
 def test_preflight_without_origin_warns_and_proceeds(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    repo = tmp_path / "plain"
-    _run_git(["init", "-q", "-b", "main", str(repo)], tmp_path)
-    tasks_dir = repo / "docs" / "tasks"
-    tasks_dir.mkdir(parents=True)
-    (tasks_dir / "03 - Test Phase.md").write_text(ROADMAP_FIXTURE, encoding="utf-8")
-    _run_git(["add", "."], repo)
-    _run_git(["commit", "-qm", "init"], repo)
+    _patch_prompt_repo(tmp_path, monkeypatch)
     _seen, fake = _approve_first_review()
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", **_roots(repo), label=RUN_LABEL, approve_all=True
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
     )
 
     assert code == 0
@@ -1898,7 +2187,7 @@ def test_l12_wrong_branch_refusal_precedes_the_prerequisite_check(
 
     assert code == 4
     err = capsys.readouterr().err
-    assert "must run on `main`" in err
+    assert "must run on the base branch `main`" in err
     assert "earlier tasks in the same file are incomplete" not in err
 
 
@@ -1911,7 +2200,6 @@ def _blocked_author_stages(
     output: str,
     *,
     write_prompt: bool = False,
-    create_branch: str | None = None,
 ):
     """A fake ``run_stage`` whose author returns ``output`` (usually ``blocked: ...``).
 
@@ -1935,8 +2223,6 @@ def _blocked_author_stages(
                 created = repo / "docs" / "task-prompts" / "03-E4.1-prompt.md"
                 created.parent.mkdir(parents=True, exist_ok=True)
                 created.write_text("prompt body\n", encoding="utf-8")
-            if create_branch:
-                _run_git(["branch", create_branch], repo)
 
         out = stages / f"{spec.name}.out.txt"
         out.write_text(output, encoding="utf-8")
@@ -1980,11 +2266,15 @@ def test_l13_blocked_report_ends_the_run_without_authoring(
     assert "Design 09 §5.2 is absent" in _run_log(tmp_path, latest.run_id)
     err = capsys.readouterr().err
     assert "Design 09 §5.2 is absent" in err
-    # Nothing was committed or written under the author's directory.
-    assert git.status_short(tmp_path, paths=["docs/task-prompts"]) == ""
-    assert not (tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
-    assert git.rev_parse(tmp_path, "03-E4.1") is None
-    assert git.rev_parse(tmp_path, "HEAD") is None
+    worktree = _task_worktree(tmp_path)
+    # The worktree Python created is reported unconditionally and kept; nothing was
+    # committed or written under the author's directory.
+    assert "blocked run left the task worktree" in err
+    assert str(worktree) in err and "branch `03-E4.1`" in err
+    assert git.status_short(worktree, paths=["docs/task-prompts"]) == ""
+    assert not (worktree / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
+    assert worktree.is_dir()
+    assert git.current_branch(tmp_path) == "main"
 
 
 def test_l13_blocked_detection_precedes_path_resolution(
@@ -2005,10 +2295,11 @@ def test_l13_blocked_detection_precedes_path_resolution(
     assert seen == ["task-prompt"]
     latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.BLOCKED
-    # The file the author left is not committed and not removed; it is uncommitted.
-    leftover = tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+    # The file the author left in the worktree is not committed and not removed.
+    worktree = _task_worktree(tmp_path)
+    leftover = worktree / "docs" / "task-prompts" / "03-E4.1-prompt.md"
     assert leftover.exists()
-    assert git.status_short(tmp_path, paths=["docs/task-prompts"]).startswith("??")
+    assert git.status_short(worktree, paths=["docs/task-prompts"]).startswith("??")
 
 
 def test_l13_leftover_prompt_is_reported_not_removed(
@@ -2024,102 +2315,32 @@ def test_l13_leftover_prompt_is_reported_not_removed(
 
     assert code == 3
     err = capsys.readouterr().err
+    worktree = _task_worktree(tmp_path)
     assert "docs/task-prompts/03-E4.1-prompt.md" in err
     assert "neither committed nor removed" in err
-    assert (tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
+    assert (worktree / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
 
 
-def test_l13_branch_created_during_run_is_reported_not_deleted(
+def test_l13_blocked_run_reports_created_worktree_unconditionally(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    _origin, clone = _origin_and_clone(tmp_path)
-    _seen, fake = _blocked_author_stages(
-        "blocked: prerequisite missing\n", create_branch="03-E4.1"
-    )
+    """The Python-created worktree is named on every blocked run and never deleted (L1.3)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _blocked_author_stages("blocked: prerequisite missing\n")
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
     )
 
     assert code == 3
+    worktree = _task_worktree(tmp_path)
     err = capsys.readouterr().err
-    assert "created branch" in err and "03-E4.1" in err
-    assert git.rev_parse(clone, "03-E4.1") is not None  # reported, never deleted
-
-
-def test_l13_preexisting_branch_is_not_reported(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    """A branch that existed before the run must not be blamed on the run."""
-    _origin, clone = _origin_and_clone(tmp_path)
-    _run_git(["branch", "03-E4.1"], clone)
-    _seen, fake = _blocked_author_stages("blocked: prerequisite missing\n")
-    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
-
-    code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
-    )
-
-    assert code == 3
-    assert "created branch" not in capsys.readouterr().err
-
-
-def test_l13_unanswerable_branch_probe_does_not_warn(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    """An advisory probe failure must not guess that the author created a branch."""
-    _origin, clone = _origin_and_clone(tmp_path)
-    _seen, fake = _blocked_author_stages(
-        "blocked: prerequisite missing\n", create_branch="03-E4.1"
-    )
-    probes = iter([(False, None), (True, "branch-sha")])
-    monkeypatch.setattr(prompt_workflow, "_probe_branch", lambda *args: next(probes))
-    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
-
-    code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
-    )
-
-    assert code == 3
-    assert "created branch" not in capsys.readouterr().err
-    assert git.rev_parse(clone, "03-E4.1") is not None
-
-
-def test_l13_transient_probe_spawn_failure_does_not_blame_preexisting_branch(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    """A pre-author probe git cannot answer must not read as "the branch is absent".
-
-    Review follow-up F1 (PR #16): the before-probe's git spawn fails transiently while
-    the branch legitimately pre-exists, and the after-probe answers. Collapsing the
-    failed spawn into ``None`` (as ``rev_parse`` alone does) would make the run warn
-    "blocked run created branch" for a branch it did not create.
-    """
-    _origin, clone = _origin_and_clone(tmp_path)
-    _run_git(["branch", "03-E4.1"], clone)  # the branch legitimately pre-exists
-    real_git_out = git._git_out
-    failed_once = [False]
-
-    def flaky_git_out(repo, args, **kwargs):
-        # Fail exactly one spawn of the branch probe (the ref arg carries `^{commit}`);
-        # every other git call is real.
-        if not failed_once[0] and f"refs/heads/03-E4.1" in " ".join(args):
-            failed_once[0] = True
-            return 127, "", "git: not found"
-        return real_git_out(repo, args, **kwargs)
-
-    monkeypatch.setattr(git, "_git_out", flaky_git_out)
-    _seen, fake = _blocked_author_stages("blocked: prerequisite missing\n")
-    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
-
-    code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
-    )
-
-    assert code == 3
-    assert failed_once[0]  # the transient failure was actually injected
-    assert "created branch" not in capsys.readouterr().err
+    assert f"task worktree `{worktree}`" in err
+    assert "branch `03-E4.1`" in err
+    assert "does not delete it" in err
+    assert worktree.is_dir()
+    assert git.rev_parse(tmp_path, "03-E4.1") is not None
 
 
 @pytest.mark.parametrize(
@@ -2192,14 +2413,17 @@ def test_l13_rendered_author_prompt_and_agent_context_state_the_contract() -> No
     )
     assert "blocked: <reason>" in rendered
     assert "a cited spec section is missing or contradicts the roadmap entry" in rendered
-    assert "before creating or switching to the `{phase}-{task}` branch" in rendered
     assert "or, when blocked, `blocked: <reason>`" in rendered
-    # Feasibility is checked before the branch is created or switched to.
-    feasibility = rendered.index(
-        "before creating or switching to the `{phase}-{task}` branch"
+    # EXTRACTION.md §3.2: AIDT owns branch setup, so the author neither branches nor
+    # commits; the feasibility check runs before writing the prompt file.
+    assert "AIDT owns branch setup" in rendered
+    assert "creates the task branch and its worktree" in rendered
+    assert "Feasibility check before writing the prompt file" in rendered
+    assert "before creating or switching" not in rendered
+    assert "create or switch" not in rendered
+    assert rendered.index("AIDT owns branch setup") < rendered.index(
+        "Feasibility check before writing the prompt file"
     )
-    branch = rendered.index("create or switch to the dedicated `{phase}-{task}` branch")
-    assert feasibility < branch
 
     author_md = (toolkit_root() / "agents" / "task-author" / "AGENTS.md").read_text(
         encoding="utf-8"
@@ -2516,25 +2740,19 @@ The conventions channel.
 def _evidence_repo(
     tmp_path: Path, monkeypatch, *, agents_md: str | None = AGENTS_EVIDENCE_FIXTURE
 ) -> Path:
-    """A committed repo (no ``origin``) with a multi-line Done when and a ``D16`` doc.
+    """A committed bare+control repo (no ``origin``) with the evidence fixtures.
 
     Committed so the local base branch resolves to a real sha while ``origin/main``
-    stays absent — the no-origin fixture the base-branch assertion needs.
+    stays absent — the no-origin fixture the base-branch assertion needs — and so branch
+    setup can create a real task worktree from it.
     """
-    _run_git(["init", "-q", "-b", "main", str(tmp_path)], tmp_path)
-    tasks_dir = tmp_path / "docs" / "tasks"
-    tasks_dir.mkdir(parents=True)
-    (tasks_dir / "03 - Test Phase.md").write_text(ROADMAP_EVIDENCE, encoding="utf-8")
-    (tmp_path / "docs" / "migration").mkdir(parents=True)
-    (tmp_path / "docs" / "migration" / "EXTRACTION.md").write_text(
-        EXTRACTION_EVIDENCE_FIXTURE, encoding="utf-8"
-    )
+    files = {
+        "docs/tasks/03 - Test Phase.md": ROADMAP_EVIDENCE,
+        "docs/migration/EXTRACTION.md": EXTRACTION_EVIDENCE_FIXTURE,
+    }
     if agents_md is not None:
-        (tmp_path / "AGENTS.md").write_text(agents_md, encoding="utf-8")
-    _run_git(["add", "."], tmp_path)
-    _run_git(["commit", "-qm", "init"], tmp_path)
-    monkeypatch.setattr(git, "current_branch", lambda repo: "main")
-    monkeypatch.setattr(git, "is_clean", lambda repo: True)
+        files["AGENTS.md"] = agents_md
+    _make_control_repo(tmp_path, files=files)
     return tmp_path
 
 
@@ -2918,12 +3136,13 @@ def test_l33_snapshots_are_not_tracked_and_not_committed(
     assert code == 0
     run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
     snapshot = _snapshot_path(tmp_path, run_id, "task-review-fixes-1-1")
-    rel = snapshot.relative_to(tmp_path).as_posix()
-    assert rel in git.untracked_paths(tmp_path)
-    # The reviewed-prompt commit is a single, path-scoped commit: no snapshot, no
-    # per-stage commits. `.prompt.md` never appears in it (the owned prompt is
-    # `03-E4.1-prompt.md`, which ends in `-prompt.md`).
-    committed = _committed_paths(tmp_path)
+    worktree = _task_worktree(tmp_path)
+    assert snapshot.is_file()
+    assert not snapshot.is_relative_to(worktree)
+    # The reviewed-prompt commit is a single, path-scoped commit on the task branch: no
+    # snapshot, no per-stage commits. `.prompt.md` never appears in it (the owned prompt
+    # is `03-E4.1-prompt.md`, which ends in `-prompt.md`).
+    committed = _committed_paths(worktree)
     assert committed == ["docs/task-prompts/03-E4.1-prompt.md"]
     assert all(not path.endswith(".prompt.md") for path in committed)
     # Snapshots are plain run-directory artifacts, not a new state-schema field.
@@ -3724,7 +3943,7 @@ def test_l51_rendered_author_prompt_carries_the_review_order_self_check() -> Non
 
     # L1.3's blocked/feasibility contract still renders (its own test stays green).
     assert "blocked: <reason>" in rendered
-    assert "before creating or switching to the `{phase}-{task}` branch" in rendered
+    assert "Feasibility check before writing the prompt file" in rendered
 
     lines = _l51_self_check_lines(rendered)
     # Heading, setup and the nine checks — never a transcription of the review order
@@ -3987,6 +4206,9 @@ def _run_l53_case(
         prompts_dir.mkdir(parents=True, exist_ok=True)
         for name, text in sibling_prompts.items():
             (prompts_dir / name).write_text(text, encoding="utf-8")
+        # Commit the siblings so the real clean-tree preflight still passes.
+        _run_git(["add", "."], tmp_path)
+        _run_git(["commit", "-qm", "siblings"], tmp_path)
     seen, fake = _fake_stages(
         "## Verdict\n\n**Approve**\n",
         approve_review=1,
@@ -4069,7 +4291,7 @@ def test_l53_strict_over_budget_refuses_before_review(
     assert [name for name, _, _ in seen] == ["task-prompt"]
     # The author output remains in place after refusal; strict mode does not undo its
     # committed/agent-owned prompt (design §13, L5.3 trap).
-    generated = tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+    generated = _task_worktree(tmp_path) / "docs" / "task-prompts" / "03-E4.1-prompt.md"
     assert generated.read_text(encoding="utf-8") == L53_OVER_BYTES_PROMPT
     # A verdict-less exit records no gate and no new gate-decision vocabulary (L4.2).
     assert latest.gates == []
