@@ -1423,22 +1423,32 @@ def test_blocked_without_findings_does_not_run_fallback_fix(
 
 
 def test_commit_reviewed_prompt_commits_changes(tmp_path: Path) -> None:
+    """_commit_reviewed_prompt commits the prompt and leaves the tree clean.
+
+    The helper is repo-agnostic (it takes the repo it commits in), so a plain fixture
+    repo is the right unit-test seam; the cleanliness assertions must read that same
+    repo, not a task-worktree path that never exists here (#55).
+    """
     _init_repo(tmp_path)
+    rel = "docs/task-prompts/03-E4.1-prompt.md"
+    # Both status assertions read this one target: retargeting the cleanliness check to a
+    # nonexistent path made `status_short` swallow the git failure and return "" (issue
+    # #55), so the check passed whether the tree was clean or dirty. The guard below
+    # fails first if the target cannot observe the dirty prompt, keeping the final
+    # assertion non-vacuous.
+    status_target = tmp_path
     prompt = tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md"
     prompt.parent.mkdir(parents=True)
     prompt.write_text("initial\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
 
-    assert prompt_workflow._commit_reviewed_prompt(
-        tmp_path, "docs/task-prompts/03-E4.1-prompt.md", "03", "E4.1"
-    )
+    assert prompt_workflow._commit_reviewed_prompt(tmp_path, rel, "03", "E4.1")
 
     prompt.write_text("revised\n", encoding="utf-8")
-    assert prompt_workflow._commit_reviewed_prompt(
-        tmp_path, "docs/task-prompts/03-E4.1-prompt.md", "03", "E4.1"
-    )
-    assert git.status_short(_task_worktree(tmp_path), paths=["docs/task-prompts/03-E4.1-prompt.md"]) == ""
+    assert git.status_short(status_target, paths=[rel]) != ""  # non-vacuity guard (#55)
+    assert prompt_workflow._commit_reviewed_prompt(tmp_path, rel, "03", "E4.1")
+    assert git.status_short(status_target, paths=[rel]) == ""
 
 
 def test_commit_reviewed_prompt_noop_when_clean(tmp_path: Path) -> None:
