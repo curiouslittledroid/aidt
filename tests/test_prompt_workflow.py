@@ -130,6 +130,7 @@ def test_prompt_workflow_requires_base_branch_for_real_run(
     )
     assert code == 4
     assert "must run on the base branch `trunk`" in capsys.readouterr().err
+    assert state.list_runs(_runs_root(tmp_path)) == []
     assert not _task_worktree(tmp_path).exists()
 
 
@@ -146,6 +147,7 @@ def test_prompt_workflow_requires_clean_tree(tmp_path: Path, monkeypatch) -> Non
         dry_run=False,
     )
     assert code == 4
+    assert state.list_runs(_runs_root(tmp_path)) == []
 
 
 def _init_repo(path: Path) -> None:
