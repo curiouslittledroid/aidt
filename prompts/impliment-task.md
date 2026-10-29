@@ -26,19 +26,11 @@ response instead of doing it.
 ## Instructions
 Carefully follow all the instructions in `task-prompt-file` prompt.
 
-### Branch setup (do this first, before any code)
+### Branch setup
 
-The task will specify a branch name (e.g. `3-D3`). Before creating or resetting anything:
-
-1. Check if the branch already exists locally: `git branch --list <branch-name>`
-2. Check if it exists on the remote: `git ls-remote --heads origin <branch-name>`
-3. **If the branch exists locally and has commits not on `main` (`git log <branch> --not main`):**
-   - Inspect what's there (`git diff --stat main...<branch>`).
-   - Those commits represent prior work (docs, specs, partial implementation). **Do not `git reset --hard`** — you would destroy that work.
-   - If the branch is just docs/specs/task-prompts (no implementation code), check it out and continue from where it left off, keeping those files.
-   - If the branch already has implementation code that conflicts with the task, **stop and ask** before overwriting anything.
-4. **If the branch does not exist:** create it fresh from `main` (`git checkout -b <branch-name>`).
-5. Verify with `git branch --show-current`.
+AIDT owns branch setup (EXTRACTION.md §3.2): `aidw implement` creates the task branch and its
+worktree before any agent stage runs. Do not create, switch, or reset branches yourself — it
+already ran the equivalent in Python.
 
 ### Before you build (verify the constraint, not just the instruction)
 

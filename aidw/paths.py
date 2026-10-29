@@ -158,6 +158,10 @@ class TargetRepo:
     git_dir: Path
     common_dir: Path
     base_branch: str = "main"
+    #: Branch and worktree name derived from task ids (EXTRACTION.md §3.4). Until E3
+    #: loads ``aidw/config.yaml`` this mirrors ``base_branch``: a hardcoded default on
+    #: the frozen dataclass, overridable by constructing/replacing a ``TargetRepo``.
+    branch_pattern: str = "{phase}-{task}"
 
     @classmethod
     def resolve(

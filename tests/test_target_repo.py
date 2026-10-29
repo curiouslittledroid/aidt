@@ -67,6 +67,7 @@ def test_linked_worktree_exposes_distinct_git_and_common_dirs(tmp_path: Path) ->
     assert target.common_dir == bare.resolve()
     assert target.git_dir != target.common_dir
     assert target.base_branch == "main"
+    assert target.branch_pattern == "{phase}-{task}"
 
 
 def test_subdirectory_walks_up_to_the_worktree_root(tmp_path: Path) -> None:
@@ -226,9 +227,16 @@ def test_plain_clone_matches_repo_root_and_uses_dot_git(
 # ---------------------------------------------------------------------------
 
 
-def test_fields_are_exactly_the_four_contract_fields() -> None:
+def test_fields_are_exactly_the_five_contract_fields() -> None:
+    # E2.4 adds ``branch_pattern`` (EXTRACTION.md §3.4), mirroring ``base_branch``.
     names = [field.name for field in dataclasses.fields(TargetRepo)]
-    assert names == ["root", "git_dir", "common_dir", "base_branch"]
+    assert names == [
+        "root",
+        "git_dir",
+        "common_dir",
+        "base_branch",
+        "branch_pattern",
+    ]
 
 
 def test_every_resolved_path_is_absolute_and_resolved(
