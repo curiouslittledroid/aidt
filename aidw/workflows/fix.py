@@ -84,6 +84,23 @@ def _latest_fix_run(runs_root: Path, branch: str) -> RunState | None:
     return matches[-1] if matches else None
 
 
+def _filter_force_model(warnings: list[Issue]) -> list[Issue]:
+    """The warnings ``--force-model`` overrides (design §5 independence check).
+
+    ``reviewer != author`` is emitted by ``check_independence`` from inside
+    ``load_all`` and ``differs from the fixer`` by the reviewer-rotation preflight;
+    ``--force-model`` accepts the model coincidence, so neither may fail a strict
+    run. Both the control-root preflight and the reloaded PR-head worktree check
+    must apply this: they load the same toolkit agent configs, so the warning is
+    identical in both (issue #58).
+    """
+    return [
+        w
+        for w in warnings
+        if "reviewer != author" not in w.message and "differs from the fixer" not in w.message
+    ]
+
+
 def _followup_summary(selection: github.ScriptResult, round_index: int) -> str:
     payload = github.parse_json_output(selection.stdout) or {}
     selected = payload.get("selected") or {}
@@ -208,11 +225,10 @@ def run(
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
     if force_model:
-        warnings = [
-            w
-            for w in warnings
-            if "reviewer != author" not in w.message and "differs from the fixer" not in w.message
-        ]
+        # The rotation warning below is appended *after* this filter: it reports the
+        # workflow's own re-review pairing, not a configured reviewer/author pair,
+        # so ``--force-model`` deliberately does not override it.
+        warnings = _filter_force_model(warnings)
 
     # Reviewer rotation: the re-review must not run on the fixer's model.
     if all(aid in agents for aid in ("fixer", "tester", "code-reviewer")):
@@ -306,6 +322,10 @@ def run(
         agents, issues = load_all(aidt.root, repo.root)
         reloaded_errors = [i for i in issues if i.level == ERROR]
         reloaded_warnings = [i for i in issues if i.level == WARNING]
+        if force_model:
+            # Same override as the control-root preflight: the reloaded configs are
+            # the toolkit's agent configs, so the same warning reappears here (issue #58).
+            reloaded_warnings = _filter_force_model(reloaded_warnings)
         if reloaded_errors or (strict and reloaded_warnings):
             print(
                 format_issues(reloaded_errors + (reloaded_warnings if strict else [])),
