@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from aidw import findings as findings_mod
@@ -50,6 +51,7 @@ from aidw.state import (
     utcnow_iso,
 )
 from aidw.verdict import APPROVE, BLOCKED as VERDICT_BLOCKED, parse_verdict
+from aidw.workflows.implement import worktree_add_command
 
 GATE_FOLLOWUPS = "approve-followups"
 GATE_FIX_PR = "approve-fix-pr"
@@ -233,27 +235,32 @@ def run(
         print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
         return 2
 
-    branch = git.current_branch(repo.root)
+    # --- preflight: gh, PR exists, targets main (design §8.4) ---------------- #
+    # ``gh`` missing and a missing PR are read failures: the refusals stay real-run
+    # only, but the ``pr_view`` read itself runs in dry-run too (E2.6 req 6), so the PR
+    # head resolves in both modes and ``git.current_branch`` is gone entirely.
     pr_info: dict = {}
+    branch: str | None = None
+    worktree: Path | None = None
+
+    if not dry_run and not github.gh_available():
+        print("`gh` was not found on PATH.", file=sys.stderr)
+        return 4
+
+    view = github.pr_view(repo.root, pr) if github.gh_available() else None
 
     if not dry_run:
-        if not github.gh_available():
-            print("`gh` was not found on PATH.", file=sys.stderr)
-            return 4
-        view = github.pr_view(repo.root, pr)
         if view is None:
             print(f"PR #{pr} was not found (or `gh` failed).", file=sys.stderr)
             return 2
-        pr_info = view
         if view.get("baseRefName") != "main":
             print(f"PR #{pr} targets `{view.get('baseRefName')}`, not `main`.", file=sys.stderr)
             return 4
-        if branch != view.get("headRefName"):
-            print(
-                f"current branch `{branch}` is not the PR head `{view.get('headRefName')}`.",
-                file=sys.stderr,
-            )
-            return 4
+
+    pr_info = view or {}
+    branch = pr_info.get("headRefName")
+
+    if not dry_run:
         existing = _latest_fix_run(runs_root, branch) if branch else None
         if existing is not None and existing.status == RUNNING:
             print(
@@ -266,6 +273,56 @@ def run(
     if max_iterations <= 0:
         print("--max-iterations must be positive.", file=sys.stderr)
         return 2
+
+    # --- locate the PR-head worktree (E2.6 req 3) ---------------------------- #
+    # The PR head is authoritative, not the control worktree's current branch. A
+    # missing worktree is a preflight refusal (exit 4, design §14) in a real run; a
+    # dry run prints the corrective command as planned output and plans the F-rounds
+    # against ``repo.root`` (the branch is known, there is just no worktree to plan in).
+    if branch:
+        worktree = git.worktree_for_branch(repo.root, branch)
+    if branch and worktree is None:
+        command = worktree_add_command(workspace, branch, repo.base_branch)
+        if dry_run:
+            print(f"worktree (planned): {(workspace.workspace_root / branch).resolve()}")
+            print(f"branch-setup (planned): {command}")
+        else:
+            print(
+                f"branch-setup refused: no worktree for `{branch}`. "
+                f"Create it first:\n  {command}",
+                file=sys.stderr,
+            )
+            return 4
+    elif worktree is not None:
+        # Re-resolve the target and agents against the worktree, and use it for every
+        # stage, every ``github.*`` read of the tree, and ``create_run`` below, so
+        # ``state.json``'s ``repo_root`` records the worktree (mirroring implement).
+        resolved = TargetRepo.resolve(worktree)
+        repo = replace(
+            resolved,
+            base_branch=repo.base_branch,
+            branch_pattern=repo.branch_pattern,
+        )
+        agents, issues = load_all(aidt.root, repo.root)
+        reloaded_errors = [i for i in issues if i.level == ERROR]
+        reloaded_warnings = [i for i in issues if i.level == WARNING]
+        if reloaded_errors or (strict and reloaded_warnings):
+            print(
+                format_issues(reloaded_errors + (reloaded_warnings if strict else [])),
+                file=sys.stderr,
+            )
+            return 2
+        if dry_run:
+            print(f"worktree (planned): {worktree}")
+    else:
+        # An unanswerable PR read (``gh`` missing, or the chain's placeholder PR 0):
+        # plan against the control root and keep going (E2.6 req 6), mirroring the
+        # existing ``child: unknown`` line rather than refusing.
+        reason = "`gh` not found" if not github.gh_available() else "PR head unknown"
+        print(f"branch: unknown ({reason})")
+
+    if branch:
+        print(f"branch: {branch}")
 
     state = create_run(
         runs_root,

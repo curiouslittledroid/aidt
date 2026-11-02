@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from aidw import git, github
+from aidw.config import ERROR, Issue
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import SUCCEEDED, StageRecord, run_dir
 from aidw.workflows import fix as fix_workflow
@@ -27,9 +28,49 @@ Suggested fix: Guard the empty case.
 """
 
 
+def _git_run(directory: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=directory,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+
 def _init_repo(path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
     (path / "aidt").mkdir()
+
+
+def _make_bare_with_control(tmp_path: Path) -> tuple[Path, Path]:
+    """Bare repo plus the ``main`` control worktree (the §3.2 bootstrap layout)."""
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git_run(seed, "init", "-q", "-b", "main")
+    (seed / "f.txt").write_text("x\n", encoding="utf-8")
+    _git_run(seed, "add", ".")
+    _git_run(seed, "commit", "-qm", "init")
+    bare = tmp_path / "bare.git"
+    _git_run(tmp_path, "clone", "--bare", "-q", str(seed), str(bare))
+    control = tmp_path / "main"
+    _git_run(bare, "worktree", "add", "-q", str(control), "main")
+    return bare, control
+
+
+def _control_only(tmp_path: Path) -> Path:
+    """Control root with **no** PR-head worktree (the missing-worktree layout, E2.6)."""
+    _bare, control = _make_bare_with_control(tmp_path)
+    return control
+
+
+def _fix_layout(tmp_path: Path, branch: str = "03-E4.1") -> tuple[Path, Path]:
+    """Control root plus the PR-head worktree created with real git (E2.6)."""
+    _bare, control = _make_bare_with_control(tmp_path)
+    worktree = git.add_worktree(control, branch)
+    assert worktree is not None
+    return control, worktree
 
 
 def _roots(repo: Path) -> dict:
@@ -80,11 +121,13 @@ class _FakeStages:
     def __init__(self, review_text: str = APPROVE_REVIEW) -> None:
         self.names: list[str] = []
         self.specs: list = []
+        self.repo_roots: list[Path] = []
         self.review_text = review_text
 
     def __call__(self, spec, **kwargs):
         self.names.append(spec.name)
         self.specs.append(spec)
+        self.repo_roots.append(kwargs["repo_root"])
         directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
@@ -104,10 +147,9 @@ class _FakeStages:
         return record
 
 
-def _patch(monkeypatch, *, branch="03-E4.1", select_impl=None, view=None):
+def _patch(monkeypatch, *, branch="03-E4.1", select_impl=None, view=None, gh=True):
     monkeypatch.setattr(fix_workflow, "load_all", lambda aidt, repo: ({}, []))
-    monkeypatch.setattr(git, "current_branch", lambda repo: branch)
-    monkeypatch.setattr(github, "gh_available", lambda: True)
+    monkeypatch.setattr(github, "gh_available", lambda: gh)
     monkeypatch.setattr(
         github,
         "pr_view",
@@ -120,39 +162,41 @@ def _patch(monkeypatch, *, branch="03-E4.1", select_impl=None, view=None):
 
 
 def test_dry_run_lists_child_and_plans(tmp_path: Path, monkeypatch, capsys) -> None:
-    _init_repo(tmp_path)
+    control, worktree = _fix_layout(tmp_path)
     _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
     stages = _FakeStages()
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
-    code = fix_workflow.run(pr=7, **_roots(tmp_path), dry_run=True)
+    code = fix_workflow.run(pr=7, **_roots(control), dry_run=True)
 
     assert code == 0
     out = capsys.readouterr().out
     assert "child:  #101 Fix the loop" in out
     assert "iter1-fix-next-review-followup" in out
     assert "review-findings-to-github" in out
+    # The PR-head worktree is located and planned against (E2.6 req 3/req 6).
+    assert f"worktree (planned): {worktree}" in out
     assert stages.names[0] == "round1-approve-review-followups"
+    assert stages.repo_roots and all(root == worktree for root in stages.repo_roots)
 
 
 def test_no_available_child_is_success(tmp_path: Path, monkeypatch) -> None:
-    _init_repo(tmp_path)
+    control, worktree = _fix_layout(tmp_path)
     _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
     stages = _FakeStages()
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
-    code = fix_workflow.run(
-        pr=7, **_roots(tmp_path), approve_all=True
-    )
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
 
     assert code == 0
     assert stages.names == ["round1-approve-review-followups"]
+    assert stages.repo_roots == [worktree]
     # The approve step must not succeed on the agent's exit code alone (design §10).
     assert callable(stages.specs[0].verify)
 
 
 def test_clean_iteration_closes_child(tmp_path: Path, monkeypatch) -> None:
-    _init_repo(tmp_path)
+    control, worktree = _fix_layout(tmp_path)
     _patch(
         monkeypatch,
         select_impl=_select_seq([_select_ok(), _select_ok(), _select_none()]),
@@ -160,9 +204,7 @@ def test_clean_iteration_closes_child(tmp_path: Path, monkeypatch) -> None:
     stages = _FakeStages(APPROVE_REVIEW)
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
-    code = fix_workflow.run(
-        pr=7, **_roots(tmp_path), approve_all=True
-    )
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
 
     assert code == 0
     assert stages.names == [
@@ -171,14 +213,52 @@ def test_clean_iteration_closes_child(tmp_path: Path, monkeypatch) -> None:
         "iter1-test",
         "iter1-code-review",
     ]
-    state = next(_runs_root(tmp_path).iterdir())
+    assert all(root == worktree for root in stages.repo_roots)
+    state = next(_runs_root(control).iterdir())
     payload = json.loads((state / "artifacts" / "fix.json").read_text(encoding="utf-8"))
     assert payload["iterations"] == 1
     assert payload["closed_issues"][0]["number"] == 101
 
 
+def test_run_state_records_the_pr_head_worktree(tmp_path: Path, monkeypatch) -> None:
+    control, worktree = _fix_layout(tmp_path)
+    _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
+    monkeypatch.setattr(fix_workflow, "run_stage", _FakeStages())
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
+
+    state = fix_workflow.list_runs(_runs_root(control))[-1]
+    assert state.repo_root == str(worktree)
+
+
+def test_reloaded_worktree_config_error_is_usage_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, worktree = _fix_layout(tmp_path)
+    _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
+    calls: list[Path] = []
+
+    def load_for_root(_aidt: Path, repo_root: Path):
+        calls.append(repo_root)
+        if repo_root == worktree:
+            return {}, [Issue(ERROR, "config", "bad config in PR worktree")]
+        return {}, []
+
+    monkeypatch.setattr(fix_workflow, "load_all", load_for_root)
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 2
+    assert calls == [control.resolve(), worktree]
+    assert stages.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
 def test_findings_trigger_publish_and_second_approval(tmp_path: Path, monkeypatch) -> None:
-    _init_repo(tmp_path)
+    control, _worktree = _fix_layout(tmp_path)
     _patch(
         monkeypatch,
         select_impl=_select_seq([_select_ok(), _select_ok(), _select_ok(), _select_none()]),
@@ -186,45 +266,43 @@ def test_findings_trigger_publish_and_second_approval(tmp_path: Path, monkeypatc
     stages = _FakeStages(FINDINGS_REVIEW)
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
-    code = fix_workflow.run(
-        pr=7, **_roots(tmp_path), approve_all=True
-    )
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
 
     assert code == 0
     assert "iter1-review-findings-to-github" in stages.names
     assert "round2-approve-review-followups" in stages.names
-    gate_names = [g.name for g in _gates(tmp_path)]
+    gate_names = [g.name for g in _gates(control)]
     assert gate_names == ["approve-followups", "approve-followups"]
 
 
-def _gates(tmp_path: Path):
+def _gates(repo: Path):
     from aidw import state as state_mod
 
-    run = state_mod.list_runs(_runs_root(tmp_path))[-1]
+    run = state_mod.list_runs(_runs_root(repo))[-1]
     return run.gates
 
 
 def test_gate_denied_stops_before_approver(tmp_path: Path, monkeypatch) -> None:
-    _init_repo(tmp_path)
+    control, _worktree = _fix_layout(tmp_path)
     _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
     stages = _FakeStages()
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
     # No --yes and a non-interactive session: the gate fails closed.
-    code = fix_workflow.run(pr=7, **_roots(tmp_path))
+    code = fix_workflow.run(pr=7, **_roots(control))
 
     assert code == 3
     assert stages.names == []
 
 
 def test_max_iterations_bounds_the_loop(tmp_path: Path, monkeypatch) -> None:
-    _init_repo(tmp_path)
+    control, _worktree = _fix_layout(tmp_path)
     _patch(monkeypatch, select_impl=_select_seq([_select_ok(), _select_ok()]))
     stages = _FakeStages(APPROVE_REVIEW)
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
     code = fix_workflow.run(
-        pr=7, **_roots(tmp_path), approve_all=True, max_iterations=1
+        pr=7, **_roots(control), approve_all=True, max_iterations=1
     )
 
     assert code == 3
@@ -242,15 +320,63 @@ def test_preflight_rejects_non_main_base(tmp_path: Path, monkeypatch) -> None:
     assert fix_workflow.run(pr=7, **_roots(tmp_path)) == 4
 
 
-def test_preflight_rejects_branch_mismatch(tmp_path: Path, monkeypatch) -> None:
-    _init_repo(tmp_path)
-    _patch(
-        monkeypatch,
-        branch="other",
-        view={"number": 7, "url": "u", "baseRefName": "main", "headRefName": "03-E4.1"},
+def test_missing_pr_head_worktree_is_refused_with_the_command(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control = _control_only(tmp_path)  # PR head known, no local worktree
+    _patch(monkeypatch)
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control))
+
+    assert code == 4
+    assert stages.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    command = (
+        f"git -C {tmp_path / 'main'} worktree add -b 03-E4.1 "
+        f"{tmp_path / '03-E4.1'} main"
     )
-    monkeypatch.setattr(fix_workflow, "run_stage", _FakeStages())
-    assert fix_workflow.run(pr=7, **_roots(tmp_path)) == 4
+    assert command in capsys.readouterr().err
+
+
+def test_missing_pr_head_worktree_dry_run_plans_the_command(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control = _control_only(tmp_path)
+    _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), dry_run=True)
+
+    assert code == 0
+    out = capsys.readouterr().out
+    command = (
+        f"git -C {tmp_path / 'main'} worktree add -b 03-E4.1 "
+        f"{tmp_path / '03-E4.1'} main"
+    )
+    assert f"branch-setup (planned): {command}" in out
+    assert "branch: 03-E4.1" in out
+    # No worktree to plan in: the F-rounds fall back to the control root, still exit 0.
+    assert stages.repo_roots and all(root == control for root in stages.repo_roots)
+
+
+def test_dry_run_unanswerable_pr_read_is_branch_unknown(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control = _control_only(tmp_path)
+    _patch(monkeypatch, gh=False, select_impl=_select_seq([_select_ok()]))
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=0, **_roots(control), dry_run=True)
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "branch: unknown (`gh` not found)" in out
+    assert stages.repo_roots and all(root == control for root in stages.repo_roots)
 
 
 def test_preflight_missing_pr(tmp_path: Path, monkeypatch) -> None:

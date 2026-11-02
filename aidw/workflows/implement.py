@@ -16,17 +16,21 @@ I6 pr                             agent pr-publisher (fresh)
 ``I2`` and ``I4`` touch disjoint trees and are safe to run concurrently in principle,
 but v1 runs every stage serially (``--parallel`` is accepted and deferred to Phase 7).
 
-Branch setup is a Python stage: before I1, ``run()`` derives the branch/worktree name
-from ``repo.branch_pattern`` and creates the worktree (``git.add_worktree``), then
-re-resolves the target and agents so every stage runs in it (EXTRACTION.md §3.2). It no
-longer refuses to run on ``main`` or on a branch that does not match the task id — the
-worktree is born on ``repo.base_branch`` — but still refuses when another implement run
-for the branch is marked ``running`` unless ``--resume``.
+Branch setup is a Python stage: ``run()`` derives the branch/worktree name from
+``repo.branch_pattern`` and **locates** the existing worktree (``git.worktree_for_branch``,
+EXTRACTION.md §3.2) — ``aidw prompt`` (E2.5) is what creates it and commits the task
+prompt inside it. When the worktree is missing, ``run()`` prints the exact ``worktree
+add`` command and refuses (exit 4, design §14) without creating anything. The located
+worktree is re-resolved into the target and agents so every stage runs in it. It no
+longer refuses to run on ``main`` or on a branch that does not match the task id, but
+still refuses when another implement run for the branch is marked ``running`` unless
+``--resume``.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import string
 import sys
@@ -96,6 +100,65 @@ class PlanStage:
             list(self.variables),
             extra=self.extra,
         )
+
+
+def worktree_add_command(
+    workspace: WorkspacePaths, branch: str, base_branch: str
+) -> str:
+    """The copy-pasteable §3.2 per-task worktree command (E2.6 req 4).
+
+    Prompt-fixed to §3.2's per-task command with ``base_branch`` substituted for the
+    literal ``main``: ``-C`` points at the base-branch worktree, so the new worktree is
+    linked off the configured base. ``workspace.workspace_root`` is absolute, so every
+    path in the returned string is absolute and the line can be pasted as-is.
+    """
+    root = workspace.workspace_root
+    return (
+        f"git -C {root / base_branch} worktree add -b {branch} "
+        f"{root / branch} {base_branch}"
+    )
+
+
+def _resolve_prompt_argument(
+    task_prompt_path: Path, control_root: Path, worktree_root: Path
+) -> tuple[Path, str] | None:
+    """Resolve the task-prompt argument inside the task worktree (E2.6 req 2).
+
+    Returns ``(prompt_path, prompt_rel)`` where ``prompt_rel`` is the repo-relative
+    subpath used by I1 and I5, or ``None`` when an absolute argument lives inside
+    neither the control root nor the worktree (a usage error). Three argument shapes:
+
+    * relative — a repo-relative subpath, resolved against ``worktree_root`` (never the
+      control root or the cwd);
+    * absolute under the control root — re-based by its repo-relative subpath;
+    * absolute under the worktree root — resolved as-is (what the chain hands over).
+
+    Pure apart from ``Path.resolve`` on the arguments; no file existence check here
+    (the caller owns the real-run-only ``is_file`` refusal).
+    """
+    raw = Path(task_prompt_path)
+    if not raw.is_absolute():
+        rel = Path(os.path.normpath(raw))
+        candidate = (worktree_root / rel).resolve()
+        try:
+            candidate.relative_to(worktree_root.resolve())
+        except ValueError:
+            return None
+        return candidate, rel.as_posix()
+    resolved = raw.resolve()
+    control = control_root.resolve()
+    worktree = worktree_root.resolve()
+    try:
+        rel = resolved.relative_to(control)
+    except ValueError:
+        pass
+    else:
+        return (worktree / rel).resolve(), rel.as_posix()
+    try:
+        rel = resolved.relative_to(worktree)
+    except ValueError:
+        return None
+    return resolved, rel.as_posix()
 
 
 def parse_task_id(prompt_path: Path) -> tuple[str, str, str] | None:
@@ -285,27 +348,15 @@ def run(
     deny = set(deny_gates or [])
     runs_root = workspace.state_root / "runs"
 
-    # --- resolve the task prompt and derive the task id --------------------- #
+    # --- task id + branch (before any side effect) -------------------------- #
+    # The task id comes from the filename alone (E2.5 commits the prompt in the task
+    # worktree, so the file is not readable from the control root at this point), and
+    # the branch is derived from it with the same helper ``aidw prompt`` uses.
     raw_path = Path(task_prompt_path)
-    if not raw_path.is_absolute():
-        raw_path = repo.root / raw_path
-    prompt_path = raw_path.resolve()
-    if not prompt_path.is_file():
-        print(f"task prompt not found: {prompt_path}", file=sys.stderr)
-        return 2
-    try:
-        prompt_rel = prompt_path.relative_to(repo.root).as_posix()
-    except ValueError:
-        print(
-            f"task prompt must live inside the repository: {prompt_path}",
-            file=sys.stderr,
-        )
-        return 2
-
-    parsed = parse_task_id(prompt_path)
+    parsed = parse_task_id(raw_path)
     if parsed is None:
         print(
-            f"cannot derive a task id from prompt filename: {prompt_path.name}",
+            f"cannot derive a task id from prompt filename: {raw_path.name}",
             file=sys.stderr,
         )
         return 2
@@ -321,6 +372,9 @@ def run(
         return 2
 
     # --- agents/config ---------------------------------------------------------- #
+    # Config validation stays in the preflight, before the locate: a combined
+    # bad-config-plus-missing-worktree run is a usage/config error (exit 2, design §14),
+    # not a preflight refusal (exit 4).
     agents, issues = load_all(aidt.root, repo.root)
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
@@ -329,10 +383,9 @@ def run(
         return 2
 
     # --- retained preflight: one live run per branch ------------------------ #
-    # The old main/branch-mismatch guards are gone: branch setup *creates* the task
-    # worktree, so `aidw implement` no longer requires being on the task branch. The
-    # still-running guard stays, checked before branch-setup, so a refusal creates
-    # neither worktree nor run state.
+    # The old main/branch-mismatch guards are gone: the task worktree is located, so
+    # `aidw implement` no longer requires being on the task branch. The still-running
+    # guard stays, checked before the locate, so a refusal creates no run state.
     existing = _latest_implement_run(runs_root, branch_name)
     if existing is not None and existing.status == RUNNING and not resume:
         print(
@@ -345,23 +398,22 @@ def run(
         print(f"no implement run to resume for `{branch_name}`.", file=sys.stderr)
         return 2
 
-    # --- plan + --from validation (pure; before any side effects) ----------- #
+    # --- --from validation (names only; before any lookup) ------------------ #
     # F1 (PR #49 review follow-up): validate `--from` against the planned stage
-    # names before branch setup and run-state creation, so a typo'd stage name
-    # refuses with exit 2 and leaves behind neither a worktree nor a run
-    # directory — the same fail-closed contract as the malformed-pattern and
-    # still-running refusals above. ``build_plan`` is pure (constants only),
-    # so this check costs no I/O.
-    plan = build_plan(
-        aidt=aidt.root,
-        prompt_rel=prompt_rel,
-        branch=branch_name,
-        task_id=task_id,
-        base_branch=repo.base_branch,
-    )
-    pre_pr = plan[:-1]
-    pr_plan = plan[-1]
-    names = [entry.name for entry in plan]
+    # names before the locate and run-state creation, so a typo'd stage name refuses
+    # with exit 2 and leaves behind no run directory. ``build_plan`` is pure
+    # (constants only); the real ``prompt_rel`` is resolved after the locate and the
+    # plan is rebuilt with it.
+    names = [
+        entry.name
+        for entry in build_plan(
+            aidt=aidt.root,
+            prompt_rel="",
+            branch=branch_name,
+            task_id=task_id,
+            base_branch=repo.base_branch,
+        )
+    ]
     from_index: int | None = None
     if from_stage is not None:
         if from_stage not in names:
@@ -373,10 +425,9 @@ def run(
         from_index = names.index(from_stage)
 
     # --- resume confirmation (before any side effects) ---------------------- #
-    # F2 (PR #49 review follow-up): ask before branch setup, so a declined resume
-    # leaves behind neither worktree nor run state — the same fail-closed contract
-    # as the still-running refusal above. The confirm must precede the
-    # ``git.add_worktree`` side effect, not follow it.
+    # F2 (PR #49 review follow-up): ask before the locate, so a declined resume
+    # leaves behind no run state — the same fail-closed contract as the
+    # still-running refusal above.
     if resume and not dry_run:
         print(f"resume: {existing.run_id}")
         print("completed stages:")
@@ -385,39 +436,29 @@ def run(
             print("resume declined.", file=sys.stderr)
             return 4
 
-    # --- branch setup: create the task worktree (EXTRACTION.md §3.2) --------- #
-    # Inline Python, not a PlanStage: I1..I6 stay the exact six stage ids (§3.5), and
-    # a refusal must leave no worktree, stage record or run state behind (E2.6 owns
-    # locating/reusing an existing worktree; this step is create-only).
-    target = repo
-    if dry_run:
-        planned_worktree = workspace.workspace_root / branch_name
-        print(
-            f"branch-setup (planned): worktree add -b {branch_name} "
-            f"{planned_worktree} {repo.base_branch}"
-        )
-    else:
-        worktree = git.add_worktree(
-            repo.root, branch_name, base_branch=repo.base_branch
-        )
-        if worktree is None:
+    # --- locate the task worktree (EXTRACTION.md §3.2, E2.6 req 1) ---------- #
+    # Inline Python, not a PlanStage: I1..I6 stay the exact six stage ids (§3.5), and a
+    # refusal must leave no run state behind. ``aidw prompt`` (E2.5) created the worktree
+    # and committed the task prompt inside it; implement only locates it. A missing
+    # worktree is a preflight refusal (exit 4, design §14) in a real run; a dry run
+    # prints the corrective command as planned output and keeps planning (req 6).
+    planned_worktree = (workspace.workspace_root / branch_name).resolve()
+    worktree = git.worktree_for_branch(repo.root, branch_name)
+    if worktree is None:
+        command = worktree_add_command(workspace, branch_name, repo.base_branch)
+        if dry_run:
+            print(f"worktree (planned): {planned_worktree}")
+            print(f"branch-setup (planned): {command}")
+            target = repo
+            worktree_root = planned_worktree
+        else:
             print(
-                f"branch-setup refused: git could not create a worktree for "
-                f"`{branch_name}` from `{repo.base_branch}` at "
-                f"{workspace.workspace_root / branch_name}. The branch may already be "
-                "checked out (one branch, one worktree) or git refused for another "
-                "reason; resolve it and re-run.",
+                f"branch-setup refused: no worktree for `{branch_name}`. "
+                f"Create it first:\n  {command}",
                 file=sys.stderr,
             )
             return 4
-        # The worktree is born at the base commit, so a task prompt still uncommitted
-        # in the control worktree (the standard authoring layout) would be absent there.
-        # Copy it so I1's `$1` and I5's relative `docs/task-prompts/<branch>-prompt.md`
-        # both resolve inside the worktree (an absolute path would break I5).
-        copied = worktree / prompt_rel
-        if not copied.is_file():
-            copied.parent.mkdir(parents=True, exist_ok=True)
-            copied.write_bytes(prompt_path.read_bytes())
+    else:
         # Re-resolve the target and agents against the worktree: agent.cwd was resolved
         # against the control root and would silently keep I1..I6 in the wrong worktree.
         resolved = TargetRepo.resolve(worktree)
@@ -426,10 +467,47 @@ def run(
             base_branch=repo.base_branch,
             branch_pattern=repo.branch_pattern,
         )
-        agents, _ = load_all(aidt.root, target.root)
+        agents, issues = load_all(aidt.root, target.root)
+        reloaded_errors = [i for i in issues if i.level == ERROR]
+        reloaded_warnings = [i for i in issues if i.level == WARNING]
+        if reloaded_errors or (strict and reloaded_warnings):
+            print(
+                format_issues(reloaded_errors + (reloaded_warnings if strict else [])),
+                file=sys.stderr,
+            )
+            return 2
+        worktree_root = target.root
+        if dry_run:
+            print(f"worktree (planned): {worktree}")
+
+    # --- resolve the prompt inside the worktree (E2.6 req 2) ---------------- #
+    resolved_prompt = _resolve_prompt_argument(raw_path, repo.root, worktree_root)
+    if resolved_prompt is None:
+        print(
+            f"task prompt must live inside the repository: {raw_path}",
+            file=sys.stderr,
+        )
+        return 2
+    prompt_path, prompt_rel = resolved_prompt
+    # The existence refusal needs the located worktree: a dry run with no worktree plans
+    # the re-based path unchecked, but a located worktree still refuses (even in dry-run).
+    if not dry_run or worktree is not None:
+        if not prompt_path.is_file():
+            print(f"task prompt not found: {prompt_path}", file=sys.stderr)
+            return 2
+
+    plan = build_plan(
+        aidt=aidt.root,
+        prompt_rel=prompt_rel,
+        branch=branch_name,
+        task_id=task_id,
+        base_branch=repo.base_branch,
+    )
+    pre_pr = plan[:-1]
+    pr_plan = plan[-1]
 
     # --- run state (new or resumed) ----------------------------------------- #
-    # A resumed run was confirmed above, before branch setup created the worktree.
+    # A resumed run was confirmed above, before the worktree locate and this write.
     if resume and not dry_run:
         state = existing
         directory = run_dir(runs_root, state.run_id)
