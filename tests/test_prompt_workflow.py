@@ -5,12 +5,13 @@ from __future__ import annotations
 import dataclasses
 import re
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
-from aidw import git, state
+from aidw import git, lock, state
 from aidw.cli import app
 from aidw.config import ERROR, Issue
 from aidw.paths import ToolkitPaths, TargetRepo, WorkspacePaths, repo_root, toolkit_root
@@ -4547,3 +4548,70 @@ def test_l61_e16_fixture_ordering_refusal_precedes_the_fetch(
     assert git.current_branch(clone) == "main"
     assert git.rev_parse(clone, "03-E4.1") is None
     assert not (clone / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
+
+# --------------------------------------------------------------------------- #
+# One run per worktree (E2.7, EXTRACTION.md §3.2/§3.10)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_task_worktree_key_is_held_for_the_whole_run_and_free_after(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The key is the task worktree the run creates, held until ``run()`` returns.
+
+    Prompt-vs-prompt contention cannot exercise the lock — git's one-branch-one-worktree
+    rule refuses a second ``prompt.run`` for the same branch before the lock is reached —
+    so this proves the *wiring*: while the author stage runs, a concurrent
+    implement/fix/review/approve started in the just-created task worktree would be
+    refused by the same key; after ``run()`` exits the key is free.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    entered, release = threading.Event(), threading.Event()
+
+    def blocking_stage(spec, **kwargs):
+        if spec.name == "task-prompt":
+            entered.set()
+            assert release.wait(timeout=60), "the holding run was never released"
+        return fake(spec, **kwargs)
+
+    monkeypatch.setattr(prompt_workflow, "run_stage", blocking_stage)
+    roots = _roots(tmp_path)
+    state_root = roots["workspace"].state_root
+    outcome: dict = {}
+
+    def hold() -> None:
+        try:
+            outcome["code"] = prompt_workflow.run(
+                phase="03",
+                epic="E4",
+                task="E4.1",
+                **roots,
+                label=RUN_LABEL,
+                approve_all=True,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted via ``outcome``
+            outcome["error"] = exc
+
+    holder = threading.Thread(target=hold, name="aidw-prompt-run")
+    holder.start()
+    assert entered.wait(timeout=60), "the author stage never ran"
+
+    task_worktree = _task_worktree(tmp_path)
+    # Branch setup precedes the acquire, so the worktree exists and is the key.
+    assert git.current_branch(task_worktree) == "03-E4.1"
+    with pytest.raises(lock.LockHeldError) as held:
+        lock.acquire(state_root, task_worktree)
+    assert held.value.worktree == task_worktree
+    assert str(task_worktree) in str(held.value)
+
+    release.set()
+    holder.join(timeout=60)
+    assert not holder.is_alive()
+    assert "error" not in outcome, outcome.get("error")
+    assert outcome["code"] == 0
+    assert seen and seen[0][0] == "task-prompt"
+
+    # Released on exit: the same worktree can start its next run.
+    with lock.acquire(state_root, task_worktree) as guard:
+        assert guard.held

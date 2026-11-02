@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from aidw import git
+from aidw import git, lock
 from aidw.config import ERROR, Issue
 from aidw.gates import GateOutcome
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
@@ -956,3 +956,196 @@ def test_impliment_prompt_has_no_agent_branch_setup() -> None:
     assert "### Branch setup (do this first" not in text
     # The one-line pointer that AIDT owns it stays.
     assert "AIDT owns branch setup" in text
+
+
+# --------------------------------------------------------------------------- #
+# One run per worktree (E2.7, EXTRACTION.md §3.2/§3.10)
+# --------------------------------------------------------------------------- #
+
+
+class _BlockingStages(_Recorder):
+    """A fake ``run_stage`` that parks the first run inside its first stage.
+
+    Parking there (not before ``create_run``) is what makes two runs genuinely
+    concurrent: the holder owns its worktree lock *and* has already written its run
+    directory, which is exactly the double-run the lock must refuse.
+    """
+
+    def __init__(self, entered: threading.Event, release: threading.Event) -> None:
+        super().__init__()
+        self.entered = entered
+        self.release_event = release
+
+    def __call__(self, spec, **kwargs):
+        self.entered.set()
+        assert self.release_event.wait(timeout=60), "the holder was never released"
+        return super().__call__(spec, **kwargs)
+
+
+def _start_run(**kwargs) -> tuple[threading.Thread, dict]:
+    """Call ``implement.run`` on a thread; ``outcome['code']`` holds its exit code."""
+    outcome: dict = {}
+
+    def target() -> None:
+        try:
+            outcome["code"] = implement_workflow.run(**kwargs)
+        except BaseException as exc:  # pragma: no cover - asserted via ``outcome``
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=target, name="aidw-implement-run")
+    thread.start()
+    return thread, outcome
+
+
+def _two_task_worktrees(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
+    """Control root plus two worktrees, each with its own committed task prompt."""
+    _bare, control = _make_bare_with_control(tmp_path)
+    first, first_prompt = _make_task_worktree(control, "03-E4.1", "03-E4.1-prompt.md")
+    second, second_prompt = _make_task_worktree(control, "03-E4.2", "03-E4.2-prompt.md")
+    return control, first, first_prompt, second, second_prompt
+
+
+def test_two_concurrent_runs_in_one_worktree_are_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The lock, not the branch-keyed still-running guard, refuses a live peer.
+
+    The second run passes ``--resume`` — the documented "finish it" path — so it clears
+    the still-running guard, which is exactly the race the lock closes: the second
+    process's check can read ``state.json`` before the first one writes it.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    holder_stages = _BlockingStages(entered, release)
+    monkeypatch.setattr(implement_workflow, "run_stage", holder_stages)
+    roots = _roots(control)
+
+    holder, outcome = _start_run(task_prompt_path=prompt, **roots, approve_all=True)
+    assert entered.wait(timeout=60), "the holding run never reached a stage"
+
+    refused = implement_workflow.run(
+        task_prompt_path=prompt, resume=True, approve_all=True, **roots
+    )
+
+    release.set()
+    holder.join(timeout=60)
+    assert not holder.is_alive()
+    assert "error" not in outcome, outcome.get("error")
+
+    assert refused == 4
+    assert outcome["code"] == 0
+    # Exactly one run directory: the refused run wrote nothing, including no run state.
+    assert len(list(_runs_root(control).iterdir())) == 1
+    err = capsys.readouterr().err
+    assert "another aidw run is already active" in err
+    assert str(worktree) in err
+
+
+def test_two_concurrent_runs_in_different_worktrees_both_proceed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Two runs in different worktrees proceed (the roadmap's E2.7 "done when")."""
+    control, first, first_prompt, second, second_prompt = _two_task_worktrees(tmp_path)
+    _patch(monkeypatch)
+    entered = {first: threading.Event(), second: threading.Event()}
+    release = threading.Event()
+
+    class _PerWorktreeStages(_Recorder):
+        def __call__(self, spec, **kwargs):
+            path = kwargs["repo_root"]
+            entered.setdefault(path, threading.Event()).set()
+            assert release.wait(timeout=60), "the runs were never released"
+            return super().__call__(spec, **kwargs)
+
+    monkeypatch.setattr(implement_workflow, "run_stage", _PerWorktreeStages())
+    roots = _roots(control)
+
+    first_thread, first_outcome = _start_run(
+        task_prompt_path=first_prompt, **roots, approve_all=True
+    )
+    second_thread, second_outcome = _start_run(
+        task_prompt_path=second_prompt, **roots, approve_all=True
+    )
+    # Both reached a stage while the other is still running: neither was refused.
+    assert entered[first].wait(timeout=60) and entered[second].wait(timeout=60)
+    release.set()
+    first_thread.join(timeout=60)
+    second_thread.join(timeout=60)
+    assert not first_thread.is_alive() and not second_thread.is_alive()
+
+    assert first_outcome.get("code") == 0, first_outcome.get("error")
+    assert second_outcome.get("code") == 0, second_outcome.get("error")
+    runs = list(_runs_root(control).iterdir())
+    assert len(runs) == 2
+    assert {state.repo_root for state in implement_workflow.list_runs(_runs_root(control))} == {
+        str(first),
+        str(second),
+    }
+
+
+def test_a_held_worktree_lock_is_refused_before_any_run_state(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The key is the *located* worktree, and the refusal precedes ``create_run``."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+    roots = _roots(control)
+
+    with lock.acquire(roots["workspace"].state_root, worktree):
+        code = implement_workflow.run(task_prompt_path=prompt, **roots, approve_all=True)
+
+    assert code == 4
+    assert recorder.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    err = capsys.readouterr().err
+    assert "another aidw run is already active" in err
+    assert str(worktree) in err
+
+
+def test_the_dry_run_takes_the_same_worktree_lock(tmp_path: Path, monkeypatch) -> None:
+    """A dry run reaches ``create_run``, so it holds and releases the same key."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
+    roots = _roots(control)
+
+    with lock.acquire(roots["workspace"].state_root, worktree):
+        code = implement_workflow.run(
+            task_prompt_path=prompt, **roots, dry_run=True
+        )
+
+    assert code == 4
+
+    # And a dry run that does acquire releases it: the key is free afterwards.
+    assert implement_workflow.run(task_prompt_path=prompt, **roots, dry_run=True) == 0
+    with lock.acquire(roots["workspace"].state_root, worktree):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected"),
+    [("success", 0), ("stage-failure", 1), ("gate-denied", 3)],
+)
+def test_the_worktree_lock_is_released_on_every_exit_path(
+    tmp_path: Path, monkeypatch, scenario: str, expected: int
+) -> None:
+    control, worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    failures = {"test"} if scenario == "stage-failure" else set()
+    monkeypatch.setattr(implement_workflow, "run_stage", _Recorder(fail=failures))
+    roots = _roots(control)
+    # ``gate-denied`` is the no-``--yes``, non-interactive default: the gate fails closed
+    # *after* the run exists, which is the mid-run refusal that must still release.
+    approve_all = scenario != "gate-denied"
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **roots, approve_all=approve_all
+    )
+
+    assert code == expected
+    with lock.acquire(roots["workspace"].state_root, worktree):
+        pass

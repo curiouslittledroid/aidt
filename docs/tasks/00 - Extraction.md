@@ -191,7 +191,7 @@
   - Deliverable: preflight changes plus tests.
   - Done when: `aidw implement` from an unrelated cwd locates the right tree, and the missing-worktree message is copy-pasteable.
 
-- [ ] **E2.7. One run per worktree**
+- [x] **E2.7. One run per worktree**
   Move the run lock into the state root, keyed by worktree path.
   - Deliverable: locking change plus a concurrency test.
   - Done when: two concurrent runs in the same worktree are refused; two runs in different worktrees proceed.

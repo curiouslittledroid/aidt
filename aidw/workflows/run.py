@@ -17,6 +17,11 @@ about (decision I1): that is what makes the cycle unattended, and it is scoped t
 ``approve-followups`` so ``approve-implementation-pr`` and ``approve-fix-pr`` keep their
 normal --yes/interactive semantics. A ``--deny-gates approve-followups`` still refuses it
 (``deny`` wins over ``skip`` in ``aidw.gates.decide``).
+
+This module takes no run lock itself (EXTRACTION.md §3.2, E2.7): each workflow it calls
+acquires and releases its **own** worktree key in turn (``prompt`` the control worktree,
+then ``implement`` the task worktree it created, …), so the two are never held at once and
+a chain cannot deadlock against itself.
 """
 
 from __future__ import annotations

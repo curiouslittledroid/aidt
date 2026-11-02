@@ -56,6 +56,12 @@ When the author's first output line is ``blocked: <reason>`` the run ends ``bloc
 uncommitted change under ``docs/task-prompts/`` in it are reported, never repaired
 (design §13, L1.3).
 The approval gate is off by default; pass ``--require-approval`` to pause for a human decision.
+
+The run lock (``aidw.lock``, EXTRACTION.md §3.2/§3.10) is keyed on the **created task
+worktree** (``target.root``), acquired after branch setup — ``git worktree add`` precedes
+it — and released on every exit path. It is therefore the same key a concurrent
+``implement``/``fix``/``review``/``approve`` started in that worktree takes. A dry run
+creates no worktree, so it locks the control worktree it plans against.
 """
 
 from __future__ import annotations
@@ -68,7 +74,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import mkdtemp
 
-from aidw import git
+from aidw import git, lock
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.findings import (
     ParsedFinding,
@@ -1416,289 +1422,173 @@ def run(
         )
         agents, _ = load_all(aidt.root, target.root)
 
-    state = create_run(
-        runs_root,
-        target.root,
-        "prompt",
-        label=label or f"{phase}-{task}",
-        task={"phase": phase, "epic": epic, "task": task, "title": entry.title},
-        strict=strict,
-        branch=branch_name,
-    )
-    directory = run_dir(runs_root, state.run_id)
-    logger = RunLogger(directory, stream=stream)
-    logger.info(f"prompt workflow {phase}/{epic}/{task}: {entry.title}")
-    print(f"run:    {state.run_id}")
-    print(f"task:   {entry.title}")
+    # --- one run per worktree (EXTRACTION.md §3.2/§3.10, E2.7) ---------------- #
+    # The key is the *resolved* worktree path -- ``target.root``, the same value
+    # ``create_run`` records as ``repo_root`` -- never the branch: a detached-HEAD
+    # worktree has no branch, and §3.2 says "keyed by worktree path". Acquired
+    # immediately before ``create_run`` (the point where the key is final) and released
+    # on every exit path below, refusals and failures included, so the worktree cannot
+    # stay locked until process exit. It lives in the state root, never in a target
+    # repo or worktree (§3.1), and it is neither ``_STATE_LOCK`` (in-process, per
+    # ``state.json`` write) nor ``--parallel`` (concurrent stages inside one run).
+    # A dry run reaches ``create_run`` too, so it holds and releases the same lock
+    # (against the control worktree, the only tree a dry run has).
+    try:
+        run_lock = lock.acquire(workspace.state_root, target.root)
+    except lock.LockHeldError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_REFUSED
 
-    author = StageSpec(
-        "task-prompt",
-        "task-author",
-        aidt.prompts_dir / "task-prompt.md",
-        [phase, epic, task],
-    )
+    try:
+        state = create_run(
+            runs_root,
+            target.root,
+            "prompt",
+            label=label or f"{phase}-{task}",
+            task={"phase": phase, "epic": epic, "task": task, "title": entry.title},
+            strict=strict,
+            branch=branch_name,
+        )
+        directory = run_dir(runs_root, state.run_id)
+        logger = RunLogger(directory, stream=stream)
+        logger.info(f"prompt workflow {phase}/{epic}/{task}: {entry.title}")
+        print(f"run:    {state.run_id}")
+        print(f"task:   {entry.title}")
 
-    # L1.3: the created worktree is deterministic, so the blocked report names it
-    # unconditionally and the old before/after branch probe is gone. No branch probe runs.
-    rec1 = run_stage(
-        author,
-        repo_root=target.root,
-        toolkit_root=aidt.root,
-        runs_root=runs_root,
-        state=state,
-        logger=logger,
-        agents=agents,
-        dry_run=dry_run,
-    )
-    print_stage(rec1, repo_root=target.root)
+        author = StageSpec(
+            "task-prompt",
+            "task-author",
+            aidt.prompts_dir / "task-prompt.md",
+            [phase, epic, task],
+        )
 
-    if dry_run:
-        rec2 = run_stage(
-            StageSpec(
-                "task-review-1",
-                "task-reviewer",
-                aidt.prompts_dir / "task-review.md",
-                [default_rel],
-            ),
+        # L1.3: the created worktree is deterministic, so the blocked report names it
+        # unconditionally and the old before/after branch probe is gone. No branch probe runs.
+        rec1 = run_stage(
+            author,
             repo_root=target.root,
             toolkit_root=aidt.root,
             runs_root=runs_root,
             state=state,
             logger=logger,
             agents=agents,
-            dry_run=True,
+            dry_run=dry_run,
         )
-        print(f"stage:  {rec2.name} [{rec2.status}] (planned) model={rec2.model}")
-        state.status = SUCCEEDED
-        save(directory, state)
-        print("dry-run complete; Pi not invoked")
-        return 0
+        print_stage(rec1, repo_root=target.root)
 
-    if rec1.status != SUCCEEDED:
-        print(f"task-prompt stage failed: {rec1.error}", file=sys.stderr)
-        return 1
+        if dry_run:
+            rec2 = run_stage(
+                StageSpec(
+                    "task-review-1",
+                    "task-reviewer",
+                    aidt.prompts_dir / "task-review.md",
+                    [default_rel],
+                ),
+                repo_root=target.root,
+                toolkit_root=aidt.root,
+                runs_root=runs_root,
+                state=state,
+                logger=logger,
+                agents=agents,
+                dry_run=True,
+            )
+            print(f"stage:  {rec2.name} [{rec2.status}] (planned) model={rec2.model}")
+            state.status = SUCCEEDED
+            save(directory, state)
+            print("dry-run complete; Pi not invoked")
+            return 0
 
-    # L1.3: detect the blocked report before ``_resolve_prompt_path`` tries the first
-    # line as a path and falls back to the conventional location — otherwise a
-    # ``blocked:`` line would be silently ignored whenever the author also left a file.
-    # The author stage stays ``succeeded`` (it exited 0 with a valid report); the *run* is
-    # what is blocked, and no commit, review or fix stage follows.
-    blocked_reason = _parse_blocked(_read_out(rec1))
-    if blocked_reason is not None:
-        reason = blocked_reason or "no reason given"
-        logger.error(f"task-prompt author reported blocked: {reason}")
-        _report_blocked_leftovers(target.root, branch=branch_name)
-        state.status = BLOCKED
-        save(directory, state)
-        print(f"blocked: {reason}", file=sys.stderr)
-        return 3
+        if rec1.status != SUCCEEDED:
+            print(f"task-prompt stage failed: {rec1.error}", file=sys.stderr)
+            return 1
 
-    prompt_path = _resolve_prompt_path(target.root, rec1, default_rel)
-    if prompt_path is None:
-        print(
-            f"generated task prompt not found at {default_rel}",
-            file=sys.stderr,
-        )
-        state.status = FAILED
-        save(directory, state)
-        return 1
-    rel = prompt_path.relative_to(target.root).as_posix()
-    print(f"prompt: {rel}")
-    budget_reason = _check_conciseness(prompt_path, rel)
-    if budget_reason is not None:
-        # L5.3: a workflow-level quality bound, not a gate. At the default it warns and
-        # the review loop still runs; `--strict` refuses with the stage-failure exit 1,
-        # records FAILED and no gate, and leaves the committed prompt/branch as-is
-        # (design §13/§14; no new gate-decision vocabulary, L4.2).
-        if strict:
-            print(f"refusing (--strict): {budget_reason}", file=sys.stderr)
+        # L1.3: detect the blocked report before ``_resolve_prompt_path`` tries the first
+        # line as a path and falls back to the conventional location — otherwise a
+        # ``blocked:`` line would be silently ignored whenever the author also left a file.
+        # The author stage stays ``succeeded`` (it exited 0 with a valid report); the *run* is
+        # what is blocked, and no commit, review or fix stage follows.
+        blocked_reason = _parse_blocked(_read_out(rec1))
+        if blocked_reason is not None:
+            reason = blocked_reason or "no reason given"
+            logger.error(f"task-prompt author reported blocked: {reason}")
+            _report_blocked_leftovers(target.root, branch=branch_name)
+            state.status = BLOCKED
+            save(directory, state)
+            print(f"blocked: {reason}", file=sys.stderr)
+            return 3
+
+        prompt_path = _resolve_prompt_path(target.root, rec1, default_rel)
+        if prompt_path is None:
+            print(
+                f"generated task prompt not found at {default_rel}",
+                file=sys.stderr,
+            )
             state.status = FAILED
             save(directory, state)
             return 1
-        print(f"warning: {budget_reason}", file=sys.stderr)
-    state.git["branch"] = branch_name
-    save(directory, state)
+        rel = prompt_path.relative_to(target.root).as_posix()
+        print(f"prompt: {rel}")
+        budget_reason = _check_conciseness(prompt_path, rel)
+        if budget_reason is not None:
+            # L5.3: a workflow-level quality bound, not a gate. At the default it warns and
+            # the review loop still runs; `--strict` refuses with the stage-failure exit 1,
+            # records FAILED and no gate, and leaves the committed prompt/branch as-is
+            # (design §13/§14; no new gate-decision vocabulary, L4.2).
+            if strict:
+                print(f"refusing (--strict): {budget_reason}", file=sys.stderr)
+                state.status = FAILED
+                save(directory, state)
+                return 1
+            print(f"warning: {budget_reason}", file=sys.stderr)
+        state.git["branch"] = branch_name
+        save(directory, state)
 
-    verdict: str | None = None
-    review_text = ""
-    # L2.3: ``previous_review_text`` and ``baseline_prompt`` are set only when the round is
-    # followed by fixes. ``review_text`` is reassigned on the next iteration, so the prior
-    # review is carried separately; the baseline is the in-memory snapshot (no per-round
-    # commits exist) taken after this verdict and before the fix stages mutate the prompt.
-    previous_review_text: str | None = None
-    baseline_prompt: str | None = None
-    review_index = 0
-    revisions = 0
-    # L4.2: per-round ``(review_index, findings_count, fix_stage_count)`` telemetry,
-    # accumulated in the loop so the gate detail and run.log carry the real per-round
-    # counts rather than a number reconstructed from stage names.
-    rounds: list[ReviewRound] = []
-    while True:
-        review_index += 1
-        name = f"task-review-{review_index}"
-        # Round 1 is deliberately unprimed (no delta brief): the independent first sample
-        # is what keeps the loop from anchoring on the previous review. It still receives
-        # its evidence pointer, which is gathered context, not prior findings. Rounds 2+
-        # add the delta brief, keyed off the stage counter rather than ``revisions`` (which
-        # is incremented later in the same iteration).
-        delta = ""
-        if review_index >= 2 and previous_review_text is not None:
-            delta = _render_delta_brief(
-                index=review_index,
-                previous_review=previous_review_text,
-                baseline=baseline_prompt,
-                current=_capture_prompt(prompt_path),
+        verdict: str | None = None
+        review_text = ""
+        # L2.3: ``previous_review_text`` and ``baseline_prompt`` are set only when the round is
+        # followed by fixes. ``review_text`` is reassigned on the next iteration, so the prior
+        # review is carried separately; the baseline is the in-memory snapshot (no per-round
+        # commits exist) taken after this verdict and before the fix stages mutate the prompt.
+        previous_review_text: str | None = None
+        baseline_prompt: str | None = None
+        review_index = 0
+        revisions = 0
+        # L4.2: per-round ``(review_index, findings_count, fix_stage_count)`` telemetry,
+        # accumulated in the loop so the gate detail and run.log carry the real per-round
+        # counts rather than a number reconstructed from stage names.
+        rounds: list[ReviewRound] = []
+        while True:
+            review_index += 1
+            name = f"task-review-{review_index}"
+            # Round 1 is deliberately unprimed (no delta brief): the independent first sample
+            # is what keeps the loop from anchoring on the previous review. It still receives
+            # its evidence pointer, which is gathered context, not prior findings. Rounds 2+
+            # add the delta brief, keyed off the stage counter rather than ``revisions`` (which
+            # is incremented later in the same iteration).
+            delta = ""
+            if review_index >= 2 and previous_review_text is not None:
+                delta = _render_delta_brief(
+                    index=review_index,
+                    previous_review=previous_review_text,
+                    baseline=baseline_prompt,
+                    current=_capture_prompt(prompt_path),
+                    rel=rel,
+                )
+            pointer = _stage_evidence_pointer(
+                stage=name,
+                directory=directory,
+                repo=target,
+                entry=entry,
+                entries=entries,
                 rel=rel,
             )
-        pointer = _stage_evidence_pointer(
-            stage=name,
-            directory=directory,
-            repo=target,
-            entry=entry,
-            entries=entries,
-            rel=rel,
-        )
-        rec = run_stage(
-            StageSpec(
-                name,
-                "task-reviewer",
-                aidt.prompts_dir / "task-review.md",
-                [rel],
-                extra=_with_evidence(pointer, delta),
-            ),
-            repo_root=target.root,
-            toolkit_root=aidt.root,
-            runs_root=runs_root,
-            state=state,
-            logger=logger,
-            agents=agents,
-        )
-        print_stage(rec, repo_root=target.root)
-        if rec.status != SUCCEEDED:
-            state.status = FAILED
-            save(directory, state)
-            return 1
-
-        review_text = _read_out(rec) or ""
-        if not review_text.strip():
-            logger.error(f"{rec.name} produced no final message")
-            print(
-                f"{rec.name} produced no final message; stopping.", file=sys.stderr
-            )
-            state.status = FAILED
-            save(directory, state)
-            return 1
-
-        verdict = parse_verdict(review_text)
-        findings, problems = parse_review_findings(review_text)
-        findings_count = len(findings)
-        if verdict == APPROVE:
-            print(f"verdict: {verdict}")
-        else:
-            print(f"verdict: {verdict or 'ambiguous'} — {findings_summary(findings)}")
-
-        if verdict == APPROVE:
-            # L4.2: an approving round ran no fix stage, so its fix count is 0.
-            _record_round(rounds, review_index, findings_count, 0)
-            break
-        if verdict == VERDICT_BLOCKED:
-            # A `Blocked` verdict means a material ambiguity only a human can settle, so
-            # it short-circuits before any fix stage and before any ``approve_all`` path
-            # can reach the gate or :func:`_commit_reviewed_prompt` — the prompt stays
-            # uncommitted and the run fails closed (design §8.1/§8.3, L2.1). This runs
-            # before ``revisions += 1`` so a Blocked review never spawns a fixer, with or
-            # without parsed findings.
-            _record_round(rounds, review_index, findings_count, 0)
-            logger.error("task review returned Blocked; failing closed.")
-            _record_review_outcome(
-                state,
-                logger,
-                verdict=verdict,
-                revisions=revisions,
-                max_revisions=max_revisions,
-                rounds=rounds,
-                decision="denied",
-                mechanism="review-loop",
-            )
-            state.status = BLOCKED
-            save(directory, state)
-            print(
-                "task review returned Blocked; a human must settle it.",
-                file=sys.stderr,
-            )
-            print(review_text, file=sys.stderr)
-            return 3
-        if revisions >= max_revisions - 1:
-            # The fix budget is spent: the terminal review has now run. There is no further
-            # revision slot, so a residual `Request changes` fails closed rather than being
-            # applied unreviewed — the prompt is left uncommitted for a human to settle, with
-            # this review's findings on stderr. `Blocked` short-circuited above, so it keeps
-            # its own "a human must settle it" message. L4.2 records the gate and the
-            # summary here too: run.log used to stay silent on exactly this symptom.
-            _record_round(rounds, review_index, findings_count, 0)
-            logger.error(
-                "task review did not approve within the revision budget; run BLOCKED"
-            )
-            _record_review_outcome(
-                state,
-                logger,
-                verdict=verdict,
-                revisions=revisions,
-                max_revisions=max_revisions,
-                rounds=rounds,
-                decision="denied",
-                mechanism="review-loop",
-            )
-            state.status = BLOCKED
-            save(directory, state)
-            print(
-                "task review did not approve within the revision budget; failing closed.",
-                file=sys.stderr,
-            )
-            print(review_text, file=sys.stderr)
-            return 3
-
-        # L4.2: a fixing round's fix count comes from the in-loop partition, not from the
-        # stage names: the whole-review fallback runs one stage while a parsed review runs
-        # one per blocking finding plus one combined could-fix stage.
-        blocking, could_fix = partition_findings(findings)
-        fix_stage_count = (
-            1 if (not findings or problems) else len(blocking) + (1 if could_fix else 0)
-        )
-
-        # Capture after the verdict and its Blocked/terminal exits, before the fix
-        # stages run, so the next round's diff is exactly this fix batch's net effect and
-        # not a cumulative diff across rounds (there is no per-round commit to diff against).
-        baseline_prompt = _capture_prompt(prompt_path)
-        previous_review_text = review_text
-        revisions += 1
-        if not findings or problems:
-            if problems:
-                print(
-                    f"         {len(problems)} finding block(s) did not parse cleanly "
-                    f"({problems[0]}); reworking with the whole review instead"
-                )
-            fallback_name = f"task-review-fixes-{revisions}"
-            _snapshot_fix_stage(
-                stage=fallback_name, directory=directory, prompt_path=prompt_path
-            )
-            rec_fix = run_stage(
+            rec = run_stage(
                 StageSpec(
-                    fallback_name,
-                    "task-fixer",
-                    aidt.prompts_dir / "task-review-fixes.md",
+                    name,
+                    "task-reviewer",
+                    aidt.prompts_dir / "task-review.md",
                     [rel],
-                    extra=_with_evidence(
-                        _stage_evidence_pointer(
-                            stage=fallback_name,
-                            directory=directory,
-                            repo=target,
-                            entry=entry,
-                            entries=entries,
-                            rel=rel,
-                        ),
-                        f"## Review findings to address\n\n{review_text}",
-                    ),
+                    extra=_with_evidence(pointer, delta),
                 ),
                 repo_root=target.root,
                 toolkit_root=aidt.root,
@@ -1707,54 +1597,131 @@ def run(
                 logger=logger,
                 agents=agents,
             )
-            print_stage(rec_fix, repo_root=target.root)
-            if rec_fix.status != SUCCEEDED:
+            print_stage(rec, repo_root=target.root)
+            if rec.status != SUCCEEDED:
                 state.status = FAILED
                 save(directory, state)
                 return 1
-        else:
-            # Blocking findings are fixed one at a time so progress is visible per change;
-            # the non-blocking could-fix findings share a single stage, so they cost one
-            # invocation instead of one each. ``blocking``/``could_fix`` were partitioned
-            # above for the L4.2 round telemetry.
-            steps: list[tuple[str, list[ParsedFinding]]] = [
-                ("finding", [finding]) for finding in blocking
-            ]
-            if could_fix:
-                steps.append(("combined", could_fix))
-            total = len(steps)
 
-            for index, (kind, group) in enumerate(steps, start=1):
-                prefix = f"fix {revisions}.{index}/{total}:"
-                if kind == "finding":
-                    finding = group[0]
-                    print(f"{prefix} {finding_title(finding)} [{finding.priority}]")
-                    extra = render_finding_block(finding, index=index, total=total)
-                else:
-                    noun = "finding" if len(group) == 1 else "findings"
-                    print(f"{prefix} {len(group)} could-fix {noun} combined")
-                    extra = render_could_fix_block(group)
+            review_text = _read_out(rec) or ""
+            if not review_text.strip():
+                logger.error(f"{rec.name} produced no final message")
+                print(
+                    f"{rec.name} produced no final message; stopping.", file=sys.stderr
+                )
+                state.status = FAILED
+                save(directory, state)
+                return 1
 
-                fix_name = f"task-review-fixes-{revisions}-{index}"
+            verdict = parse_verdict(review_text)
+            findings, problems = parse_review_findings(review_text)
+            findings_count = len(findings)
+            if verdict == APPROVE:
+                print(f"verdict: {verdict}")
+            else:
+                print(f"verdict: {verdict or 'ambiguous'} — {findings_summary(findings)}")
+
+            if verdict == APPROVE:
+                # L4.2: an approving round ran no fix stage, so its fix count is 0.
+                _record_round(rounds, review_index, findings_count, 0)
+                break
+            if verdict == VERDICT_BLOCKED:
+                # A `Blocked` verdict means a material ambiguity only a human can settle, so
+                # it short-circuits before any fix stage and before any ``approve_all`` path
+                # can reach the gate or :func:`_commit_reviewed_prompt` — the prompt stays
+                # uncommitted and the run fails closed (design §8.1/§8.3, L2.1). This runs
+                # before ``revisions += 1`` so a Blocked review never spawns a fixer, with or
+                # without parsed findings.
+                _record_round(rounds, review_index, findings_count, 0)
+                logger.error("task review returned Blocked; failing closed.")
+                _record_review_outcome(
+                    state,
+                    logger,
+                    verdict=verdict,
+                    revisions=revisions,
+                    max_revisions=max_revisions,
+                    rounds=rounds,
+                    decision="denied",
+                    mechanism="review-loop",
+                )
+                state.status = BLOCKED
+                save(directory, state)
+                print(
+                    "task review returned Blocked; a human must settle it.",
+                    file=sys.stderr,
+                )
+                print(review_text, file=sys.stderr)
+                return 3
+            if revisions >= max_revisions - 1:
+                # The fix budget is spent: the terminal review has now run. There is no further
+                # revision slot, so a residual `Request changes` fails closed rather than being
+                # applied unreviewed — the prompt is left uncommitted for a human to settle, with
+                # this review's findings on stderr. `Blocked` short-circuited above, so it keeps
+                # its own "a human must settle it" message. L4.2 records the gate and the
+                # summary here too: run.log used to stay silent on exactly this symptom.
+                _record_round(rounds, review_index, findings_count, 0)
+                logger.error(
+                    "task review did not approve within the revision budget; run BLOCKED"
+                )
+                _record_review_outcome(
+                    state,
+                    logger,
+                    verdict=verdict,
+                    revisions=revisions,
+                    max_revisions=max_revisions,
+                    rounds=rounds,
+                    decision="denied",
+                    mechanism="review-loop",
+                )
+                state.status = BLOCKED
+                save(directory, state)
+                print(
+                    "task review did not approve within the revision budget; failing closed.",
+                    file=sys.stderr,
+                )
+                print(review_text, file=sys.stderr)
+                return 3
+
+            # L4.2: a fixing round's fix count comes from the in-loop partition, not from the
+            # stage names: the whole-review fallback runs one stage while a parsed review runs
+            # one per blocking finding plus one combined could-fix stage.
+            blocking, could_fix = partition_findings(findings)
+            fix_stage_count = (
+                1 if (not findings or problems) else len(blocking) + (1 if could_fix else 0)
+            )
+
+            # Capture after the verdict and its Blocked/terminal exits, before the fix
+            # stages run, so the next round's diff is exactly this fix batch's net effect and
+            # not a cumulative diff across rounds (there is no per-round commit to diff against).
+            baseline_prompt = _capture_prompt(prompt_path)
+            previous_review_text = review_text
+            revisions += 1
+            if not findings or problems:
+                if problems:
+                    print(
+                        f"         {len(problems)} finding block(s) did not parse cleanly "
+                        f"({problems[0]}); reworking with the whole review instead"
+                    )
+                fallback_name = f"task-review-fixes-{revisions}"
                 _snapshot_fix_stage(
-                    stage=fix_name, directory=directory, prompt_path=prompt_path
+                    stage=fallback_name, directory=directory, prompt_path=prompt_path
                 )
                 rec_fix = run_stage(
                     StageSpec(
-                        fix_name,
+                        fallback_name,
                         "task-fixer",
                         aidt.prompts_dir / "task-review-fixes.md",
                         [rel],
                         extra=_with_evidence(
                             _stage_evidence_pointer(
-                                stage=fix_name,
+                                stage=fallback_name,
                                 directory=directory,
                                 repo=target,
                                 entry=entry,
                                 entries=entries,
                                 rel=rel,
                             ),
-                            extra,
+                            f"## Review findings to address\n\n{review_text}",
                         ),
                     ),
                     repo_root=target.root,
@@ -1769,114 +1736,173 @@ def run(
                     state.status = FAILED
                     save(directory, state)
                     return 1
+            else:
+                # Blocking findings are fixed one at a time so progress is visible per change;
+                # the non-blocking could-fix findings share a single stage, so they cost one
+                # invocation instead of one each. ``blocking``/``could_fix`` were partitioned
+                # above for the L4.2 round telemetry.
+                steps: list[tuple[str, list[ParsedFinding]]] = [
+                    ("finding", [finding]) for finding in blocking
+                ]
+                if could_fix:
+                    steps.append(("combined", could_fix))
+                total = len(steps)
 
-        # L3.4: one reconcile stage per fix batch, after the batch and before the next
-        # review. The fixers work one finding at a time and prefer the smallest edit, so the
-        # batch can end internally inconsistent. After L4.1 there is no final fix batch to
-        # reconcile: a review is always the last stage for a non-approving prompt, and
-        # ``max_revisions`` counts review rounds with the last one review-only. ``review_index``
-        # is the round number, so the name matches neither ``task-review-N`` nor
-        # ``task-review-fixes-*`` — the L3.3 snapshot writer, the ``_fix_round`` regex and
-        # the harness's ``fix_status`` branch all leave it alone.
-        reconcile_name = f"task-review-reconcile-{review_index}"
-        rec_reconcile = run_stage(
-            StageSpec(
-                reconcile_name,
-                "task-fixer",
-                aidt.prompts_dir / "task-review-fixes.md",
-                [rel],
-                extra=_with_evidence(
-                    _stage_evidence_pointer(
-                        stage=reconcile_name,
-                        directory=directory,
-                        repo=target,
-                        entry=entry,
-                        entries=entries,
-                        rel=rel,
-                    ),
-                    _render_reconcile(
-                        index=review_index,
-                        review_text=review_text,
-                        baseline=baseline_prompt,
-                        # Captured here, before run_stage: this is the fix batch's net
-                        # effect, not a diff polluted by the reconcile edit itself.
-                        current=_capture_prompt(prompt_path),
-                        rel=rel,
+                for index, (kind, group) in enumerate(steps, start=1):
+                    prefix = f"fix {revisions}.{index}/{total}:"
+                    if kind == "finding":
+                        finding = group[0]
+                        print(f"{prefix} {finding_title(finding)} [{finding.priority}]")
+                        extra = render_finding_block(finding, index=index, total=total)
+                    else:
+                        noun = "finding" if len(group) == 1 else "findings"
+                        print(f"{prefix} {len(group)} could-fix {noun} combined")
+                        extra = render_could_fix_block(group)
+
+                    fix_name = f"task-review-fixes-{revisions}-{index}"
+                    _snapshot_fix_stage(
+                        stage=fix_name, directory=directory, prompt_path=prompt_path
+                    )
+                    rec_fix = run_stage(
+                        StageSpec(
+                            fix_name,
+                            "task-fixer",
+                            aidt.prompts_dir / "task-review-fixes.md",
+                            [rel],
+                            extra=_with_evidence(
+                                _stage_evidence_pointer(
+                                    stage=fix_name,
+                                    directory=directory,
+                                    repo=target,
+                                    entry=entry,
+                                    entries=entries,
+                                    rel=rel,
+                                ),
+                                extra,
+                            ),
+                        ),
+                        repo_root=target.root,
+                        toolkit_root=aidt.root,
+                        runs_root=runs_root,
+                        state=state,
+                        logger=logger,
+                        agents=agents,
+                    )
+                    print_stage(rec_fix, repo_root=target.root)
+                    if rec_fix.status != SUCCEEDED:
+                        state.status = FAILED
+                        save(directory, state)
+                        return 1
+
+            # L3.4: one reconcile stage per fix batch, after the batch and before the next
+            # review. The fixers work one finding at a time and prefer the smallest edit, so the
+            # batch can end internally inconsistent. After L4.1 there is no final fix batch to
+            # reconcile: a review is always the last stage for a non-approving prompt, and
+            # ``max_revisions`` counts review rounds with the last one review-only. ``review_index``
+            # is the round number, so the name matches neither ``task-review-N`` nor
+            # ``task-review-fixes-*`` — the L3.3 snapshot writer, the ``_fix_round`` regex and
+            # the harness's ``fix_status`` branch all leave it alone.
+            reconcile_name = f"task-review-reconcile-{review_index}"
+            rec_reconcile = run_stage(
+                StageSpec(
+                    reconcile_name,
+                    "task-fixer",
+                    aidt.prompts_dir / "task-review-fixes.md",
+                    [rel],
+                    extra=_with_evidence(
+                        _stage_evidence_pointer(
+                            stage=reconcile_name,
+                            directory=directory,
+                            repo=target,
+                            entry=entry,
+                            entries=entries,
+                            rel=rel,
+                        ),
+                        _render_reconcile(
+                            index=review_index,
+                            review_text=review_text,
+                            baseline=baseline_prompt,
+                            # Captured here, before run_stage: this is the fix batch's net
+                            # effect, not a diff polluted by the reconcile edit itself.
+                            current=_capture_prompt(prompt_path),
+                            rel=rel,
+                        ),
                     ),
                 ),
-            ),
-            repo_root=target.root,
-            toolkit_root=aidt.root,
-            runs_root=runs_root,
-            state=state,
-            logger=logger,
-            agents=agents,
+                repo_root=target.root,
+                toolkit_root=aidt.root,
+                runs_root=runs_root,
+                state=state,
+                logger=logger,
+                agents=agents,
+            )
+            print_stage(rec_reconcile, repo_root=target.root)
+            if rec_reconcile.status != SUCCEEDED:
+                state.status = FAILED
+                save(directory, state)
+                return 1
+
+            # L4.2 (review follow-up #31): recorded only now that the whole fix batch and
+            # its reconcile ran — ``fix_stage_count`` is predicted above, and a round line
+            # printed before the batch would outlive a mid-batch ``return 1`` above and
+            # overstate the stages the run actually completed.
+            _record_round(rounds, review_index, findings_count, fix_stage_count)
+
+        verdict_line = f"Review verdict: {verdict or 'ambiguous'}"
+        summary = "\n".join(
+            [
+                f"Task: {phase} {epic} {task} — {entry.title}",
+                f"Prompt: {prompt_path.relative_to(target.root)}",
+                verdict_line,
+            ]
         )
-        print_stage(rec_reconcile, repo_root=target.root)
-        if rec_reconcile.status != SUCCEEDED:
-            state.status = FAILED
+        if require_approval:
+            outcome = decide(
+                GATE,
+                summary,
+                approve_all=approve_all,
+                skip=skip,
+                deny=deny,
+                gate_default=gate_default,
+            )
+        else:
+            # The prompt is verified by the reviewer above; the human gate is optional and
+            # off by default. Record the auto-decision so state still shows what happened.
+            outcome = GateOutcome(GATE, True, "optional (default)")
+        _record_review_outcome(
+            state,
+            logger,
+            verdict=verdict,
+            revisions=revisions,
+            max_revisions=max_revisions,
+            rounds=rounds,
+            decision=outcome.decision,
+            mechanism=outcome.mechanism,
+        )
+        if not outcome.approved:
+            state.status = BLOCKED
             save(directory, state)
-            return 1
+            print(f"gate {GATE} denied ({outcome.mechanism}); stopping.", file=sys.stderr)
+            return 3
 
-        # L4.2 (review follow-up #31): recorded only now that the whole fix batch and
-        # its reconcile ran — ``fix_stage_count`` is predicted above, and a round line
-        # printed before the batch would outlive a mid-batch ``return 1`` above and
-        # overstate the stages the run actually completed.
-        _record_round(rounds, review_index, findings_count, fix_stage_count)
+        # The author no longer commits: this is the single commit point for the authored
+        # (initial or reviewed) prompt, in the task worktree on the branch it already has
+        # checked out. Only the owned prompt path is committed.
+        if _commit_reviewed_prompt(target.root, rel, phase, task):
+            logger.info(f"reviewed prompt committed or unchanged: {rel}")
+        else:
+            logger.error(f"failed to commit reviewed prompt {rel}")
+            print(
+                f"warning: could not commit the reviewed prompt ({rel}); "
+                "the branch is dirty",
+                file=sys.stderr,
+            )
 
-    verdict_line = f"Review verdict: {verdict or 'ambiguous'}"
-    summary = "\n".join(
-        [
-            f"Task: {phase} {epic} {task} — {entry.title}",
-            f"Prompt: {prompt_path.relative_to(target.root)}",
-            verdict_line,
-        ]
-    )
-    if require_approval:
-        outcome = decide(
-            GATE,
-            summary,
-            approve_all=approve_all,
-            skip=skip,
-            deny=deny,
-            gate_default=gate_default,
-        )
-    else:
-        # The prompt is verified by the reviewer above; the human gate is optional and
-        # off by default. Record the auto-decision so state still shows what happened.
-        outcome = GateOutcome(GATE, True, "optional (default)")
-    _record_review_outcome(
-        state,
-        logger,
-        verdict=verdict,
-        revisions=revisions,
-        max_revisions=max_revisions,
-        rounds=rounds,
-        decision=outcome.decision,
-        mechanism=outcome.mechanism,
-    )
-    if not outcome.approved:
-        state.status = BLOCKED
+        state.status = SUCCEEDED
         save(directory, state)
-        print(f"gate {GATE} denied ({outcome.mechanism}); stopping.", file=sys.stderr)
-        return 3
-
-    # The author no longer commits: this is the single commit point for the authored
-    # (initial or reviewed) prompt, in the task worktree on the branch it already has
-    # checked out. Only the owned prompt path is committed.
-    if _commit_reviewed_prompt(target.root, rel, phase, task):
-        logger.info(f"reviewed prompt committed or unchanged: {rel}")
-    else:
-        logger.error(f"failed to commit reviewed prompt {rel}")
-        print(
-            f"warning: could not commit the reviewed prompt ({rel}); "
-            "the branch is dirty",
-            file=sys.stderr,
-        )
-
-    state.status = SUCCEEDED
-    save(directory, state)
-    print("prompt workflow complete")
-    print(f"branch: {branch_name}")
-    print(f"prompt: {rel}")
-    return 0
+        print("prompt workflow complete")
+        print(f"branch: {branch_name}")
+        print(f"prompt: {rel}")
+        return 0
+    finally:
+        run_lock.release()

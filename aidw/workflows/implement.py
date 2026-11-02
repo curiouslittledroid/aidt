@@ -25,6 +25,12 @@ worktree is re-resolved into the target and agents so every stage runs in it. It
 longer refuses to run on ``main`` or on a branch that does not match the task id, but
 still refuses when another implement run for the branch is marked ``running`` unless
 ``--resume``.
+
+The run lock (``aidw.lock``, EXTRACTION.md §3.2/§3.10) is keyed on the **located
+worktree path**, acquired immediately before ``create_run`` and released on every exit
+path (success, stage/gate failure, and the post-acquire refusals). A live peer in the
+same worktree is refused with exit 4 and writes no run state. ``--dry-run`` reaches
+``create_run`` too, so it holds and releases the same lock.
 """
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from aidw import git
+from aidw import git, lock
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
@@ -506,36 +512,90 @@ def run(
     pre_pr = plan[:-1]
     pr_plan = plan[-1]
 
-    # --- run state (new or resumed) ----------------------------------------- #
-    # A resumed run was confirmed above, before the worktree locate and this write.
-    if resume and not dry_run:
-        state = existing
-        directory = run_dir(runs_root, state.run_id)
-        logger = RunLogger(directory, stream=stream)
-    else:
-        state = create_run(
-            runs_root,
-            target.root,
-            "implement",
-            label=branch_name,
-            task={"phase": phase, "task": task, "prompt_path": prompt_rel},
-            strict=strict,
-            branch=branch_name,
-        )
-        if pr is not None:
-            state.pr = {**state.pr, "number": pr}
-        directory = run_dir(runs_root, state.run_id)
-        logger = RunLogger(directory, stream=stream)
-        save(directory, state)
+    # --- one run per worktree (EXTRACTION.md §3.2/§3.10, E2.7) ---------------- #
+    # The key is the *resolved* worktree path -- ``target.root``, the same value
+    # ``create_run`` records as ``repo_root`` -- never the branch: a detached-HEAD
+    # worktree has no branch, and §3.2 says "keyed by worktree path". Acquired
+    # immediately before ``create_run`` (the point where the key is final) and released
+    # on every exit path below, refusals and failures included, so the worktree cannot
+    # stay locked until process exit. It lives in the state root, never in a target
+    # repo or worktree (§3.1), and it is neither ``_STATE_LOCK`` (in-process, per
+    # ``state.json`` write) nor ``--parallel`` (concurrent stages inside one run).
+    # A dry run reaches this line too (``create_run`` writes ``state.json``
+    # unconditionally), so it holds and releases the same lock.
+    try:
+        run_lock = lock.acquire(workspace.state_root, target.root)
+    except lock.LockHeldError as exc:
+        print(str(exc), file=sys.stderr)
+        return 4
 
-    logger.info(f"implement workflow {task_id}: {prompt_rel}")
-    print(f"run:    {state.run_id}")
-    print(f"branch: {branch_name}")
-    print(f"prompt: {prompt_rel}")
+    try:
+        # --- run state (new or resumed) ----------------------------------------- #
+        # A resumed run was confirmed above, before the worktree locate and this write.
+        if resume and not dry_run:
+            state = existing
+            directory = run_dir(runs_root, state.run_id)
+            logger = RunLogger(directory, stream=stream)
+        else:
+            state = create_run(
+                runs_root,
+                target.root,
+                "implement",
+                label=branch_name,
+                task={"phase": phase, "task": task, "prompt_path": prompt_rel},
+                strict=strict,
+                branch=branch_name,
+            )
+            if pr is not None:
+                state.pr = {**state.pr, "number": pr}
+            directory = run_dir(runs_root, state.run_id)
+            logger = RunLogger(directory, stream=stream)
+            save(directory, state)
 
-    # --- dry run: plan every stage, no Pi, no git/GitHub writes -------------- #
-    if dry_run:
-        for entry in plan:
+        logger.info(f"implement workflow {task_id}: {prompt_rel}")
+        print(f"run:    {state.run_id}")
+        print(f"branch: {branch_name}")
+        print(f"prompt: {prompt_rel}")
+
+        # --- dry run: plan every stage, no Pi, no git/GitHub writes -------------- #
+        if dry_run:
+            for entry in plan:
+                record = run_stage(
+                    entry.spec(aidt.root),
+                    repo_root=target.root,
+                    toolkit_root=aidt.root,
+                    runs_root=runs_root,
+                    state=state,
+                    logger=logger,
+                    agents=agents,
+                    dry_run=True,
+                )
+                print(f"{entry.id} {record.name} [{record.status}] (planned) "
+                      f"agent={record.agent} model={record.model}")
+            print(f"gate (planned): {GATE}")
+            state.status = SUCCEEDED
+            save(directory, state)
+            print("dry-run complete; Pi not invoked")
+            return 0
+
+        # --- stage selection (resume / --from) ---------------------------------- #
+        # ``from_index`` was validated before branch setup; the log line waits for
+        # the run's logger to exist.
+        if from_index is not None:
+            logger.info(f"--from {from_stage}: re-running from {names[from_index]}")
+
+        def should_run(index: int, name: str) -> bool:
+            if from_index is not None and index >= from_index:
+                return True
+            record = state.stage(name)
+            return not (record is not None and record.status == SUCCEEDED)
+
+        # --- I1..I5 -------------------------------------------------------------- #
+        def execute(entry: PlanStage, index: int) -> bool:
+            """Run one stage unless it already succeeded; return its success."""
+            if not should_run(index, entry.name):
+                print(f"stage:  {entry.id} {entry.name} [skipped]")
+                return True
             record = run_stage(
                 entry.spec(aidt.root),
                 repo_root=target.root,
@@ -544,165 +604,131 @@ def run(
                 state=state,
                 logger=logger,
                 agents=agents,
-                dry_run=True,
             )
-            print(f"{entry.id} {record.name} [{record.status}] (planned) "
-                  f"agent={record.agent} model={record.model}")
-        print(f"gate (planned): {GATE}")
+            print_stage(record, repo_root=target.root, prefix=entry.id)
+            if record.status != SUCCEEDED:
+                print(f"stage {entry.name} failed: {record.error}", file=sys.stderr)
+                state.status = FAILED
+                state.resume = {"next_stage": entry.name}
+                save(directory, state)
+                return False
+            return True
+
+        index_of = {entry.name: index for index, entry in enumerate(pre_pr)}
+        by_name = {entry.name: entry for entry in pre_pr}
+
+        if parallel:
+            # The one pair docs/workflow.md calls safe to parallelize: /test writes package
+            # tests, /update-architecture writes docs/architecture/**. They share no files,
+            # so they may run concurrently in the same working tree. The run-state writes are
+            # serialized inside run_stage.
+            logger.info("--parallel: running test and update-architecture concurrently")
+            if not execute(by_name["impliment-task"], index_of["impliment-task"]):
+                return 1
+            pair = [by_name["test"], by_name["update-architecture"]]
+            active = [entry for entry in pair if should_run(index_of[entry.name], entry.name)]
+            for entry in pair:
+                if entry not in active:
+                    print(f"stage:  {entry.id} {entry.name} [skipped]")
+            failed = False
+            if active:
+                with ThreadPoolExecutor(max_workers=len(active)) as pool:
+                    futures = {
+                        pool.submit(
+                            run_stage,
+                            entry.spec(aidt.root),
+                            repo_root=target.root,
+                            toolkit_root=aidt.root,
+                            runs_root=runs_root,
+                            state=state,
+                            logger=logger,
+                            agents=agents,
+                        ): entry
+                        for entry in active
+                    }
+                    for future in as_completed(futures):
+                        entry = futures[future]
+                        record = future.result()
+                        print_stage(record, repo_root=target.root, prefix=entry.id)
+                        if record.status != SUCCEEDED:
+                            print(
+                                f"stage {entry.name} failed: {record.error}",
+                                file=sys.stderr,
+                            )
+                            failed = True
+            if failed:
+                state.status = FAILED
+                save(directory, state)
+                return 1
+            for name in ("update-traceability", "record-implementation-results"):
+                if not execute(by_name[name], index_of[name]):
+                    return 1
+        else:
+            for index, entry in enumerate(pre_pr):
+                if not execute(entry, index):
+                    return 1
+
+        # --- gate ---------------------------------------------------------------- #
+        approved = any(g.name == GATE and g.decision == "approved" for g in state.gates)
+        if approved:
+            print(f"gate:   {GATE} [already approved]")
+        else:
+            summary = _gate_summary(state, target, branch_name, prompt_rel)
+            outcome = decide(
+                GATE,
+                summary,
+                approve_all=approve_all,
+                skip=skip,
+                deny=deny,
+                gate_default=gate_default,
+            )
+            state.record_gate(
+                GateRecord(
+                    name=GATE,
+                    decision=outcome.decision,
+                    mechanism=outcome.mechanism,
+                    at=utcnow_iso(),
+                )
+            )
+            save(directory, state)
+            if not outcome.approved:
+                state.status = BLOCKED
+                save(directory, state)
+                print(
+                    f"gate {GATE} denied ({outcome.mechanism}); stopping.",
+                    file=sys.stderr,
+                )
+                return 3
+            print(f"gate:   {GATE} [{outcome.mechanism}]")
+
+        # --- I6 ------------------------------------------------------------------ #
+        if should_run(len(plan) - 1, pr_plan.name):
+            record = run_stage(
+                pr_plan.spec(aidt.root),
+                repo_root=target.root,
+                toolkit_root=aidt.root,
+                runs_root=runs_root,
+                state=state,
+                logger=logger,
+                agents=agents,
+            )
+            print_stage(record, repo_root=target.root, prefix=pr_plan.id)
+            if record.status != SUCCEEDED:
+                print(f"stage {pr_plan.name} failed: {record.error}", file=sys.stderr)
+                return 1
+            _record_pr(state, target, record)
+        else:
+            print(f"stage:  {pr_plan.id} {pr_plan.name} [skipped]")
+
+        _write_artifacts(directory, state, branch_name)
         state.status = SUCCEEDED
+        state.resume = {"next_stage": None}
         save(directory, state)
-        print("dry-run complete; Pi not invoked")
+
+        print("implement workflow complete")
+        print(f"branch: {branch_name}")
+        if state.pr.get("url"):
+            print(f"pr:     {state.pr['url']}")
         return 0
-
-    # --- stage selection (resume / --from) ---------------------------------- #
-    # ``from_index`` was validated before branch setup; the log line waits for
-    # the run's logger to exist.
-    if from_index is not None:
-        logger.info(f"--from {from_stage}: re-running from {names[from_index]}")
-
-    def should_run(index: int, name: str) -> bool:
-        if from_index is not None and index >= from_index:
-            return True
-        record = state.stage(name)
-        return not (record is not None and record.status == SUCCEEDED)
-
-    # --- I1..I5 -------------------------------------------------------------- #
-    def execute(entry: PlanStage, index: int) -> bool:
-        """Run one stage unless it already succeeded; return its success."""
-        if not should_run(index, entry.name):
-            print(f"stage:  {entry.id} {entry.name} [skipped]")
-            return True
-        record = run_stage(
-            entry.spec(aidt.root),
-            repo_root=target.root,
-            toolkit_root=aidt.root,
-            runs_root=runs_root,
-            state=state,
-            logger=logger,
-            agents=agents,
-        )
-        print_stage(record, repo_root=target.root, prefix=entry.id)
-        if record.status != SUCCEEDED:
-            print(f"stage {entry.name} failed: {record.error}", file=sys.stderr)
-            state.status = FAILED
-            state.resume = {"next_stage": entry.name}
-            save(directory, state)
-            return False
-        return True
-
-    index_of = {entry.name: index for index, entry in enumerate(pre_pr)}
-    by_name = {entry.name: entry for entry in pre_pr}
-
-    if parallel:
-        # The one pair docs/workflow.md calls safe to parallelize: /test writes package
-        # tests, /update-architecture writes docs/architecture/**. They share no files,
-        # so they may run concurrently in the same working tree. The run-state writes are
-        # serialized inside run_stage.
-        logger.info("--parallel: running test and update-architecture concurrently")
-        if not execute(by_name["impliment-task"], index_of["impliment-task"]):
-            return 1
-        pair = [by_name["test"], by_name["update-architecture"]]
-        active = [entry for entry in pair if should_run(index_of[entry.name], entry.name)]
-        for entry in pair:
-            if entry not in active:
-                print(f"stage:  {entry.id} {entry.name} [skipped]")
-        failed = False
-        if active:
-            with ThreadPoolExecutor(max_workers=len(active)) as pool:
-                futures = {
-                    pool.submit(
-                        run_stage,
-                        entry.spec(aidt.root),
-                        repo_root=target.root,
-                        toolkit_root=aidt.root,
-                        runs_root=runs_root,
-                        state=state,
-                        logger=logger,
-                        agents=agents,
-                    ): entry
-                    for entry in active
-                }
-                for future in as_completed(futures):
-                    entry = futures[future]
-                    record = future.result()
-                    print_stage(record, repo_root=target.root, prefix=entry.id)
-                    if record.status != SUCCEEDED:
-                        print(
-                            f"stage {entry.name} failed: {record.error}",
-                            file=sys.stderr,
-                        )
-                        failed = True
-        if failed:
-            state.status = FAILED
-            save(directory, state)
-            return 1
-        for name in ("update-traceability", "record-implementation-results"):
-            if not execute(by_name[name], index_of[name]):
-                return 1
-    else:
-        for index, entry in enumerate(pre_pr):
-            if not execute(entry, index):
-                return 1
-
-    # --- gate ---------------------------------------------------------------- #
-    approved = any(g.name == GATE and g.decision == "approved" for g in state.gates)
-    if approved:
-        print(f"gate:   {GATE} [already approved]")
-    else:
-        summary = _gate_summary(state, target, branch_name, prompt_rel)
-        outcome = decide(
-            GATE,
-            summary,
-            approve_all=approve_all,
-            skip=skip,
-            deny=deny,
-            gate_default=gate_default,
-        )
-        state.record_gate(
-            GateRecord(
-                name=GATE,
-                decision=outcome.decision,
-                mechanism=outcome.mechanism,
-                at=utcnow_iso(),
-            )
-        )
-        save(directory, state)
-        if not outcome.approved:
-            state.status = BLOCKED
-            save(directory, state)
-            print(
-                f"gate {GATE} denied ({outcome.mechanism}); stopping.",
-                file=sys.stderr,
-            )
-            return 3
-        print(f"gate:   {GATE} [{outcome.mechanism}]")
-
-    # --- I6 ------------------------------------------------------------------ #
-    if should_run(len(plan) - 1, pr_plan.name):
-        record = run_stage(
-            pr_plan.spec(aidt.root),
-            repo_root=target.root,
-            toolkit_root=aidt.root,
-            runs_root=runs_root,
-            state=state,
-            logger=logger,
-            agents=agents,
-        )
-        print_stage(record, repo_root=target.root, prefix=pr_plan.id)
-        if record.status != SUCCEEDED:
-            print(f"stage {pr_plan.name} failed: {record.error}", file=sys.stderr)
-            return 1
-        _record_pr(state, target, record)
-    else:
-        print(f"stage:  {pr_plan.id} {pr_plan.name} [skipped]")
-
-    _write_artifacts(directory, state, branch_name)
-    state.status = SUCCEEDED
-    state.resume = {"next_stage": None}
-    save(directory, state)
-
-    print("implement workflow complete")
-    print(f"branch: {branch_name}")
-    if state.pr.get("url"):
-        print(f"pr:     {state.pr['url']}")
-    return 0
+    finally:
+        run_lock.release()

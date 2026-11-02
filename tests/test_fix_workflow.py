@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 
-from aidw import git, github
+from aidw import git, github, lock
 from aidw.config import ERROR, WARNING, Issue
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import SUCCEEDED, StageRecord, run_dir
@@ -456,3 +457,164 @@ def test_zero_max_iterations_is_usage_error(tmp_path: Path, monkeypatch) -> None
         )
         == 2
     )
+
+# --------------------------------------------------------------------------- #
+# One run per worktree (E2.7, EXTRACTION.md §3.2/§3.10)
+# --------------------------------------------------------------------------- #
+
+
+def _two_pr_head_worktrees(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, dict[int, str]]:
+    """Control root plus two PR-head worktrees, and a pr -> head-branch map."""
+    _bare, control = _make_bare_with_control(tmp_path)
+    first = git.add_worktree(control, "03-E4.1")
+    second = git.add_worktree(control, "03-E4.2")
+    assert first is not None and second is not None
+    return control, first, second, {7: "03-E4.1", 8: "03-E4.2"}
+
+
+def test_a_held_pr_head_worktree_lock_is_refused_before_any_run_state(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The key is the re-resolved PR-head worktree, not the control root.
+
+    A lock keyed on the pre-re-resolve control root would not be held here, so this run
+    would proceed and the test would fail.
+    """
+    control, worktree = _fix_layout(tmp_path)
+    _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+    roots = _roots(control)
+
+    with lock.acquire(roots["workspace"].state_root, worktree):
+        code = fix_workflow.run(pr=7, **roots, approve_all=True)
+
+    assert code == 4
+    assert stages.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    err = capsys.readouterr().err
+    assert "another aidw run is already active" in err
+    assert str(worktree) in err
+
+
+def test_two_concurrent_fix_runs_on_the_pr_head_are_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A live peer is refused *by the lock* and leaves no second run directory.
+
+    ``_latest_fix_run`` stays branch-keyed (E2.7 req 5) and would refuse the second run
+    first, before it could reach the lock — the second run's check reads ``state.json``
+    before the first has written it, which is exactly the race the lock closes. The test
+    therefore neutralises that guard (and only that guard) to exercise the lock itself.
+    """
+    control, worktree = _fix_layout(tmp_path)
+    _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
+    monkeypatch.setattr(fix_workflow, "_latest_fix_run", lambda runs_root, branch: None)
+    entered, release = threading.Event(), threading.Event()
+
+    class _BlockingStages(_FakeStages):
+        def __call__(self, spec, **kwargs):
+            entered.set()
+            assert release.wait(timeout=60), "the holder was never released"
+            return super().__call__(spec, **kwargs)
+
+    holder_stages = _BlockingStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", holder_stages)
+    roots = _roots(control)
+    outcome: dict = {}
+
+    def hold() -> None:
+        try:
+            outcome["code"] = fix_workflow.run(pr=7, **roots, approve_all=True)
+        except BaseException as exc:  # pragma: no cover - asserted via ``outcome``
+            outcome["error"] = exc
+
+    holder = threading.Thread(target=hold, name="aidw-fix-run")
+    holder.start()
+    assert entered.wait(timeout=60), "the holding run never reached a stage"
+
+    refused = fix_workflow.run(pr=7, **roots, approve_all=True)
+
+    release.set()
+    holder.join(timeout=60)
+    assert not holder.is_alive()
+    assert "error" not in outcome, outcome.get("error")
+
+    assert refused == 4
+    assert outcome["code"] == 0
+    assert len(list(_runs_root(control).iterdir())) == 1
+    err = capsys.readouterr().err
+    assert "another aidw run is already active" in err
+    assert str(worktree) in err
+
+
+def test_fix_runs_in_different_worktrees_proceed(tmp_path: Path, monkeypatch) -> None:
+    """Two PR heads are two keys, so both runs proceed (a repo-root key would refuse)."""
+    control, first, second, heads = _two_pr_head_worktrees(tmp_path)
+    _patch(monkeypatch, select_impl=_select_seq([]))
+    monkeypatch.setattr(
+        github,
+        "pr_view",
+        lambda repo, pr: {
+            "number": pr,
+            "url": f"https://github.com/o/r/pull/{pr}",
+            "baseRefName": "main",
+            "headRefName": heads[pr],
+        },
+    )
+    entered = {first: threading.Event(), second: threading.Event()}
+    release = threading.Event()
+
+    class _PerWorktreeStages(_FakeStages):
+        def __call__(self, spec, **kwargs):
+            entered.setdefault(kwargs["repo_root"], threading.Event()).set()
+            assert release.wait(timeout=60), "the runs were never released"
+            return super().__call__(spec, **kwargs)
+
+    monkeypatch.setattr(fix_workflow, "run_stage", _PerWorktreeStages())
+    roots = _roots(control)
+    outcomes: dict[int, dict] = {7: {}, 8: {}}
+
+    def run_pr(pr: int) -> None:
+        try:
+            outcomes[pr]["code"] = fix_workflow.run(pr=pr, **roots, approve_all=True)
+        except BaseException as exc:  # pragma: no cover - asserted via ``outcomes``
+            outcomes[pr]["error"] = exc
+
+    threads = [
+        threading.Thread(target=run_pr, args=(pr,), name=f"aidw-fix-{pr}")
+        for pr in (7, 8)
+    ]
+    for thread in threads:
+        thread.start()
+    assert entered[first].wait(timeout=60) and entered[second].wait(timeout=60)
+    release.set()
+    for thread in threads:
+        thread.join(timeout=60)
+        assert not thread.is_alive()
+
+    assert outcomes[7].get("code") == 0, outcomes[7].get("error")
+    assert outcomes[8].get("code") == 0, outcomes[8].get("error")
+    states = fix_workflow.list_runs(_runs_root(control))
+    assert {state.repo_root for state in states} == {str(first), str(second)}
+
+
+def test_the_worktree_lock_is_released_after_the_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Even a run that walks the whole fix loop frees its key before returning."""
+    control, worktree = _fix_layout(tmp_path)
+    _patch(
+        monkeypatch,
+        select_impl=_select_seq([_select_ok(), _select_ok(), _select_none()]),
+    )
+    monkeypatch.setattr(fix_workflow, "run_stage", _FakeStages(APPROVE_REVIEW))
+    roots = _roots(control)
+
+    assert fix_workflow.run(pr=7, **roots, approve_all=True) == 0
+
+    with lock.acquire(roots["workspace"].state_root, worktree):
+        pass
