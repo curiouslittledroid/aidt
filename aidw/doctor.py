@@ -33,6 +33,14 @@ _SYMBOL = {OK: "  ok  ", WARN: " warn ", FAIL: " fail "}
 #: and ``publish`` with ``Unknown JSON field: "subIssues"``.
 GH_MIN_VERSION = (2, 94, 0)
 
+#: The oldest Pi AIDW works with: its argv flags are verified against 0.85.x (§5.5). Below
+#: this floor a stage fails *before the first model call* — an older Pi cannot load the
+#: extensions the operator's package set installs (``@earendil-works/pi-ai/compat`` is a
+#: 0.85 addition), so every ``pi`` invocation exits 1 at extension load and AIDW records
+#: only ``exit code 1`` with zero tokens, zero events and an empty stage JSONL. That is
+#: unreadable from a run record, so preflight names it instead (§12).
+PI_MIN_VERSION = (0, 85, 0)
+
 #: Sub-issue capabilities to probe for, as ``(argv, label, help pattern)``. Probed from
 #: ``gh``'s own help output as well as version-checked, so a stale or shadowed binary that
 #: reports a new version without the features is still caught, and the report names exactly
@@ -124,7 +132,23 @@ def _check_uv() -> Check:
     )
 
 
+def _parse_pi_version(output: str) -> tuple[int, int, int] | None:
+    """``X.Y.Z`` from ``pi --version``, which prints the bare version (``0.74.2``)."""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", output)
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.groups())
+    return major, minor, patch
+
+
 def _check_pi() -> Check:
+    """``pi`` must be on ``PATH`` and at least :data:`PI_MIN_VERSION` (§5.5, §12).
+
+    An unversioned presence check is not enough: a stale ``pi`` earlier on ``PATH`` — an
+    old ``nvm`` bin dir shadowing the current one — starts up far enough to answer
+    ``--version`` and then dies loading extensions inside the first stage, which reaches
+    the run record as nothing more than ``exit code 1``.
+    """
     path = shutil.which("pi")
     if not path:
         return Check("pi", FAIL, "not on PATH")
@@ -132,6 +156,18 @@ def _check_pi() -> Check:
     if code != 0:
         return Check("pi", WARN, f"found at {path} but `pi --version` failed")
     first = out.splitlines()[0] if out else "unknown"
+    version = _parse_pi_version(out)
+    if version is not None and version < PI_MIN_VERSION:
+        shown = ".".join(str(part) for part in version)
+        minimum = ".".join(str(part) for part in PI_MIN_VERSION)
+        return Check(
+            "pi",
+            FAIL,
+            f"{shown} ({path}) predates the Pi AIDW supports; require pi >= {minimum}. "
+            "An older Pi cannot load the installed extensions, so every stage exits 1 "
+            "before its first model call. Check for a stale nvm bin dir earlier on PATH "
+            "with `which -a pi`.",
+        )
     return Check("pi", OK, f"{first} ({path})")
 
 

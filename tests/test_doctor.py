@@ -11,9 +11,11 @@ from aidw.doctor import (
     WARN,
     _check_dependencies,
     _check_gh_version,
+    _check_pi,
     _check_python,
     _missing_gh_capabilities,
     _parse_gh_version,
+    _parse_pi_version,
     collect_checks,
 )
 
@@ -58,6 +60,26 @@ def _install_gh(
     return calls
 
 
+def _install_pi(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    version: str | None = "1.2.0",
+    path: str | None = "/usr/local/bin/pi",
+    version_exit: int = 0,
+) -> list[list[str]]:
+    """Stand in for ``pi``; returns the list of argv arrays the checks invoked."""
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: path)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], cwd: object = None) -> tuple[int, str]:
+        assert cmd[0] == "pi", f"unexpected command: {cmd}"
+        calls.append(cmd)
+        return version_exit, version or ""
+
+    monkeypatch.setattr(doctor, "_run", fake_run)
+    return calls
+
+
 def test_python_check_ok() -> None:
     check = _check_python()
     assert check.status == OK
@@ -74,6 +96,52 @@ def test_collect_checks_returns_results(fake_external_clis: None) -> None:  # no
     # Findings must be within the known status vocabulary.
     for check in checks:
         assert check.status in (OK, "WARN", FAIL)
+
+
+def test_parse_pi_version() -> None:
+    assert _parse_pi_version("0.74.2") == (0, 74, 2)
+    assert _parse_pi_version("1.2.0 (node v24.18.0)") == (1, 2, 0)
+    assert _parse_pi_version("pi 0.85.0") == (0, 85, 0)
+    assert _parse_pi_version("pi: command not found") is None
+
+
+def test_pi_check_ok_for_supported_pi(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_pi(monkeypatch, version="1.2.0")
+    check = _check_pi()
+    assert check.status == OK
+    assert "1.2.0" in check.detail
+    assert "/usr/local/bin/pi" in check.detail
+
+
+def test_pi_check_ok_at_the_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_pi(monkeypatch, version="pi 0.85.0")
+    assert _check_pi().status == OK
+
+
+def test_pi_check_fails_below_the_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The incident this check exists for: a stale ``pi`` shadowing a current one on PATH.
+
+    It answered ``--version`` happily and then died loading extensions, which surfaced as a
+    bare ``exit code 1`` with zero tokens in the run record.
+    """
+    _install_pi(monkeypatch, version="0.74.2", path="/Users/phil/.nvm/versions/node/v22.9.0/bin/pi")
+    check = _check_pi()
+    assert check.status == FAIL
+    assert "0.74.2" in check.detail
+    assert "/Users/phil/.nvm/versions/node/v22.9.0/bin/pi" in check.detail
+    assert "0.85.0" in check.detail
+    assert "which -a pi" in check.detail
+
+
+def test_pi_check_warns_when_version_unreadable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unparseable or failing ``--version`` is not proof of an old Pi."""
+    _install_pi(monkeypatch, version="", version_exit=1)
+    assert _check_pi().status == WARN
+
+
+def test_pi_check_fails_when_pi_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_pi(monkeypatch, path=None)
+    assert _check_pi().status == FAIL
 
 
 def test_parse_gh_version() -> None:
