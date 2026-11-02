@@ -185,7 +185,7 @@
   - Deliverable: workflow changes.
   - Done when: a full run creates exactly one new worktree, leaves the base worktree clean, and commits only the prompt path on the task branch.
 
-- [ ] **E2.6. `implement`/`fix` resolve their worktree**
+- [x] **E2.6. `implement`/`fix` resolve their worktree**
   Resolve branch → worktree via `worktrees()`; when absent, print the exact
   `git worktree add …` command and stop. `--repo` overrides.
   - Deliverable: preflight changes plus tests.
