@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 from aidw import git, github
-from aidw.config import ERROR, Issue
+from aidw.config import ERROR, WARNING, Issue
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import SUCCEEDED, StageRecord, run_dir
 from aidw.workflows import fix as fix_workflow
@@ -255,6 +255,65 @@ def test_reloaded_worktree_config_error_is_usage_error(
     assert stages.names == []
     runs_root = _runs_root(control)
     assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def _independence_warning() -> Issue:
+    # ``check_independence`` emits this from inside ``load_all`` for every root alike:
+    # the models come from the toolkit agent configs, not the repo (issue #58).
+    return Issue(
+        WARNING,
+        "code-reviewer",
+        "model matches `implementer` (test/model); "
+        "the workflow requires reviewer != author",
+    )
+
+
+def test_strict_independence_warning_refuses_without_force_model(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control, _worktree = _fix_layout(tmp_path)
+    _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
+    monkeypatch.setattr(
+        fix_workflow, "load_all", lambda _aidt, _repo: ({}, [_independence_warning()])
+    )
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True, strict=True)
+
+    # The warning itself stays fatal under --strict without the explicit override.
+    assert code == 2
+    assert stages.names == []
+    assert "reviewer != author" in capsys.readouterr().err
+
+
+def test_force_model_overrides_reloaded_worktree_independence_warning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, worktree = _fix_layout(tmp_path)
+    _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
+    calls: list[Path] = []
+
+    def load_for_root(_aidt: Path, repo_root: Path):
+        calls.append(repo_root)
+        return {}, [_independence_warning()]
+
+    monkeypatch.setattr(fix_workflow, "load_all", load_for_root)
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(
+        pr=7, **_roots(control), approve_all=True, strict=True, force_model=True
+    )
+
+    # Both loads warn identically; --force-model must override the reloaded
+    # worktree check exactly as it overrides the control-root preflight (issue #58).
+    assert calls == [control.resolve(), worktree]
+    assert code == 0
+    assert stages.names == ["round1-approve-review-followups"]
+    assert stages.repo_roots == [worktree]
+    state = fix_workflow.list_runs(_runs_root(control))[-1]
+    assert state.pr["force_model"] is True
 
 
 def test_findings_trigger_publish_and_second_approval(tmp_path: Path, monkeypatch) -> None:
