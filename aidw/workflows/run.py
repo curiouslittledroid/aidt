@@ -63,6 +63,49 @@ def _resolved_task_prompt(
     return find_task_prompt(repo, phase, task)
 
 
+def _locate_task_worktree(
+    repo: TargetRepo,
+    workspace: WorkspacePaths,
+    phase: str,
+    task: str,
+    *,
+    dry_run: bool,
+) -> tuple[str | None, Path | None, int | None]:
+    """Derive the task branch and locate its worktree for the chain (E2.6 req 5).
+
+    Returns ``(branch, worktree, refusal_code)``. The chain has the ids but not the
+    prompt filename, so it derives the branch exactly as ``prompt``/``implement`` do
+    (``derive_branch_name``). ``branch`` is ``None`` only when ``branch_pattern`` is
+    malformed — exit 2 before any lookup. A non-dry run whose worktree is absent prints
+    the §3.2 command and returns 4 (the same refusal ``implement`` gives); a dry run has
+    no worktree to locate and no refusal, keeping its conventional-path fallback.
+    """
+    branch = implement_workflow.derive_branch_name(
+        repo.branch_pattern, phase=phase, task=task
+    )
+    if branch is None:
+        print(
+            f"malformed repo.branch_pattern {repo.branch_pattern!r}: it must be a "
+            "format string referencing both `{phase}` and `{task}` "
+            '(e.g. "{phase}-{task}").',
+            file=sys.stderr,
+        )
+        return branch, None, 2
+    if dry_run:
+        return branch, None, None
+    worktree = git.worktree_for_branch(repo.root, branch)
+    if worktree is None:
+        command = implement_workflow.worktree_add_command(
+            workspace, branch, repo.base_branch
+        )
+        print(
+            f"chain stopped: no worktree for `{branch}`. Create it first:\n  {command}",
+            file=sys.stderr,
+        )
+        return branch, None, 4
+    return branch, worktree, None
+
+
 def find_pr_number(runs_root: Path, branch: str | None) -> int | None:
     """The PR number the newest ``implement`` run recorded for ``branch``.
 
@@ -122,7 +165,15 @@ def task_to_pr(
         print(f"chain stopped: `prompt` exited {code}.", file=sys.stderr)
         return code
 
-    prompt_path = _resolved_task_prompt(repo.root, phase, task, dry_run=dry_run)
+    branch, worktree, refusal = _locate_task_worktree(
+        repo, workspace, phase, task, dry_run=dry_run
+    )
+    if refusal is not None:
+        return refusal
+    # The prompt is committed in the task worktree, so the non-dry scan runs there;
+    # the dry run keeps the conventional path because it creates no worktree.
+    prompt_root = repo.root if dry_run else worktree
+    prompt_path = _resolved_task_prompt(prompt_root, phase, task, dry_run=dry_run)
     if prompt_path is None:
         print(
             f"chain stopped: no task prompt found for {phase}-{task} after `prompt`.",
@@ -254,7 +305,15 @@ def prompt_to_fix(
         print(f"chain stopped: `prompt` exited {code}.", file=sys.stderr)
         return code
 
-    prompt_path = _resolved_task_prompt(repo.root, phase, task, dry_run=dry_run)
+    branch, worktree, refusal = _locate_task_worktree(
+        repo, workspace, phase, task, dry_run=dry_run
+    )
+    if refusal is not None:
+        return refusal
+    # The prompt is committed in the task worktree, so the non-dry scan runs there;
+    # the dry run keeps the conventional path because it creates no worktree.
+    prompt_root = repo.root if dry_run else worktree
+    prompt_path = _resolved_task_prompt(prompt_root, phase, task, dry_run=dry_run)
     if prompt_path is None:
         print(
             f"chain stopped: no task prompt found for {phase}-{task} after `prompt`.",
@@ -280,7 +339,6 @@ def prompt_to_fix(
         print(f"chain stopped: `implement` exited {code}.", file=sys.stderr)
         return code
 
-    branch = git.current_branch(repo.root)
     if pr is not None:
         pr_number = pr
     elif dry_run:

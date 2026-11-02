@@ -1,10 +1,12 @@
-"""Tests for the ``aidw implement`` workflow (design §8.2, Phase 4).
+"""Tests for the ``aidw implement`` workflow (design §8.2, Phase 4; E2.6).
 
-E2.4 makes branch setup a Python stage: ``run()`` derives the branch/worktree name from
-``repo.branch_pattern``, creates the worktree with ``git.add_worktree`` before I1, copies
-the (possibly uncommitted) task prompt into it, and re-resolves the target/agents so
-I1..I6 run in the new worktree. The harness therefore builds the real bare+control layout
-(EXTRACTION.md §3.2) and never fakes git output; only the Pi seam (``run_stage``) is mocked.
+E2.6 turns branch setup into a **locate**: ``run()`` derives the branch/worktree name
+from ``repo.branch_pattern``, finds the worktree ``aidw prompt`` (E2.5) already created
+with ``git.worktree_for_branch``, and re-resolves the target/agents so I1..I6 run in it.
+A missing worktree is a preflight refusal (exit 4) that prints the §3.2 ``worktree add``
+command; implement no longer creates one or copies the prompt. The harness therefore
+builds the real bare+control layout (EXTRACTION.md §3.2), pre-creating the task worktree
+with real git, and never fakes git output; only the Pi seam (``run_stage``) is mocked.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from aidw import git
+from aidw.config import ERROR, Issue
 from aidw.gates import GateOutcome
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import (
@@ -70,8 +73,42 @@ def _write_prompt(control: Path, name: str = "03-E4.1-prompt.md") -> Path:
 
 
 def _layout(tmp_path: Path) -> tuple[Path, Path]:
+    """Control root plus the prompt uncommitted there (no task worktree. E2.6)."""
     _bare, control = _make_bare_with_control(tmp_path)
     return control, _write_prompt(control)
+
+
+def _make_task_worktree(
+    control: Path,
+    branch: str = "03-E4.1",
+    name: str = "03-E4.1-prompt.md",
+    base_branch: str = "main",
+) -> tuple[Path, Path]:
+    """Pre-create the task worktree and commit the prompt inside it (the E2.5 layout).
+
+    This is what ``aidw prompt`` leaves behind: the branch's worktree is created, the
+    task prompt is committed there, and the control root stays on the base branch.
+    """
+    worktree = git.add_worktree(control, branch, base_branch=base_branch)
+    assert worktree is not None
+    prompt = worktree / "docs" / "task-prompts" / name
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_text("# Implement E4.1\n", encoding="utf-8")
+    _git_run(worktree, "add", ".")
+    _git_run(worktree, "commit", "-qm", "task prompt")
+    return worktree, prompt
+
+
+def _located_layout(
+    tmp_path: Path,
+    branch: str = "03-E4.1",
+    name: str = "03-E4.1-prompt.md",
+    base_branch: str = "main",
+) -> tuple[Path, Path, Path]:
+    """Control root plus a ready task worktree/prompt (the E2.5/E2.6 happy path)."""
+    _bare, control = _make_bare_with_control(tmp_path)
+    worktree, prompt = _make_task_worktree(control, branch, name, base_branch)
+    return control, worktree, prompt
 
 
 def _roots(control: Path) -> dict:
@@ -214,7 +251,9 @@ def test_build_plan_uses_the_configured_base_branch() -> None:
 def test_non_default_branch_pattern_names_branch_worktree_and_state(
     tmp_path: Path, monkeypatch
 ) -> None:
-    control, prompt = _layout(tmp_path)
+    control, worktree, prompt = _located_layout(
+        tmp_path, branch="E4.1-03", name="03-E4.1-prompt.md"
+    )
     roots = _roots(control)
     roots["repo"] = dataclasses.replace(
         roots["repo"], branch_pattern="{task}-{phase}"
@@ -226,7 +265,8 @@ def test_non_default_branch_pattern_names_branch_worktree_and_state(
     code = implement_workflow.run(task_prompt_path=prompt, **roots, approve_all=True)
 
     assert code == 0
-    assert (tmp_path / "E4.1-03").is_dir()
+    assert worktree == (tmp_path / "E4.1-03").resolve()
+    assert recorder.repo_roots[0] == worktree
     state = implement_workflow.list_runs(_runs_root(control))[-1]
     assert state.git.get("branch") == "E4.1-03"
 
@@ -258,7 +298,7 @@ def test_malformed_branch_pattern_is_usage_error_before_worktree(
 # --------------------------------------------------------------------------- #
 
 
-def test_dry_run_plans_branch_setup_and_all_six_stages(
+def test_dry_run_plans_locate_and_all_six_stages(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     control, prompt = _layout(tmp_path)
@@ -280,11 +320,18 @@ def test_dry_run_plans_branch_setup_and_all_six_stages(
         "pr",
     ]
     out = capsys.readouterr().out
-    assert "branch-setup (planned)" in out
-    assert "worktree add -b 03-E4.1" in out
-    assert str(tmp_path / "03-E4.1") in out
+    command = (
+        f"git -C {tmp_path / 'main'} worktree add -b 03-E4.1 "
+        f"{tmp_path / '03-E4.1'} main"
+    )
+    # The dry run plans the locate, not a ``worktree add`` it no longer performs, and
+    # prints the corrective command copy-pasteable (E2.6 req 4/req 6).
+    assert f"worktree (planned): {tmp_path / '03-E4.1'}" in out
+    assert f"branch-setup (planned): {command}" in out
     # A dry run performs no worktree writes.
     assert not (tmp_path / "03-E4.1").exists()
+    # The prompt argument is re-based onto the planned worktree (req 2/req 6).
+    assert recorder.specs[0].variables == ["docs/task-prompts/03-E4.1-prompt.md"]
 
 
 def test_dry_run_writes_runs_under_the_state_root(tmp_path: Path, monkeypatch) -> None:
@@ -310,10 +357,10 @@ def test_dry_run_writes_runs_under_the_state_root(tmp_path: Path, monkeypatch) -
 # --------------------------------------------------------------------------- #
 
 
-def test_worktree_exists_before_first_stage_and_prompt_is_copied(
+def test_locates_existing_worktree_and_runs_every_stage_in_it(
     tmp_path: Path, monkeypatch
 ) -> None:
-    control, prompt = _layout(tmp_path)
+    control, worktree, prompt = _located_layout(tmp_path)
     _patch(monkeypatch)
     recorder = _Recorder()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
@@ -323,13 +370,39 @@ def test_worktree_exists_before_first_stage_and_prompt_is_copied(
     )
 
     assert code == 0
-    worktree = (tmp_path / "03-E4.1").resolve()
-    assert worktree.is_dir()
-    # The prompt was uncommitted in the control worktree and must have been copied in.
-    copied = worktree / "docs" / "task-prompts" / "03-E4.1-prompt.md"
-    assert copied.is_file()
-    # I1 ran after the worktree existed, with the worktree as its repo root.
     assert recorder.names[0] == "impliment-task"
+    # Every stage ran in the located worktree, not the control root.
+    assert recorder.repo_roots == [worktree] * len(recorder.repo_roots)
+    # No second worktree was created: one branch maps to exactly one worktree.
+    branches = [entry.branch for entry in git.worktrees(control) if entry.branch]
+    assert branches.count("03-E4.1") == 1
+
+
+def test_repo_override_from_unrelated_cwd_locates_the_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``--repo``/``explicit=`` selects the control root; the lookup follows it."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    unrelated = tmp_path / "elsewhere"
+    unrelated.mkdir()
+    monkeypatch.chdir(unrelated)
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    target = TargetRepo.resolve(explicit=control)
+    workspace = WorkspacePaths.resolve(
+        target, state_dir_override=control.parent / "aidt-state"
+    )
+    code = implement_workflow.run(
+        task_prompt_path=prompt,
+        repo=target,
+        aidt=ToolkitPaths.resolve(),
+        workspace=workspace,
+        approve_all=True,
+    )
+
+    assert code == 0
     assert recorder.repo_roots[0] == worktree
 
 
@@ -343,7 +416,7 @@ def test_base_branch_flows_through_the_whole_run(tmp_path: Path, monkeypatch) ->
     _git_run(develop_wt, "add", ".")
     _git_run(develop_wt, "commit", "-qm", "develop work")
     _git_run(bare, "worktree", "remove", str(develop_wt))
-    prompt = _write_prompt(control)
+    worktree, prompt = _make_task_worktree(control, base_branch="develop")
 
     roots = _roots(control)
     roots["repo"] = dataclasses.replace(roots["repo"], base_branch="develop")
@@ -362,17 +435,16 @@ def test_base_branch_flows_through_the_whole_run(tmp_path: Path, monkeypatch) ->
 
     assert code == 0
     assert len(summaries) == 1
+    prompt_rel = "docs/task-prompts/03-E4.1-prompt.md"
     # develop contains g.txt while main does not; the gate summary must use the
     # configured base just as the PR record does, so it must not report g.txt.
     assert "g.txt" not in summaries[0]
-    worktree = (tmp_path / "03-E4.1").resolve()
-    assert worktree.is_dir()
-    # The worktree branches from develop, not main: g.txt is absent from main's diff base.
-    assert git.changed_files(worktree, "main") == ["g.txt"]
-    assert git.changed_files(worktree, "develop") == []
+    assert worktree == (tmp_path / "03-E4.1").resolve()
+    # The worktree branches from develop: only the committed prompt differs from develop.
+    assert git.changed_files(worktree, "develop") == [prompt_rel]
     # state.pr.changed_files and I4's base_ref both measure against develop.
     state = implement_workflow.list_runs(_runs_root(control))[-1]
-    assert state.pr.get("changed_files") == []
+    assert state.pr.get("changed_files") == [prompt_rel]
     arch = next(s for s in recorder.specs if s.name == "update-architecture")
     assert arch.variables == ["03-E4.1", "develop"]
 
@@ -382,10 +454,10 @@ def test_base_branch_flows_through_the_whole_run(tmp_path: Path, monkeypatch) ->
 # --------------------------------------------------------------------------- #
 
 
-def test_agents_are_reloaded_against_the_created_worktree(
+def test_agents_are_reloaded_against_the_located_worktree(
     tmp_path: Path, monkeypatch
 ) -> None:
-    control, prompt = _layout(tmp_path)
+    control, worktree, prompt = _located_layout(tmp_path)
     load_roots: list[Path] = []
 
     def record_load(_aidt: Path, repo_root: Path):
@@ -400,8 +472,8 @@ def test_agents_are_reloaded_against_the_created_worktree(
         task_prompt_path=prompt, **_roots(control), approve_all=True
     )
 
-    worktree = (tmp_path / "03-E4.1").resolve()
     assert code == 0
+    # Config validates against the control root first, then agents reload for the worktree.
     assert load_roots == [control.resolve(), worktree]
     assert recorder.repo_roots[0] == worktree
 
@@ -414,6 +486,133 @@ def test_missing_prompt_is_usage_error(tmp_path: Path, monkeypatch) -> None:
         **_roots(control),
     )
     assert code == 2
+
+
+def test_relative_prompt_resolves_inside_the_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A relative argument is a repo-relative subpath of the worktree, not the control root."""
+    control, worktree, _prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=Path("docs/task-prompts/03-E4.1-prompt.md"),
+        **_roots(control),
+        approve_all=True,
+    )
+
+    assert code == 0
+    assert recorder.specs[0].variables == ["docs/task-prompts/03-E4.1-prompt.md"]
+    assert recorder.repo_roots[0] == worktree
+
+
+def test_config_error_wins_over_missing_worktree(tmp_path: Path, monkeypatch) -> None:
+    """Config validation stays pre-locate, so bad config is exit 2, not exit 4."""
+    control, _prompt = _layout(tmp_path)  # no task worktree
+    issue = Issue(ERROR, "config", "bad config")
+    monkeypatch.setattr(implement_workflow, "load_all", lambda aidt, repo: ({}, [issue]))
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=control / "docs" / "task-prompts" / "03-E4.1-prompt.md",
+        **_roots(control),
+    )
+
+    assert code == 2
+    assert recorder.names == []
+
+
+def test_reloaded_worktree_config_error_is_usage_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, worktree, prompt = _located_layout(tmp_path)
+    calls: list[Path] = []
+
+    def load_for_root(_aidt: Path, repo_root: Path):
+        calls.append(repo_root)
+        if repo_root == worktree:
+            return {}, [Issue(ERROR, "config", "bad config in task worktree")]
+        return {}, []
+
+    monkeypatch.setattr(implement_workflow, "load_all", load_for_root)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 2
+    assert calls == [control.resolve(), worktree]
+    assert recorder.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def test_relative_prompt_cannot_escape_the_task_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, _worktree, _prompt = _located_layout(tmp_path)
+    escaped = tmp_path / "escaped" / "docs" / "task-prompts" / "03-E4.1-prompt.md"
+    escaped.parent.mkdir(parents=True)
+    escaped.write_text("outside the worktree\n", encoding="utf-8")
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=Path("../escaped/docs/task-prompts/03-E4.1-prompt.md"),
+        **_roots(control),
+        approve_all=True,
+    )
+
+    assert code == 2
+    assert recorder.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def test_located_worktree_missing_prompt_is_usage_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _bare, control = _make_bare_with_control(tmp_path)
+    worktree = git.add_worktree(control, "03-E4.1")
+    assert worktree is not None  # located, but the prompt was never committed there
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=Path("docs/task-prompts/03-E4.1-prompt.md"),
+        **_roots(control),
+    )
+
+    assert code == 2
+    assert recorder.names == []
+
+
+def test_located_worktree_missing_prompt_is_usage_error_in_dry_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _bare, control = _make_bare_with_control(tmp_path)
+    assert git.add_worktree(control, "03-E4.1") is not None
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=Path("docs/task-prompts/03-E4.1-prompt.md"),
+        **_roots(control),
+        dry_run=True,
+    )
+
+    # A located worktree still refuses in dry-run; only the absent-worktree case suspends
+    # the existence check.
+    assert code == 2
+    assert recorder.names == []
 
 
 def test_running_run_is_refused_without_resume(tmp_path: Path, monkeypatch) -> None:
@@ -433,13 +632,10 @@ def test_running_run_is_refused_without_resume(tmp_path: Path, monkeypatch) -> N
     assert len(list(_runs_root(control).iterdir())) == 1
 
 
-def test_branch_setup_fails_closed_when_branch_already_checked_out(
-    tmp_path: Path, monkeypatch
+def test_missing_worktree_is_refused_with_the_command(
+    tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    control, prompt = _layout(tmp_path)
-    # Pre-create the task worktree with real git: git refuses the second checkout.
-    existing = git.add_worktree(control, "03-E4.1")
-    assert existing is not None
+    control, prompt = _layout(tmp_path)  # no task worktree
     _patch(monkeypatch)
     recorder = _Recorder()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
@@ -452,6 +648,11 @@ def test_branch_setup_fails_closed_when_branch_already_checked_out(
     assert recorder.names == []
     runs_root = _runs_root(control)
     assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    command = (
+        f"git -C {tmp_path / 'main'} worktree add -b 03-E4.1 "
+        f"{tmp_path / '03-E4.1'} main"
+    )
+    assert command in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- #
@@ -460,7 +661,7 @@ def test_branch_setup_fails_closed_when_branch_already_checked_out(
 
 
 def test_full_run_succeeds_and_records_pr(tmp_path: Path, monkeypatch) -> None:
-    control, prompt = _layout(tmp_path)
+    control, worktree, prompt = _located_layout(tmp_path)
     _patch(monkeypatch)
     monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
 
@@ -474,6 +675,7 @@ def test_full_run_succeeds_and_records_pr(tmp_path: Path, monkeypatch) -> None:
     runs = list(_runs_root(control).iterdir())
     state = implement_workflow.list_runs(_runs_root(control))[-1]
     assert state.status == SUCCEEDED
+    assert state.repo_root == str(worktree)
     assert state.gates and state.gates[-1].name == implement_workflow.GATE
     assert state.pr.get("number") == 42
     assert len(runs) == 1
@@ -481,7 +683,7 @@ def test_full_run_succeeds_and_records_pr(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_stage_failure_returns_one(tmp_path: Path, monkeypatch) -> None:
-    control, prompt = _layout(tmp_path)
+    control, _worktree, prompt = _located_layout(tmp_path)
     _patch(monkeypatch)
     monkeypatch.setattr(implement_workflow, "run_stage", _Recorder(fail={"test"}))
 
@@ -497,7 +699,7 @@ def test_stage_failure_returns_one(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_gate_denied_returns_blocked(tmp_path: Path, monkeypatch) -> None:
-    control, prompt = _layout(tmp_path)
+    control, _worktree, prompt = _located_layout(tmp_path)
     _patch(monkeypatch)
     recorder = _Recorder()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
@@ -511,7 +713,7 @@ def test_gate_denied_returns_blocked(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
-    control, prompt = _layout(tmp_path)
+    control, _worktree, prompt = _located_layout(tmp_path)
     _patch(monkeypatch)
     runs_dir = _runs_root(control)
 
@@ -557,7 +759,7 @@ def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_from_forces_rerun(tmp_path: Path, monkeypatch) -> None:
-    control, prompt = _layout(tmp_path)
+    control, _worktree, prompt = _located_layout(tmp_path)
     _patch(monkeypatch)
     runs_dir = _runs_root(control)
 
@@ -675,7 +877,7 @@ class _TrackingStages(_Recorder):
 
 
 def test_serial_runs_the_pair_one_at_a_time(tmp_path: Path, monkeypatch) -> None:
-    control, prompt = _layout(tmp_path)
+    control, _worktree, prompt = _located_layout(tmp_path)
     _patch(monkeypatch)
     recorder = _TrackingStages()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
@@ -693,7 +895,7 @@ def test_serial_runs_the_pair_one_at_a_time(tmp_path: Path, monkeypatch) -> None
 def test_parallel_runs_test_and_architecture_concurrently(
     tmp_path: Path, monkeypatch
 ) -> None:
-    control, prompt = _layout(tmp_path)
+    control, _worktree, prompt = _located_layout(tmp_path)
     _patch(monkeypatch)
     recorder = _TrackingStages()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)

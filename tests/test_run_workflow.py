@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 import time
 from pathlib import Path
@@ -25,6 +26,48 @@ def _roots(repo: Path) -> tuple[TargetRepo, ToolkitPaths, WorkspacePaths]:
             target, state_dir_override=repo.parent / f"{repo.name}-state"
         ),
     )
+
+
+def _git_run(directory: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=directory,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+
+def _make_bare_with_control(tmp_path: Path) -> tuple[Path, Path]:
+    """Bare repo plus the ``main`` control worktree (the §3.2 bootstrap layout)."""
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git_run(seed, "init", "-q", "-b", "main")
+    (seed / "f.txt").write_text("x\n", encoding="utf-8")
+    _git_run(seed, "add", ".")
+    _git_run(seed, "commit", "-qm", "init")
+    bare = tmp_path / "bare.git"
+    _git_run(tmp_path, "clone", "--bare", "-q", str(seed), str(bare))
+    control = tmp_path / "main"
+    _git_run(bare, "worktree", "add", "-q", str(control), "main")
+    return bare, control
+
+
+def _chain_layout(
+    tmp_path: Path, phase: str = "03", task: str = "E4.1"
+) -> tuple[Path, Path, Path]:
+    """Control root plus the task worktree with the prompt committed inside it (E2.5)."""
+    _bare, control = _make_bare_with_control(tmp_path)
+    branch = f"{phase}-{task}"
+    worktree = git_mod.add_worktree(control, branch)
+    assert worktree is not None
+    prompt = worktree / "docs" / "task-prompts" / f"{branch}-prompt.md"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_text("body\n", encoding="utf-8")
+    _git_run(worktree, "add", ".")
+    _git_run(worktree, "commit", "-qm", "task prompt")
+    return control, worktree, prompt
 
 
 def test_find_task_prompt_picks_newest(tmp_path: Path) -> None:
@@ -57,13 +100,10 @@ def test_task_to_pr_stops_when_prompt_fails(tmp_path: Path, monkeypatch) -> None
     assert called == []
 
 
-def test_task_to_pr_hands_resolved_prompt_to_implement(tmp_path: Path, monkeypatch) -> None:
-    _init_repo(tmp_path)
-    root = tmp_path / "docs" / "task-prompts"
-    root.mkdir(parents=True)
-    prompt = root / "03-E4.1-prompt.md"
-    prompt.write_text("body\n", encoding="utf-8")
-
+def test_task_to_pr_resolves_prompt_inside_the_located_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, _worktree, prompt = _chain_layout(tmp_path)
     monkeypatch.setattr(run_workflow.prompt_workflow, "run", lambda **kwargs: 0)
     captured: dict = {}
     monkeypatch.setattr(
@@ -72,7 +112,7 @@ def test_task_to_pr_hands_resolved_prompt_to_implement(tmp_path: Path, monkeypat
         lambda **kwargs: captured.update(kwargs) or 0,
     )
 
-    repo, aidt, workspace = _roots(tmp_path)
+    repo, aidt, workspace = _roots(control)
     code = run_workflow.task_to_pr(
         phase="03", epic="E4", task="E4.1", repo=repo, aidt=aidt, workspace=workspace
     )
@@ -81,6 +121,54 @@ def test_task_to_pr_hands_resolved_prompt_to_implement(tmp_path: Path, monkeypat
     assert captured["repo"] is repo
     assert captured["aidt"] is aidt
     assert captured["workspace"] is workspace
+
+
+def test_task_to_pr_missing_worktree_stops_chain_with_command(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _bare, control = _make_bare_with_control(tmp_path)  # no task worktree
+    monkeypatch.setattr(run_workflow.prompt_workflow, "run", lambda **kwargs: 0)
+    called: list[dict] = []
+    monkeypatch.setattr(
+        run_workflow.implement_workflow,
+        "run",
+        lambda **kwargs: called.append(kwargs) or 0,
+    )
+
+    repo, aidt, workspace = _roots(control)
+    code = run_workflow.task_to_pr(
+        phase="03", epic="E4", task="E4.1", repo=repo, aidt=aidt, workspace=workspace
+    )
+
+    assert code == 4
+    assert called == []
+    command = (
+        f"git -C {tmp_path / 'main'} worktree add -b 03-E4.1 "
+        f"{tmp_path / '03-E4.1'} main"
+    )
+    assert command in capsys.readouterr().err
+
+
+def test_task_to_pr_malformed_pattern_is_usage_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _bare, control = _make_bare_with_control(tmp_path)
+    monkeypatch.setattr(run_workflow.prompt_workflow, "run", lambda **kwargs: 0)
+    called: list[dict] = []
+    monkeypatch.setattr(
+        run_workflow.implement_workflow,
+        "run",
+        lambda **kwargs: called.append(kwargs) or 0,
+    )
+
+    repo, aidt, workspace = _roots(control)
+    repo = dataclasses.replace(repo, branch_pattern="static")
+    code = run_workflow.task_to_pr(
+        phase="03", epic="E4", task="E4.1", repo=repo, aidt=aidt, workspace=workspace
+    )
+
+    assert code == 2
+    assert called == []
 
 
 def test_review_and_fix_stops_when_review_fails(tmp_path: Path, monkeypatch) -> None:
@@ -177,15 +265,6 @@ def test_find_pr_number_ignores_other_branches_workflows_and_missing_pr(
     assert run_workflow.find_pr_number(runs_root, None) is None
 
 
-def _write_task_prompt(tmp_path: Path) -> Path:
-    """The prompt ``prompt`` would have committed, so the chain can move to ``implement``."""
-    root = tmp_path / "docs" / "task-prompts"
-    root.mkdir(parents=True, exist_ok=True)
-    prompt = root / "03-E4.1-prompt.md"
-    prompt.write_text("body\n", encoding="utf-8")
-    return prompt
-
-
 def test_prompt_to_fix_stops_when_prompt_fails(tmp_path: Path, monkeypatch) -> None:
     _init_repo(tmp_path)
     monkeypatch.setattr(run_workflow.prompt_workflow, "run", lambda **kwargs: 4)
@@ -208,8 +287,7 @@ def test_prompt_to_fix_stops_when_prompt_fails(tmp_path: Path, monkeypatch) -> N
 
 
 def test_prompt_to_fix_stops_when_implement_fails(tmp_path: Path, monkeypatch) -> None:
-    _init_repo(tmp_path)
-    _write_task_prompt(tmp_path)
+    control, _worktree, _prompt = _chain_layout(tmp_path)
     monkeypatch.setattr(run_workflow.prompt_workflow, "run", lambda **kwargs: 0)
     monkeypatch.setattr(run_workflow.implement_workflow, "run", lambda **kwargs: 1)
     called: list[str] = []
@@ -219,7 +297,7 @@ def test_prompt_to_fix_stops_when_implement_fails(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(
         run_workflow.fix_workflow, "run", lambda **kwargs: called.append("fix") or 0
     )
-    repo, aidt, workspace = _roots(tmp_path)
+    repo, aidt, workspace = _roots(control)
     code = run_workflow.prompt_to_fix(
         phase="03", epic="E4", task="E4.1", repo=repo, aidt=aidt, workspace=workspace
     )
@@ -228,23 +306,18 @@ def test_prompt_to_fix_stops_when_implement_fails(tmp_path: Path, monkeypatch) -
 
 
 def test_prompt_to_fix_refuses_when_no_pr_is_recorded(tmp_path: Path, monkeypatch) -> None:
-    _init_repo(tmp_path)
-    _write_task_prompt(tmp_path)
+    control, _worktree, _prompt = _chain_layout(tmp_path)
     monkeypatch.setattr(run_workflow.prompt_workflow, "run", lambda **kwargs: 0)
     monkeypatch.setattr(run_workflow.implement_workflow, "run", lambda **kwargs: 0)
     called: list[str] = []
     monkeypatch.setattr(
         run_workflow.review_workflow, "run", lambda **kwargs: called.append("review") or 0
     )
-    repo, aidt, workspace = _roots(tmp_path)
+    repo, aidt, workspace = _roots(control)
     # An implement run that recorded no PR URL (for example the `/pr` stage output was
-    # unparseable) must not silently run review against PR #0.
-    _record_pr(
-        workspace,
-        tmp_path,
-        branch=git_mod.current_branch(tmp_path),
-        number=0,
-    )
+    # unparseable) must not silently run review against PR #0. Discovery must key on the
+    # *derived task branch*, not the control root's current (base) branch.
+    _record_pr(workspace, control, branch="03-E4.1", number=0)
     code = run_workflow.prompt_to_fix(
         phase="03", epic="E4", task="E4.1", repo=repo, aidt=aidt, workspace=workspace
     )
@@ -253,8 +326,7 @@ def test_prompt_to_fix_refuses_when_no_pr_is_recorded(tmp_path: Path, monkeypatc
 
 
 def test_prompt_to_fix_runs_the_whole_cycle(tmp_path: Path, monkeypatch) -> None:
-    _init_repo(tmp_path)
-    prompt = _write_task_prompt(tmp_path)
+    control, _worktree, prompt = _chain_layout(tmp_path)
 
     order: list[str] = []
     monkeypatch.setattr(
@@ -279,10 +351,10 @@ def test_prompt_to_fix_runs_the_whole_cycle(tmp_path: Path, monkeypatch) -> None
         lambda **kwargs: order.append("fix") or fixed.update(kwargs) or 0,
     )
 
-    repo, aidt, workspace = _roots(tmp_path)
-    branch = git_mod.current_branch(tmp_path)
-    assert branch
-    _record_pr(workspace, tmp_path, branch=branch, number=42)
+    repo, aidt, workspace = _roots(control)
+    # The post-E2.5 layout: the control root is on `main`, the implement run is recorded
+    # for the derived task branch. Discovery must find it without --pr.
+    _record_pr(workspace, control, branch="03-E4.1", number=42)
 
     code = run_workflow.prompt_to_fix(
         phase="03", epic="E4", task="E4.1", repo=repo, aidt=aidt, workspace=workspace
@@ -301,8 +373,7 @@ def test_prompt_to_fix_runs_the_whole_cycle(tmp_path: Path, monkeypatch) -> None
 
 
 def test_prompt_to_fix_explicit_pr_overrides_discovery(tmp_path: Path, monkeypatch) -> None:
-    _init_repo(tmp_path)
-    _write_task_prompt(tmp_path)
+    control, _worktree, _prompt = _chain_layout(tmp_path)
     monkeypatch.setattr(run_workflow.prompt_workflow, "run", lambda **kwargs: 0)
     monkeypatch.setattr(run_workflow.implement_workflow, "run", lambda **kwargs: 0)
     reviewed: list[int] = []
@@ -315,7 +386,7 @@ def test_prompt_to_fix_explicit_pr_overrides_discovery(tmp_path: Path, monkeypat
     monkeypatch.setattr(
         run_workflow.fix_workflow, "run", lambda **kwargs: fixed.update(kwargs) or 0
     )
-    repo, aidt, workspace = _roots(tmp_path)
+    repo, aidt, workspace = _roots(control)
     code = run_workflow.prompt_to_fix(
         phase="03",
         epic="E4",
@@ -334,8 +405,7 @@ def test_prompt_to_fix_deny_still_refuses_the_auto_approval(
     tmp_path: Path, monkeypatch
 ) -> None:
     """``--deny-gates approve-followups`` wins over the chain's own skip (design §6)."""
-    _init_repo(tmp_path)
-    _write_task_prompt(tmp_path)
+    control, _worktree, _prompt = _chain_layout(tmp_path)
     monkeypatch.setattr(run_workflow.prompt_workflow, "run", lambda **kwargs: 0)
     monkeypatch.setattr(run_workflow.implement_workflow, "run", lambda **kwargs: 0)
     monkeypatch.setattr(run_workflow.review_workflow, "run", lambda **kwargs: 0)
@@ -343,7 +413,7 @@ def test_prompt_to_fix_deny_still_refuses_the_auto_approval(
     monkeypatch.setattr(
         run_workflow.fix_workflow, "run", lambda **kwargs: fixed.update(kwargs) or 3
     )
-    repo, aidt, workspace = _roots(tmp_path)
+    repo, aidt, workspace = _roots(control)
     code = run_workflow.prompt_to_fix(
         phase="03",
         epic="E4",
