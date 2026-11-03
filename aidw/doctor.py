@@ -372,12 +372,17 @@ def _check_target_config(root: Path) -> Check:
     # Resolved, not ``declared.schema_version`` (roadmap: "the resolved schema version"):
     # the two are equal today only because ``schema_version`` has no toolkit default.
     schema_version = resolve_config(declared)["schema_version"]
-    rendered = (
-        f"{schema_version.value} ({schema_version.source})"
-        if schema_version.is_set
-        else NO_TARGET_CONFIG
+    # Review follow-up #78: an unset resolved ``schema_version`` only happens when there
+    # is no config file at all, so ``source`` is already the NO_TARGET_CONFIG sentinel;
+    # appending the suffix would render the sentinel twice ("none (defaults) — schema
+    # version none (defaults)"). Render it once.
+    if not schema_version.is_set:
+        return Check("target config", OK, source)
+    return Check(
+        "target config",
+        OK,
+        f"{source} — schema version {schema_version.value} ({schema_version.source})",
     )
-    return Check("target config", OK, f"{source} — schema version {rendered}")
 
 
 def _check_prompts(aidt: Path) -> Check:

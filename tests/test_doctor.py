@@ -27,6 +27,7 @@ from aidw import doctor, git
 from aidw.cli import app
 from aidw.doctor import (
     FAIL,
+    NO_TARGET_CONFIG,
     OK,
     WARN,
     _check_dependencies,
@@ -120,11 +121,18 @@ def _make_supported(
     return bare, control
 
 
-def _write_target_config(repo: Path, text: str) -> Path:
-    """Write ``<repo>/aidw/config.yaml`` verbatim and return its path."""
+def _write_target_config(repo: Path, text: str | bytes) -> Path:
+    """Write ``<repo>/aidw/config.yaml`` verbatim and return its path.
+
+    ``bytes`` are written raw so the non-UTF-8 vector (review follow-up #77) can put
+    undecodable bytes in the file the way an editor saving latin-1 would.
+    """
     path = repo / "aidw" / "config.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    if isinstance(text, bytes):
+        path.write_bytes(text)
+    else:
+        path.write_text(text, encoding="utf-8")
     return path
 
 
@@ -686,7 +694,11 @@ def test_missing_target_config_reports_defaults(
     check = _named(collect_checks(explicit=control), "target config")
 
     assert check.status == OK
-    assert "none (defaults)" in check.detail
+    # Review follow-up #78: the OK detail renders the sentinel exactly once — the
+    # schema-version suffix is dropped when the resolved schema version is unset,
+    # instead of doubling it to "none (defaults) — schema version none (defaults)".
+    assert check.detail == NO_TARGET_CONFIG
+    assert check.detail.count("none (defaults)") == 1
     # The value the check renders comes from an *unset* resolved leaf, not a FAIL.
     declared = load_target_config(config_path)
     assert declared.source_path is None
@@ -707,6 +719,13 @@ MALFORMED_CONFIG_CASES = [
         "`schema_version`",
         id="missing-schema-version",
     ),
+    # Review follow-up #77: byte 0xe9 is invalid UTF-8, so the loader fails at decode
+    # time (UnicodeDecodeError, a ValueError) rather than at parse time.
+    pytest.param(
+        b"schema_version: 1\nname: caf\xe9\n",
+        "cannot read/parse config",
+        id="non-utf-8",
+    ),
 ]
 
 
@@ -714,7 +733,7 @@ MALFORMED_CONFIG_CASES = [
 def test_malformed_target_config_fails_naming_the_field_path(
     tmp_path: Path,
     fake_external_clis: None,  # noqa: ARG001
-    text: str,
+    text: str | bytes,
     field_path: str,
 ) -> None:
     """Fail closed: a malformed config is a FAIL whose detail names the field path."""
@@ -741,6 +760,21 @@ def test_cli_doctor_reports_malformed_target_config_and_exits_non_zero(
     assert result.exit_code == 1, result.output
     assert str(config_path.resolve()) in result.stdout
     assert "`paths.foo`" in result.stdout
+    assert "Traceback" not in result.output
+
+
+def test_cli_doctor_reports_non_utf8_target_config_and_exits_non_zero(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """Review follow-up #77: an undecodable config fails closed at the CLI boundary."""
+    _bare, control = _make_supported(tmp_path)
+    config_path = _write_target_config(control, b"schema_version: 1\nname: caf\xe9\n")
+
+    result = runner.invoke(app, ["--repo", str(control), "doctor"])
+
+    assert result.exit_code == 1, result.output
+    assert str(config_path.resolve()) in result.stdout
+    assert "cannot read/parse config" in result.stdout
     assert "Traceback" not in result.output
 
 
