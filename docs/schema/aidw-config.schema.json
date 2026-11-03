@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "aidw target-repo config",
+  "description": "Schema for <target>/aidw/config.yaml (AIDT EXTRACTION.md §3.4, task E3.1). Unknown keys are rejected at every object level. Toolkit defaults are applied by E3.2/E3.4 and are deliberately not expressed here: this file describes the config file, not the resolved config.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Config schema version understood by the toolkit (D10). Required whenever this file exists."
+    },
+    "requires_toolkit": {
+      "type": "string",
+      "description": "Optional minimum toolkit version (D10)."
+    },
+    "max_revisions": {
+      "type": "integer",
+      "description": "Revision budget for the prompt workflow (design.md §12). The toolkit's default is applied by E3.2."
+    },
+    "repo": {
+      "type": "object",
+      "description": "Repository and branch conventions.",
+      "additionalProperties": false,
+      "properties": {
+        "base_branch": {
+          "type": "string",
+          "description": "PR base branch and branch point."
+        },
+        "branch_pattern": {
+          "type": "string",
+          "description": "Branch and worktree name template built from task ids."
+        }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "description": "Per-repo path conventions; values are strings, resolved by later tasks.",
+      "additionalProperties": false,
+      "properties": {
+        "roadmap_dir": { "type": "string" },
+        "roadmap_glob": { "type": "string" },
+        "task_prompts_dir": { "type": "string" },
+        "implementation_results_dir": { "type": "string" },
+        "build_results_template": { "type": "string" },
+        "architecture_dir": { "type": "string" }
+      }
+    },
+    "workflows": {
+      "type": "object",
+      "description": "Open map keyed by workflow name (D12 lets a repo add stages).",
+      "additionalProperties": { "$ref": "#/$defs/workflow" }
+    },
+    "github": {
+      "type": "object",
+      "description": "Markers and labels persisted to GitHub (D5 / §3.9).",
+      "additionalProperties": false,
+      "properties": {
+        "markers": {
+          "type": "object",
+          "description": "The fixed three marker templates.",
+          "additionalProperties": false,
+          "properties": {
+            "parent": { "type": "string" },
+            "child": { "type": "string" },
+            "summary": { "type": "string" }
+          }
+        },
+        "labels": {
+          "type": "object",
+          "description": "Open map keyed by label name.",
+          "additionalProperties": { "$ref": "#/$defs/label" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stages": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/stage" }
+        },
+        "parallel_groups": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "enabled": {
+          "type": "boolean",
+          "enum": [true, false],
+          "description": "Repo-optional stages are disabled explicitly with false (§3.5, D12)."
+        },
+        "prompt": { "type": "string" },
+        "agent": { "type": "string" }
+      }
+    },
+    "label": {
+      "type": "object",
+      "description": "Exactly a colour and a description; both are required (D5).",
+      "additionalProperties": false,
+      "required": ["color", "description"],
+      "properties": {
+        "color": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
