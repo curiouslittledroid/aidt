@@ -11,16 +11,29 @@ These tests are the executable specification of :mod:`aidw.target_config`:
   defaults injected) and pure (no file writes, no input mutation, no shared containers);
 - ``docs/schema/aidw-config.schema.json`` agrees field-for-field with the dataclasses.
 
-The loader deliberately does not merge defaults (E3.2/E3.4), compare versions (E3.3),
-validate path existence (E3.7), or own the stage-id vocabulary (E4.1/E4.5); no test here
-asks it to.
+E3.2 adds the second half of the module — layered resolution with provenance:
+:func:`aidw.target_config.resolve_config` merges the toolkit defaults under a declared
+config and under per-invocation overrides, and the tests below pin the precedence
+(override > config > default > *unset*), the flat dotted-path addressing, the
+declared-ness-not-value-equality rule, and the resolver's purity (no input mutation, no
+I/O, no shared containers), plus a seeded property run over generated configs.
+
+The loader deliberately does not merge defaults (E3.4 seeds the values), compare versions
+(E3.3), validate path existence (E3.7), or own the stage-id vocabulary (E4.1/E4.5); no
+test here asks it to. ``aidw config show``'s rendering of these values is
+``tests/test_cli.py``'s, and the ``max_revisions`` consumer is
+``tests/test_prompt_workflow.py``'s.
 """
 
 from __future__ import annotations
 
+import ast
 import copy
 import dataclasses
+import inspect
 import json
+import pathlib
+import random
 from pathlib import Path
 from typing import Any
 
@@ -30,16 +43,27 @@ import yaml
 from aidw.config import ERROR
 from aidw.paths import toolkit_root
 from aidw.target_config import (
+    DEFAULT_MAX_REVISIONS,
+    SOURCE_CONFIG,
+    SOURCE_DEFAULT,
+    SOURCE_OVERRIDE,
+    SOURCES,
+    ConfigDefaults,
+    ConfigOverrides,
     GitHubConfig,
     LabelConfig,
     MarkersConfig,
     PathsConfig,
     RepoConfig,
+    ResolvedConfig,
+    ResolvedValue,
     StageConfig,
     TargetConfig,
+    TOOLKIT_DEFAULTS,
     WorkflowConfig,
     format_issues,
     load_target_config,
+    resolve_config,
 )
 
 #: The §3.4 example, with every field E3.1 owns populated. Deliberately declares an
@@ -811,3 +835,344 @@ def test_dataclass_field_names_are_the_fixed_section_3_4_names(
     cls: type, expected: set[str]
 ) -> None:
     assert _dataclass_fields(cls) - NON_SCHEMA_TARGET_FIELDS == expected
+
+
+# ---------------------------------------------------------------------------
+# Layered resolution with provenance (E3.2, EXTRACTION.md §3.3/§3.4, design §12/H8)
+# ---------------------------------------------------------------------------
+
+#: Pinned seed and run count for the seeded property test below. This repo's dev
+#: dependencies are pytest only (``pyproject.toml``; no hypothesis), so the provenance
+#: invariants are exercised over a reproducible, seeded sample rather than a shrinking
+#: generator. Same seed + same count => same cases, on every machine.
+PROPERTY_SEED = 3211
+PROPERTY_RUNS = 64
+
+
+def _resolve_loaded(
+    tmp_path: Path, config: dict[str, Any] | None = None, **kwargs: Any
+) -> ResolvedConfig:
+    declared = TargetConfig() if config is None else _load(tmp_path, config)
+    assert declared.issues == [], format_issues(declared.issues)
+    return resolve_config(declared, **kwargs)
+
+
+def test_only_max_revisions_is_a_seeded_default() -> None:
+    """Requirement 2: the defaults structure seeds exactly design §12's budget."""
+    assert DEFAULT_MAX_REVISIONS == 3
+    assert TOOLKIT_DEFAULTS.max_revisions == DEFAULT_MAX_REVISIONS
+    # Empty slots for E3.4/E6/E4.1; their *values* are those tasks' to add.
+    assert TOOLKIT_DEFAULTS.schema_version is None
+    assert TOOLKIT_DEFAULTS.requires_toolkit is None
+    assert TOOLKIT_DEFAULTS.repo == RepoConfig()
+    assert TOOLKIT_DEFAULTS.paths == PathsConfig()
+    assert TOOLKIT_DEFAULTS.github == GitHubConfig(markers=MarkersConfig())
+    assert dict(TOOLKIT_DEFAULTS.workflows) == {}
+    assert {f.name for f in dataclasses.fields(ConfigDefaults)} >= {
+        "repo",
+        "paths",
+        "github",
+        "workflows",
+    }
+
+
+def test_undeclared_max_revisions_resolves_to_the_default(tmp_path: Path) -> None:
+    resolved = _resolve_loaded(tmp_path, {"schema_version": 1})
+
+    assert resolved["max_revisions"] == ResolvedValue(3, SOURCE_DEFAULT)
+
+
+def test_declared_max_revisions_beats_the_default(tmp_path: Path) -> None:
+    resolved = _resolve_loaded(tmp_path, {"schema_version": 1, "max_revisions": 5})
+
+    assert resolved["max_revisions"] == ResolvedValue(5, SOURCE_CONFIG)
+
+
+def test_override_beats_declared_and_default(tmp_path: Path) -> None:
+    """The only override surface today is ``--max-revisions`` (design §12/H8)."""
+    resolved = _resolve_loaded(
+        tmp_path,
+        {"schema_version": 1, "max_revisions": 5},
+        overrides=ConfigOverrides(max_revisions=7),
+    )
+
+    assert resolved["max_revisions"] == ResolvedValue(7, SOURCE_OVERRIDE)
+
+    no_config = _resolve_loaded(
+        tmp_path / "again", None, overrides=ConfigOverrides(max_revisions=7)
+    )
+    assert no_config["max_revisions"] == ResolvedValue(7, SOURCE_OVERRIDE)
+
+
+def test_explicit_value_equal_to_the_default_still_reports_config(
+    tmp_path: Path,
+) -> None:
+    """Requirement 3: declared-ness, not value equality, decides ``config``.
+
+    A ``value == default ? "default" : "config"`` implementation mislabels this config;
+    the loader's ``_declared`` tracking is what makes the explicit ``3`` observable.
+    """
+    declared = _load(tmp_path, {"schema_version": 1, "max_revisions": 3})
+    assert "max_revisions" in declared._declared
+
+    resolved = resolve_config(declared)
+
+    assert resolved["max_revisions"] == ResolvedValue(3, SOURCE_CONFIG)
+
+
+def test_partial_config_leaves_every_other_leaf_unset(tmp_path: Path) -> None:
+    """Requirement 1/4: no invented defaults — the rest is ``None``/``None`` (unset)."""
+    resolved = _resolve_loaded(
+        tmp_path, {"schema_version": 1, "repo": {"base_branch": "trunk"}}
+    )
+
+    assert resolved["repo.base_branch"] == ResolvedValue("trunk", SOURCE_CONFIG)
+    assert resolved["schema_version"] == ResolvedValue(1, SOURCE_CONFIG)
+    for path, entry in resolved.items():
+        if path in {"repo.base_branch", "schema_version", "max_revisions"}:
+            continue
+        assert entry == ResolvedValue(), path
+        assert entry.value is None and entry.source is None
+
+    # ``repo.branch_pattern`` is a sibling leaf, not a whole-container entry.
+    assert resolved["repo.branch_pattern"].is_set is False
+
+
+def test_declared_markers_and_labels_carry_config_provenance(tmp_path: Path) -> None:
+    resolved = _resolve_loaded(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "github": {
+                "markers": {"parent": "<!-- p -->"},
+                "labels": {"must-fix": {"color": "B60205", "description": "Blocking"}},
+            },
+        },
+    )
+
+    assert resolved["github.markers.parent"] == ResolvedValue("<!-- p -->", SOURCE_CONFIG)
+    assert resolved["github.markers.child"] == ResolvedValue()
+    assert resolved["github.markers.summary"] == ResolvedValue()
+    assert resolved["github.labels.must-fix.color"] == ResolvedValue(
+        "B60205", SOURCE_CONFIG
+    )
+    assert resolved["github.labels.must-fix.description"] == ResolvedValue(
+        "Blocking", SOURCE_CONFIG
+    )
+    # Open maps contribute only the keys the config declared (E6 seeds defaults later).
+    assert not any(path.startswith("github.labels.could-fix") for path in resolved)
+
+
+def test_workflow_stages_are_one_whole_list_entry(tmp_path: Path) -> None:
+    """Requirement 1: the list's own path carries provenance; elements carry none."""
+    resolved = _resolve_loaded(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "workflows": {
+                "prompt": {
+                    "stages": [{"id": "author"}, {"id": "review"}],
+                    "parallel_groups": [["review", "record"]],
+                }
+            },
+        },
+    )
+
+    assert resolved["workflows.prompt.stages"] == ResolvedValue(
+        [{"id": "author"}, {"id": "review"}], SOURCE_CONFIG
+    )
+    assert resolved["workflows.prompt.parallel_groups"] == ResolvedValue(
+        [["review", "record"]], SOURCE_CONFIG
+    )
+    # No per-element and no per-stage-subfield entries: addressing is one path per list.
+    assert not any("stages[" in path or "parallel_groups[" in path for path in resolved)
+    assert "workflows.prompt.stages.id" not in resolved
+    assert "workflows.prompt.stages.0.enabled" not in resolved
+    # An undeclared sibling list is absent rather than an ``unset`` entry.
+    undeclared = _resolve_loaded(
+        tmp_path / "sibling",
+        {"schema_version": 1, "workflows": {"prompt": {"stages": [{"id": "x"}]}}},
+    )
+    assert "workflows.prompt.stages" in undeclared
+    assert "workflows.prompt.parallel_groups" not in undeclared
+
+
+def test_declared_empty_lists_stay_config_rather_than_unset(tmp_path: Path) -> None:
+    """An explicit ``stages: []`` is the config declaring an empty list (§3.5 disable-all)."""
+    resolved = _resolve_loaded(
+        tmp_path,
+        {"schema_version": 1, "workflows": {"implement": {"stages": []}}},
+    )
+
+    assert resolved["workflows.implement.stages"] == ResolvedValue([], SOURCE_CONFIG)
+    assert "workflows.implement.parallel_groups" not in resolved
+
+
+def test_resolver_is_pure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No mutation of the input, no I/O, no aliased containers, stable across calls."""
+    config_data = {
+        "schema_version": 1,
+        "max_revisions": 2,
+        "repo": {"base_branch": "trunk", "branch_pattern": "{task}"},
+        "workflows": {"prompt": {"stages": [{"id": "author"}]}},
+        "github": {"labels": {"must-fix": {"color": "B60205", "description": "d"}}},
+    }
+    declared = _load(tmp_path, config_data)
+    before_dict = copy.deepcopy(declared.to_dict())
+    before_stages = copy.deepcopy(declared.workflows["prompt"].stages)
+
+    def _no_io(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("resolve_config must not touch the filesystem")
+
+    monkeypatch.setattr(pathlib.Path, "read_text", _no_io)
+    monkeypatch.setattr(pathlib.Path, "write_text", _no_io)
+    monkeypatch.setattr(pathlib.Path, "open", _no_io)
+    first = resolve_config(declared, overrides=ConfigOverrides(max_revisions=9))
+    second = resolve_config(declared, overrides=ConfigOverrides(max_revisions=9))
+
+    assert first.to_dict() == second.to_dict()
+    assert first is not second
+    assert declared.to_dict() == before_dict
+    assert declared.workflows["prompt"].stages == before_stages
+
+    # Mutating a resolved container cannot corrupt the config or a later resolution.
+    expected = copy.deepcopy(first.to_dict())
+    first["workflows.prompt.stages"].value.clear()
+    assert (
+        resolve_config(declared, overrides=ConfigOverrides(max_revisions=9)).to_dict()
+        == expected
+    )
+    assert declared.to_dict() == before_dict
+
+
+def test_resolved_lists_are_fresh_containers(tmp_path: Path) -> None:
+    declared = _load(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "workflows": {"prompt": {"stages": [{"id": "author"}]}},
+        },
+    )
+
+    first = resolve_config(declared)
+    second = resolve_config(declared)
+
+    first_value = first["workflows.prompt.stages"].value
+    second_value = second["workflows.prompt.stages"].value
+    assert first_value == second_value
+    assert first_value is not second_value
+    assert first_value is not declared.workflows["prompt"].stages
+    assert first_value[0] is not declared.workflows["prompt"].stages[0]
+
+
+def _imported_modules(source: str) -> set[str]:
+    """Every module named by an ``import``/``from ... import`` statement in ``source``."""
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    return imported
+
+
+def test_default_max_revisions_has_a_single_home() -> None:
+    """Requirement 2: ``aidw/target_config.py`` defines it; ``prompt.py`` imports it.
+
+    A second definition would let design §12's "default stays 3" drift, and the reverse
+    import (``target_config -> workflows.prompt``) would be a cycle back into this module.
+    """
+    from aidw import target_config
+    from aidw.workflows import prompt as prompt_workflow
+
+    assert prompt_workflow.DEFAULT_MAX_REVISIONS is DEFAULT_MAX_REVISIONS
+    assert "DEFAULT_MAX_REVISIONS =" not in inspect.getsource(prompt_workflow)
+    assert not any(
+        module.startswith("aidw.workflows")
+        for module in _imported_modules(inspect.getsource(target_config))
+    )
+
+
+def _random_config(rng: random.Random) -> dict[str, Any]:
+    """A random but loader-valid §3.4 config, for the seeded property run."""
+    config: dict[str, Any] = {"schema_version": 1}
+    if rng.random() < 0.6:
+        config["max_revisions"] = rng.choice([1, 2, 3, 5, 9])
+    if rng.random() < 0.5:
+        config["repo"] = {
+            "base_branch": rng.choice(["main", "trunk"]),
+            "branch_pattern": rng.choice(["{phase}-{task}", "{task}"]),
+        }
+    if rng.random() < 0.5:
+        config["paths"] = {
+            "roadmap_dir": rng.choice(["docs/tasks", "tasks"]),
+            "architecture_dir": "docs/architecture",
+        }
+    if rng.random() < 0.4:
+        config["workflows"] = {
+            rng.choice(["prompt", "implement"]): {
+                "stages": [{"id": rng.choice(["author", "review", "implement"])}]
+            }
+        }
+    if rng.random() < 0.4:
+        config["github"] = {
+            "labels": {
+                rng.choice(["must-fix", "should-fix"]): {
+                    "color": "B60205",
+                    "description": "d",
+                }
+            }
+        }
+    return config
+
+
+def test_provenance_precedence_property(tmp_path: Path) -> None:
+    """Seeded property run over the three-source precedence (seed/numRuns pinned above).
+
+    Invariants, for every generated config: an override always wins; a declared value is
+    always ``config`` (even when it equals the default) and an absent one always
+    ``default``; unset means ``value is None``; no resolved label is outside
+    :data:`SOURCES`; resolution is idempotent and alias-free.
+    """
+    rng = random.Random(PROPERTY_SEED)
+
+    for index in range(PROPERTY_RUNS):
+        config_data = _random_config(rng)
+        declared = _load(tmp_path / f"run-{index}", config_data)
+        assert declared.issues == [], format_issues(declared.issues)
+        declared_before = copy.deepcopy(declared.to_dict())
+
+        plain = resolve_config(declared)
+        overridden = resolve_config(
+            declared, overrides=ConfigOverrides(max_revisions=11)
+        )
+
+        # Override dominance, independent of what the config declared.
+        assert overridden["max_revisions"] == ResolvedValue(11, SOURCE_OVERRIDE)
+        if "max_revisions" in config_data:
+            assert plain["max_revisions"] == ResolvedValue(
+                config_data["max_revisions"], SOURCE_CONFIG
+            )
+            assert plain["repo.base_branch"].source in (SOURCE_CONFIG, None)
+        else:
+            assert plain["max_revisions"] == ResolvedValue(
+                DEFAULT_MAX_REVISIONS, SOURCE_DEFAULT
+            )
+
+        for path, entry in plain.items():
+            if entry.source is None:
+                assert entry.value is None, path
+                assert not entry.is_set
+            else:
+                assert entry.source in SOURCES, path
+                assert entry.is_set
+                # ``to_dict`` keeps the same two-key shape for every resolved leaf.
+                assert set(entry.to_dict()) == {"value", "source"}
+
+        # Idempotent and alias-free: mutating a result's containers changes nothing.
+        expected = copy.deepcopy(plain.to_dict())
+        for entry in plain.values():
+            if isinstance(entry.value, list):
+                entry.value.clear()
+        assert resolve_config(declared).to_dict() == expected
+        assert declared.to_dict() == declared_before

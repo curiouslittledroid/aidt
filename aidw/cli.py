@@ -50,6 +50,11 @@ from aidw.report import (
     usage_line,
 )
 from aidw.runner import StageSpec, resolve_prompt, run_stage
+from aidw.target_config import (
+    ResolvedValue,
+    load_target_config,
+    resolve_config,
+)
 from aidw.workflows import approve as approve_workflow
 from aidw.workflows import fix as fix_workflow
 from aidw.workflows import implement as implement_workflow
@@ -1223,6 +1228,14 @@ def prompts(
     raise typer.Exit(EXIT_USAGE)
 
 
+def _render_resolved(entry: ResolvedValue) -> str:
+    """One human-mode value: scalars bare, containers as JSON, so a list stays readable."""
+    value = entry.value
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
+    return str(value)
+
+
 @app.command()
 def config(
     action: str = typer.Argument("show", help="show"),
@@ -1230,14 +1243,30 @@ def config(
         False, "--json", help="Emit one JSON object with per-value provenance."
     ),
 ) -> None:
-    """Show the resolved roots and the target config file, with provenance.
+    """Show the resolved roots and the resolved target config, with provenance.
 
-    Skeleton only (EXTRACTION.md §3.3): every value is resolved, but the target
-    ``aidw/config.yaml`` is detected with ``is_file()`` and never parsed — loading
-    and validating it is E3.1/E3.2 scope. The action is validated before any
-    printing or resolution so a doubly-bad invocation (unknown action plus a bad
-    target) exits ``EXIT_USAGE`` with empty stdout; a bad target still refuses via
-    :func:`_roots`'s ``RepoNotFoundError`` -> ``EXIT_REFUSED`` path.
+    EXTRACTION.md §3.3: "the resolved config merged from defaults + target repo, **with
+    the provenance of each value**" — the main debugging aid for D4/D14. The six root
+    entries (E1.6) keep their shape; ``config_file`` now comes from the loader rather
+    than ``is_file()``, and a ``config`` section dumps
+    :func:`aidw.target_config.resolve_config` — one flat object keyed by §3.4 dotted
+    path, each leaf ``{value, source}``, an unset leaf ``{"value": null}``.
+
+    This command takes no per-value override flag (§3.3 lists none), so it displays
+    ``default``/``config``/``unset``; ``override`` provenance is exercised through
+    ``resolve_config``'s ``overrides`` argument and ``aidw prompt --max-revisions``.
+
+    Fail-closed on a config the loader rejects (unparseable YAML, an unreadable file —
+    including a directory in place of it — a non-mapping root, an unknown key, a wrong
+    type): the issues go to stderr and the exit code is ``EXIT_STAGE_FAILURE``, with no
+    resolved output. JSON stdout stays empty (E1.6's all-or-nothing rule) and human mode
+    keeps the two no-repo root lines printed before resolution. A broken symlink is
+    absent to the loader's ``exists()``, exactly as it was to ``is_file()``, so it still
+    resolves ``none``/``defaults`` with exit 0.
+
+    The action is validated before any printing or resolution so a doubly-bad invocation
+    (unknown action plus a bad target) exits ``EXIT_USAGE`` with empty stdout; a bad
+    target still refuses via :func:`_roots`'s ``RepoNotFoundError`` -> ``EXIT_REFUSED``.
     """
     if action != "show":
         typer.echo(f"unknown action: {action} (expected show)", err=True)
@@ -1256,9 +1285,23 @@ def config(
     _explicit, target_source = _resolve_target_selection()
     state_source = _state_root_source(workspace)
 
+    # Loaded, not merely detected: per-value provenance is impossible without parsing
+    # the file, and a broken config must surface here instead of displaying as "none".
     config_path = target.root / "aidw" / "config.yaml"
-    if config_path.is_file():
-        config_value: Optional[str] = str(config_path.resolve())
+    declared = load_target_config(config_path)
+    config_errors = [issue for issue in declared.issues if issue.level == ERROR]
+    if config_errors:
+        # Fail closed (E3.2 Requirement 6): a broken or partial config is never silently
+        # resolved to defaults. Nothing below this point runs, so no resolved output is
+        # emitted — for ``--json`` that means empty stdout, as on the wrong-target
+        # refusal below.
+        typer.echo(format_issues(config_errors), err=True)
+        raise typer.Exit(EXIT_STAGE_FAILURE)
+
+    resolved = resolve_config(declared)
+    config_value: Optional[str]
+    if declared.source_path is not None:
+        config_value = str(declared.source_path.resolve())
         config_source = "target repo"
     else:
         config_value = None
@@ -1278,6 +1321,7 @@ def config(
             },
             "state_root": {"value": str(workspace.state_root), "source": state_source},
             "config_file": {"value": config_value, "source": config_source},
+            "config": resolved.to_dict(),
         }
         typer.echo(json.dumps(payload))
         return
@@ -1286,6 +1330,14 @@ def config(
     typer.echo(f"workspace root: {workspace.workspace_root} (workspace)")
     typer.echo(f"state root: {workspace.state_root} ({state_source})")
     typer.echo(f"config file: {config_value or 'none'} ({config_source})")
+    # One line per resolved leaf, in the same order as the JSON section, so the two modes
+    # report the same set of values. An unset leaf prints ``unset`` and no source, since
+    # no source describes it (that is what E3.4's defaults turn into ``default``).
+    for path, entry in resolved.items():
+        if entry.is_set:
+            typer.echo(f"{path}: {_render_resolved(entry)} ({entry.source})")
+        else:
+            typer.echo(f"{path}: unset")
 
 
 def main() -> None:

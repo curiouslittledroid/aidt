@@ -275,13 +275,16 @@ def _patch_prompt_repo(
     roadmap: str | None = None,
     extra_files: dict[str, str] | None = None,
     base_branch: str = "main",
+    config_text: str | None = None,
 ) -> None:
     """A committed bare+control repo (no origin) carrying the roadmap fixtures.
 
     ``roadmap`` defaults to :data:`ROADMAP_FIXTURE`; the default cannot be a literal
     default argument because that fixture is defined later in this module. ``extra_files``
-    adds further phase files for the ``file``-scope tests. The files are committed so
-    branch setup really creates a task worktree from ``base_branch``; ``current_branch``
+    adds further phase files for the ``file``-scope tests. ``config_text`` is written to
+    ``aidw/config.yaml`` (E3.2) and committed, so the control worktree stays clean for the
+    real-run preflight and :func:`run` reads it from ``repo.root``. The files are committed
+    so branch setup really creates a task worktree from ``base_branch``; ``current_branch``
     and ``is_clean`` are left unmocked so preflight reads real git.
     """
     files = {
@@ -289,6 +292,8 @@ def _patch_prompt_repo(
             roadmap if roadmap is not None else ROADMAP_FIXTURE
         )
     }
+    if config_text is not None:
+        files["aidw/config.yaml"] = config_text
     for name, text in (extra_files or {}).items():
         files[f"docs/tasks/{name}"] = text
     _make_control_repo(tmp_path, files=files, base_branch=base_branch)
@@ -3621,6 +3626,179 @@ def test_l43_budget_two_ends_at_review_two(
     assert "max_revisions=2" in _run_log(tmp_path, latest.run_id)
     # The effective value is visible on stdout as well as in the gate detail/run.log.
     assert "max_revisions=2" in capsys.readouterr().out
+
+
+def test_l43_config_max_revisions_beats_the_default(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A target config declaring `max_revisions: 2` is the effective budget (design §12).
+
+    The config is the *target repo's* file at `<target>/aidw/config.yaml` (§3.4), read
+    through the loader and merged by `resolve_config` — not the toolkit's.
+    """
+    _patch_prompt_repo(
+        tmp_path, monkeypatch, config_text="schema_version: 1\nmax_revisions: 2\n"
+    )
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+    )
+
+    assert code == 3
+    names = [name for name, _, _ in seen]
+    assert names == [
+        "task-prompt",
+        "task-review-1",
+        "task-review-fixes-1-1",
+        "task-review-fixes-1-2",
+        "task-review-fixes-1-3",
+        "task-review-reconcile-1",
+        "task-review-2",
+    ]
+    assert "task-review-3" not in names
+
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    for token in ("max_revisions=2", "rounds=2", "revisions=1"):
+        assert token in gate.detail
+    assert "max_revisions=2" in capsys.readouterr().out
+
+
+def test_l43_cli_flag_beats_config_max_revisions(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """`--max-revisions 1` beats a config declaring 2: one review, no fix batch (H8)."""
+    _patch_prompt_repo(
+        tmp_path, monkeypatch, config_text="schema_version: 1\nmax_revisions: 2\n"
+    )
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        max_revisions=1,
+    )
+
+    assert code == 3
+    assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
+
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    for token in ("max_revisions=1", "rounds=1", "revisions=0"):
+        assert token in gate.detail
+    assert "max_revisions=1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("config_text", "expected"),
+    [
+        pytest.param("{{ not yaml: [", "cannot read/parse config", id="unparseable"),
+        pytest.param(
+            "schema_version: 1\nreop:\n  base_branch: main\n",
+            "unknown key `reop`",
+            id="unknown-key",
+        ),
+        pytest.param("schema_version: one\n", "must be an integer", id="wrong-type"),
+    ],
+)
+def test_l43_broken_config_refuses_instead_of_defaulting(
+    tmp_path: Path, monkeypatch, capsys, config_text: str, expected: str
+) -> None:
+    """A config with ERROR issues refuses with exit 2, before any run state (E3.2/Req 5).
+
+    A silent `DEFAULT_MAX_REVISIONS` fallback would pass every earlier `max_revisions`
+    test, so the assertion that matters is the refusal plus the absence of the run
+    record, branch and worktree.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch, config_text=config_text)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert expected in err
+    assert "error: config.yaml:" in err
+    # Nothing was created: no stage ran, no run record, no branch and no worktree.
+    assert seen == []
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert not (_runs_root(tmp_path)).exists()
+    assert git.worktree_for_branch(tmp_path, "03-E4.1") is None
+    assert not (tmp_path.parent / f"{tmp_path.name}-ws" / "03-E4.1").exists()
+
+
+def test_l43_broken_config_refuses_on_a_dry_run_too(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The refusal is independent of `--dry-run`: a plan must not hide a broken config."""
+    _patch_prompt_repo(tmp_path, monkeypatch, config_text="{{ not yaml: [")
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        dry_run=True,
+    )
+
+    assert code == 2
+    assert "cannot read/parse config" in capsys.readouterr().err
+    assert seen == []
+    assert state.list_runs(_runs_root(tmp_path)) == []
+
+
+def test_l43_unreadable_directory_config_refuses_before_dry_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A directory at ``aidw/config.yaml`` is a loader error, not a missing config.
+
+    This covers the ``Path.exists()``/``read_text()`` edge explicitly: prompt planning must
+    refuse the unreadable config before it can fall back to the default budget or create
+    any run state, including when the invocation is a dry run (E3.2 Requirement 5).
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    (tmp_path / "aidw" / "config.yaml").mkdir(parents=True)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        dry_run=True,
+    )
+
+    assert code == 2
+    assert "cannot read/parse config" in capsys.readouterr().err
+    assert seen == []
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert git.worktree_for_branch(tmp_path, "03-E4.1") is None
 
 
 def test_l43_budget_four_runs_four_reviews(

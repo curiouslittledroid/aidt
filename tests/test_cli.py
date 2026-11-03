@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 from aidw import __version__, github
 from aidw import state as state_mod
-from aidw.cli import EXIT_REFUSED, EXIT_USAGE, app
+from aidw.cli import EXIT_REFUSED, EXIT_STAGE_FAILURE, EXIT_USAGE, app
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths, toolkit_root
 from aidw.workflows import (
     approve as approve_workflow,
@@ -542,7 +542,32 @@ CONFIG_KEYS = {
     "workspace_root",
     "state_root",
     "config_file",
+    # E3.2: the resolved §3.4 config, one flat dotted-path mapping of ``{value, source}``.
+    "config",
 }
+
+#: The six E1.6 root entries, kept intact by E3.2.
+CONFIG_ROOT_KEYS = CONFIG_KEYS - {"config"}
+
+#: Every §3.4 leaf resolved by ``resolve_config`` for a config that declares nothing
+#: beyond ``schema_version`` (the ``paths:``/``repo:``/``github:`` default values are
+#: E3.4/E6's, so they are *unset* here, and ``max_revisions`` is the one seeded default).
+CONFIG_LEAF_PATHS = (
+    "schema_version",
+    "requires_toolkit",
+    "max_revisions",
+    "repo.base_branch",
+    "repo.branch_pattern",
+    "paths.roadmap_dir",
+    "paths.roadmap_glob",
+    "paths.task_prompts_dir",
+    "paths.implementation_results_dir",
+    "paths.build_results_template",
+    "paths.architecture_dir",
+    "github.markers.parent",
+    "github.markers.child",
+    "github.markers.summary",
+)
 
 
 def _config_lines(stdout: str) -> list[str]:
@@ -603,7 +628,7 @@ def test_config_show_resolves_target_and_workspace_once(
 
 
 def test_config_show_human_single_checkout(tmp_path: Path, monkeypatch) -> None:
-    """Six ``label: value (source)`` lines; sources identical to JSON mode."""
+    """The six root lines, then one line per resolved leaf (dotted path, source)."""
     monkeypatch.delenv("AIDW_REPO", raising=False)
     monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
@@ -613,9 +638,11 @@ def test_config_show_human_single_checkout(tmp_path: Path, monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     lines = _config_lines(result.stdout)
-    assert len(lines) == 6
-    # Exactly the six pinned source strings, no display-label wording pinned.
-    assert sorted(_line_source(line) for line in lines) == [
+    # Six root entries + one line per §3.4 leaf; no YAML nesting, no per-stage entries.
+    assert len(lines) == 6 + len(CONFIG_LEAF_PATHS)
+    root_lines, leaf_lines = lines[:6], lines[6:]
+    # Exactly the six pinned root source strings, no display-label wording pinned.
+    assert sorted(_line_source(line) for line in root_lines) == [
         "cwd",
         "defaults",
         "package",
@@ -630,10 +657,20 @@ def test_config_show_human_single_checkout(tmp_path: Path, monkeypatch) -> None:
     assert f"{_expected_state(tmp_path)} (workspace)" in result.stdout
 
     defaults_line = [
-        line for line in lines if _line_source(line) == "defaults"
+        line for line in root_lines if _line_source(line) == "defaults"
     ]
     assert len(defaults_line) == 1
     assert "none" in defaults_line[0]
+
+    # The leaf section is the same order and the same set as the JSON section.
+    assert [line.split(":", 1)[0] for line in leaf_lines] == list(CONFIG_LEAF_PATHS)
+    by_path = {line.split(":", 1)[0]: line for line in leaf_lines}
+    assert by_path["max_revisions"] == "max_revisions: 3 (default)"
+    # No default exists for these yet (E3.4/E6), so they print ``unset`` with no source.
+    for path in CONFIG_LEAF_PATHS:
+        if path == "max_revisions":
+            continue
+        assert by_path[path] == f"{path}: unset"
 
 
 def test_config_show_json_single_checkout(tmp_path: Path, monkeypatch) -> None:
@@ -647,8 +684,16 @@ def test_config_show_json_single_checkout(tmp_path: Path, monkeypatch) -> None:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert set(payload) == CONFIG_KEYS
-    for entry in payload.values():
-        assert set(entry) == {"value", "source"}
+    for key in CONFIG_ROOT_KEYS:
+        assert set(payload[key]) == {"value", "source"}
+    # The ``config`` section is the flat dotted-path dump, not a nested §3.4 shape.
+    assert list(payload["config"]) == list(CONFIG_LEAF_PATHS)
+    assert payload["config"]["max_revisions"] == {"value": 3, "source": "default"}
+    for path, entry in payload["config"].items():
+        if path == "max_revisions":
+            continue
+        # Unset: value null and *no* ``source`` key at all.
+        assert entry == {"value": None}
 
     assert payload["toolkit_root"] == {
         "value": str(ToolkitPaths.resolve().root),
@@ -689,8 +734,117 @@ def test_config_show_detects_the_target_config_file(tmp_path: Path, monkeypatch)
     }
 
 
-def test_config_show_config_file_directory_is_not_a_config(tmp_path: Path, monkeypatch) -> None:
-    """Detection is ``is_file``: a directory named config.yaml is ``none``."""
+def test_config_show_dumps_a_declared_config_by_dotted_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The ``config`` section is one flat mapping: ``config`` provenance per declared leaf,
+    a whole-list entry at ``workflows.<name>.stages``, and ``unset`` elsewhere."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+    config_path = tmp_path / "aidw" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        "schema_version: 1\n"
+        "repo:\n"
+        "  base_branch: trunk\n"
+        "workflows:\n"
+        "  prompt:\n"
+        "    stages:\n"
+        "      - id: author\n"
+        "      - id: review\n"
+        "github:\n"
+        "  labels:\n"
+        "    must-fix: {color: \"B60205\", description: Blocking}\n",
+        encoding="utf-8",
+    )
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["config_file"] == {
+        "value": str(config_path.resolve()),
+        "source": "target repo",
+    }
+    config = payload["config"]
+    assert config["schema_version"] == {"value": 1, "source": "config"}
+    assert config["repo.base_branch"] == {"value": "trunk", "source": "config"}
+    # A list carries provenance only at its own path: no ``stages[0]``-style entries.
+    assert config["workflows.prompt.stages"] == {
+        "value": [{"id": "author"}, {"id": "review"}],
+        "source": "config",
+    }
+    assert not any(path.startswith("workflows.prompt.stages[") for path in config)
+    assert "workflows.prompt.parallel_groups" not in config
+    assert config["github.labels.must-fix.color"] == {
+        "value": "B60205",
+        "source": "config",
+    }
+    # Undeclared leaves stay unset rather than gaining an invented default (E3.4/E6).
+    assert config["repo.branch_pattern"] == {"value": None}
+    # ...and the one seeded default still resolves as ``default``.
+    assert config["max_revisions"] == {"value": 3, "source": "default"}
+    assert config["paths.roadmap_dir"] == {"value": None}
+
+
+def test_config_show_human_renders_declared_and_unset_leaves(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Human mode appends ``dotted-path: value (source)`` lines, with list values as JSON."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+    config_path = tmp_path / "aidw" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        "schema_version: 1\n"
+        "repo:\n"
+        "  base_branch: trunk\n"
+        "workflows:\n"
+        "  prompt:\n"
+        "    stages:\n"
+        "      - id: author\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["config", "show"])
+
+    assert result.exit_code == 0, result.output
+    lines = _config_lines(result.stdout)
+    assert "repo.base_branch: trunk (config)" in lines
+    assert 'workflows.prompt.stages: [{"id": "author"}] (config)' in lines
+    assert "max_revisions: 3 (default)" in lines
+    assert "paths.roadmap_dir: unset" in lines
+    assert f"config file: {config_path.resolve()} (target repo)" in lines
+
+
+def test_config_show_override_provenance_is_not_reachable_here(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``config show`` takes no override flag (§3.3): no leaf reports ``override``."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    sources = {
+        entry.get("source") for entry in json.loads(result.stdout)["config"].values()
+    }
+    assert sources == {"default", None}
+
+
+def test_config_show_config_file_directory_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    """E3.2 flips E1.6's ``none``: a directory passes ``exists()`` but cannot be read.
+
+    The loader's ``read_text`` raises ``OSError``, which is an ERROR issue — a broken
+    config is refused, never silently resolved to defaults.
+    """
     monkeypatch.delenv("AIDW_REPO", raising=False)
     monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
@@ -699,17 +853,13 @@ def test_config_show_config_file_directory_is_not_a_config(tmp_path: Path, monke
 
     result = _config_show_json()
 
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout)["config_file"] == {
-        "value": None,
-        "source": "defaults",
-    }
+    assert result.exit_code == EXIT_STAGE_FAILURE
+    assert result.stdout == ""  # all-or-nothing: no resolved output at all
+    assert "cannot read/parse config" in result.stderr
 
 
-def test_config_show_config_file_detection_does_not_parse_yaml(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """An invalid regular file is still detected; parsing belongs to E3.1/E3.5."""
+def test_config_show_unparseable_yaml_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    """E3.2 flips E1.6's "detect but never parse": a broken YAML file refuses."""
     monkeypatch.delenv("AIDW_REPO", raising=False)
     monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
@@ -720,17 +870,42 @@ def test_config_show_config_file_detection_does_not_parse_yaml(
 
     result = _config_show_json()
 
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout)["config_file"] == {
-        "value": str(config_path.resolve()),
-        "source": "target repo",
-    }
+    assert result.exit_code == EXIT_STAGE_FAILURE
+    assert result.stdout == ""
+    assert "cannot read/parse config" in result.stderr
+
+
+def test_config_show_unknown_key_fails_closed_human_keeps_root_lines(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A validated-but-invalid config refuses; human mode keeps the two E1.6 lines."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+    config_path = tmp_path / "aidw" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text("schema_version: 1\nreop:\n  base_branch: main\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["config", "show"])
+
+    assert result.exit_code == EXIT_STAGE_FAILURE
+    assert "unknown key `reop`" in result.stderr
+    # The two no-repo root lines precede the refusal; nothing else is printed.
+    assert result.stdout.splitlines() == [
+        f"toolkit root: {ToolkitPaths.resolve().root} (package)",
+        f"version: {__version__} (package)",
+    ]
 
 
 def test_config_show_broken_config_symlink_uses_defaults(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """A broken config symlink is not a regular file and is treated as absent."""
+    """A broken config symlink is invisible to the loader's ``exists()``: absent.
+
+    Same outcome E1.6's ``is_file()`` detection gave (``null``/``defaults``, exit 0); only
+    the mechanism changed, so no fail-closed refusal applies here.
+    """
     monkeypatch.delenv("AIDW_REPO", raising=False)
     monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
