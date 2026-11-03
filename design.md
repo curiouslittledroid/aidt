@@ -507,13 +507,22 @@ preflight (branch matches task id, task prompt exists, no other run active)
 ### 8.3 `aidw review --pr <n>`
 
 ```
-preflight (PR exists, targets main, current branch is the PR head)
+preflight (PR exists, targets main, the PR head's worktree is located)
   → R1 code-review                    (agent code-reviewer, fresh, read-only)
   if findings:
     → R2 review-findings-to-github    (agent review-publisher, fresh, no gate)   creates parent + children
   else: report Approved and stop
 ```
 
+- Preflight is PR-head-driven, not cwd-driven (decision K1): `gh pr view` gives the base
+  and head, and the **PR head's worktree** is located (`git.worktree_for_branch`) and
+  re-resolved into the target, exactly as §8.4 does. The invoking worktree's checked-out
+  branch is never consulted, so a review survives being run from the control root while
+  the PR head is checked out in a sibling directory — which is the normal case for the
+  §8.6 chain, whose `implement` stage works in the task worktree. A known head with no
+  local worktree is a preflight refusal (exit 4) that prints the §3.2 `git worktree add`
+  command; under `--dry-run` it is printed as planned output and the plan falls back to
+  the invoking worktree. A single checkout (§3.10) locates itself and is unchanged.
 - `R1` renders `.pi/prompts/code-review.md` (no variables) and parses the verdict
   (`Approve` / `Request changes` / `Blocked`) and the findings block from the final message.
 - If `Blocked`, the workflow stops and reports — it does not publish.
@@ -970,6 +979,7 @@ Exit codes: `0` success/approved, `1` stage or gate failure, `2` usage/config er
 | H11 | The workflow measures a produced prompt against the conciseness budget (80–120 lines, <15KB; ~150 lines for larger tasks), warns with a `budget:` count naming the offending requirement, and refuses under `--strict`. (L5.3, design §8.1) |
 | H12 | `tests/test_prompt_workflow.py` pins the new loop contract on a synthesized fixture with no real model and no network: the L1.1/L1.2 refusals, the L1.3 blocked path, the L3.4 reconcile stage, the L3.3 snapshots, the L4.1 terminal review, the L2.3 delta brief, the L4.2 recording, and the L2.1/L2.2/L3.1/L3.2/L5.1 instruction clauses. (L6.1, design §15) |
 | J1 | `aidw doctor` enforces `PI_MIN_VERSION = 0.85.0` and `FAIL`s below it, instead of reporting whatever `pi --version` prints. AIDW's Pi argv is verified against 0.85.x (§5.5), and below that floor a stage dies inside extension load *before* its first model call — `@earendil-works/pi-ai/compat` is a 0.85 addition, so a stale `pi` shadowed by an old `nvm` bin dir answers `--version` and then exits 1, which reaches the run record only as `exit code 1` with zero tokens, zero events and an empty stage JSONL. The finding names the floor, the offending path and `which -a pi`. (§12; `aidw/doctor.py`) |
+| K1 | `aidw review` resolves the **PR-head worktree** instead of comparing the invoking worktree's checked-out branch to the PR head (supersedes the pre-E2.6 "current branch is the PR head" preflight, which §8.3 now states as "the PR head's worktree is located"). `gh pr view` supplies base and head; `git.worktree_for_branch` locates the head's worktree, and `TargetRepo.resolve` re-resolves the target and agent cwds against it, so stages, `github.*` reads, the run lock and `state.json`'s `repo_root` all use the task worktree — mirroring `implement` (§8.2) and `fix` (§8.4). The invoking branch is never read. A known head with no local worktree refuses (exit 4) with the copy-pasteable §3.2 `git worktree add` command and writes no run state; under `--dry-run` the command is planned output and the plan falls back to the invoking worktree, so a dry run still plans without a worktree. `pr_view` now runs under `--dry-run` too, so the head resolves in both modes (§8.4's E2.6 req 6 precedent). Why: since E2.6 the task branch lives in a sibling worktree, so the control root a chain/operator invokes `review` from is on `main`; the old equality test could never pass, and `aidw run prompt-to-fix` stopped with ``chain stopped: `review` exited 4`` on the review stage of every worktree run. A single checkout is a worktree whose branch *is* the PR head, so it locates itself and behaves exactly as before. Review remains branch-blind about *which* worktree invoked it, which also makes the E2.7 run lock key the task worktree rather than the control root. (design §§8.3, 8.6, 14; `aidw/workflows/review.py`) |
 | I1 | `aidw run prompt-to-fix <phase> <epic> <task> [--pr <n>]` is the whole cycle — `prompt` → `implement` → `review` → `approve-followups` → `fix` — composed from the four existing orchestrators, so each keeps its own preflight, gates, state and resumability and the chain stops at the first non-zero exit. The PR number is read from the newest `implement` run's recorded `pr.number` (`--pr <n>` overrides it; `0` is the `--dry-run` placeholder, since a dry run opens no PR) instead of a new `gh` query. The chain auto-approves exactly one gate: it adds `approve-followups` to the `fix` stage's skip set and prints the mechanism. `approve-implementation-pr` and `approve-fix-pr` keep their normal `--yes`/`--gate-default`/interactive semantics, and `--deny-gates approve-followups` still refuses the auto-approval (`deny` is checked before `skip`, §6). `aidw run` also gains `--skip-gates` and `--force-model` for every chain. (design §8.6; §14 CLI reference; `aidw/workflows/run.py`) |
 
 ---

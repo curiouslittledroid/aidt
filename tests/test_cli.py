@@ -454,6 +454,8 @@ def test_review_dry_run_reads_target_and_uses_toolkit_prompts(
     tmp_path: Path, monkeypatch
 ) -> None:
     target = _init_repo_with_task(tmp_path / "target")
+    # `review` reads the PR head in dry-run too (K1), so keep the plan off the network.
+    monkeypatch.setattr(github, "gh_available", lambda: False)
     calls = _spy_run_stage(monkeypatch, review_workflow)
 
     result = runner.invoke(app, ["--repo", str(target), "review", "--pr", "7", "--dry-run"])

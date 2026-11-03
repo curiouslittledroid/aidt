@@ -207,6 +207,19 @@
   - Deliverable: a shared fixture used by E2 and later epics.
   - Done when: at least three tests across two modules use it, and it cleans up after itself.
 
+- [x] **E2.10. `review` resolves the PR-head worktree**
+  E2.6 made `implement`/`fix` locate the PR-head worktree; `review` kept the pre-worktree preflight
+  (`git.current_branch` must equal the PR head), so it refuses with `current branch `main` is not
+  the PR head` whenever the task branch lives in a sibling worktree — `aidw run prompt-to-fix`
+  therefore stopped at its review stage with `chain stopped: `review` exited 4` on every worktree
+  run. Resolve the head's worktree and review there (design §8.3, decision K1).
+  - Deliverable: `review` locates the PR-head worktree, re-resolves the target and agents against
+    it, keys the run lock and `state.json`'s `repo_root` on it, and refuses (exit 4) with the
+    `git worktree add` command when it is missing; a single checkout still reviews in place.
+  - Done when: a review of a worktree PR succeeds from the control root on `main`, the missing
+    worktree is refused with the copy-pasteable command and no run state, and the plan still
+    prints under `--dry-run` with no worktree.
+
 ## Epic E3: Target-repo config (D3, D10, D11, D12, D17)
 
 - [x] **E3.1. Schema, loader, validation**

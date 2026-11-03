@@ -1,7 +1,7 @@
 """``aidw review`` — independent code review and findings publication (design §8.3).
 
 ```
-preflight (PR exists, targets main, current branch is the PR head)
+preflight (PR exists, targets main, the PR head's worktree is located)
   → R1 code-review                 agent code-reviewer  (fresh, read-only)
   if findings:
     → R2 review-findings-to-github agent review-publisher (fresh, ungated)
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from aidw import findings as findings_mod
@@ -40,6 +41,7 @@ from aidw.state import (
     save,
 )
 from aidw.verdict import APPROVE, BLOCKED as VERDICT_BLOCKED, parse_verdict
+from aidw.workflows.implement import worktree_add_command
 
 R1 = "code-review"
 R2 = "review-findings-to-github"
@@ -97,29 +99,84 @@ def run(
         print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
         return 2
 
-    branch = git.current_branch(repo.root)
+    # --- preflight: gh, PR exists, targets main (design §8.3) ---------------- #
+    # The PR head is authoritative, not this process's current branch (K1). Since E2.6
+    # the task branch lives in its own worktree, so the control root a chain invokes us
+    # from is on `main` while the PR head is checked out in a sibling directory: a
+    # ``git.current_branch(repo.root) == headRefName`` test could therefore never pass
+    # for ``aidw run prompt-to-fix`` right after its ``implement`` stage, which exits 4
+    # on the review stage of every worktree run. ``pr_view`` runs in dry-run too, so the
+    # head resolves in both modes (E2.6 req 6, mirroring ``fix``).
     pr_info: dict = {}
+    branch: str | None = None
+    worktree: Path | None = None
+
+    if not dry_run and not github.gh_available():
+        print("`gh` was not found on PATH.", file=sys.stderr)
+        return 4
+
+    view = github.pr_view(repo.root, pr) if github.gh_available() else None
 
     if not dry_run:
-        if not github.gh_available():
-            print("`gh` was not found on PATH.", file=sys.stderr)
-            return 4
-        view = github.pr_view(repo.root, pr)
         if view is None:
             print(f"PR #{pr} was not found (or `gh` failed).", file=sys.stderr)
             return 2
-        pr_info = view
-        base = view.get("baseRefName")
-        if base != "main":
-            print(f"PR #{pr} targets `{base}`, not `main`.", file=sys.stderr)
+        if view.get("baseRefName") != "main":
+            print(f"PR #{pr} targets `{view.get('baseRefName')}`, not `main`.", file=sys.stderr)
             return 4
-        head = view.get("headRefName")
-        if branch != head:
+
+    pr_info = view or {}
+    branch = pr_info.get("headRefName")
+
+    # --- locate the PR-head worktree (K1) ------------------------------------ #
+    # A missing worktree is a preflight refusal (exit 4, design §14) in a real run, with
+    # the same copy-pasteable command ``implement``/``fix`` print; a dry run prints it as
+    # planned output and keeps planning against ``repo.root`` (the branch is known, there
+    # is just no worktree to plan in).
+    if branch:
+        worktree = git.worktree_for_branch(repo.root, branch)
+    if branch and worktree is None:
+        command = worktree_add_command(workspace, branch, repo.base_branch)
+        if dry_run:
+            print(f"worktree (planned): {(workspace.workspace_root / branch).resolve()}")
+            print(f"branch-setup (planned): {command}")
+        else:
             print(
-                f"current branch `{branch}` is not the PR head `{head}`.",
+                f"branch-setup refused: no worktree for `{branch}`. "
+                f"Create it first:\n  {command}",
                 file=sys.stderr,
             )
             return 4
+    elif worktree is not None:
+        # Re-resolve the target and agents against the worktree, and use it for every
+        # stage, every ``github.*`` read of the tree, the run lock and ``create_run``
+        # below, so ``state.json``'s ``repo_root`` records the worktree (mirroring
+        # implement/fix). ``agent.cwd`` was resolved against the control root and would
+        # silently review the wrong tree.
+        resolved = TargetRepo.resolve(worktree)
+        repo = replace(
+            resolved,
+            base_branch=repo.base_branch,
+            branch_pattern=repo.branch_pattern,
+        )
+        agents, issues = load_all(aidt.root, repo.root)
+        errors = [i for i in issues if i.level == ERROR]
+        warnings = [i for i in issues if i.level == WARNING]
+        if force_model:
+            warnings = [w for w in warnings if "reviewer != author" not in w.message]
+        if errors or (strict and warnings):
+            print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
+            return 2
+        if dry_run:
+            print(f"worktree (planned): {worktree}")
+    else:
+        # An unanswerable PR read (``gh`` missing, or the chain's placeholder PR 0):
+        # plan against the control root and keep going (E2.6 req 6).
+        reason = "`gh` not found" if not github.gh_available() else "PR head unknown"
+        print(f"branch: unknown ({reason})")
+
+    if branch:
+        print(f"branch: {branch}")
 
     # --- one run per worktree (EXTRACTION.md §3.2/§3.10, E2.7) ---------------- #
     # The key is the *resolved* worktree path -- ``repo.root``, the same value

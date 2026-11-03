@@ -1,7 +1,7 @@
 """``aidw fix`` — fix approved review follow-ups (design §8.4).
 
 ```
-preflight (PR exists, targets main, current branch is the PR head)
+preflight (PR exists, targets main, the PR head's worktree is located)
   → list open children; show GitHub state
   ◇  approve-followups              runs /approve-review-followups (agent review-approver)
   ⟳  one approved child at a time:
