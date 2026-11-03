@@ -24,11 +24,20 @@ def _noop_prompt() -> Path:
 
 
 def test_resolve_prompt_by_name() -> None:
-    assert resolve_prompt(toolkit_root(), "code-review") == toolkit_root() / "prompts" / "code-review.md"
+    # E4.2: the resolver is target-aware (precedence 2–3), so the target root is an
+    # explicit argument. The toolkit repo has no ``aidw/prompts/`` shadow, so the
+    # toolkit default is still what ``code-review`` names here.
+    assert resolve_prompt(toolkit_root(), repo_root(), "code-review") == (
+        toolkit_root() / "prompts" / "code-review.md"
+    )
 
 
 def test_resolve_prompt_by_path() -> None:
-    resolved = resolve_prompt(toolkit_root(), str(_noop_prompt()))
+    # E4.2: a declared ``prompt:`` path is precedence 1 and is passed as a plain string;
+    # an absolute one is used as-is rather than reinterpreted as a filename.
+    resolved = resolve_prompt(
+        toolkit_root(), repo_root(), "noop", str(_noop_prompt())
+    )
     assert resolved == _noop_prompt()
 
 
