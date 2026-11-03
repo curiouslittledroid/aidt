@@ -61,6 +61,13 @@ cannot *understand* refuses at the same site and with the same contract (E3.3, D
 ``SUPPORTED_SCHEMA_VERSION`` or an unsatisfied ``requires_toolkit`` pin, and the issues go
 to stderr with exit 2 before ``load_tasks``/``derive_branch_name``, so the run leaves no
 state, branch or worktree (EXTRACTION.md §3.11 "refuses to run").
+Immediately after that refusal (E3.7, §3.4 "Configured read-paths must exist"), the two
+paths this workflow first needs — ``paths.roadmap_dir`` and ``paths.task_prompts_dir`` —
+are existence-checked against the target root through
+:func:`aidw.target_config.check_paths`; a missing one is the same exit-2 refusal naming the
+field and the resolved absolute path, still before any branch, worktree or run record. This
+is validation only: ``load_tasks`` keeps its own ``docs/tasks`` lookup until E5.2 consumes
+the configured ``roadmap_dir``.
 When the author's first output line is ``blocked: <reason>`` the run ends ``blocked``
 (exit 3) with the reason in the run log and on stderr; the created task worktree and any
 uncommitted change under ``docs/task-prompts/`` in it are reported, never repaired
@@ -108,6 +115,7 @@ from aidw.target_config import (
     DEFAULT_MAX_REVISIONS,
     ConfigOverrides,
     check_compatibility,
+    check_paths,
     load_target_config,
     resolve_config,
 )
@@ -126,6 +134,12 @@ from aidw.verdict import APPROVE, BLOCKED as VERDICT_BLOCKED, parse_verdict
 from aidw.workflows.implement import derive_branch_name
 
 GATE = "approve-task-prompt"
+
+#: The read-paths this workflow first needs (E3.7, EXTRACTION.md §3.4): the roadmap it
+#: resolves the task in and the directory the author writes the prompt into. Checked at
+#: startup, before any branch/worktree/run state; the record stage's own read-paths are
+#: ``aidw implement``'s to check.
+_STARTUP_READ_PATHS = ("roadmap_dir", "task_prompts_dir")
 
 #: Remote the base-branch preflight fetches (L1.1, design §8.1). Full ``git fetch origin``
 #: keeps ``refs/remotes/origin/<base>`` current; a partial refspec would not.
@@ -1331,9 +1345,21 @@ def run(
     if compatibility_issues:
         print(format_issues(compatibility_issues), file=sys.stderr)
         return 2
-    max_revisions = resolve_config(
+    resolved = resolve_config(
         declared, overrides=ConfigOverrides(max_revisions=max_revisions)
-    )["max_revisions"].value
+    )
+    max_revisions = resolved["max_revisions"].value
+    # E3.7 (§3.4 "Configured read-paths must exist"): the two read-paths this workflow
+    # first needs must exist against the *target* root — never the toolkit root, never the
+    # cwd — or the run refuses here with the field and the resolved path in the message.
+    # Same site and contract as the two refusals above: stderr + exit 2, regardless of
+    # `--dry-run`, before `load_tasks`, any branch/worktree and any run record. Validation
+    # only: `load_tasks` still reads `docs/tasks` itself (E5.2 consumes the configured
+    # `roadmap_dir`), so this does not silently re-point the roadmap parser.
+    path_issues = check_paths(resolved, repo.root, fields=_STARTUP_READ_PATHS)
+    if path_issues:
+        print(format_issues(path_issues), file=sys.stderr)
+        return 2
     # ``aidt`` locates the toolkit's assets (prompts, agent configs); run state lives
     # under the per-repo state root (EXTRACTION.md §3.10), resolved once by ``_roots``
     # and threaded in as ``workspace`` so no workflow re-resolves it.

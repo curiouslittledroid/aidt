@@ -12,6 +12,7 @@ with real git, and never fakes git output; only the Pi seam (``run_stage``) is m
 from __future__ import annotations
 
 import dataclasses
+import shutil
 import subprocess
 import threading
 import time
@@ -49,12 +50,26 @@ def _init_repo(path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
 
 
+#: E3.7's read-paths the record stage needs (§3.4), committed into the seed so both the
+#: control worktree and the task worktree carry them. ``docs/architecture`` is deliberately
+#: absent: it is a write-target I4 creates on demand.
+RECORD_READ_PATH_FILES = {
+    "docs/task-prompts/.gitkeep": "",
+    "docs/implementation-results/.gitkeep": "",
+    "docs/implementation-results/TEMPLATE.md": "# Build results template\n",
+}
+
+
 def _make_bare_with_control(tmp_path: Path) -> tuple[Path, Path]:
     """Bare repo plus the ``main`` control worktree (the §3.2 bootstrap layout)."""
     seed = tmp_path / "seed"
     seed.mkdir()
     _git_run(seed, "init", "-q", "-b", "main")
     (seed / "f.txt").write_text("x\n", encoding="utf-8")
+    for rel, text in RECORD_READ_PATH_FILES.items():
+        path = seed / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
     _git_run(seed, "add", ".")
     _git_run(seed, "commit", "-qm", "init")
     bare = tmp_path / "bare.git"
@@ -895,7 +910,7 @@ def test_serial_runs_the_pair_one_at_a_time(tmp_path: Path, monkeypatch) -> None
 def test_parallel_runs_test_and_architecture_concurrently(
     tmp_path: Path, monkeypatch
 ) -> None:
-    control, _worktree, prompt = _located_layout(tmp_path)
+    control, worktree, prompt = _located_layout(tmp_path)
     _patch(monkeypatch)
     recorder = _TrackingStages()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
@@ -919,6 +934,9 @@ def test_parallel_runs_test_and_architecture_concurrently(
         "record-implementation-results",
         "pr",
     ]
+    # E3.7 requirement 6: the parallel branch creates I4's write-target before the pair
+    # is submitted (the stage that needs it runs in the same batch).
+    assert (worktree / "docs" / "architecture").is_dir()
 
 
 # --------------------------------------------------------------------------- #
@@ -1149,3 +1167,312 @@ def test_the_worktree_lock_is_released_on_every_exit_path(
     assert code == expected
     with lock.acquire(roots["workspace"].state_root, worktree):
         pass
+
+
+# --------------------------------------------------------------------------- #
+# E3.7 — configured read-paths and the architecture write-target
+# (EXTRACTION.md §3.4 "Configured read-paths must exist")
+# --------------------------------------------------------------------------- #
+#
+# Two post-locate sites, never the pre-locate startup preflight: the I5 record preflight
+# (`implementation_results_dir`/`build_results_template`, resolved against `target.root`)
+# and the I4 write-target (`architecture_dir`, created on demand when its config stage
+# `architecture` is enabled). Like the task-prompt existence refusal, a missing path is
+# exit 2 and names the field and the resolved absolute path.
+
+
+def _remove_record_path(worktree: Path, field: str) -> Path:
+    """Delete one of I5's read-paths from the worktree and return its resolved path."""
+    relative = (
+        "docs/implementation-results"
+        if field == "implementation_results_dir"
+        else "docs/implementation-results/TEMPLATE.md"
+    )
+    path = worktree / relative
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    return path.resolve()
+
+
+@pytest.mark.parametrize("field", ["implementation_results_dir", "build_results_template"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_e37_missing_record_read_path_refuses_naming_field_and_path(
+    tmp_path: Path, monkeypatch, capsys, field: str, dry_run: bool
+) -> None:
+    """The record preflight resolves against the located worktree, not the control root."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    missing = _remove_record_path(worktree, field)
+    # The control tree still has the path: a wrong-root check would pass and prove nothing.
+    assert (control / "docs" / "implementation-results").exists()
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt,
+        **_roots(control),
+        approve_all=True,
+        dry_run=dry_run,
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "error: config.yaml:" in err
+    assert f"`paths.{field}` does not exist" in err
+    assert str(missing) in err
+    # No stage ran and no run state was written: the preflight precedes create_run.
+    assert recorder.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def test_e37_record_preflight_refuses_a_malformed_worktree_config(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The record preflight reuses prompt.py's loader-ERROR contract (exit 2)."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    (worktree / "aidw").mkdir()
+    (worktree / "aidw" / "config.yaml").write_text(
+        "schema_version: 1\npaths:\n  bogus: docs/x\n", encoding="utf-8"
+    )
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True, dry_run=True
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "unknown key `paths.bogus`" in err
+    assert recorder.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def test_e37_record_preflight_refuses_an_incompatible_worktree_config(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """An incompatible config never hides behind the hardcoded record paths (E3.3/D10)."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    (worktree / "aidw").mkdir()
+    (worktree / "aidw" / "config.yaml").write_text(
+        "schema_version: 2\n", encoding="utf-8"
+    )
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True, dry_run=True
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "`schema_version` 2 is newer" in err
+    assert recorder.names == []
+
+
+def test_e37_a_dry_run_without_a_worktree_plans_the_record_stage_unchecked(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """No worktree root means nothing to check: the plan proceeds (the refusal's contract)."""
+    control, prompt = _layout(tmp_path)
+    shutil.rmtree(control / "docs" / "implementation-results")
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 0
+    assert "does not exist" not in capsys.readouterr().err
+    assert recorder.names == [
+        "impliment-task",
+        "test",
+        "update-traceability",
+        "update-architecture",
+        "record-implementation-results",
+        "pr",
+    ]
+
+
+def test_e37_resume_that_skips_a_succeeded_record_stage_skips_its_preflight(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The preflight belongs to I5, so a skipped I5 skips it (and its refusal)."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    runs_dir = _runs_root(control)
+    state = create_run(
+        runs_dir,
+        worktree,
+        "implement",
+        label="03-E4.1",
+        task={"phase": "03", "task": "E4.1"},
+        branch="03-E4.1",
+    )
+    directory = run_dir(runs_dir, state.run_id)
+    for name in (
+        "impliment-task",
+        "test",
+        "update-traceability",
+        "update-architecture",
+        "record-implementation-results",
+    ):
+        state.record_stage(
+            StageRecord(name=name, agent="implementer", model="m", status=SUCCEEDED)
+        )
+    save(directory, state)
+    _remove_record_path(worktree, "implementation_results_dir")
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), resume=True, approve_all=True
+    )
+
+    assert code == 0
+    assert "does not exist" not in capsys.readouterr().err
+    assert recorder.names == ["pr"]
+
+
+def test_e37_dry_run_with_a_located_worktree_creates_no_architecture_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Plan-only: a dry run writes nothing into the target tree, I4's write-target included."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 0
+    assert "update-architecture" in recorder.names
+    assert not (worktree / "docs" / "architecture").exists()
+
+
+def test_e37_enabled_architecture_stage_creates_the_write_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An enabled `architecture` stage creates the absent `architecture_dir` on demand."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    assert not (worktree / "docs" / "architecture").exists()
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-architecture" in recorder.names
+    assert (worktree / "docs" / "architecture").is_dir()
+
+
+@pytest.mark.parametrize("mode", ["resume-succeeded", "from-pr"])
+def test_e37_skipped_architecture_stage_creates_nothing(
+    tmp_path: Path, monkeypatch, mode: str
+) -> None:
+    """The mkdir runs only when I4 will actually execute (`should_run`, not the plan)."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    runs_dir = _runs_root(control)
+    state = create_run(
+        runs_dir,
+        worktree,
+        "implement",
+        label="03-E4.1",
+        task={"phase": "03", "task": "E4.1"},
+        branch="03-E4.1",
+    )
+    directory = run_dir(runs_dir, state.run_id)
+    names = (
+        "impliment-task",
+        "test",
+        "update-traceability",
+        "update-architecture",
+    )
+    if mode == "from-pr":
+        names = (*names, "record-implementation-results")
+    for name in names:
+        state.record_stage(
+            StageRecord(name=name, agent="implementer", model="m", status=SUCCEEDED)
+        )
+    save(directory, state)
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    kwargs = {"resume": True, "approve_all": True}
+    if mode == "from-pr":
+        kwargs["from_stage"] = "pr"
+
+    code = implement_workflow.run(task_prompt_path=prompt, **_roots(control), **kwargs)
+
+    assert code == 0
+    assert "update-architecture" not in recorder.names
+    assert not (worktree / "docs" / "architecture").exists()
+
+
+def test_e37_architecture_write_target_that_is_a_file_fails_naming_the_stage(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A creation failure names the *config* stage id `architecture`, not `update-architecture`."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    blocker = worktree / "docs" / "architecture"
+    blocker.write_text("not a directory\n", encoding="utf-8")
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "stage `architecture`" in err
+    assert str(blocker.resolve()) in err
+    # I4 itself never ran; the stages before it did.
+    assert "update-architecture" not in recorder.names
+    assert recorder.names == ["impliment-task", "test", "update-traceability"]
+
+
+def test_e37_disabled_architecture_stage_passes_an_absent_write_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`enabled: false` for the config stage `architecture` means no creation and no error."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    (worktree / "aidw").mkdir()
+    (worktree / "aidw" / "config.yaml").write_text(
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    stages:\n"
+        "      - id: implement\n"
+        "      - id: architecture\n"
+        "        enabled: false\n",
+        encoding="utf-8",
+    )
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    # The flag is read for path validation only: the hardcoded chain still runs I4 (E4.5
+    # wires `enabled` into the chain, which E3.7 deliberately does not).
+    assert "update-architecture" in recorder.names
+    assert not (worktree / "docs" / "architecture").exists()

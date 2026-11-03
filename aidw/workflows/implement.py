@@ -31,6 +31,26 @@ worktree path**, acquired immediately before ``create_run`` and released on ever
 path (success, stage/gate failure, and the post-acquire refusals). A live peer in the
 same worktree is refused with exit 4 and writes no run state. ``--dry-run`` reaches
 ``create_run`` too, so it holds and releases the same lock.
+
+Configured paths (E3.7, EXTRACTION.md §3.4 "Configured read-paths must exist") are
+validated at two post-locate sites, never in the pre-locate startup preflight — the
+control worktree (``repo.root``) and the task-branch worktree (``target.root``) are
+different trees, and only the located one is what I4/I5 write into:
+
+- **I5 record stage** (:func:`_check_record_preflight`): after the locate and before I5
+  runs *or is planned*, load and resolve ``<target.root>/aidw/config.yaml`` and check
+  ``paths.implementation_results_dir`` / ``paths.build_results_template``. A malformed or
+  incompatible config refuses with exit 2 regardless of ``--dry-run`` (the same
+  loader-ERROR + compatibility contract ``aidw prompt`` uses), so a bad config never
+  hides behind the hardcoded paths. A dry run with no located worktree has no root to
+  check and plans unchecked; a ``--resume``/``--from`` that skips a succeeded I5 skips
+  its preflight with it.
+- **I4 architecture stage** (:func:`_ensure_architecture_dir`): immediately before I4
+  executes, create the ``paths.architecture_dir`` write-target
+  (``mkdir(parents=True, exist_ok=True)``) when its owning config stage ``architecture``
+  is enabled (:func:`aidw.target_config.stage_enabled`). A dry run writes nothing, a
+  skipped I4 creates nothing, and a creation failure fails naming the stage by its config
+  id. Wiring ``enabled`` into the stage chain itself is E4.5's, not this workflow's.
 """
 
 from __future__ import annotations
@@ -44,13 +64,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from aidw import git, lock
+from aidw import __version__, git, lock
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
 from aidw.runner import StageSpec, run_stage
+from aidw.target_config import (
+    ARCHITECTURE_STAGE_ID,
+    ResolvedConfig,
+    check_compatibility,
+    check_paths,
+    load_target_config,
+    resolve_config,
+    resolved_path,
+    stage_enabled,
+)
 from aidw.state import (
     BLOCKED,
     FAILED,
@@ -66,6 +96,18 @@ from aidw.state import (
 )
 
 GATE = "approve-implementation-pr"
+
+#: The read-paths the record stage (I5) first needs (E3.7, EXTRACTION.md §3.4): where it
+#: writes ``<branch>/build-results.md`` and the template it fills in. Validated against the
+#: located worktree, never the control root.
+_RECORD_READ_PATHS = ("implementation_results_dir", "build_results_template")
+
+#: The I5 stage's runtime name, used to decide whether its post-locate preflight runs.
+_RECORD_STAGE = "record-implementation-results"
+
+#: The I4 stage's runtime name (its config stage id is
+#: :data:`aidw.target_config.ARCHITECTURE_STAGE_ID`).
+_ARCHITECTURE_STAGE = "update-architecture"
 
 #: ``03-E4.1-prompt.md`` → phase ``03``, task ``E4.1``, branch ``03-E4.1``.
 _PROMPT_NAME = re.compile(
@@ -317,6 +359,84 @@ def _record_pr(state: RunState, repo: TargetRepo, record) -> None:
     state.pr["changed_files"] = git.changed_files(repo.root, repo.base_branch)
 
 
+def _resolved_worktree_config(
+    target_root: Path,
+) -> tuple[ResolvedConfig | None, int | None]:
+    """Load, validate, check compatibility and resolve the **worktree's** config.
+
+    ``target_root`` is the located task worktree (``target.root``), never the control
+    ``repo.root``: the two are different trees and only the worktree is what I4/I5 write
+    into. The refusal contract is ``aidw prompt``'s (E3.2/E3.3): loader ``ERROR`` issues
+    and :func:`aidw.target_config.check_compatibility` issues each go to stderr with exit
+    2, and the caller applies it regardless of ``--dry-run``. Returns ``(resolved, None)``
+    on success or ``(None, 2)`` on refusal; ``resolve_config`` runs only after the gates
+    pass, so a broken config is never silently patched with defaults (§3.4).
+    """
+    declared = load_target_config(target_root / "aidw" / "config.yaml")
+    config_errors = [issue for issue in declared.issues if issue.level == ERROR]
+    if config_errors:
+        print(format_issues(config_errors), file=sys.stderr)
+        return None, 2
+    compatibility_issues = check_compatibility(declared, toolkit_version=__version__)
+    if compatibility_issues:
+        print(format_issues(compatibility_issues), file=sys.stderr)
+        return None, 2
+    return resolve_config(declared), None
+
+
+def _check_record_preflight(target_root: Path) -> int | None:
+    """Validate I5's read-paths in the located worktree (E3.7, EXTRACTION.md §3.4).
+
+    Returns ``None`` when both ``paths.implementation_results_dir`` and
+    ``paths.build_results_template`` exist, else exit 2 after printing the issue naming
+    the field and the resolved absolute path. A config that does not load or is
+    incompatible refuses the same way — the record stage's whole job is reading the
+    template, so a malformed config must not hide behind a hardcoded path.
+    """
+    resolved, refusal = _resolved_worktree_config(target_root)
+    if refusal is not None:
+        return refusal
+    issues = check_paths(resolved, target_root, fields=_RECORD_READ_PATHS)
+    if issues:
+        print(format_issues(issues), file=sys.stderr)
+        return 2
+    return None
+
+
+def _ensure_architecture_dir(target_root: Path) -> int | None:
+    """Create I4's write-target when its owning config stage is enabled (E3.7).
+
+    Called immediately before I4 executes in a real run, resolving
+    ``paths.architecture_dir`` against the located worktree — never doctor and never the
+    pre-locate startup preflight. ``architecture_dir`` is a **write-target** (§3.4): it
+    may legitimately be absent and is created on demand. "Enabled" is read from the
+    resolved ``workflows.implement.stages`` list for the config stage id ``architecture``
+    (:func:`aidw.target_config.stage_enabled`); a disabled stage passes an absent directory
+    with no creation, and an absent/undeclared stage is enabled because the hardcoded chain
+    still runs I4. A creation failure — the path exists as a non-directory, or it cannot
+    be created — is exit 2 naming the stage by that config id, not the runtime label.
+    """
+    resolved, refusal = _resolved_worktree_config(target_root)
+    if refusal is not None:
+        return refusal
+    if not stage_enabled(resolved, "implement", ARCHITECTURE_STAGE_ID):
+        return None
+    path = resolved_path(resolved, "architecture_dir", target_root)
+    if path is None:
+        # No declared value and no default: nothing names a directory to create.
+        return None
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(
+            f"refusing: stage `{ARCHITECTURE_STAGE_ID}` needs its write-target "
+            f"`paths.architecture_dir` at {path}, which could not be created: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    return None
+
+
 def _write_artifacts(directory: Path, state: RunState, branch: str) -> Path:
     artifacts_dir = directory / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -512,6 +632,32 @@ def run(
     pre_pr = plan[:-1]
     pr_plan = plan[-1]
 
+    # --- I5 read-paths, post-locate (E3.7, EXTRACTION.md §3.4) ---------------- #
+    # One insertion point, after the locate and before I5 runs *or is planned*: the check
+    # resolves against ``target.root`` — the re-resolved worktree the stages record as
+    # ``repo_root`` — never the control ``repo.root``, so a repo whose control tree is
+    # Mythical-Forge-shaped but whose worktree is not (or the reverse) is judged on the
+    # tree I5 actually writes into. It runs whenever I5 will run or be planned: every real
+    # run (the locate already refused exit 4 when no worktree exists), a `--resume`/`--from`
+    # that reaches I5, and a `--dry-run` with a located worktree. A dry run planning with no
+    # worktree has no worktree root to check (the task-prompt existence refusal's own
+    # contract), and a `--resume`/`--from` that skips an already-succeeded I5 skips this
+    # check with it.
+    record_index = next(
+        index for index, entry in enumerate(pre_pr) if entry.name == _RECORD_STAGE
+    )
+    record_skipped = (from_index is not None and record_index < from_index) or (
+        not dry_run
+        and resume
+        and existing is not None
+        and (record := existing.stage(_RECORD_STAGE)) is not None
+        and record.status == SUCCEEDED
+    )
+    if not record_skipped and (not dry_run or worktree is not None):
+        refusal = _check_record_preflight(target.root)
+        if refusal is not None:
+            return refusal
+
     # --- one run per worktree (EXTRACTION.md §3.2/§3.10, E2.7) ---------------- #
     # The key is the *resolved* worktree path -- ``target.root``, the same value
     # ``create_run`` records as ``repo_root`` -- never the branch: a detached-HEAD
@@ -630,6 +776,14 @@ def run(
             for entry in pair:
                 if entry not in active:
                     print(f"stage:  {entry.id} {entry.name} [skipped]")
+            # E3.7 requirement 6: I4's write-target is created immediately before the
+            # active architecture stage runs — never under `--dry-run` (this branch is
+            # real-run only) and never for a skipped I4 (`active` already honours
+            # `should_run`).
+            if any(entry.name == _ARCHITECTURE_STAGE for entry in active):
+                refusal = _ensure_architecture_dir(target.root)
+                if refusal is not None:
+                    return refusal
             failed = False
             if active:
                 with ThreadPoolExecutor(max_workers=len(active)) as pool:
@@ -665,6 +819,13 @@ def run(
                     return 1
         else:
             for index, entry in enumerate(pre_pr):
+                # E3.7 requirement 6: the write-target exists immediately before I4 runs,
+                # only when `should_run` will actually execute it (a `--resume`/`--from`
+                # that skips a succeeded I4 creates nothing).
+                if entry.name == _ARCHITECTURE_STAGE and should_run(index, entry.name):
+                    refusal = _ensure_architecture_dir(target.root)
+                    if refusal is not None:
+                        return refusal
                 if not execute(entry, index):
                     return 1
 

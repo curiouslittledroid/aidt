@@ -58,8 +58,12 @@ from packaging.version import InvalidVersion, Version
 from aidw.config import ERROR
 from aidw.paths import TargetRepo, toolkit_root
 from aidw.target_config import (
+    ARCHITECTURE_STAGE_ID,
     CONFIG_FILENAME,
     DEFAULT_MAX_REVISIONS,
+    GLOB_PATH_FIELDS,
+    PATH_FIELDS,
+    READ_PATH_FIELDS,
     SOURCE_CONFIG,
     SOURCE_DEFAULT,
     SOURCE_OVERRIDE,
@@ -77,11 +81,16 @@ from aidw.target_config import (
     StageConfig,
     TargetConfig,
     TOOLKIT_DEFAULTS,
+    WRITE_TARGET_FIELDS,
     WorkflowConfig,
     check_compatibility,
+    check_paths,
     format_issues,
     load_target_config,
     resolve_config,
+    resolve_target_path,
+    resolved_path,
+    stage_enabled,
 )
 
 #: The §3.4 example, with every field E3.1 owns populated. Deliberately declares an
@@ -1755,3 +1764,268 @@ def test_compatibility_refusal_property() -> None:
         assert issues is not check_compatibility(
             declared, toolkit_version=toolkit_version
         )
+
+
+# --------------------------------------------------------------------------- #
+# Configured path validation (E3.7, EXTRACTION.md §3.4 \"Configured read-paths must
+# exist\")
+# --------------------------------------------------------------------------- #
+
+#: Pinned seed/numRuns for the seeded property run over path validation (AGENTS.md §6:
+#: every new rules-engine module ships one harness with explicit values, no Hypothesis
+#: discovery).
+PATH_PROPERTY_SEED = 713
+PATH_PROPERTY_RUNS = 40
+
+
+def _read_path_target(tmp_path: Path, *, missing: frozenset[str] = frozenset()) -> Path:
+    """A target root carrying every default read-path except ``missing``."""
+    root = tmp_path / "target"
+    root.mkdir(parents=True, exist_ok=True)
+    for name in READ_PATH_FIELDS:
+        if name in missing:
+            continue
+        path = root / getattr(TOOLKIT_DEFAULTS.paths, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if name == "build_results_template":
+            path.write_text("# Build results template\n", encoding="utf-8")
+        else:
+            path.mkdir(exist_ok=True)
+    return root
+
+
+def _resolved_for(tmp_path: Path, overrides: dict[str, Any] | None = None) -> ResolvedConfig:
+    """Load a config in ``tmp_path`` and resolve it (``target_root`` is its ``target/``)."""
+    config: dict[str, Any] = {"schema_version": 1}
+    config.update(overrides or {})
+    declared = _load(tmp_path, config)
+    assert declared.issues == [], format_issues(declared.issues)
+    return resolve_config(declared)
+
+
+def test_path_classification_is_exhaustive_over_path_fields() -> None:
+    """Every ``paths:`` entry is exactly one of read-path, write-target or glob (E3.7)."""
+    classified = [*READ_PATH_FIELDS, *WRITE_TARGET_FIELDS, *GLOB_PATH_FIELDS]
+    assert sorted(classified) == sorted(PATH_FIELDS)
+    assert len(classified) == len(set(classified))
+
+    # The E3.7 roadmap entry's exhaustive set: four read-paths, not §3.4's three.
+    assert set(READ_PATH_FIELDS) == {
+        "roadmap_dir",
+        "task_prompts_dir",
+        "implementation_results_dir",
+        "build_results_template",
+    }
+    assert WRITE_TARGET_FIELDS == ("architecture_dir",)
+    assert GLOB_PATH_FIELDS == ("roadmap_glob",)
+    assert ARCHITECTURE_STAGE_ID == "architecture"
+
+
+@pytest.mark.parametrize("field", READ_PATH_FIELDS)
+def test_each_missing_read_path_yields_one_issue_naming_field_and_resolved_path(
+    tmp_path: Path, field: str
+) -> None:
+    """One hand-calculated vector per read-path: field + resolved absolute path."""
+    target = _read_path_target(tmp_path)
+    missing = f"docs/absent-{field}"
+    resolved = _resolved_for(tmp_path, {"paths": {field: missing}})
+
+    issues = check_paths(resolved, target)
+
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue.level == ERROR
+    assert issue.source == CONFIG_FILENAME
+    assert f"`paths.{field}` does not exist" in issue.message
+    assert str((target / missing).resolve()) in issue.message
+    # Every *other* read-path exists, so nothing else is reported.
+    for other in READ_PATH_FIELDS:
+        if other != field:
+            assert f"`paths.{other}`" not in issue.message
+
+
+def test_all_read_paths_present_yields_no_issues(tmp_path: Path) -> None:
+    target = _read_path_target(tmp_path)
+    resolved = _resolved_for(tmp_path)
+
+    assert check_paths(resolved, target) == []
+
+
+def test_defaults_in_an_empty_target_root_yield_one_issue_each(tmp_path: Path) -> None:
+    """The *defaults* are validated too (§3.4/D17): an empty repo fails four times."""
+    target = tmp_path / "empty-target"
+    target.mkdir()
+    resolved = _resolved_for(tmp_path)
+
+    issues = check_paths(resolved, target)
+
+    assert len(issues) == len(READ_PATH_FIELDS)
+    for field, issue in zip(READ_PATH_FIELDS, issues):
+        assert f"`paths.{field}` does not exist" in issue.message
+        assert str((target / getattr(TOOLKIT_DEFAULTS.paths, field)).resolve()) in (
+            issue.message
+        )
+
+
+def test_roadmap_glob_is_never_existence_checked(tmp_path: Path) -> None:
+    """``roadmap_glob`` is a filename pattern: treating it as a path fails every config."""
+    target = _read_path_target(tmp_path)
+    resolved = _resolved_for(
+        tmp_path, {"paths": {"roadmap_glob": "no-such*pattern-[0-9]* - *.md"}}
+    )
+
+    assert check_paths(resolved, target) == []
+    with pytest.raises(ValueError, match="not a read-path"):
+        check_paths(resolved, target, fields=("roadmap_glob",))
+
+
+def test_write_target_absence_produces_no_issue(tmp_path: Path) -> None:
+    """``architecture_dir`` is a write-target: legitimately absent, never checked here."""
+    target = _read_path_target(tmp_path)
+    assert not (target / "docs" / "architecture").exists()
+    resolved = _resolved_for(tmp_path)
+
+    assert check_paths(resolved, target) == []
+    with pytest.raises(ValueError, match="not a read-path"):
+        check_paths(resolved, target, fields=("architecture_dir",))
+
+
+def test_architecture_stage_is_enabled_when_absent_and_disabled_only_by_false(
+    tmp_path: Path,
+) -> None:
+    """"Enabled" defaults to true: an undeclared stage is still run by the hardcoded chain."""
+    no_stages = _resolved_for(tmp_path / "a")
+    assert stage_enabled(no_stages, "implement", ARCHITECTURE_STAGE_ID) is True
+
+    absent_entry = _resolved_for(
+        tmp_path / "b",
+        {"workflows": {"implement": {"stages": [{"id": "implement"}]}}},
+    )
+    assert stage_enabled(absent_entry, "implement", ARCHITECTURE_STAGE_ID) is True
+
+    explicit_true = _resolved_for(
+        tmp_path / "c",
+        {
+            "workflows": {
+                "implement": {
+                    "stages": [{"id": "architecture", "enabled": True}]
+                }
+            }
+        },
+    )
+    assert stage_enabled(explicit_true, "implement", ARCHITECTURE_STAGE_ID) is True
+
+    disabled = _resolved_for(
+        tmp_path / "d",
+        {
+            "workflows": {
+                "implement": {
+                    "stages": [{"id": "architecture", "enabled": False}]
+                }
+            }
+        },
+    )
+    assert stage_enabled(disabled, "implement", ARCHITECTURE_STAGE_ID) is False
+    # A disabled stage's write-target is still not a read-path, so nothing is reported.
+    assert check_paths(disabled, _read_path_target(tmp_path / "d")) == []
+
+
+def test_relative_paths_resolve_against_the_target_root_not_the_config_directory(
+    tmp_path: Path,
+) -> None:
+    """§3.1/§3.4: ``paths.*`` are target-relative — the two roots must not be confused."""
+    target = _read_path_target(tmp_path)
+    config_dir = tmp_path / "config-elsewhere"
+    config_dir.mkdir()
+    resolved = _resolved_for(config_dir, {"paths": {"roadmap_dir": "docs/tasks"}})
+
+    assert resolve_target_path("docs/tasks", target) == (target / "docs" / "tasks").resolve()
+    absolute = str((target / "docs" / "tasks").resolve())
+    assert resolve_target_path(absolute, target) == Path(absolute)
+    assert resolved_path(resolved, "roadmap_dir", target) == (
+        target / "docs" / "tasks"
+    ).resolve()
+    # The config directory has no docs/, proving the base is the target root.
+    assert not (config_dir / "docs").exists()
+    assert check_paths(resolved, target) == []
+
+
+def test_check_paths_writes_nothing_and_mutates_nothing(tmp_path: Path) -> None:
+    """Purity: no filesystem writes, no input mutation, a fresh result list."""
+    target = _read_path_target(tmp_path, missing=frozenset({"task_prompts_dir"}))
+    resolved = _resolved_for(tmp_path)
+    resolved_before = copy.deepcopy(resolved.to_dict())
+    tree_before = sorted(path for path in target.rglob("*"))
+    config_before = (tmp_path / "aidw" / "config.yaml").read_text(encoding="utf-8")
+
+    first = check_paths(resolved, target)
+    second = check_paths(resolved, target)
+
+    assert first is not second
+    assert first == second
+    assert sorted(path for path in target.rglob("*")) == tree_before
+    assert not (target / "docs" / "task-prompts").exists()
+    assert (tmp_path / "aidw" / "config.yaml").read_text(encoding="utf-8") == (
+        config_before
+    )
+    assert resolved.to_dict() == resolved_before
+    assert isinstance(resolved, ResolvedConfig)  # frozen dataclass, not rewritten
+
+
+def _random_path_case(rng: random.Random) -> tuple[dict[str, Any], set[str]]:
+    """A random config override plus the read-paths it points at absent locations."""
+    overrides: dict[str, Any] = {}
+    missing: set[str] = set()
+    for name in READ_PATH_FIELDS:
+        roll = rng.random()
+        if roll < 0.4:
+            overrides[name] = f"docs/absent-{name}-{rng.choice(['a', 'b'])}"
+            missing.add(name)
+        elif roll < 0.5:
+            # The default value, declared explicitly: present in the fixture target root.
+            overrides[name] = getattr(TOOLKIT_DEFAULTS.paths, name)
+    if rng.random() < 0.3:
+        overrides["architecture_dir"] = "docs/absent-architecture"
+    if rng.random() < 0.3:
+        overrides["roadmap_glob"] = rng.choice(["[0-9]* - *.md", "none-*.md"])
+    return overrides, missing
+
+
+def test_path_validation_property(tmp_path: Path) -> None:
+    """Seeded property run (seed/numRuns pinned above) over generated path configs.
+
+    Invariants: exactly the read-paths that resolve to a missing location are reported,
+    in :data:`READ_PATH_FIELDS` order; every message names its field and its resolved
+    path; the glob and the write-target are never reported; the target tree and the
+    resolved input are unchanged; and no call ever creates the write-target.
+    """
+    rng = random.Random(PATH_PROPERTY_SEED)
+
+    for index in range(PATH_PROPERTY_RUNS):
+        overrides, missing = _random_path_case(rng)
+        case = tmp_path / f"run-{index}"
+        target = _read_path_target(case)
+        resolved = _resolved_for(case, {"paths": overrides} if overrides else {})
+        before = copy.deepcopy(resolved.to_dict())
+        tree_before = sorted(path for path in target.rglob("*"))
+
+        issues = check_paths(resolved, target)
+
+        assert len(issues) == len(missing), (overrides, [i.message for i in issues])
+        assert [issue.message.split("`")[1] for issue in issues] == [
+            f"paths.{name}" for name in READ_PATH_FIELDS if name in missing
+        ]
+        for issue in issues:
+            field = issue.message.split("`")[1].removeprefix("paths.")
+            expected = (target / getattr(TOOLKIT_DEFAULTS.paths, field)).resolve()
+            if field in overrides:
+                expected = (target / overrides[field]).resolve()
+            assert str(expected) in issue.message
+            assert "roadmap_glob" not in issue.message
+            assert "architecture_dir" not in issue.message
+            assert issue.level == ERROR
+            assert issue.source == CONFIG_FILENAME
+
+        assert sorted(path for path in target.rglob("*")) == tree_before
+        assert not (target / "docs" / "architecture").exists()
+        assert resolved.to_dict() == before

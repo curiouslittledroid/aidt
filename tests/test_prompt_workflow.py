@@ -239,6 +239,15 @@ Request changes — one should-fix item remains.
 """
 
 
+#: E3.7's four default read-paths (§3.4), committed into every fixture repo so the
+#: ``aidw prompt`` startup existence check passes unless a test overrides a field.
+DEFAULT_READ_PATH_FILES = {
+    "docs/task-prompts/.gitkeep": "",
+    "docs/implementation-results/.gitkeep": "",
+    "docs/implementation-results/TEMPLATE.md": "# Build results template\n",
+}
+
+
 def _make_control_repo(
     tmp_path: Path,
     *,
@@ -256,6 +265,13 @@ def _make_control_repo(
     seed = workspace / "seed"
     seed.mkdir(parents=True)
     _run_git(["init", "-q", "-b", base_branch, str(seed)], workspace)
+    # E3.7: a repo shaped like Mythical Forge provides the default read-paths, so the
+    # startup path check passes for every test that is not specifically testing it. A
+    # directory needs a file inside it to be committed, hence the ``.gitkeep`` files.
+    files = {
+        **DEFAULT_READ_PATH_FILES,
+        **files,
+    }
     for rel, text in files.items():
         path = seed / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1359,8 +1375,14 @@ def test_blocked_terminal_review_keeps_human_escalation_path(
     assert "a human must settle it" in captured.err
     assert "the dependency branch is the authority" in captured.err
     assert "task review did not approve within the revision budget" not in captured.err
+    # The author and fix stages run in the *task worktree*, not the control root: the
+    # blocked run leaves the prompt uncommitted there. This used to name ``tmp_path``
+    # (the control), where ``git status -- <missing path>`` printed a "could not open
+    # directory" warning to stderr — and ``git.status_short`` folds stderr into its
+    # return value, so the assertion passed vacuously until E3.7's read-path fixture made
+    # ``docs/task-prompts/`` exist in the control tree and the warning disappeared.
     assert git.status_short(
-        tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]
+        _task_worktree(tmp_path), paths=["docs/task-prompts/03-E4.1-prompt.md"]
     ) != ""
 
 
@@ -1566,6 +1588,11 @@ def _origin_and_clone(
     tasks_dir = seed / "docs" / "tasks"
     tasks_dir.mkdir(parents=True)
     (tasks_dir / "03 - Test Phase.md").write_text(roadmap, encoding="utf-8")
+    # E3.7's default read-paths must exist for the startup existence check to pass.
+    for rel, text in DEFAULT_READ_PATH_FILES.items():
+        path = seed / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
     _run_git(["add", "."], seed)
     _run_git(["commit", "-qm", "init"], seed)
     origin = tmp_path / "origin.git"
@@ -4934,3 +4961,95 @@ def test_the_task_worktree_key_is_held_for_the_whole_run_and_free_after(
     # Released on exit: the same worktree can start its next run.
     with lock.acquire(state_root, task_worktree) as guard:
         assert guard.held
+
+
+# --------------------------------------------------------------------------- #
+# E3.7 — configured read-paths must exist (EXTRACTION.md §3.4)
+# --------------------------------------------------------------------------- #
+#
+# The startup preflight checks the two read-paths this workflow first needs —
+# `paths.roadmap_dir` and `paths.task_prompts_dir` — against the target root, at the same
+# site and with the same contract as the E3.2/E3.3 config refusals: stderr + exit 2,
+# before `load_tasks`, any branch/worktree and any run record, regardless of `--dry-run`.
+
+
+@pytest.mark.parametrize("field", ["roadmap_dir", "task_prompts_dir"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_e37_missing_startup_read_path_refuses_naming_field_and_path(
+    tmp_path: Path, monkeypatch, capsys, field: str, dry_run: bool
+) -> None:
+    """A missing read-path is exit 2 naming the dotted field and the resolved path."""
+    missing = f"docs/absent-{field}"
+    _patch_prompt_repo(
+        tmp_path,
+        monkeypatch,
+        config_text=f"schema_version: 1\npaths:\n  {field}: {missing}\n",
+    )
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    def _must_not_run(*_args, **_kwargs):
+        raise AssertionError(
+            "a missing read-path must refuse before load_tasks/derive_branch_name"
+        )
+
+    monkeypatch.setattr(prompt_workflow, "load_tasks", _must_not_run)
+    monkeypatch.setattr(prompt_workflow, "derive_branch_name", _must_not_run)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        dry_run=dry_run,
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "error: config.yaml:" in err
+    assert f"`paths.{field}` does not exist" in err
+    assert str((tmp_path / missing).resolve()) in err
+    # Nothing was created: no stage ran, no run record, no branch and no worktree.
+    assert seen == []
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert git.worktree_for_branch(tmp_path, "03-E4.1") is None
+    assert not (tmp_path.parent / f"{tmp_path.name}-ws" / "03-E4.1").exists()
+
+
+def test_e37_a_missing_non_startup_read_path_does_not_block_prompt(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Only the two read-paths this workflow needs are checked here.
+
+    ``implementation_results_dir``/``build_results_template`` belong to the record stage,
+    so a plan that never reaches I5 must not refuse on them (E3.7 requirement 4's
+    narrowing; ``aidw implement`` owns the record-stage preflight).
+    """
+    _patch_prompt_repo(
+        tmp_path,
+        monkeypatch,
+        config_text=(
+            "schema_version: 1\n"
+            "paths:\n"
+            "  implementation_results_dir: docs/absent-results\n"
+            "  build_results_template: docs/absent-results/TEMPLATE.md\n"
+        ),
+    )
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        dry_run=True,
+    )
+
+    assert code == 0
+    assert "does not exist" not in capsys.readouterr().err
+    assert seen and seen[0][0] == "task-prompt"

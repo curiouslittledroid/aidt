@@ -28,7 +28,10 @@ config:
   loaded and type-checked there. Interpreting them is :func:`check_compatibility`
   (E3.3, D10/§3.11), a separate pure pass a workflow preflight runs after the loader.
 - It does not touch the filesystem beyond reading the one config file. ``paths:`` values
-  are opaque strings; existence validation is E3.7's.
+  are opaque strings; field classification and existence validation are E3.7's
+  (:data:`READ_PATH_FIELDS` / :data:`WRITE_TARGET_FIELDS` / :data:`GLOB_PATH_FIELDS`,
+  :func:`check_paths`, :func:`resolve_target_path`, :func:`stage_enabled`), a separate
+  pure pass over a :class:`ResolvedConfig` that a preflight or ``aidw doctor`` runs.
 
 Validation is fail-closed: **unknown keys are errors at every object level**, wrong types
 name the offending field path, and a missing ``schema_version`` (when a config file
@@ -50,7 +53,7 @@ reverse).
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -90,6 +93,27 @@ PATH_FIELDS = (
     "build_results_template",
     "architecture_dir",
 )
+
+#: E3.7's classification of ``paths:``. Every entry in :data:`PATH_FIELDS` is exactly one
+#: of these three: a **read-path** an input must exist for (§3.4 "Configured read-paths
+#: must exist"), a **write-target** a stage creates on demand, or a **glob** that is a
+#: filename pattern rather than a filesystem path. ``roadmap_glob``'s
+#: ``[0-9]* - *.md`` is not a path: existence-checking it would treat the literal pattern
+#: as a filename and fail every valid config.
+READ_PATH_FIELDS = (
+    "roadmap_dir",
+    "task_prompts_dir",
+    "implementation_results_dir",
+    "build_results_template",
+)
+WRITE_TARGET_FIELDS = ("architecture_dir",)
+GLOB_PATH_FIELDS = ("roadmap_glob",)
+
+#: The config stage id that owns :data:`WRITE_TARGET_FIELDS` (``architecture_dir``). §3.4's
+#: ``workflows.implement.stages`` example fixes the id; the runtime chain's label for the
+#: same stage is I4 ``update-architecture``, a different name by design (the flag is read
+#: from the *config* vocabulary).
+ARCHITECTURE_STAGE_ID = "architecture"
 
 #: ``github.markers`` is a fixed three-key object (D5 / §3.9); any other marker key is a
 #: typo, and a missing one is filled by E6's frozen defaults.
@@ -1168,3 +1192,122 @@ def resolve_config(
             )
 
     return ResolvedConfig(merge.entries)
+
+
+# --------------------------------------------------------------------------- #
+# Configured path validation (E3.7, EXTRACTION.md §3.4 "Configured read-paths must
+# exist"; design §12's doctor duty)
+# --------------------------------------------------------------------------- #
+
+
+def resolve_target_path(value: str, target_root: Path) -> Path:
+    """Resolve one ``paths:`` value against the **target** root (EXTRACTION.md §3.1/§3.4).
+
+    ``paths.*`` values are target-relative unless already absolute, so the base is always
+    the working tree the workflow operates on — ``TargetRepo.root`` — never
+    :func:`aidw.paths.toolkit_root` and never the cwd (AGENTS.md "Two roots"); resolving
+    against the toolkit root would flag a healthy target repo's ``docs/`` as missing.
+    Pure: no existence requirement, no creation, no mutation. ``resolve()`` is used so the
+    path a refusal names is absolute and comparable to an operator's own ``pwd``-based
+    diagnosis.
+    """
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = target_root / candidate
+    return candidate.resolve()
+
+
+def resolved_path(
+    resolved: ResolvedConfig, name: str, target_root: Path
+) -> Path | None:
+    """The resolved value of ``paths.<name>`` as an absolute path, or ``None`` when unset.
+
+    ``None`` means the leaf resolved *unset* (no declared value and no toolkit default),
+    which is the only state where there is nothing to validate or create. Every
+    :data:`PATH_FIELDS` leaf has a default today, so it is reached only by a code-built
+    config that removed one.
+    """
+    entry = resolved.get(f"paths.{name}")
+    if entry is None or entry.value is None:
+        return None
+    return resolve_target_path(str(entry.value), target_root)
+
+
+def check_paths(
+    resolved: ResolvedConfig,
+    target_root: Path,
+    *,
+    fields: Sequence[str] | None = None,
+) -> list[Issue]:
+    """One ``ERROR`` per **read-path** that does not exist under ``target_root`` (§3.4).
+
+    ``fields`` narrows the check to the read-paths a specific preflight first needs
+    (``aidw prompt`` validates ``roadmap_dir``/``task_prompts_dir``; the record stage
+    validates ``implementation_results_dir``/``build_results_template``). Omitting it
+    checks every :data:`READ_PATH_FIELDS` entry — the exhaustive set E3.7's roadmap entry
+    fixes (four, not §3.4's three: ``implementation_results_dir`` is the fourth).
+
+    Write-targets produce **no** issue here: they are outputs of a stage and may
+    legitimately be absent, and they are created on demand by the stage that owns them
+    (:func:`stage_enabled` decides whether that stage is enabled). ``roadmap_glob`` is a
+    filename pattern, never a filesystem path, so it is never checked. Asking for a field
+    outside :data:`READ_PATH_FIELDS` raises: silently ignoring it would let a later task
+    existence-check a write-target or the glob by mistake.
+
+    Existence only — §3.4 says "exist", not "is a directory"/"is a file": the template is
+    a file and the three dirs are directories in Mythical Forge's layout, but that typing
+    is not part of the contract this check enforces.
+
+    Pure: reads the filesystem (``exists``) and writes nothing, mutates neither the
+    :class:`ResolvedConfig` (frozen) nor anything it references, and returns a fresh list
+    the caller owns. Each message names both the dotted field (``paths.roadmap_dir``) and
+    the resolved absolute path — §3.4's "an error naming the field and the path".
+    """
+    names = READ_PATH_FIELDS if fields is None else tuple(fields)
+    issues: list[Issue] = []
+    for name in names:
+        if name not in READ_PATH_FIELDS:
+            raise ValueError(
+                f"`paths.{name}` is not a read-path; only {READ_PATH_FIELDS} are "
+                "existence-checked (write-targets are created on demand, "
+                "`roadmap_glob` is a filename pattern)"
+            )
+        path = resolved_path(resolved, name, target_root)
+        if path is None:
+            # Unset: no declared value and no default, so no path was named to validate.
+            continue
+        if path.exists():
+            continue
+        issues.append(
+            Issue(
+                ERROR,
+                CONFIG_FILENAME,
+                f"`paths.{name}` does not exist: {path} — create it, or override "
+                f"`paths.{name}` in `<target>/aidw/config.yaml` (the toolkit defaults "
+                "are Mythical Forge's layout, §3.4/D17)",
+            )
+        )
+    return issues
+
+
+def stage_enabled(
+    resolved: ResolvedConfig, workflow: str, stage_id: str
+) -> bool:
+    """Whether a config stage is enabled, read from the resolved stage list (§3.4/D12).
+
+    E3.7 reads this **for path validation only** — ``architecture_dir`` may be absent when
+    its owning ``architecture`` stage is disabled. Wiring ``enabled`` into the stage chain
+    itself is E4.5, so this never decides what runs.
+
+    An absent ``workflows.<workflow>.stages`` entry, or a list that does not mention
+    ``stage_id``, is **enabled**: the hardcoded chain still runs the stage, so treating an
+    undeclared stage as disabled would silently exempt a path the run will need. An entry
+    with ``id: <stage_id>`` and ``enabled: false`` is the only disabled form.
+    """
+    entry = resolved.get(f"workflows.{workflow}.stages")
+    if entry is None or entry.value is None:
+        return True
+    for stage in entry.value:
+        if isinstance(stage, Mapping) and stage.get("id") == stage_id:
+            return bool(stage.get("enabled", True))
+    return True

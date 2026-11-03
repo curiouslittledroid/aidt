@@ -37,11 +37,23 @@ def _init_repo(path: Path) -> None:
 
 
 def _init_repo_with_task(path: Path) -> Path:
-    """A tmp git repo carrying the roadmap task ``03 E4 E4.1``."""
+    """A tmp git repo carrying the roadmap task ``03 E4 E4.1``.
+
+    Also carries E3.7's default read-paths (§3.4), so ``aidw prompt``'s startup existence
+    check passes: a directory needs a file inside it, hence the ``.gitkeep`` files.
+    """
     _init_repo(path)
     tasks = path / "docs" / "tasks"
     tasks.mkdir(parents=True)
     (tasks / "03 - Test Phase.md").write_text(ROADMAP_FIXTURE, encoding="utf-8")
+    for rel, text in (
+        ("docs/task-prompts/.gitkeep", ""),
+        ("docs/implementation-results/.gitkeep", ""),
+        ("docs/implementation-results/TEMPLATE.md", "# Build results template\n"),
+    ):
+        target = path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
     return path
 
 
@@ -435,7 +447,7 @@ def test_implement_dry_run_reads_target_and_uses_toolkit_prompts(
 ) -> None:
     target = _init_repo_with_task(tmp_path / "target")
     prompt = target / "docs" / "task-prompts" / "03-E4.1-prompt.md"
-    prompt.parent.mkdir(parents=True)
+    prompt.parent.mkdir(parents=True, exist_ok=True)
     prompt.write_text("# Implement E4.1\n", encoding="utf-8")
     calls = _spy_run_stage(monkeypatch, implement_workflow)
 

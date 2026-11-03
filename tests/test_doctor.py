@@ -90,18 +90,39 @@ def _git_run(directory: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _init_committed_repo(directory: Path) -> None:
+#: The four default read-paths E3.7 validates (§3.4 "Configured read-paths must exist").
+#: Written into every fixture repo so the path check passes unless a test removes one; a
+#: directory needs a file inside it to be committed, hence the ``.gitkeep`` placeholders.
+READ_PATH_FILES = {
+    "docs/tasks/.gitkeep": "",
+    "docs/task-prompts/.gitkeep": "",
+    "docs/implementation-results/.gitkeep": "",
+    "docs/implementation-results/TEMPLATE.md": "# Build results template\n",
+}
+
+
+def _init_committed_repo(directory: Path, *, read_paths: bool = True) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     _git_run(directory, "init", "-q", "-b", "main")
     (directory / "f.txt").write_text("x", encoding="utf-8")
+    if read_paths:
+        for rel, text in READ_PATH_FILES.items():
+            path = directory / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
     _git_run(directory, "add", ".")
     _git_run(directory, "commit", "-qm", "init")
 
 
-def _make_bare(tmp_path: Path, *, remote: str | None = FAKE_ORIGIN) -> Path:
+def _make_bare(
+    tmp_path: Path,
+    *,
+    remote: str | None = FAKE_ORIGIN,
+    read_paths: bool = True,
+) -> Path:
     """A bare clone of a committed seed at ``tmp_path/bare.git``."""
     seed = tmp_path / "seed"
-    _init_committed_repo(seed)
+    _init_committed_repo(seed, read_paths=read_paths)
     bare = tmp_path / "bare.git"
     _git_run(tmp_path, "clone", "--bare", "-q", str(seed), str(bare))
     if remote is not None:
@@ -110,10 +131,19 @@ def _make_bare(tmp_path: Path, *, remote: str | None = FAKE_ORIGIN) -> Path:
 
 
 def _make_supported(
-    tmp_path: Path, *, task_worktree: bool = False, remote: str | None = FAKE_ORIGIN
+    tmp_path: Path,
+    *,
+    task_worktree: bool = False,
+    remote: str | None = FAKE_ORIGIN,
+    read_paths: bool = True,
 ) -> tuple[Path, Path]:
-    """The §3.2 supported layout: bare repo plus sibling control/task worktrees."""
-    bare = _make_bare(tmp_path, remote=remote)
+    """The §3.2 supported layout: bare repo plus sibling control/task worktrees.
+
+    ``read_paths=False`` builds the repo without E3.7's four default read-paths, so a
+    config-less run of the path check fails closed (a non-Mythical-Forge repo must supply
+    the files or override the field — §3.4/D17).
+    """
+    bare = _make_bare(tmp_path, remote=remote, read_paths=read_paths)
     control = tmp_path / "main"
     _git_run(bare, "worktree", "add", "-q", str(control), "main")
     if task_worktree:
@@ -846,6 +876,84 @@ def test_target_config_check_is_read_only_and_leaves_the_config_untouched(
     assert config_path.read_text(encoding="utf-8") == before_text
     assert sorted((control / "aidw").iterdir()) == before_listing
     assert not (control / "aidw" / "config.yaml.tmp").exists()
+
+
+#: E3.7: the four default read-path fields (§3.4, exhaustive per the E3.7 roadmap entry).
+DEFAULT_READ_PATH_FIELDS = (
+    "roadmap_dir",
+    "task_prompts_dir",
+    "implementation_results_dir",
+    "build_results_template",
+)
+
+#: Their resolved locations in a fixture repo.
+DEFAULT_READ_PATHS = (
+    "docs/tasks",
+    "docs/task-prompts",
+    "docs/implementation-results",
+    "docs/implementation-results/TEMPLATE.md",
+)
+
+
+def test_configless_repo_with_the_default_read_paths_is_ok(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """E3.7: a repo shaped like Mythical Forge passes the path check with no config.
+
+    ``paths.architecture_dir`` is legitimately absent (a write-target), so it must not
+    produce an issue — the check is read-paths only.
+    """
+    _bare, control = _make_supported(tmp_path)
+    for rel in DEFAULT_READ_PATHS:
+        assert (control / rel).exists(), rel
+    assert not (control / "docs" / "architecture").exists()
+
+    check = _named(collect_checks(explicit=control), "target config")
+
+    assert check.status == OK, check.detail
+    assert "does not exist" not in check.detail
+    assert run_doctor(explicit=control) == 0
+
+
+def test_configless_repo_with_missing_default_read_paths_fails_closed(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """§3.4/D17: the *defaults* must exist too, not only an explicitly named path.
+
+    The defaults are Mythical Forge's layout, so a target repo that does not have those
+    files must supply them or override the field. The refusal names the field and the
+    resolved absolute path — never a silent fallback.
+    """
+    _bare, control = _make_supported(tmp_path, read_paths=False)
+
+    check = _named(collect_checks(explicit=control), "target config")
+
+    assert check.status == FAIL
+    assert "`paths.roadmap_dir` does not exist" in check.detail
+    assert str((control / "docs" / "tasks").resolve()) in check.detail
+    assert "`paths.build_results_template`" in check.detail
+    assert run_doctor(explicit=control) == 1
+
+
+@pytest.mark.parametrize("field", DEFAULT_READ_PATH_FIELDS)
+def test_valid_config_naming_a_nonexistent_read_path_fails_naming_field_and_path(
+    tmp_path: Path,
+    fake_external_clis: None,  # noqa: ARG001
+    field: str,
+) -> None:
+    """One vector per read-path: each absent override is a FAIL naming field + path."""
+    _bare, control = _make_supported(tmp_path)
+    missing = f"docs/missing-{field}"
+    _write_target_config(
+        control, f"schema_version: 1\npaths:\n  {field}: {missing}\n"
+    )
+
+    check = _named(collect_checks(explicit=control), "target config")
+
+    assert check.status == FAIL
+    assert f"`paths.{field}` does not exist" in check.detail
+    assert str((control / missing).resolve()) in check.detail
+    assert run_doctor(explicit=control) == 1
 
 
 def test_configless_repo_never_gains_an_aidw_directory(

@@ -269,7 +269,7 @@
   - Deliverable: the doc.
   - Done when: a reader can write a correct config for a new repo without reading the code.
 
-- [ ] **E3.7. Validate configured paths (fail closed)**
+- [x] **E3.7. Validate configured paths (fail closed)**
   Classify every `paths:` entry as a **read-path** or a **write-target**. Read-paths must exist when a config or default names them — `build_results_template`, `roadmap_dir`, `task_prompts_dir`, `implementation_results_dir` — and a missing one is an error naming the field and the path, surfaced by `aidw doctor` and by the preflight of the stage that first needs it. Write-targets are outputs of a stage and may legitimately be absent (`architecture_dir` today, and any repo-added stage's dir): create them on demand and require them only when a stage that writes there is enabled. Either way there is no silent fallback and no agent-side improvisation: the record stage stops and reports a missing build-results template rather than inventing a structure (§3.4, E7.2).
   - Deliverable: path classification (read vs write) plus existence validation and tests, wired into doctor and the stage preflight.
   - Done when: a config naming a nonexistent read-path fails with the field and the path in the message; a config whose only absent path is a write-target for a disabled stage passes; and a config whose write-target is needed by an enabled stage is either created or fails with a message naming the stage.

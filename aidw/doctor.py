@@ -11,7 +11,8 @@ honoured and a bare directory is reachable), and the workspace root, state root 
 control worktree are classified by :func:`aidw.layout.check_layout` — the same guard
 ``cli._roots`` uses — rather than by a doctor-local copy of its rules. Once a working
 tree exists, ``target config`` (E3.5) reports the ``<target>/aidw/config.yaml`` path, its
-resolved ``schema_version`` and any validation or compatibility error (§3.4/§3.11, D10).
+resolved ``schema_version`` and any validation, compatibility or configured-path error
+(§3.4/§3.11, D10; E3.7).
 
 See ``design.md`` §12/§14 and ``docs/migration/EXTRACTION.md``
 §3.1/§3.2/§3.4/§3.10/§3.11.
@@ -41,6 +42,7 @@ from aidw.paths import (
 from aidw.target_config import (
     ERROR,
     check_compatibility,
+    check_paths,
     format_issues,
     load_target_config,
     resolve_config,
@@ -344,22 +346,31 @@ def _check_target_config(root: Path) -> Check:
 
     The failure decision is the loader's ``ERROR`` issues unioned with
     :func:`aidw.target_config.check_compatibility` (D10: an unsupported
-    ``schema_version`` or an unsatisfied ``requires_toolkit``). It never comes from the
-    merged output: ``resolve_config``'s contract is that callers refuse a broken config
-    *before* resolving, so the schema version is rendered only after that gate. The
-    loader's messages already name the full field path (``unknown key paths.foo``), and
-    :func:`format_issues` is the same formatter ``aidw config show`` and the workflow
-    preflights use, so the report names the field rather than paraphrasing it.
+    ``schema_version`` or an unsatisfied ``requires_toolkit``) and with E3.7's configured
+    read-path check (:func:`aidw.target_config.check_paths`, §3.4 "Configured read-paths
+    must exist"): a missing ``paths.roadmap_dir`` — including one that is only absent
+    through the *default* — is a ``FAIL`` naming the field and the resolved path. This is
+    deliberate: the defaults are Mythical Forge's layout (D17), so a repo without those
+    files must supply them or override the field. The loader's messages already name the
+    full field path (``unknown key paths.foo``), and :func:`format_issues` is the same
+    formatter ``aidw config show`` and the workflow preflights use, so the report names
+    the field rather than paraphrasing it.
 
-    Read-only: one file read, nothing written (§3.1), and the toolkit version is passed
-    in from :data:`aidw.__version__` rather than hardcoded, so doctor cannot claim a
-    compatibility verdict for a version other than the one it ships in.
+    Read-only: one file read, nothing written (§3.1) — the write-targets
+    (:func:`aidw.target_config.check_paths` never flags them) are created on demand by the
+    stage that owns them, never by doctor. The toolkit version is passed in from
+    :data:`aidw.__version__` rather than hardcoded, so doctor cannot claim a compatibility
+    verdict for a version other than the one it ships in. ``resolve_config`` runs even when
+    the config carries errors so the path check can still be reported alongside them; the
+    rendered schema version is only shown once the issue gate has passed.
     """
     config_path = root / "aidw" / "config.yaml"
     declared = load_target_config(config_path)
 
+    resolved = resolve_config(declared)
     issues = [issue for issue in declared.issues if issue.level == ERROR]
     issues.extend(check_compatibility(declared, toolkit_version=__version__))
+    issues.extend(check_paths(resolved, root))
 
     source = (
         str(declared.source_path.resolve())
@@ -371,7 +382,7 @@ def _check_target_config(root: Path) -> Check:
 
     # Resolved, not ``declared.schema_version`` (roadmap: "the resolved schema version"):
     # the two are equal today only because ``schema_version`` has no toolkit default.
-    schema_version = resolve_config(declared)["schema_version"]
+    schema_version = resolved["schema_version"]
     # Review follow-up #78: an unset resolved ``schema_version`` only happens when there
     # is no config file at all, so ``source`` is already the NO_TARGET_CONFIG sentinel;
     # appending the suffix would render the sentinel twice ("none (defaults) — schema
