@@ -416,6 +416,33 @@ def test_git_version_is_checked_outside_a_repository(
     assert _named(checks, "repo root").status == FAIL
 
 
+def test_recorded_git_version_gate_row_matches_doctor_behaviour() -> None:
+    """Review follow-up #64: the task's recorded audit must not contradict the code.
+
+    Both unreadable-version cases are ``WARN`` at HEAD (the two tests above), so the
+    ``build-results.md`` gate table may not record that case as a ❌ failure. A stale ❌
+    in the permanent record misleads the next reader into thinking a gate failed when
+    the suite is green — this row pins the record to the behaviour it claims.
+    """
+    doc = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "implementation-results"
+        / "00-E2.8"
+        / "build-results.md"
+    )
+    row = next(
+        line
+        for line in doc.read_text(encoding="utf-8").splitlines()
+        if line.startswith("| git ≥ 2.31 floor")
+    )
+
+    assert "✅" in row
+    assert "❌" not in row
+    assert "version_exit=1" in row
+    assert "_check_git_version" in row
+
+
 # ---------------------------------------------------------------------------
 # target-is-not-bare: a named FAIL with the §3.2 bootstrap (requirement 3)
 # ---------------------------------------------------------------------------
@@ -553,6 +580,43 @@ def test_single_checkout_warns_on_the_state_root_and_exits_zero(
     assert str(repo.resolve()) in state.detail
     assert _named(checks, "control worktree").status == OK
     assert run_doctor(explicit=repo) == 0
+
+
+def test_single_checkout_control_worktree_ok_detail_does_not_claim_non_membership(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """Review follow-up #63: in a plain clone the workspace root IS the sole
+    registered worktree (the self-entry check_layout's len == 1 gate exempts),
+    so the OK detail must echo the guard's outcome instead of asserting
+    non-membership.
+    """
+    repo = _make_plain_clone(tmp_path)
+    workspace = WorkspacePaths.resolve(TargetRepo.resolve(explicit=repo))
+    # The trigger's ground truth: the workspace root is the one listed worktree.
+    listed = [entry.path for entry in git.worktrees(workspace.workspace_root)]
+    assert listed == [workspace.workspace_root]
+
+    control = _named(collect_checks(explicit=repo), "control worktree")
+
+    assert control.status == OK
+    assert "guard passed" in control.detail
+    assert "is not a second registered worktree" in control.detail
+    assert "is not a registered worktree" not in control.detail
+
+
+def test_single_checkout_cli_output_uses_the_accurate_control_worktree_detail(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """The corrected detail is visible in the user-facing doctor report."""
+    repo = _make_plain_clone(tmp_path)
+
+    result = runner.invoke(app, ["--repo", str(repo), "doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert "control worktree" in result.stdout
+    assert "clone-of-a-worktree guard passed" in result.stdout
+    assert "is not a second registered worktree" in result.stdout
+    assert "is not a registered worktree" not in result.stdout
 
 
 # ---------------------------------------------------------------------------

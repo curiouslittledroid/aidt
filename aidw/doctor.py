@@ -423,11 +423,17 @@ def _layout_checks(target: TargetRepo) -> list[Check]:
     if layout_error is not None:
         checks.append(Check("control worktree", FAIL, str(layout_error)))
     else:
+        # The guard's OK spans two layouts with opposite membership facts: the supported
+        # bare + sibling-worktree model (workspace root not registered at all) and the
+        # single-checkout plain clone (workspace root IS the sole, deliberately exempted
+        # self-entry — check_layout's len == 1 gate). Echo the guard's outcome instead of
+        # asserting non-membership, which is false for the latter (review follow-up #63).
         checks.append(
             Check(
                 "control worktree",
                 OK,
-                f"{workspace.workspace_root} is not a registered worktree",
+                f"clone-of-a-worktree guard passed: {workspace.workspace_root} "
+                "is not a second registered worktree",
             )
         )
     return checks
