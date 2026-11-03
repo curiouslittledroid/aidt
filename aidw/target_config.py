@@ -27,8 +27,10 @@ config:
 - The *loader* does not compare ``schema_version``/``requires_toolkit``: the fields are
   loaded and type-checked there. Interpreting them is :func:`check_compatibility`
   (E3.3, D10/§3.11), a separate pure pass a workflow preflight runs after the loader.
-- It does not touch the filesystem beyond reading the one config file. ``paths:`` values
-  are opaque strings; existence validation is E3.7's.
+- It does not touch the filesystem beyond reading the one config file. Translating a
+  ``paths:`` string into a filesystem check is :func:`validate_paths`/
+  :func:`ensure_write_targets` (E3.7), which take a resolved config and a target root;
+  the loader never stats a path.
 
 Validation is fail-closed: **unknown keys are errors at every object level**, wrong types
 name the offending field path, and a missing ``schema_version`` (when a config file
@@ -46,6 +48,14 @@ or whose ``requires_toolkit`` pin this toolkit's own version does not satisfy. I
 and takes the toolkit version as an argument, so this module never imports ``aidw``'s
 version or a workflow module (``aidw.workflows.prompt`` imports *this* check, never the
 reverse).
+
+Path classification (E3.7, §3.4 "Configured read-paths must exist") is the fourth and
+last job: every ``paths:`` entry is either a **read-path** (:data:`READ_PATHS`), which must
+exist when a config or a toolkit default names it, or a **write-target**
+(:data:`WRITE_TARGETS`), which a stage creates on demand. :func:`validate_paths` is the
+read-path check (pure, no writes, no fallback); :func:`ensure_write_targets` is the
+write-target side (``mkdir`` only, and only for a stage that is enabled). ``roadmap_glob``
+is a pattern, not a path, and is neither classified nor existence-checked.
 """
 
 from __future__ import annotations
@@ -1168,3 +1178,158 @@ def resolve_config(
             )
 
     return ResolvedConfig(merge.entries)
+
+
+# --------------------------------------------------------------------------- #
+# Path classification and existence validation (E3.7, EXTRACTION.md §3.4)
+# --------------------------------------------------------------------------- #
+
+#: §3.4 read-paths: values the toolkit *reads*, so a missing one is always an error.
+#: §3.4 lists three of these; E3.7's roadmap entry adds ``implementation_results_dir``,
+#: and the roadmap's four are the classification of record. Deliberately not merged with
+#: §3.4's *other* use of "write-target" (the gate-scope declaration: R18's
+#: ``implementation_results_dir``/``architecture_dir``/``roadmap_dir``/
+#: ``task_prompts_dir``), which asks a different question — what a gate cannot read —
+#: about a partly overlapping set.
+READ_PATHS = (
+    "build_results_template",
+    "roadmap_dir",
+    "task_prompts_dir",
+    "implementation_results_dir",
+)
+
+#: §3.4 write-targets, as ``field -> id of the stage that writes there``. A write-target
+#: may legitimately be absent: the stage creates it on demand, and only an *enabled*
+#: stage is obliged to. ``architecture_dir`` is the only one today; a repo-added stage's
+#: directory is E4.5/E4.6's to add here. ``roadmap_glob`` is a pattern, not a path, and is
+#: deliberately in neither this mapping nor :data:`READ_PATHS`.
+WRITE_TARGETS = {"architecture_dir": "architecture"}
+
+#: The issue ``source`` for a path-existence problem. A resolved leaf can come from a
+#: default (D17) rather than the file, so the source is the config's canonical name — the
+#: per-value provenance is named in the message instead (``source: default``), which is
+#: exactly what a repo without Mythical Forge's layout needs to read.
+PATH_ISSUE_SOURCE = CONFIG_FILENAME
+
+
+def _resolved_path(
+    resolved: ResolvedConfig, field: str
+) -> ResolvedValue | None:
+    """The resolved ``paths.<field>`` leaf, or ``None`` when it did not resolve.
+
+    Defensive on purpose: an unset leaf (or one a hand-built :class:`ResolvedConfig` does
+    not carry at all) is skipped rather than stat'd, so a caller can never validate a
+    path the config did not name. ``ResolvedConfig`` is a ``Mapping``, so ``get`` is the
+    tolerant lookup.
+    """
+    entry = resolved.get(f"paths.{field}")
+    if entry is None or not entry.is_set or entry.value is None:
+        return None
+    return entry
+
+
+def _target_path(target_root: Path, value: str) -> Path:
+    """``target_root / value``, where an absolute ``value`` wins (``pathlib`` semantics).
+
+    Both a repo-relative ``docs/tasks`` and an absolute override resolve without a
+    special case, which is why the §3.4 defaults and an operator's absolute path take the
+    same code path.
+    """
+    return Path(target_root) / value
+
+
+def validate_paths(resolved: ResolvedConfig, target_root: Path) -> list[Issue]:
+    """Report every resolved read-path that does not exist under ``target_root`` (§3.4).
+
+    The rule is fail-closed and has no fallback (§3.4 "Configured read-paths must exist",
+    D17/R7): a value named by the config **or by the toolkit default** must exist, so a
+    repo without Mythical Forge's layout fails legibly here instead of having an agent
+    improvise around a missing template (E7.2's "stop and report"). Every issue names
+    both the field (``paths.<field>``) and the resolved path, plus the value's provenance,
+    so the report says *what* to create and whether the config or the default named it.
+
+    Pure: one ``exists()`` per set read-path, no writes and no mutation of ``resolved``.
+    """
+    issues: list[Issue] = []
+    for field in READ_PATHS:
+        entry = _resolved_path(resolved, field)
+        if entry is None:
+            continue
+        path = _target_path(target_root, str(entry.value))
+        if path.exists():
+            continue
+        issues.append(
+            Issue(
+                ERROR,
+                PATH_ISSUE_SOURCE,
+                f"`paths.{field}` {path} does not exist "
+                f"(read-path, source: {entry.source})",
+            )
+        )
+    return issues
+
+
+def _write_target_enabled(declared: TargetConfig, stage_id: str) -> bool:
+    """Whether the stage that writes a write-target is enabled (E3.7, prompt-fixed).
+
+    Disabled **iff** the declared config's ``workflows.*.stages`` carries a stage with
+    this ``id`` and ``enabled is False``; otherwise enabled. The default is read from the
+    declared side and not from the resolved one because §3.4's stage lists are
+    whole-list overrides: a config that declares no stage at all has no entry to consult,
+    and the resolution would report the absent list as unset rather than as "enabled".
+    Enabled-by-default is what keeps the six-stage implement chain E4.1 preserves working
+    for a config that never mentions architecture.
+    """
+    for workflow in declared.workflows.values():
+        for stage in workflow.stages:
+            if stage.id == stage_id and stage.enabled is False:
+                return False
+    return True
+
+
+def ensure_write_targets(
+    declared: TargetConfig, resolved: ResolvedConfig, target_root: Path
+) -> list[Issue]:
+    """Create each enabled stage's write-target, reporting a failure per field (E3.7).
+
+    A write-target is an *output*: §3.4 lets it be absent, so this creates it
+    (``mkdir(parents=True, exist_ok=True)``) instead of failing. Two rules bound that:
+
+    - a **disabled** stage's write-target is skipped entirely — no directory, no issue,
+      because nothing will write there (§3.4: "required only when a stage that writes
+      there is enabled"). Enablement comes from ``declared`` (see
+      :func:`_write_target_enabled`); the *path* comes from ``resolved``, since a
+      config that never declares ``architecture_dir`` still gets the D17 default.
+    - a creation failure is an ``ERROR`` naming the stage, never a silent skip: the stage
+      cannot run without its output directory, and inventing a fallback location is the
+      agent-side improvisation §3.4 forbids.
+
+    Only ``OSError`` is caught (a parent that is a file, a permission denial, a read-only
+    volume): those are the environmental failures a caller can report. Anything else is a
+    bug here and must surface as a traceback rather than as a plausible-looking issue.
+
+    Deliberately *not* called by ``aidw doctor``: doctor is read-only (§3.1). Its call
+    site belongs to the workflow whose stage writes there (E4.3 for implement).
+    """
+    issues: list[Issue] = []
+    for field, stage_id in WRITE_TARGETS.items():
+        if not _write_target_enabled(declared, stage_id):
+            continue
+        entry = _resolved_path(resolved, field)
+        if entry is None:
+            continue
+        path = _target_path(target_root, str(entry.value))
+        if path.is_dir():
+            continue
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            issues.append(
+                Issue(
+                    ERROR,
+                    PATH_ISSUE_SOURCE,
+                    f"`paths.{field}` {path} cannot be created for stage "
+                    f"`{stage_id}`: {exc}",
+                )
+            )
+    return issues

@@ -44,6 +44,7 @@ from aidw.target_config import (
     format_issues,
     load_target_config,
     resolve_config,
+    validate_paths,
 )
 
 OK = "OK"
@@ -344,15 +345,21 @@ def _check_target_config(root: Path) -> Check:
 
     The failure decision is the loader's ``ERROR`` issues unioned with
     :func:`aidw.target_config.check_compatibility` (D10: an unsupported
-    ``schema_version`` or an unsatisfied ``requires_toolkit``). It never comes from the
-    merged output: ``resolve_config``'s contract is that callers refuse a broken config
-    *before* resolving, so the schema version is rendered only after that gate. The
-    loader's messages already name the full field path (``unknown key paths.foo``), and
-    :func:`format_issues` is the same formatter ``aidw config show`` and the workflow
-    preflights use, so the report names the field rather than paraphrasing it.
+    ``schema_version`` or an unsatisfied ``requires_toolkit``) and, once those pass,
+    with :func:`aidw.target_config.validate_paths` (E3.7: a §3.4 read-path that does not
+    exist, named by the config *or* by a toolkit default). It never comes from the merged
+    output: ``resolve_config``'s contract is that callers refuse a broken config *before*
+    resolving, so the config is resolved exactly once, after both refusals, and the same
+    resolution feeds the path check and the schema-version line — the two cannot disagree
+    about what the config resolved to. The loader's messages already name the full field
+    path (``unknown key paths.foo``), and :func:`format_issues` is the same formatter
+    ``aidw config show`` and the workflow preflights use, so the report names the field
+    rather than paraphrasing it.
 
-    Read-only: one file read, nothing written (§3.1), and the toolkit version is passed
-    in from :data:`aidw.__version__` rather than hardcoded, so doctor cannot claim a
+    Read-only: one file read, one ``exists()`` per set read-path, nothing written (§3.1).
+    ``ensure_write_targets`` is deliberately **not** called here — doctor must never
+    create a directory a stage has not asked for — and the toolkit version is passed in
+    from :data:`aidw.__version__` rather than hardcoded, so doctor cannot claim a
     compatibility verdict for a version other than the one it ships in.
     """
     config_path = root / "aidw" / "config.yaml"
@@ -369,9 +376,17 @@ def _check_target_config(root: Path) -> Check:
     if issues:
         return Check("target config", FAIL, f"{source}\n{format_issues(issues)}")
 
+    # E3.7: resolved exactly once, after the two refusals above, and reused for both the
+    # read-path check and the schema-version line. The path issues join the same list so
+    # the FAIL/OK decision stays a single one (§3.4 "Configured read-paths must exist").
+    resolved = resolve_config(declared)
+    issues.extend(validate_paths(resolved, root))
+    if issues:
+        return Check("target config", FAIL, f"{source}\n{format_issues(issues)}")
+
     # Resolved, not ``declared.schema_version`` (roadmap: "the resolved schema version"):
     # the two are equal today only because ``schema_version`` has no toolkit default.
-    schema_version = resolve_config(declared)["schema_version"]
+    schema_version = resolved["schema_version"]
     # Review follow-up #78: an unset resolved ``schema_version`` only happens when there
     # is no config file at all, so ``source`` is already the NO_TARGET_CONFIG sentinel;
     # appending the suffix would render the sentinel twice ("none (defaults) — schema

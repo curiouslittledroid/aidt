@@ -37,11 +37,21 @@ def _init_repo(path: Path) -> None:
 
 
 def _init_repo_with_task(path: Path) -> Path:
-    """A tmp git repo carrying the roadmap task ``03 E4 E4.1``."""
+    """A tmp git repo carrying the roadmap task ``03 E4 E4.1`` and the read-paths.
+
+    The four §3.4 read-paths ``aidw prompt``'s preflight validates (E3.7) must exist, or
+    the dry-run scenario this fixture backs refuses at that preflight instead of planning
+    stages: ``docs/tasks/`` (the roadmap), ``docs/task-prompts/``,
+    ``docs/implementation-results/`` and its ``TEMPLATE.md``.
+    """
     _init_repo(path)
     tasks = path / "docs" / "tasks"
     tasks.mkdir(parents=True)
     (tasks / "03 - Test Phase.md").write_text(ROADMAP_FIXTURE, encoding="utf-8")
+    (path / "docs" / "task-prompts").mkdir(parents=True)
+    results = path / "docs" / "implementation-results"
+    results.mkdir(parents=True)
+    (results / "TEMPLATE.md").write_text("# Build results template\n", encoding="utf-8")
     return path
 
 
@@ -435,7 +445,9 @@ def test_implement_dry_run_reads_target_and_uses_toolkit_prompts(
 ) -> None:
     target = _init_repo_with_task(tmp_path / "target")
     prompt = target / "docs" / "task-prompts" / "03-E4.1-prompt.md"
-    prompt.parent.mkdir(parents=True)
+    # ``_init_repo_with_task`` already creates the directory (E3.7's read-path), so this
+    # must not be an exclusive ``mkdir``.
+    prompt.parent.mkdir(parents=True, exist_ok=True)
     prompt.write_text("# Implement E4.1\n", encoding="utf-8")
     calls = _spy_run_stage(monkeypatch, implement_workflow)
 

@@ -61,6 +61,11 @@ cannot *understand* refuses at the same site and with the same contract (E3.3, D
 ``SUPPORTED_SCHEMA_VERSION`` or an unsatisfied ``requires_toolkit`` pin, and the issues go
 to stderr with exit 2 before ``load_tasks``/``derive_branch_name``, so the run leaves no
 state, branch or worktree (EXTRACTION.md §3.11 "refuses to run").
+The same preflight then refuses (exit 2, stderr) when a resolved ``paths:`` read-path does
+not exist in the target — by default or by config, since D17's defaults are Mythical
+Forge's layout (E3.7, §3.4 "Configured read-paths must exist"). Every issue names the
+field and the resolved path, so the operator sees what to create or override; there is no
+fallback and no agent-side improvisation.
 When the author's first output line is ``blocked: <reason>`` the run ends ``blocked``
 (exit 3) with the reason in the run log and on stderr; the created task worktree and any
 uncommitted change under ``docs/task-prompts/`` in it are reported, never repaired
@@ -110,6 +115,7 @@ from aidw.target_config import (
     check_compatibility,
     load_target_config,
     resolve_config,
+    validate_paths,
 )
 from aidw.state import (
     BLOCKED,
@@ -1331,9 +1337,22 @@ def run(
     if compatibility_issues:
         print(format_issues(compatibility_issues), file=sys.stderr)
         return 2
-    max_revisions = resolve_config(
+    resolved = resolve_config(
         declared, overrides=ConfigOverrides(max_revisions=max_revisions)
-    )["max_revisions"].value
+    )
+    # Path preflight (E3.7, EXTRACTION.md §3.4/§3.11) at the *same* site and with the same
+    # contract as the two refusals above: stderr + exit 2, before `load_tasks`,
+    # `derive_branch_name`, any run record, branch or worktree, and regardless of
+    # `--dry-run`. A read-path this repo does not have is exactly the "stage preflight
+    # that first needs it" §3.4 names — the prompt workflow reads the roadmap and writes
+    # into the task-prompts directory — and failing here is what stops an agent from
+    # improvising around a missing directory. Resolved once: `max_revisions` comes from
+    # the same resolution the check validated.
+    path_issues = validate_paths(resolved, repo.root)
+    if path_issues:
+        print(format_issues(path_issues), file=sys.stderr)
+        return 2
+    max_revisions = resolved["max_revisions"].value
     # ``aidt`` locates the toolkit's assets (prompts, agent configs); run state lives
     # under the per-repo state root (EXTRACTION.md §3.10), resolved once by ``_roots``
     # and threaded in as ``workspace`` so no workflow re-resolves it.
