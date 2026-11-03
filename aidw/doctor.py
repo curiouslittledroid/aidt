@@ -4,7 +4,13 @@ Checks the local environment, repository state, AIDT's own prompts and helper sc
 agent configs and optional external tooling. Reports ``OK`` / ``WARN`` / ``FAIL`` per
 check and exits non-zero only when at least one check fails.
 
-See ``design.md`` §12.
+The target side of the report is the §3.2 layout diagnosis (E2.8): the target is
+resolved through :meth:`aidw.paths.TargetRepo.resolve` (so ``--repo``/``AIDW_REPO`` are
+honoured and a bare directory is reachable), and the workspace root, state root and
+control worktree are classified by :func:`aidw.layout.check_layout` — the same guard
+``cli._roots`` uses — rather than by a doctor-local copy of its rules.
+
+See ``design.md`` §12/§14 and ``docs/migration/EXTRACTION.md`` §3.1/§3.2/§3.10.
 """
 
 from __future__ import annotations
@@ -19,7 +25,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aidw import inventory
-from aidw.paths import RepoNotFoundError, ToolkitPaths, repo_root, toolkit_root
+from aidw.layout import LayoutError, check_layout
+from aidw.paths import (
+    BareRepositoryError,
+    RepoNotFoundError,
+    TargetRepo,
+    ToolkitPaths,
+    WorkspacePaths,
+    toolkit_root,
+)
 
 OK = "OK"
 WARN = "WARN"
@@ -40,6 +54,12 @@ GH_MIN_VERSION = (2, 94, 0)
 #: only ``exit code 1`` with zero tokens, zero events and an empty stage JSONL. That is
 #: unreadable from a run record, so preflight names it instead (§12).
 PI_MIN_VERSION = (0, 85, 0)
+
+#: The oldest git AIDW works with: ``TargetRepo.resolve`` reads the repository identity
+#: with ``git rev-parse --path-format=absolute``, which git added in 2.31 (§3.2 "Minimum
+#: git"). Older git fails that flag inside every command's preflight, so the floor is
+#: checked up front rather than discovered as an unreadable repository.
+GIT_MIN_VERSION = (2, 31, 0)
 
 #: Sub-issue capabilities to probe for, as ``(argv, label, help pattern)``. Probed from
 #: ``gh``'s own help output as well as version-checked, so a stale or shadowed binary that
@@ -239,6 +259,46 @@ def _check_gh_version() -> Check:
     return Check("gh version", OK, f"{shown} ({path})")
 
 
+def _parse_git_version(output: str) -> tuple[int, int, int] | None:
+    """``X.Y.Z`` from ``git --version`` (``git version 2.39.5 (Apple Git-154)``)."""
+    match = re.search(r"git version (\d+)\.(\d+)\.(\d+)", output)
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.groups())
+    return major, minor, patch
+
+
+def _check_git_version() -> Check:
+    """``git`` must be present and at least :data:`GIT_MIN_VERSION` (§3.2).
+
+    Unlike ``gh`` (workflow-optional, ``WARN`` when absent) git is required by every
+    command, so an absent binary is a ``FAIL`` — the same split ``pi`` uses. An
+    unreadable ``--version`` is still only a ``WARN``: it is not proof of an old git.
+    """
+    path = shutil.which("git")
+    if path is None:
+        return Check("git version", FAIL, "not on PATH; git is required by every command")
+
+    code, out = _run(["git", "--version"])
+    if code != 0:
+        return Check("git version", WARN, f"found at {path} but `git --version` failed")
+
+    version = _parse_git_version(out)
+    shown = ".".join(str(part) for part in version) if version else "unknown version"
+    minimum = ".".join(str(part) for part in GIT_MIN_VERSION)
+    if version is not None and version < GIT_MIN_VERSION:
+        return Check(
+            "git version",
+            FAIL,
+            f"{shown} ({path}) predates `rev-parse --path-format=absolute`; require "
+            f"git >= {minimum} (EXTRACTION.md §3.2). Upgrade git and make sure that "
+            "copy is first on PATH.",
+        )
+    if version is None:
+        return Check("git version", WARN, f"{shown} ({path})")
+    return Check("git version", OK, f"{shown} ({path})")
+
+
 def _check_git(root: Path) -> Check:
     code, out = _run(["git", "branch", "--show-current"], cwd=root)
     if code != 0:
@@ -328,7 +388,59 @@ def _check_toolkit_root() -> Check:
     return Check("toolkit root", status, detail)
 
 
-def collect_checks() -> list[Check]:
+def _layout_checks(target: TargetRepo) -> list[Check]:
+    """Workspace root, state root and control-worktree checks (§3.2/§3.10).
+
+    :func:`aidw.layout.check_layout` is the single classification source, deliberately
+    reused instead of reimplemented: a doctor-local copy of its membership/
+    more-than-one rule could report ``OK`` while ``cli._roots`` refuses the same layout.
+    Its advisory warnings map to a ``WARN`` on the state root, never a ``FAIL``; its
+    :class:`LayoutError` maps to a ``FAIL`` on the control worktree.
+
+    ``check_layout`` decides the clone-of-a-worktree trap *before* it returns warnings,
+    so a rejected layout never also reports the state-inside-tree ``WARN`` (and can
+    never exit 0 on it). Nothing here writes: ``WorkspacePaths.resolve`` only checks
+    writability and the layout guard runs read-only git (§3.1 "nothing generated is ever
+    written into a target repo").
+    """
+    workspace = WorkspacePaths.resolve(target)
+    checks: list[Check] = [Check("workspace root", OK, str(workspace.workspace_root))]
+
+    layout_error: LayoutError | None = None
+    warnings: list[str] = []
+    try:
+        warnings = check_layout(target, workspace)
+    except LayoutError as exc:
+        layout_error = exc
+
+    # The warnings are already worded by the guard (both paths, the §3.10 explanation),
+    # so echo them rather than restating the finding.
+    state_detail = str(workspace.state_root)
+    if warnings:
+        state_detail = f"{state_detail} — {' '.join(warnings)}"
+    checks.append(Check("state root", WARN if warnings else OK, state_detail))
+
+    if layout_error is not None:
+        checks.append(Check("control worktree", FAIL, str(layout_error)))
+    else:
+        checks.append(
+            Check(
+                "control worktree",
+                OK,
+                f"{workspace.workspace_root} is not a registered worktree",
+            )
+        )
+    return checks
+
+
+def collect_checks(explicit: Path | None = None) -> list[Check]:
+    """Run every check; ``explicit`` is the ``--repo``/``AIDW_REPO`` target override.
+
+    The override is threaded from :func:`aidw.cli.doctor` (the single place that reads
+    the environment) so ``aidw --repo <path> doctor`` and ``AIDW_REPO`` select the
+    target, and a bare directory is reachable — the legacy ``repo_root()`` walk-up
+    neither honoured the override nor detected a bare repo.
+    """
     checks: list[Check] = [
         _check_python(),
         _check_python3(),
@@ -337,20 +449,29 @@ def collect_checks() -> list[Check]:
         _check_pi(),
         _check_gh(),
         _check_gh_version(),
-        # Must precede the repo_root() try/except: that branch returns early, and the
+        # Environment checks run outside any repository, so the git floor is verified
+        # before the target is resolved (§3.2).
+        _check_git_version(),
+        # Must precede the target try/except: that branch returns early, and the
         # toolkit root is deliberately resolvable with no repository at all.
         _check_toolkit_root(),
     ]
 
     try:
-        root = repo_root()
+        target = TargetRepo.resolve(explicit=explicit)
+    except BareRepositoryError as exc:
+        # Must precede RepoNotFoundError — BareRepositoryError is its subclass, and the
+        # §3.2 bootstrap in this message is the whole point of the check.
+        checks.append(Check("target repo", FAIL, str(exc)))
+        return checks
     except RepoNotFoundError as exc:
         checks.append(Check("repo root", FAIL, str(exc)))
         return checks
 
-    checks.append(Check("repo root", OK, str(root)))
-    checks.append(_check_git(root))
-    checks.append(_check_mcp(root))
+    checks.append(Check("repo root", OK, str(target.root)))
+    checks.extend(_layout_checks(target))
+    checks.append(_check_git(target.root))
+    checks.append(_check_mcp(target.root))
 
     aidt = toolkit_root()
     checks.append(_check_prompts(aidt))
@@ -359,9 +480,14 @@ def collect_checks() -> list[Check]:
     return checks
 
 
-def run_doctor(verbose: bool = False) -> int:
-    """Print the environment report and return a process exit code."""
-    checks = collect_checks()
+def run_doctor(verbose: bool = False, explicit: Path | None = None) -> int:
+    """Print the environment report and return a process exit code.
+
+    Exits non-zero when any check FAILs (``design.md`` §14); a bare target or a
+    clone-of-a-worktree layout is a FAIL, the single-checkout state-inside-tree case is
+    only a WARN.
+    """
+    checks = collect_checks(explicit=explicit)
     width = max(len(check.name) for check in checks)
 
     print("AIDT doctor")
