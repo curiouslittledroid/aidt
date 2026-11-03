@@ -209,7 +209,7 @@
 
 ## Epic E3: Target-repo config (D3, D10, D11, D12, D17)
 
-- [ ] **E3.1. Schema, loader, validation**
+- [x] **E3.1. Schema, loader, validation**
   `aidw/config.py` (or a new `aidw/target_config.py`) defines the §3.4 schema as dataclasses, plus
   `docs/schema/aidw-config.schema.json`. YAML (D11). Unknown keys are an error, not ignored.
   - Deliverable: loader + schema + round-trip tests.
