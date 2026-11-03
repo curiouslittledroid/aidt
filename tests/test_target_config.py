@@ -4,7 +4,8 @@ These tests are the executable specification of :mod:`aidw.target_config`:
 
 - a full §3.4-shaped config loads with zero issues and every field populated;
 - a ``schema_version: 1``-only config and a *missing* config file both load cleanly
-  (E3.1 proves they load; producing the Mythical Forge layout is E3.4's);
+  (E3.1 proves they load); E3.4 below proves resolution produces the Mythical Forge
+  layout from them;
 - unknown keys at every object level, wrong types, out-of-set ``enabled`` values and
   missing required keys each fail with the offending field path;
 - YAML → dataclass → dict → YAML is lossless (the declared config is reproduced, no
@@ -17,6 +18,11 @@ config and under per-invocation overrides, and the tests below pin the precedenc
 (override > config > default > *unset*), the flat dotted-path addressing, the
 declared-ness-not-value-equality rule, and the resolver's purity (no input mutation, no
 I/O, no shared containers), plus a seeded property run over generated configs.
+
+E3.4 seeds the defaults: the eight §3.4 ``repo:``/``paths:`` values (D17/R7) are pinned
+one by one, a ``schema_version: 1``-only config resolves all eight with
+``source == "default"``, a declared ``repo.base_branch`` beats its sibling's default, and
+the seeded defaults are never mutated by resolution.
 
 E3.3 adds the compatibility pass, :func:`aidw.target_config.check_compatibility`: the two
 independent refusals (§3.11's "newer than understood" ``schema_version`` and an
@@ -36,6 +42,7 @@ from __future__ import annotations
 import ast
 import copy
 import dataclasses
+import fnmatch
 import inspect
 import json
 import pathlib
@@ -49,7 +56,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
 from aidw.config import ERROR
-from aidw.paths import toolkit_root
+from aidw.paths import TargetRepo, toolkit_root
 from aidw.target_config import (
     CONFIG_FILENAME,
     DEFAULT_MAX_REVISIONS,
@@ -868,16 +875,45 @@ def _resolve_loaded(
     return resolve_config(declared, **kwargs)
 
 
-def test_only_max_revisions_is_a_seeded_default() -> None:
-    """Requirement 2: the defaults structure seeds exactly design §12's budget."""
+def test_every_seeded_default_is_the_section_3_4_mythical_forge_value() -> None:
+    """Requirement 4/E3.4: each of the eight §3.4 defaults is asserted by name.
+
+    Eight separate assertions rather than a loop over a shared dict: a dropped, renamed
+    or mistyped default must fail loudly under its own name instead of vanishing into a
+    parametrisation. These are D17/R7's strings — Mythical Forge's current layout — not
+    neutral placeholders, so ``00 - Extraction.md`` (the real roadmap filenames) must
+    match ``roadmap_glob`` character-for-character: ``[0-9]* - *.md``.
+    """
+    # ``repo:`` — EXTRACTION.md §3.4.
+    assert TOOLKIT_DEFAULTS.repo.base_branch == "main"
+    assert TOOLKIT_DEFAULTS.repo.branch_pattern == "{phase}-{task}"
+    # ``paths:`` — EXTRACTION.md §3.4.
+    assert TOOLKIT_DEFAULTS.paths.roadmap_dir == "docs/tasks"
+    assert TOOLKIT_DEFAULTS.paths.roadmap_glob == "[0-9]* - *.md"
+    assert TOOLKIT_DEFAULTS.paths.task_prompts_dir == "docs/task-prompts"
+    assert (
+        TOOLKIT_DEFAULTS.paths.implementation_results_dir
+        == "docs/implementation-results"
+    )
+    assert (
+        TOOLKIT_DEFAULTS.paths.build_results_template
+        == "docs/implementation-results/TEMPLATE.md"
+    )
+    assert TOOLKIT_DEFAULTS.paths.architecture_dir == "docs/architecture"
+
+
+def test_seeded_defaults_are_the_budget_and_the_mythical_forge_layout_only() -> None:
+    """Requirement 1/2: nothing else is seeded — no ``schema_version``, no ``github``."""
     assert DEFAULT_MAX_REVISIONS == 3
     assert TOOLKIT_DEFAULTS.max_revisions == DEFAULT_MAX_REVISIONS
-    # Empty slots for E3.4/E6/E4.1; their *values* are those tasks' to add.
+    # E3.1/E3.3 own the version fields: a missing config file has no resolved version,
+    # and ``requires_toolkit`` is an optional pin, never a default.
     assert TOOLKIT_DEFAULTS.schema_version is None
     assert TOOLKIT_DEFAULTS.requires_toolkit is None
-    assert TOOLKIT_DEFAULTS.repo == RepoConfig()
-    assert TOOLKIT_DEFAULTS.paths == PathsConfig()
+    # E6 owns the frozen D5 markers/labels: present as empty slots, so they stay unset.
     assert TOOLKIT_DEFAULTS.github == GitHubConfig(markers=MarkersConfig())
+    assert dict(TOOLKIT_DEFAULTS.github.labels) == {}
+    # E4.1 owns the stage-list defaults.
     assert dict(TOOLKIT_DEFAULTS.workflows) == {}
     assert {f.name for f in dataclasses.fields(ConfigDefaults)} >= {
         "repo",
@@ -885,6 +921,60 @@ def test_only_max_revisions_is_a_seeded_default() -> None:
         "github",
         "workflows",
     }
+
+
+def test_default_roadmap_glob_matches_the_real_roadmap_filenames() -> None:
+    """The ``roadmap_glob`` trap: ``[0-9]* - *.md`` is space-dash-space, and exact.
+
+    The real phase filenames (``00 - Extraction.md``, ``03.1 - Target-repo config.md``)
+    only match the seeded glob because the separators are spaces; a ``[0-9]*-*.md``
+    typo would match nothing and E5.2's parser would silently find no roadmap. The
+    near-misses are pinned as *not* matching for the same reason.
+    """
+    pattern = TOOLKIT_DEFAULTS.paths.roadmap_glob
+
+    assert fnmatch.fnmatch("00 - Extraction.md", pattern)
+    assert fnmatch.fnmatch("03.1 - Target-repo config.md", pattern)
+    assert not fnmatch.fnmatch("00-Extraction.md", pattern)
+    assert not fnmatch.fnmatch("Extraction.md", pattern)
+    # Prefix pinned: the roadmap's own parser only accepts two-digit (optionally dotted)
+    # ids (``aidw/roadmap.py:_FILENAME_RE``), so a glob leading with ``*`` is wrong.
+    assert not fnmatch.fnmatch("extraction - notes.md", pattern)
+
+
+def test_toolkit_defaults_equal_a_freshly_built_defaults_structure() -> None:
+    """``TOOLKIT_DEFAULTS`` is immutable in practice: resolution never mutates it."""
+    assert TOOLKIT_DEFAULTS == ConfigDefaults()
+    assert TOOLKIT_DEFAULTS.repo == RepoConfig(
+        base_branch="main", branch_pattern="{phase}-{task}"
+    )
+    assert TOOLKIT_DEFAULTS.paths == PathsConfig(
+        roadmap_dir="docs/tasks",
+        roadmap_glob="[0-9]* - *.md",
+        task_prompts_dir="docs/task-prompts",
+        implementation_results_dir="docs/implementation-results",
+        build_results_template="docs/implementation-results/TEMPLATE.md",
+        architecture_dir="docs/architecture",
+    )
+
+
+def test_the_two_repo_defaults_match_the_target_repo_dataclass() -> None:
+    """Trap/second source of truth: ``TargetRepo``'s literals must stay equal.
+
+    E3.4 seeds config defaults that duplicate ``aidw.paths.TargetRepo``'s frozen
+    ``base_branch``/``branch_pattern`` defaults instead of collapsing them into one shared
+    constant — ``target_config`` must not import ``aidw.paths`` (layering), and rewiring
+    ``TargetRepo`` to the resolved config is E4/E5's. This test is what keeps the two
+    homes from drifting until then.
+    """
+    from aidw import target_config
+
+    assert not any(
+        module == "aidw.paths" or module.startswith("aidw.paths.")
+        for module in _imported_modules(inspect.getsource(target_config))
+    )
+    assert TargetRepo.base_branch == TOOLKIT_DEFAULTS.repo.base_branch
+    assert TargetRepo.branch_pattern == TOOLKIT_DEFAULTS.repo.branch_pattern
 
 
 def test_undeclared_max_revisions_resolves_to_the_default(tmp_path: Path) -> None:
@@ -931,22 +1021,131 @@ def test_explicit_value_equal_to_the_default_still_reports_config(
     assert resolved["max_revisions"] == ResolvedValue(3, SOURCE_CONFIG)
 
 
-def test_partial_config_leaves_every_other_leaf_unset(tmp_path: Path) -> None:
-    """Requirement 1/4: no invented defaults — the rest is ``None``/``None`` (unset)."""
+def test_partial_config_resolves_defaults_and_leaves_only_unseeded_leaves_unset(
+    tmp_path: Path,
+) -> None:
+    """Requirement 5/E3.4: a declared leaf wins; its siblings fall back to the defaults."""
     resolved = _resolve_loaded(
         tmp_path, {"schema_version": 1, "repo": {"base_branch": "trunk"}}
     )
 
     assert resolved["repo.base_branch"] == ResolvedValue("trunk", SOURCE_CONFIG)
     assert resolved["schema_version"] == ResolvedValue(1, SOURCE_CONFIG)
-    for path, entry in resolved.items():
-        if path in {"repo.base_branch", "schema_version", "max_revisions"}:
-            continue
-        assert entry == ResolvedValue(), path
-        assert entry.value is None and entry.source is None
+    # The undeclared sibling is a separate leaf and keeps the §3.4 default.
+    assert resolved["repo.branch_pattern"] == ResolvedValue(
+        "{phase}-{task}", SOURCE_DEFAULT
+    )
+    # After E3.4 the only unseeded leaves are ``requires_toolkit`` and the E6 markers.
+    assert {
+        path
+        for path, entry in resolved.items()
+        if entry == ResolvedValue()
+    } == {
+        "requires_toolkit",
+        "github.markers.parent",
+        "github.markers.child",
+        "github.markers.summary",
+    }
 
-    # ``repo.branch_pattern`` is a sibling leaf, not a whole-container entry.
-    assert resolved["repo.branch_pattern"].is_set is False
+
+#: The eight §3.4 ``repo:``/``paths:`` leaves and D17's Mythical Forge values, spelled
+#: out literally (never imported from the module) so a changed default fails here.
+MYTHICAL_FORGE_LAYOUT = (
+    ("repo.base_branch", "main"),
+    ("repo.branch_pattern", "{phase}-{task}"),
+    ("paths.roadmap_dir", "docs/tasks"),
+    ("paths.roadmap_glob", "[0-9]* - *.md"),
+    ("paths.task_prompts_dir", "docs/task-prompts"),
+    ("paths.implementation_results_dir", "docs/implementation-results"),
+    ("paths.build_results_template", "docs/implementation-results/TEMPLATE.md"),
+    ("paths.architecture_dir", "docs/architecture"),
+)
+
+
+def test_schema_version_only_config_resolves_the_mythical_forge_layout() -> None:
+    """The roadmap's Done-when: ``schema_version: 1`` alone produces the MF layout.
+
+    Built in code rather than loaded, so the vector proves resolution itself injects no
+    ``config`` provenance and invents no ``github``/``workflows`` entries.
+    """
+    resolved = resolve_config(TargetConfig(schema_version=1))
+
+    for path, value in MYTHICAL_FORGE_LAYOUT:
+        assert resolved[path] == ResolvedValue(value, SOURCE_DEFAULT), path
+        assert resolved[path].is_set is True
+
+    # Every other leaf is either the E3.2 budget or still unseeded; no E6/E4.1 value.
+    assert set(resolved) == {
+        "schema_version",
+        "requires_toolkit",
+        "max_revisions",
+        * (path for path, _ in MYTHICAL_FORGE_LAYOUT),
+        "github.markers.parent",
+        "github.markers.child",
+        "github.markers.summary",
+    }
+    assert not any(path.startswith(("github.labels.", "workflows.")) for path in resolved)
+    assert resolved["max_revisions"] == ResolvedValue(3, SOURCE_DEFAULT)
+
+
+def test_schema_version_only_config_file_through_the_loader_resolves_the_layout(
+    tmp_path: Path,
+) -> None:
+    """The same Done-when through the real loader: a near-empty file is all it takes."""
+    resolved = _resolve_loaded(tmp_path, {"schema_version": 1})
+
+    for path, value in MYTHICAL_FORGE_LAYOUT:
+        assert resolved[path] == ResolvedValue(value, SOURCE_DEFAULT), path
+
+
+def test_declared_base_branch_beats_the_default_but_not_its_sibling(
+    tmp_path: Path,
+) -> None:
+    """Precedence vector: ``config`` > ``default``, decided per leaf."""
+    resolved = _resolve_loaded(
+        tmp_path, {"schema_version": 1, "repo": {"base_branch": "trunk"}}
+    )
+
+    assert resolved["repo.base_branch"] == ResolvedValue("trunk", SOURCE_CONFIG)
+    assert resolved["repo.branch_pattern"] == ResolvedValue(
+        "{phase}-{task}", SOURCE_DEFAULT
+    )
+
+
+def test_declared_value_equal_to_a_default_is_still_config(tmp_path: Path) -> None:
+    """Declared-ness, not value equality: ``main`` declared is ``config``, not ``default``."""
+    resolved = _resolve_loaded(
+        tmp_path, {"schema_version": 1, "repo": {"base_branch": "main"}}
+    )
+
+    assert resolved["repo.base_branch"] == ResolvedValue("main", SOURCE_CONFIG)
+    assert resolved["repo.branch_pattern"] == ResolvedValue(
+        "{phase}-{task}", SOURCE_DEFAULT
+    )
+
+
+def test_defaults_resolution_is_pure_and_does_not_touch_toolkit_defaults() -> None:
+    """Requirement 4: resolving twice is fresh, alias-free, and mutates nothing."""
+    declared = TargetConfig(schema_version=1)
+    before = copy.deepcopy(declared)
+    defaults_before = TOOLKIT_DEFAULTS
+
+    first = resolve_config(declared)
+    second = resolve_config(declared)
+
+    assert first.to_dict() == second.to_dict()
+    assert first is not second
+    assert first.entries is not second.entries
+    # Every entry is a fresh ``ResolvedValue``, not a shared one.
+    for path in first:
+        assert first[path] is not second[path], path
+    # The defaults structure is never mutated, so a later resolution is unaffected.
+    assert TOOLKIT_DEFAULTS == defaults_before == ConfigDefaults()
+    assert declared == before
+    first.entries.clear()
+    assert len(resolve_config(declared)) == len(second)
+    assert resolve_config(declared).to_dict() == second.to_dict()
+    assert TOOLKIT_DEFAULTS.paths.roadmap_dir == "docs/tasks"
 
 
 def test_declared_markers_and_labels_carry_config_provenance(tmp_path: Path) -> None:
@@ -1201,11 +1400,19 @@ def test_provenance_precedence_property(tmp_path: Path) -> None:
             assert plain["max_revisions"] == ResolvedValue(
                 config_data["max_revisions"], SOURCE_CONFIG
             )
-            assert plain["repo.base_branch"].source in (SOURCE_CONFIG, None)
         else:
             assert plain["max_revisions"] == ResolvedValue(
                 DEFAULT_MAX_REVISIONS, SOURCE_DEFAULT
             )
+
+        # E3.4: the §3.4 ``repo:``/``paths:`` leaves always resolve — ``config`` when the
+        # file declared them, ``default`` otherwise — and never fall back to *unset*.
+        assert plain["repo.base_branch"].source == (
+            SOURCE_CONFIG if "repo" in config_data else SOURCE_DEFAULT
+        )
+        assert plain["paths.roadmap_dir"].source == (
+            SOURCE_CONFIG if "paths" in config_data else SOURCE_DEFAULT
+        )
 
         for path, entry in plain.items():
             if entry.source is None:

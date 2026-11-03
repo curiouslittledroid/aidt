@@ -20,9 +20,10 @@ config:
 
 - It does not inject defaults; a field that is absent stays ``None``/empty. Only
   :func:`resolve_config` merges, so a near-empty config is never re-serialised inflated,
-  and a loader caller still sees what was actually declared (E3.1's round-trip). Default
-  *values* beyond ``max_revisions`` are E3.4/E6/E4.1's; the defaults structure carries the
-  empty slots so those tasks add values without touching the merge.
+  and a loader caller still sees what was actually declared (E3.1's round-trip). The
+  seeded default *values* are E3.4's (the eight ``repo:``/``paths:`` leaves, D17) plus
+  design §12's ``max_revisions``; ``github``/``workflows`` stay empty until E6/E4.1 seed
+  them, and those tasks likewise add values without touching the merge.
 - The *loader* does not compare ``schema_version``/``requires_toolkit``: the fields are
   loaded and type-checked there. Interpreting them is :func:`check_compatibility`
   (E3.3, D10/§3.11), a separate pure pass a workflow preflight runs after the loader.
@@ -91,7 +92,7 @@ PATH_FIELDS = (
 )
 
 #: ``github.markers`` is a fixed three-key object (D5 / §3.9); any other marker key is a
-#: typo, and a missing one is filled by E3.2/E3.4's frozen defaults.
+#: typo, and a missing one is filled by E6's frozen defaults.
 MARKER_FIELDS = ("parent", "child", "summary")
 
 WORKFLOW_KEYS = ("stages", "parallel_groups")
@@ -365,9 +366,10 @@ class GitHubConfig:
 class TargetConfig:
     """The declared ``<target>/aidw/config.yaml`` (§3.4).
 
-    Absent optional values stay ``None``/empty: the loader never injects defaults (E3.4's
-    job) and never interprets ``schema_version`` (E3.3's). ``source_path`` is ``None``
-    when no config file was found, which is the valid "defaults only" case.
+    Absent optional values stay ``None``/empty: the loader never injects defaults (they
+    live in :data:`TOOLKIT_DEFAULTS`, E3.4's) and never interprets ``schema_version``
+    (E3.3's). ``source_path`` is ``None`` when no config file was found, which is the
+    valid "defaults only" case.
     """
 
     schema_version: int | None = None
@@ -857,9 +859,10 @@ class ResolvedValue:
     """One resolved §3.4 leaf: its value plus where that value came from.
 
     ``source is None`` is the *unset* state (value ``None`` too): the config did not
-    declare the field and no default exists for it — E3.4 is what later flips the
-    ``paths:``/``repo:`` leaves from *unset* to ``default``. ``aidw config show`` renders
-    that state as ``unset`` and omits the ``source`` key in its JSON.
+    declare the field and no default exists for it. After E3.4 the ``paths:``/``repo:``
+    leaves always resolve ``default``; the still-unset leaves are ``requires_toolkit`` and
+    ``github.markers.*`` until E6 seeds them. ``aidw config show`` renders that state as
+    ``unset`` and omits the ``source`` key in its JSON.
     """
 
     value: Any = None
@@ -924,21 +927,49 @@ class ConfigOverrides:
 class ConfigDefaults:
     """Toolkit defaults merged *below* a target repo's declared config (§3.4, D17).
 
-    Seeded with **only** ``max_revisions`` (design §12/H8). ``repo``/``paths``/``github``/
-    ``workflows`` are present but empty: an empty slot resolves *unset* rather than
-    inventing a Mythical-Forge value, because those defaults are E3.4's, E6's and E4.1's
-    to own — seeding ``repo.base_branch`` here would also put a second source of truth
-    next to ``aidw.paths.TargetRepo.base_branch``. A later task adds values by populating
-    a slot; :func:`resolve_config` already walks the slots, so the merge does not change.
-    ``schema_version`` is left empty on purpose: it is required *in* a config file, and
-    interpreting it is E3.3's, so a repo with no config file has no resolved version.
+    Seeded with design §12's revision budget (``max_revisions``, H8) and the eight §3.4
+    ``repo:``/``paths:`` values E3.4 owns. Those eight are exactly Mythical Forge's
+    current layout (D17/R7): deliberately not neutral, so a Mythical-Forge-shaped repo's
+    config file is near-empty and doubles as the documented example.
+
+    ``aidw.paths.TargetRepo`` carries the same two ``repo:`` literals as frozen dataclass
+    defaults. That is a second home *by design* until E4/E5 wire the resolved config
+    through: this module must not import ``aidw.paths`` (layering), so the equality is
+    pinned by the tests rather than derived from one shared constant.
+
+    ``github``/``workflows`` are present but empty: an empty slot resolves *unset* rather
+    than inventing a value, because those defaults are E6's and E4.1's to own. A later
+    task adds values by populating a slot; :func:`resolve_config` already walks the
+    slots, so the merge does not change. ``schema_version`` and ``requires_toolkit`` are
+    left empty on purpose: the former is required *in* a config file and interpreting it
+    is E3.3's, so a repo with no config file has no resolved version; the latter is an
+    optional pin, never a default.
     """
 
     schema_version: int | None = None
     requires_toolkit: str | None = None
     max_revisions: int | None = DEFAULT_MAX_REVISIONS
-    repo: RepoConfig = field(default_factory=RepoConfig)
-    paths: PathsConfig = field(default_factory=PathsConfig)
+    # EXTRACTION.md §3.4's ``repo:`` block, character-for-character (D17).
+    repo: RepoConfig = field(
+        default_factory=lambda: RepoConfig(
+            base_branch="main",
+            branch_pattern="{phase}-{task}",
+        )
+    )
+    # EXTRACTION.md §3.4's ``paths:`` block, character-for-character (D17).
+    # ``roadmap_glob`` is literal: ``[0-9]* - *.md`` (space, dash, space) is what matches
+    # the real ``00 - Extraction.md`` filenames; ``[0-9]*-*.md`` would silently match
+    # nothing.
+    paths: PathsConfig = field(
+        default_factory=lambda: PathsConfig(
+            roadmap_dir="docs/tasks",
+            roadmap_glob="[0-9]* - *.md",
+            task_prompts_dir="docs/task-prompts",
+            implementation_results_dir="docs/implementation-results",
+            build_results_template="docs/implementation-results/TEMPLATE.md",
+            architecture_dir="docs/architecture",
+        )
+    )
     # ``markers`` is materialised (not ``None``) so the merge can read its slots; every
     # field is still ``None``, so markers stay unset until E6 seeds the frozen D5 values.
     github: GitHubConfig = field(default_factory=lambda: GitHubConfig(markers=MarkersConfig()))

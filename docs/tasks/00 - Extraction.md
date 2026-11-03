@@ -252,7 +252,7 @@
   - Deliverable: a preflight check with a clear, actionable message.
   - Done when: tests cover both refusals and the happy path.
 
-- [ ] **E3.4. Defaults equal the Mythical Forge layout (D17)**
+- [x] **E3.4. Defaults equal the Mythical Forge layout (D17)**
   Every default under `paths:` and `repo:` matches Mythical Forge's current values, so a
   Mythical-Forge-shaped config is valid and near-empty.
   - Deliverable: defaults plus a test asserting each default value explicitly.
