@@ -201,7 +201,7 @@
   - Deliverable: doctor checks plus tests (follow the existing `gh version` check style, `FAIL` for hard blockers, `WARN` for advisory).
   - Done when: `uv run aidw doctor` diagnoses each rejected layout by name.
 
-- [ ] **E2.9. Worktree fixtures**
+- [x] **E2.9. Worktree fixtures**
   A test helper that builds a temporary bare repo with a `main` worktree and a task worktree, wired
   off the bare repo exactly as §3.2 specifies.
   - Deliverable: a shared fixture used by E2 and later epics.

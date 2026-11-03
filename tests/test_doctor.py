@@ -6,9 +6,10 @@ faked binaries, and the E2.8 target-layout checks (``git version``, ``repo root`
 temporary repositories — a bare repo, the supported bare + sibling-worktree layout, a
 single-checkout plain clone and the §3.2 clone-of-a-worktree trap.
 
-The repo fixtures are local copies of ``tests/test_layout.py``'s helpers (E2.9 owns the
-shared worktree fixture), so the bare/trap/supported layouts are exercised against
-actual ``git worktree list`` output rather than a stubbed guard.
+The repo fixtures are deliberately local: E2.9's ``worktree_repo`` fixture covers only
+the bare + ``main`` + ``task`` layout, while these tests add the bare-only, trap and
+single-checkout layouts, so each is exercised against actual ``git worktree list``
+output rather than a stubbed guard.
 """
 
 from __future__ import annotations

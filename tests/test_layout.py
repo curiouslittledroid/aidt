@@ -7,9 +7,10 @@ bare + control worktree, a single-checkout plain clone, and a plain clone with a
 worktree hanging off it — so the membership/more-than-one rule and the fail-closed
 unverifiable-list path are exercised against actual git output.
 
-Fixtures are deliberately local (E2.9 owns the shared worktree fixture); they mirror
-``tests/test_git.py``'s bare+control helper and ``tests/test_workspace_paths.py``'s
-plain-clone helpers.
+The supported layout comes from the shared ``worktree_repo`` fixture (E2.9). The
+*rejected* and single-checkout layouts stay local on purpose: ``_make_trap`` and
+``_make_plain_clone`` build layouts the fixture must never produce, and ``_make_bare``
+is the bare-with-no-control-worktree case the bare-target refusal needs.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from typer.testing import CliRunner
@@ -25,6 +27,12 @@ from aidw import git, paths
 from aidw.cli import EXIT_REFUSED, app
 from aidw.layout import LayoutError, check_layout
 from aidw.paths import BareRepositoryError, TargetRepo, WorkspacePaths
+
+if TYPE_CHECKING:  # pragma: no cover - type-only
+    # Two conftest files are collected (``tests/`` and the review-followup script tests)
+    # and share the top-level module name ``conftest``; a runtime import would break the
+    # full-suite run. Annotations are strings, so the name is never resolved here.
+    from conftest import WorktreeRepo
 
 runner = CliRunner()
 
@@ -78,18 +86,6 @@ def _make_bare(tmp_path: Path, *, remote: str | None = FAKE_ORIGIN) -> Path:
     if remote is not None:
         _git_run(bare, "remote", "set-url", "origin", remote)
     return bare
-
-
-def _make_supported(
-    tmp_path: Path, *, task_worktree: bool = False, remote: str | None = FAKE_ORIGIN
-) -> tuple[Path, Path]:
-    """The §3.2 supported layout: bare repo plus the ``main`` control worktree."""
-    bare = _make_bare(tmp_path, remote=remote)
-    control = tmp_path / "main"
-    _git_run(bare, "worktree", "add", "-q", str(control), "main")
-    if task_worktree:
-        _git_run(bare, "worktree", "add", "-q", "-b", "task", str(tmp_path / "task"), "main")
-    return bare, control
 
 
 def _make_plain_clone(tmp_path: Path, name: str = "plain") -> Path:
@@ -362,19 +358,18 @@ def test_single_checkout_warns_without_raising(tmp_path: Path) -> None:
     assert str(target.root) in warnings[0]
 
 
-def test_supported_bare_and_control_worktree_passes(tmp_path: Path) -> None:
-    _bare, control = _make_supported(tmp_path)
-    target, workspace = _resolved(control)
+def test_supported_bare_and_control_worktree_passes(
+    worktree_repo: WorktreeRepo,
+) -> None:
+    target, workspace = _resolved(worktree_repo.control)
 
     assert check_layout(target, workspace) == []
 
 
 def test_supported_layout_with_a_task_worktree_passes_from_each_worktree(
-    tmp_path: Path,
+    worktree_repo: WorktreeRepo,
 ) -> None:
-    _bare, control = _make_supported(tmp_path, task_worktree=True)
-
-    for start in (control, tmp_path / "task"):
+    for start in (worktree_repo.control, worktree_repo.task):
         target, workspace = _resolved(start)
         assert check_layout(target, workspace) == [], start
 
@@ -478,10 +473,10 @@ def test_cli_warns_on_the_single_checkout_layout(
     assert str(state_root) in result.stderr
 
 
-def test_cli_passes_the_supported_layout_without_warning(tmp_path: Path) -> None:
-    _bare, control = _make_supported(tmp_path)
-
-    result = runner.invoke(app, ["--repo", str(control), "runs", "list"])
+def test_cli_passes_the_supported_layout_without_warning(
+    worktree_repo: WorktreeRepo,
+) -> None:
+    result = runner.invoke(app, ["--repo", str(worktree_repo.control), "runs", "list"])
 
     assert result.exit_code == 0, result.output
     assert "Warning" not in result.stderr
@@ -516,9 +511,10 @@ def test_origin_remote_returns_none_outside_a_repository(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
-def test_check_layout_leaves_the_repository_unchanged(tmp_path: Path) -> None:
-    _bare, control = _make_supported(tmp_path, task_worktree=True)
-    target, workspace = _resolved(control)
+def test_check_layout_leaves_the_repository_unchanged(
+    worktree_repo: WorktreeRepo,
+) -> None:
+    target, workspace = _resolved(worktree_repo.control)
 
     before_worktrees = [(wt.path, wt.branch, wt.detached) for wt in git.worktrees(target.root)]
     before_status = git.status_short(target.root)
@@ -530,7 +526,7 @@ def test_check_layout_leaves_the_repository_unchanged(tmp_path: Path) -> None:
     assert after_worktrees == before_worktrees
     assert after_status == before_status
     # The single-checkout side of the same check leaves no state directory behind.
-    plain = _make_plain_clone(tmp_path)
+    plain = _make_plain_clone(worktree_repo.workspace)
     plain_target, plain_workspace = _resolved(plain)
     assert not plain_workspace.state_root.exists()
     check_layout(plain_target, plain_workspace)
@@ -558,13 +554,14 @@ def test_check_layout_runs_only_read_only_git(
     assert recorded == [["worktree", "list", "--porcelain"]], recorded
 
 
-def test_check_layout_verdict_is_invariant_to_cwd(tmp_path: Path, monkeypatch) -> None:
+def test_check_layout_verdict_is_invariant_to_cwd(
+    worktree_repo: WorktreeRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Metamorphic: the verdict depends on the resolved paths, not the working directory."""
-    _bare, control = _make_supported(tmp_path)
-    target, workspace = _resolved(control)
+    target, workspace = _resolved(worktree_repo.control)
     expected = check_layout(target, workspace)
 
-    elsewhere = tmp_path / "elsewhere"
+    elsewhere = worktree_repo.workspace / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
 

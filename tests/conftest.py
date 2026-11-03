@@ -4,12 +4,19 @@ Tests must never leave run state in the toolkit's ``runs/`` directory: workflows
 under the per-repo state root (E1.4) and the prompt tests label their runs ``pytest``.
 The session fixture below deletes any ``runs/*-pytest-*`` directory left under the
 toolkit root, so a stale artifact from a crashed session is cleaned up automatically.
+
+It also owns the shared real-git fixtures: the session-wide commit identity and
+:func:`worktree_repo`, which builds the EXTRACTION.md §3.2 supported layout (a bare repo
+with ``main`` and ``task`` sibling worktrees) once per test (E2.9).
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -69,6 +76,115 @@ def _git_identity() -> None:
             os.environ.pop(name, None)
         else:
             os.environ[name] = value
+
+
+# ---------------------------------------------------------------------------
+# The §3.2 supported worktree layout (E2.9)
+# ---------------------------------------------------------------------------
+
+
+def _git_run(directory: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run git in ``directory``, raising on failure.
+
+    The commit identity comes from :func:`_git_identity`'s session environment, so no
+    test — and no fixture — configures identity inside each temporary repo (AGENTS.md):
+    two spawns per temporary repo across ~300 repos.
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=directory,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+
+@dataclass(frozen=True)
+class WorktreeRepo:
+    """One repository wired as EXTRACTION.md §3.2 specifies (E2.9).
+
+    ``bare`` is the bare clone — the common dir every worktree is linked off — and
+    ``control``/``task`` are *sibling* linked worktrees, never worktrees of each other
+    and never nested inside one another (§3.2's rejected layouts). ``workspace`` is the
+    directory all of them sit directly under, i.e. the ``tmp_path`` root.
+
+    Container name and fixture name are prompt-fixed for E2.9: the spec fixes the
+    *layout*, not the helper's naming.
+    """
+
+    bare: Path
+    control: Path
+    task: Path
+    workspace: Path
+
+    def add_task(self, branch: str, *, base: str = "main") -> Path:
+        """Create a *further* sibling worktree on ``branch`` off ``base``.
+
+        Runs §3.2's per-task command from the **control** worktree — the position
+        ``aidw.git.add_worktree`` runs from — so a consumer asserting the real wiring
+        sees the same shape. The branch is born in its own worktree; creating it on
+        ``main`` and moving it is impossible (one branch, one worktree, §3.2).
+
+        Raises ``subprocess.CalledProcessError`` when git refuses, which is the honest
+        contract for a helper that returns a ``Path``: the branch is already checked
+        out (``add_task("task")`` — use ``repo.task`` for the pre-created worktree), the
+        branch name already exists, or the target path is already occupied. It cannot
+        return ``None`` quietly the way ``aidw.git.add_worktree`` does, because a silent
+        ``None`` would let a test pass while asserting nothing.
+        """
+        path = self.workspace / branch
+        _git_run(self.control, "worktree", "add", "-q", "-b", branch, str(path), base)
+        return path.resolve()
+
+
+@pytest.fixture
+def worktree_repo(tmp_path: Path, _git_identity: None) -> WorktreeRepo:
+    """Build the §3.2 supported layout under ``tmp_path`` and hand back its paths.
+
+    ``git init -b main`` of a committed seed → ``git clone --bare`` to
+    ``<workspace>/bare.git`` → ``git -C bare.git worktree add ../main main`` (the
+    control worktree) → ``git -C <control> worktree add -b task <workspace>/task main``
+    (the per-task command, from the control worktree, mirroring
+    ``aidw.git.add_worktree``).
+
+    The seed must be *committed* before the bare clone: an empty ``git init`` has no
+    ``main`` ref, so ``worktree add ../main main`` would fail with "invalid reference".
+
+    Function-scoped on ``tmp_path`` deliberately — a session-scoped bare repo with
+    registered worktrees would leak checkouts between tests. There is no teardown
+    because pytest removes ``tmp_path``: no explicit teardown spawns, and nothing is
+    written outside ``tmp_path`` (no ``.aidw/state``, no toolkit ``runs/``), so
+    ``_clean_test_runs`` stays green. The ``seed`` directory stays behind as the clone
+    source; it is not a worktree and ``git.worktrees`` never reports it.
+    """
+    workspace = tmp_path.resolve()
+
+    seed = workspace / "seed"
+    seed.mkdir()
+    _git_run(seed, "init", "-q", "-b", "main")
+    (seed / "f.txt").write_text("x", encoding="utf-8")
+    _git_run(seed, "add", ".")
+    _git_run(seed, "commit", "-qm", "init")
+
+    bare = workspace / "bare.git"
+    _git_run(workspace, "clone", "--bare", "-q", str(seed), str(bare))
+
+    # §3.2's one-time bootstrap: the control worktree is linked off the bare repo and
+    # named relative to it, so ``bare.git`` and ``main`` are siblings.
+    control = workspace / "main"
+    _git_run(bare, "worktree", "add", "-q", "../main", "main")
+
+    # §3.2's per-task command, run from the control worktree (not the bare repo).
+    task = workspace / "task"
+    _git_run(control, "worktree", "add", "-q", "-b", "task", str(task), "main")
+
+    return WorktreeRepo(
+        bare=bare.resolve(),
+        control=control.resolve(),
+        task=task.resolve(),
+        workspace=workspace,
+    )
 
 
 @pytest.fixture
