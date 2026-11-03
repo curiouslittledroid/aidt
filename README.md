@@ -194,9 +194,12 @@ uv run aidw review --pr 42 --dry-run   # plan R1/R2 + print the publisher argv
 uv run aidw review --pr 42             # live review + publish
 ```
 
-Preflight reads the PR via `gh` (read-only) and refuses unless the PR targets `main` and
-the current branch is the PR head. A `Blocked` verdict, an ambiguous verdict, or a finding
-that will not parse into a manifest fails closed: findings are recorded under
+Preflight reads the PR via `gh` (read-only) and refuses unless the PR targets `main` and the
+PR head's worktree exists locally; it reviews **that** worktree, so it can be run from the
+control root (or the bare directory's `main` checkout) while the task branch is checked out
+in a sibling directory. When the worktree is missing it prints the `git worktree add` line to
+create it and stops. A `Blocked` verdict, an ambiguous verdict, or a finding that will not
+parse into a manifest fails closed: findings are recorded under
 `runs/<id>/artifacts/findings.json`, but nothing is published.
 
 AIDT never calls a mutating `gh` command. GitHub writes only ever go through the bundled

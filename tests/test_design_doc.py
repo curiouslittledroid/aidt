@@ -55,3 +55,34 @@ def test_section_81_blocked_run_reports_leftovers() -> None:
     assert "reports," in design and "never repairs" in design
     assert "an uncommitted change under" in design
     assert "branch that appeared during the run" in design
+
+
+def _section_83_block(design: str) -> str:
+    """The §8.3 ``aidw review`` block: its heading up to the §8.4 heading."""
+    start = design.index("### 8.3 `aidw review --pr <n>`")
+    end = design.index("### 8.4 ", start)
+    return design[start:end]
+
+
+def test_section_83_review_locates_the_pr_head_worktree() -> None:
+    """§8.3 and §17 K1 must state the PR-head-worktree preflight, not the old cwd test.
+
+    The trigger: the pre-E2.6 ``current branch is the PR head`` preflight shipped in
+    ``review.py`` while ``implement``/``fix`` resolved worktrees, so ``aidw run
+    prompt-to-fix`` exited 4 on the review stage of every worktree run. Decision K1
+    replaces it; this pins the design wording to the behaviour so the cwd-driven claim
+    cannot quietly return to one side only.
+    """
+    design = _design_md()
+
+    block = _section_83_block(design)
+    assert "the PR head's worktree is located" in block
+    assert "current branch is the PR head" not in block
+    assert "`git.worktree_for_branch`" in block
+
+    rows = [line for line in design.splitlines() if line.startswith("| K1 |")]
+    assert len(rows) == 1, f"expected exactly one §17 K1 row, found {len(rows)}"
+    k1 = rows[0]
+    assert "exit 4" in k1
+    assert "prompt-to-fix" in k1
+    assert "PR-head worktree" in k1
