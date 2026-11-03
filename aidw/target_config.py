@@ -976,10 +976,13 @@ def resolve_config(
             # keys, so a non-empty list is the declared-ness signal there too. The
             # ``_declared`` check is what keeps an explicit ``stages: []`` from looking
             # absent on the round-trip path.
-            declared = declared_workflow is not None and (
+            # Loop-local name must not shadow the ``declared`` TargetConfig
+            # parameter: shadowing it crashes the second workflow's iteration
+            # (review follow-up for PR #68, finding F1).
+            is_declared = declared_workflow is not None and (
                 key in declared_workflow._declared or bool(declared_value)
             )
-            if not declared and default_value is None:
+            if not is_declared and default_value is None:
                 # Open maps contribute entries only for keys that exist: a workflow's
                 # undeclared sibling list is *absent*, not an ``unset`` entry. Otherwise
                 # every declared workflow would drag in a phantom
@@ -989,7 +992,7 @@ def resolve_config(
                 f"workflows.{name}.{key}",
                 declared_value=declared_value,
                 default_value=default_value,
-                declared=declared,
+                declared=is_declared,
             )
 
     return ResolvedConfig(merge.entries)
