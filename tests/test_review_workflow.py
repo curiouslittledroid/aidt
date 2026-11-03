@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 
-from aidw import git, github
+import pytest
+
+from aidw import git, github, lock
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import SUCCEEDED, StageRecord, run_dir
 from aidw.workflows import review as review_workflow
@@ -181,3 +184,85 @@ def test_preflight_missing_pr(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(github, "pr_view", lambda repo, pr: None)
     monkeypatch.setattr(review_workflow, "run_stage", _FakeStages(APPROVED_REVIEW))
     assert review_workflow.run(pr=7, **_roots(tmp_path)) == 2
+
+# --------------------------------------------------------------------------- #
+# One run per worktree (E2.7, EXTRACTION.md §3.2/§3.10)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_held_repo_root_lock_is_refused_before_any_run_state(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """``review`` keys on ``repo.root``, which its PR-head preflight pins to this tree."""
+    _init_repo(tmp_path)
+    _patch(monkeypatch)
+    stages = _FakeStages(APPROVED_REVIEW)
+    monkeypatch.setattr(review_workflow, "run_stage", stages)
+    roots = _roots(tmp_path)
+
+    with lock.acquire(roots["workspace"].state_root, tmp_path):
+        code = review_workflow.run(pr=7, **roots)
+
+    assert code == 4
+    assert stages.names == []
+    runs_root = _runs_root(tmp_path)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    err = capsys.readouterr().err
+    assert "another aidw run is already active" in err
+    assert str(tmp_path.resolve()) in err
+
+
+def test_two_concurrent_review_runs_from_one_repo_root_are_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A live review refuses a second one from the same worktree, leaving one run."""
+    _init_repo(tmp_path)
+    _patch(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+
+    class _BlockingStages(_FakeStages):
+        def __call__(self, spec, **kwargs):
+            entered.set()
+            assert release.wait(timeout=60), "the holder was never released"
+            return super().__call__(spec, **kwargs)
+
+    monkeypatch.setattr(review_workflow, "run_stage", _BlockingStages(APPROVED_REVIEW))
+    roots = _roots(tmp_path)
+    outcome: dict = {}
+
+    def hold() -> None:
+        try:
+            outcome["code"] = review_workflow.run(pr=7, **roots)
+        except BaseException as exc:  # pragma: no cover - asserted via ``outcome``
+            outcome["error"] = exc
+
+    holder = threading.Thread(target=hold, name="aidw-review-run")
+    holder.start()
+    assert entered.wait(timeout=60), "the holding run never reached a stage"
+
+    refused = review_workflow.run(pr=7, **roots)
+
+    release.set()
+    holder.join(timeout=60)
+    assert not holder.is_alive()
+    assert "error" not in outcome, outcome.get("error")
+
+    assert refused == 4
+    assert outcome["code"] == 0
+    assert len(list(_runs_root(tmp_path).iterdir())) == 1
+    assert "another aidw run is already active" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("review_text", "expected"), [(APPROVED_REVIEW, 0), (BLOCKED_REVIEW, 3)])
+def test_the_lock_is_released_on_every_exit_path(
+    tmp_path: Path, monkeypatch, review_text: str, expected: int
+) -> None:
+    _init_repo(tmp_path)
+    _patch(monkeypatch)
+    monkeypatch.setattr(review_workflow, "run_stage", _FakeStages(review_text))
+    roots = _roots(tmp_path)
+
+    assert review_workflow.run(pr=7, **roots) == expected
+
+    with lock.acquire(roots["workspace"].state_root, tmp_path):
+        pass

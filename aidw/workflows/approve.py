@@ -10,13 +10,18 @@ This extracts the approval step that ``aidw fix`` performs at its entry, so a hu
 apply the GitHub decision without starting the whole fix loop. The prompt itself is
 ``aidt/prompts/approve-review-followups.md``; all GitHub writes are performed by the
 bundled ``review_followup.py`` script the prompt invokes (design §13).
+
+The run lock (``aidw.lock``, EXTRACTION.md §3.2/§3.10) is keyed on ``repo.root``. Unlike
+``implement``/``fix`` this workflow resolves no worktree, so its key is the invocation
+worktree by design: two concurrent approvals started in the same tree refuse (exit 4,
+before any run state), while approvals started in different worktrees both proceed.
 """
 
 from __future__ import annotations
 
 import sys
 
-from aidw import git, github
+from aidw import git, github, lock
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
@@ -106,47 +111,118 @@ def run(
             return 2
         pr_info = view
 
-    state = create_run(
-        runs_root,
-        repo.root,
-        "approve",
-        label=f"pr-{pr}",
-        pr={
-            "number": pr,
-            **({"url": pr_info["url"]} if pr_info.get("url") else {}),
-        },
-        strict=strict,
-        branch=branch,
-    )
-    directory = run_dir(runs_root, state.run_id)
-    logger = RunLogger(directory, stream=stream)
-    print(f"run:    {state.run_id}")
-    print(f"pr:     #{pr}" + (f" {pr_info['url']}" if pr_info.get("url") else ""))
+    # --- one run per worktree (EXTRACTION.md §3.2/§3.10, E2.7) ---------------- #
+    # The key is the *resolved* worktree path -- ``repo.root``, the same value
+    # ``create_run`` records as ``repo_root`` -- never the branch: a detached-HEAD
+    # worktree has no branch, and §3.2 says "keyed by worktree path". Acquired
+    # immediately before ``create_run`` (the point where the key is final) and released
+    # on every exit path below, refusals and failures included, so the worktree cannot
+    # stay locked until process exit. It lives in the state root, never in a target
+    # repo or worktree (§3.1), and it is neither ``_STATE_LOCK`` (in-process, per
+    # ``state.json`` write) nor ``--parallel`` (concurrent stages inside one run).
+    # A dry run reaches ``create_run`` too, so it holds and releases the same lock.
+    try:
+        run_lock = lock.acquire(workspace.state_root, repo.root)
+    except lock.LockHeldError as exc:
+        print(str(exc), file=sys.stderr)
+        return 4
 
-    if dry_run:
-        if github.gh_available():
-            selection = github.select_followups(aidt.root, repo.root, pr)
-            payload = github.parse_json_output(selection.stdout) or {}
-            if selection.exit_code == github.EXIT_NONE_AVAILABLE:
-                print("child:  none available")
-            elif selection.exit_code == github.EXIT_OK:
-                selected = payload.get("selected") or {}
-                print(
-                    f"child:  #{selected.get('number')} {selected.get('title')} "
-                    f"({selected.get('priority')})"
-                )
-                print(
-                    f"children: {payload.get('childrenInspected')} inspected "
-                    f"of {payload.get('totalChildren')}"
-                )
+    try:
+        state = create_run(
+            runs_root,
+            repo.root,
+            "approve",
+            label=f"pr-{pr}",
+            pr={
+                "number": pr,
+                **({"url": pr_info["url"]} if pr_info.get("url") else {}),
+            },
+            strict=strict,
+            branch=branch,
+        )
+        directory = run_dir(runs_root, state.run_id)
+        logger = RunLogger(directory, stream=stream)
+        print(f"run:    {state.run_id}")
+        print(f"pr:     #{pr}" + (f" {pr_info['url']}" if pr_info.get("url") else ""))
+
+        if dry_run:
+            if github.gh_available():
+                selection = github.select_followups(aidt.root, repo.root, pr)
+                payload = github.parse_json_output(selection.stdout) or {}
+                if selection.exit_code == github.EXIT_NONE_AVAILABLE:
+                    print("child:  none available")
+                elif selection.exit_code == github.EXIT_OK:
+                    selected = payload.get("selected") or {}
+                    print(
+                        f"child:  #{selected.get('number')} {selected.get('title')} "
+                        f"({selected.get('priority')})"
+                    )
+                    print(
+                        f"children: {payload.get('childrenInspected')} inspected "
+                        f"of {payload.get('totalChildren')}"
+                    )
+                else:
+                    print(
+                        f"select failed (exit {selection.exit_code}): "
+                        f"{selection.stderr.strip()[:200]}",
+                        file=sys.stderr,
+                    )
             else:
-                print(
-                    f"select failed (exit {selection.exit_code}): "
-                    f"{selection.stderr.strip()[:200]}",
-                    file=sys.stderr,
-                )
-        else:
-            print("child:  unknown (`gh` not found)")
+                print("child:  unknown (`gh` not found)")
+            record = run_stage(
+                StageSpec(
+                    STAGE,
+                    AGENT,
+                    aidt.prompts_dir / PROMPT,
+                    [str(pr)],
+                    verify=lambda: github.verify_approvals(aidt.root, repo.root, pr),
+                ),
+                repo_root=repo.root,
+                toolkit_root=aidt.root,
+                runs_root=runs_root,
+                state=state,
+                logger=logger,
+                agents=agents,
+                dry_run=True,
+            )
+            print(
+                f"{record.name} [{record.status}] (planned) "
+                f"agent={record.agent} model={record.model}"
+            )
+            print(f"gate (planned): {GATE}")
+            state.status = SUCCEEDED
+            save(directory, state)
+            print("dry-run complete; Pi not invoked, no GitHub state written")
+            return 0
+
+        selection = github.select_followups(aidt.root, repo.root, pr)
+        outcome = decide(
+            GATE,
+            _selection_summary(selection),
+            approve_all=approve_all,
+            skip=skip,
+            deny=deny,
+            gate_default=gate_default,
+        )
+        state.record_gate(
+            GateRecord(
+                name=GATE,
+                decision=outcome.decision,
+                mechanism=outcome.mechanism,
+                at=utcnow_iso(),
+            )
+        )
+        save(directory, state)
+        print(f"gate:   {GATE} [{outcome.mechanism}]")
+        if not outcome.approved:
+            state.status = BLOCKED
+            save(directory, state)
+            print(
+                f"gate {GATE} denied ({outcome.mechanism}); stopping.",
+                file=sys.stderr,
+            )
+            return 3
+
         record = run_stage(
             StageSpec(
                 STAGE,
@@ -161,69 +237,17 @@ def run(
             state=state,
             logger=logger,
             agents=agents,
-            dry_run=True,
         )
-        print(
-            f"{record.name} [{record.status}] (planned) "
-            f"agent={record.agent} model={record.model}"
-        )
-        print(f"gate (planned): {GATE}")
+        print_stage(record, repo_root=repo.root)
+        if record.status != SUCCEEDED:
+            state.status = FAILED
+            save(directory, state)
+            print(f"stage {STAGE} failed: {record.error}", file=sys.stderr)
+            return 1
+
         state.status = SUCCEEDED
         save(directory, state)
-        print("dry-run complete; Pi not invoked, no GitHub state written")
+        print("approve-followups complete")
         return 0
-
-    selection = github.select_followups(aidt.root, repo.root, pr)
-    outcome = decide(
-        GATE,
-        _selection_summary(selection),
-        approve_all=approve_all,
-        skip=skip,
-        deny=deny,
-        gate_default=gate_default,
-    )
-    state.record_gate(
-        GateRecord(
-            name=GATE,
-            decision=outcome.decision,
-            mechanism=outcome.mechanism,
-            at=utcnow_iso(),
-        )
-    )
-    save(directory, state)
-    print(f"gate:   {GATE} [{outcome.mechanism}]")
-    if not outcome.approved:
-        state.status = BLOCKED
-        save(directory, state)
-        print(
-            f"gate {GATE} denied ({outcome.mechanism}); stopping.",
-            file=sys.stderr,
-        )
-        return 3
-
-    record = run_stage(
-        StageSpec(
-            STAGE,
-            AGENT,
-            aidt.prompts_dir / PROMPT,
-            [str(pr)],
-            verify=lambda: github.verify_approvals(aidt.root, repo.root, pr),
-        ),
-        repo_root=repo.root,
-        toolkit_root=aidt.root,
-        runs_root=runs_root,
-        state=state,
-        logger=logger,
-        agents=agents,
-    )
-    print_stage(record, repo_root=repo.root)
-    if record.status != SUCCEEDED:
-        state.status = FAILED
-        save(directory, state)
-        print(f"stage {STAGE} failed: {record.error}", file=sys.stderr)
-        return 1
-
-    state.status = SUCCEEDED
-    save(directory, state)
-    print("approve-followups complete")
-    return 0
+    finally:
+        run_lock.release()

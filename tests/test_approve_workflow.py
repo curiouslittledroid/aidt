@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 
-from aidw import git, github
+import pytest
+
+from aidw import git, github, lock
 from aidw.gates import GateOutcome
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import SUCCEEDED, StageRecord, run_dir
@@ -18,13 +21,39 @@ def _init_repo(path: Path) -> None:
     (path / "aidt").mkdir()
 
 
-def _roots(repo: Path) -> dict:
+def _git_run(directory: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=directory,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+
+def _make_bare_with_control(tmp_path: Path) -> Path:
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git_run(seed, "init", "-q", "-b", "main")
+    (seed / "f.txt").write_text("x\\n", encoding="utf-8")
+    _git_run(seed, "add", ".")
+    _git_run(seed, "commit", "-qm", "init")
+    bare = tmp_path / "bare.git"
+    _git_run(tmp_path, "clone", "--bare", "-q", str(seed), str(bare))
+    control = tmp_path / "main"
+    _git_run(bare, "worktree", "add", "-q", str(control), "main")
+    return control
+
+
+def _roots(repo: Path, *, state_dir: Path | None = None) -> dict:
     target = TargetRepo.resolve(repo)
     return {
         "repo": target,
         "aidt": ToolkitPaths.resolve(),
         "workspace": WorkspacePaths.resolve(
-            target, state_dir_override=repo.parent / f"{repo.name}-state"
+            target,
+            state_dir_override=state_dir or repo.parent / f"{repo.name}-state",
         ),
     }
 
@@ -174,3 +203,224 @@ def test_missing_pr_is_usage_error(tmp_path: Path, monkeypatch) -> None:
     code = approve_workflow.run(pr=7, **_roots(tmp_path))
 
     assert code == 2
+
+# --------------------------------------------------------------------------- #
+# One run per worktree (E2.7, EXTRACTION.md §3.2/§3.10)
+# --------------------------------------------------------------------------- #
+
+
+def _approved(monkeypatch) -> None:
+    monkeypatch.setattr(
+        approve_workflow,
+        "decide",
+        lambda *args, **kwargs: GateOutcome(approve_workflow.GATE, True, "--yes"),
+    )
+
+
+def test_a_held_repo_root_lock_is_refused_before_any_run_state(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """``approve`` resolves no worktree, so its key is the invocation worktree by design."""
+    _init_repo(tmp_path)
+    _patch(monkeypatch)
+    _approved(monkeypatch)
+    stages = _FakeStages()
+    monkeypatch.setattr(approve_workflow, "run_stage", stages)
+    roots = _roots(tmp_path)
+
+    with lock.acquire(roots["workspace"].state_root, tmp_path):
+        code = approve_workflow.run(pr=7, **roots, approve_all=True)
+
+    assert code == 4
+    assert stages.names == []
+    runs_root = _runs_root(tmp_path)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    err = capsys.readouterr().err
+    assert "another aidw run is already active" in err
+    assert str(tmp_path.resolve()) in err
+
+
+def test_two_concurrent_approve_runs_from_one_repo_root_are_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Same-cwd concurrent approvals refuse; only one run directory is created."""
+    _init_repo(tmp_path)
+    _patch(monkeypatch)
+    _approved(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+
+    class _BlockingStages(_FakeStages):
+        def __call__(self, spec, **kwargs):
+            entered.set()
+            assert release.wait(timeout=60), "the holder was never released"
+            return super().__call__(spec, **kwargs)
+
+    monkeypatch.setattr(approve_workflow, "run_stage", _BlockingStages())
+    roots = _roots(tmp_path)
+    outcome: dict = {}
+
+    def hold() -> None:
+        try:
+            outcome["code"] = approve_workflow.run(pr=7, **roots, approve_all=True)
+        except BaseException as exc:  # pragma: no cover - asserted via ``outcome``
+            outcome["error"] = exc
+
+    holder = threading.Thread(target=hold, name="aidw-approve-run")
+    holder.start()
+    assert entered.wait(timeout=60), "the holding run never reached a stage"
+
+    refused = approve_workflow.run(pr=7, **roots, approve_all=True)
+
+    release.set()
+    holder.join(timeout=60)
+    assert not holder.is_alive()
+    assert "error" not in outcome, outcome.get("error")
+
+    assert refused == 4
+    assert outcome["code"] == 0
+    assert len(list(_runs_root(tmp_path).iterdir())) == 1
+    assert "another aidw run is already active" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("scenario", ["success", "stage-failure", "gate-denied"])
+def test_the_lock_is_released_on_every_exit_path(
+    tmp_path: Path, monkeypatch, scenario: str
+) -> None:
+    _init_repo(tmp_path)
+    _patch(monkeypatch)
+    expected = {"success": 0, "stage-failure": 1, "gate-denied": 3}[scenario]
+    status = "failed" if scenario == "stage-failure" else SUCCEEDED
+    monkeypatch.setattr(approve_workflow, "run_stage", _FakeStages(status=status))
+    if scenario == "gate-denied":
+        monkeypatch.setattr(
+            approve_workflow,
+            "decide",
+            lambda *args, **kwargs: GateOutcome(approve_workflow.GATE, False, "human-denied"),
+        )
+    else:
+        _approved(monkeypatch)
+    roots = _roots(tmp_path)
+
+    assert approve_workflow.run(pr=7, **roots, approve_all=True) == expected
+
+    with lock.acquire(roots["workspace"].state_root, tmp_path):
+        pass
+
+def test_approvals_from_different_worktrees_both_proceed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Different invocation worktrees are different keys — by design, not a violation.
+
+    ``approve`` resolves no worktree, so its key is the worktree it was started in: two
+    approvals in the *same* tree refuse (above), two in different trees both proceed.
+    """
+    for name in ("first", "second"):
+        (tmp_path / name).mkdir()
+        _init_repo(tmp_path / name)
+    _patch(monkeypatch)
+    _approved(monkeypatch)
+    entered = {
+        (tmp_path / "first").resolve(): threading.Event(),
+        (tmp_path / "second").resolve(): threading.Event(),
+    }
+    release = threading.Event()
+
+    class _PerWorktreeStages(_FakeStages):
+        def __call__(self, spec, **kwargs):
+            entered.setdefault(kwargs["repo_root"], threading.Event()).set()
+            assert release.wait(timeout=60), "the runs were never released"
+            return super().__call__(spec, **kwargs)
+
+    monkeypatch.setattr(approve_workflow, "run_stage", _PerWorktreeStages())
+    roots = {name: _roots(tmp_path / name) for name in ("first", "second")}
+    outcomes: dict[str, dict] = {"first": {}, "second": {}}
+
+    def approve(name: str) -> None:
+        try:
+            outcomes[name]["code"] = approve_workflow.run(
+                pr=7, **roots[name], approve_all=True
+            )
+        except BaseException as exc:  # pragma: no cover - asserted via ``outcomes``
+            outcomes[name]["error"] = exc
+
+    threads = [
+        threading.Thread(target=approve, args=(name,), name=f"aidw-approve-{name}")
+        for name in ("first", "second")
+    ]
+    for thread in threads:
+        thread.start()
+    for path in entered:
+        assert entered[path].wait(timeout=60), f"{path} never reached a stage"
+    release.set()
+    for thread in threads:
+        thread.join(timeout=60)
+        assert not thread.is_alive()
+
+    assert outcomes["first"].get("code") == 0, outcomes["first"].get("error")
+    assert outcomes["second"].get("code") == 0, outcomes["second"].get("error")
+    for name in ("first", "second"):
+        assert len(list(_runs_root(tmp_path / name).iterdir())) == 1
+
+
+def test_approvals_in_different_worktrees_share_state_but_not_a_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The approve key is the invocation path, even in one bare-repo workspace."""
+    control = _make_bare_with_control(tmp_path)
+    first = git.add_worktree(control, "task-a")
+    second = git.add_worktree(control, "task-b")
+    assert first is not None and second is not None
+
+    _patch(monkeypatch)
+    _approved(monkeypatch)
+    shared_state = tmp_path / "shared-state"
+    roots = {
+        name: _roots(path, state_dir=shared_state)
+        for name, path in (("first", first), ("second", second))
+    }
+    assert roots["first"]["workspace"].state_root == roots["second"]["workspace"].state_root
+
+    entered = {first: threading.Event(), second: threading.Event()}
+    release = threading.Event()
+
+    class _PerWorktreeStages(_FakeStages):
+        def __call__(self, spec, **kwargs):
+            entered[kwargs["repo_root"]].set()
+            assert release.wait(timeout=60), "the runs were never released"
+            return super().__call__(spec, **kwargs)
+
+    monkeypatch.setattr(approve_workflow, "run_stage", _PerWorktreeStages())
+    outcomes: dict[str, dict] = {"first": {}, "second": {}}
+
+    def approve(name: str) -> None:
+        try:
+            pr = 7 if name == "first" else 8
+            outcomes[name]["code"] = approve_workflow.run(
+                pr=pr, **roots[name], approve_all=True
+            )
+        except BaseException as exc:  # pragma: no cover - asserted via outcomes
+            outcomes[name]["error"] = exc
+
+    threads = [
+        threading.Thread(target=approve, args=(name,), name=f"aidw-approve-{name}")
+        for name in ("first", "second")
+    ]
+    for thread in threads:
+        thread.start()
+    for path in entered:
+        assert entered[path].wait(timeout=60), f"{path} never reached a stage"
+    release.set()
+    for thread in threads:
+        thread.join(timeout=60)
+        assert not thread.is_alive()
+
+    assert outcomes["first"].get("code") == 0, outcomes["first"].get("error")
+    assert outcomes["second"].get("code") == 0, outcomes["second"].get("error")
+    # Both calls entered their stage while the other was still live, proving that
+    # separate invocation paths acquire separate mutexes in the same state root.
+    lock_files = {
+        path.name for path in (roots["first"]["workspace"].state_root / "locks").iterdir()
+    }
+    assert lock_files == {lock.lock_filename(first), lock.lock_filename(second)}
+    runs = list(roots["first"]["workspace"].state_root.joinpath("runs").iterdir())
+    assert len(runs) == 2
