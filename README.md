@@ -284,6 +284,22 @@ gate the chain approves for you: `approve-implementation-pr` and `approve-fix-pr
 their normal `--yes`/interactive behaviour, and `--deny-gates approve-followups` refuses
 the auto-approval (deny wins over skip), so the fix loop stops at the gate instead.
 
+An `Approve` review that publishes no findings ends the chain there, with exit code 0:
+
+```text
+verdict: Approve
+review approved with no findings; nothing to publish
+chain:  review published no follow-ups for PR #72; nothing for the fix loop to approve or fix.
+chain complete.
+```
+
+There is no review-follow-up parent issue in that case, so the fix loop would have nothing
+to approve or fix — and running it would fail its entry postcondition. `review` records the
+outcome in its run state (`pr.followups_published`), and the chain reads it: follow-ups
+published by an earlier round of the same PR keep the loop, and if no record is readable
+(a `--dry-run`, or a state root the chain did not write) the chain runs `fix` as before.
+`aidw fix --pr <n>` on its own is unchanged and still fails closed.
+
 ### Roadmap inspection
 
 ```bash

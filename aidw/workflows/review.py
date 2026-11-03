@@ -12,6 +12,10 @@ Publishing is deliberately **ungated**: the human decision happens on GitHub bef
 ``aidw fix`` runs (design §6, E2). A ``Blocked`` verdict, an ambiguous verdict, or a
 finding that cannot be parsed into a manifest stops the workflow before publication.
 
+The run state records ``pr.followups_published`` on both successful exits (decision I2),
+so ``aidw run prompt-to-fix`` can end the chain after an approving review that published
+nothing — there is no review-follow-up parent issue for the fix loop to work on.
+
 The run lock (``aidw.lock``, EXTRACTION.md §3.2/§3.10) is keyed on ``repo.root``, acquired
 immediately before ``create_run`` and released on every exit path. The preflight's
 current-branch-equals-PR-head refusal is what makes ``repo.root`` reliably the task
@@ -45,6 +49,15 @@ from aidw.workflows.implement import worktree_add_command
 
 R1 = "code-review"
 R2 = "review-findings-to-github"
+
+#: ``state.pr`` key recording whether this review published follow-ups (decision I2).
+#: Both successful exits write it — ``True`` after R2 published a parent issue, ``False``
+#: for an approving review with nothing to publish — so ``aidw run`` can tell the two
+#: apart by re-reading the state it just wrote instead of asking GitHub again. The chain
+#: uses it to end gracefully instead of starting a fix loop for a PR that has no
+#: review-follow-up parent issue; the failed and blocked exits never write it, because a
+#: non-zero exit already stops the chain.
+PR_FOLLOWUPS = "followups_published"
 
 
 def _read_out(record) -> str | None:
@@ -315,6 +328,7 @@ def run(
                 return 3
             state.status = SUCCEEDED
             state.pr["verdict"] = verdict
+            state.pr[PR_FOLLOWUPS] = False
             save(directory, state)
             print("review approved with no findings; nothing to publish")
             return 0
@@ -364,6 +378,7 @@ def run(
         state.pr.update(
             {
                 "verdict": verdict,
+                PR_FOLLOWUPS: True,
                 "parent_issue": published["parent_issue"],
                 "child_issues": published["child_issues"],
                 "summary_comment": published["summary_comment"],

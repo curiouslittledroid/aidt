@@ -453,3 +453,164 @@ def test_prompt_to_fix_dry_run_uses_a_placeholder_pr(tmp_path: Path, monkeypatch
     )
     assert code == 0
     assert reviewed == [0]
+
+
+# --------------------------------------------------------------------------- #
+# Graceful end when an approving review published nothing (decision I2)
+# --------------------------------------------------------------------------- #
+
+
+def _record_review(
+    workspace: WorkspacePaths,
+    repo: Path,
+    *,
+    pr: int,
+    published: bool | None,
+    label: str | None = None,
+) -> None:
+    """Write a ``review`` run state, optionally carrying the I2 marker.
+
+    ``published=None`` writes a state without ``pr.followups_published``, which is what
+    ``review --dry-run`` and pre-I2 records look like.
+    """
+    runs_root = workspace.state_root / "runs"
+    pr_record: dict = {"number": pr}
+    if published is not None:
+        pr_record[run_workflow.PR_FOLLOWUPS] = published
+    created = state_mod.create_run(
+        runs_root,
+        repo,
+        "review",
+        label=label or f"pr-{pr}-review",
+        pr=pr_record,
+    )
+    state_mod.save(runs_root / created.run_id, created)
+
+
+def _fake_review(published: bool | None, *, order: list[str] | None = None):
+    """A ``review_workflow.run`` stand-in that records its outcome like the real one."""
+
+    def run(**kwargs) -> int:
+        if order is not None:
+            order.append("review")
+        _record_review(
+            kwargs["workspace"],
+            kwargs["repo"].root,
+            pr=kwargs["pr"],
+            published=published,
+        )
+        return 0
+
+    return run
+
+
+def test_review_published_followups_reads_every_review_run_for_the_pr(
+    tmp_path: Path,
+) -> None:
+    """``False`` only when no review of this PR ever published follow-ups (I2)."""
+    _init_repo(tmp_path)
+    _repo, _aidt, workspace = _roots(tmp_path)
+    runs_root = workspace.state_root / "runs"
+
+    assert run_workflow.review_published_followups(runs_root, 7) is None
+
+    # A record without the marker (a dry run, or a pre-I2 state) is not evidence.
+    _record_review(workspace, tmp_path, pr=7, published=None, label="pr-7-dry-run")
+    assert run_workflow.review_published_followups(runs_root, 7) is None
+
+    _record_review(workspace, tmp_path, pr=7, published=False, label="pr-7-a")
+    assert run_workflow.review_published_followups(runs_root, 7) is False
+
+    # Another PR's review says nothing about this one.
+    _record_review(workspace, tmp_path, pr=8, published=True, label="pr-8")
+    assert run_workflow.review_published_followups(runs_root, 7) is False
+
+    # An earlier round's follow-ups outlive a later "nothing to publish" review.
+    _record_review(workspace, tmp_path, pr=7, published=True, label="pr-7-b")
+    assert run_workflow.review_published_followups(runs_root, 7) is True
+
+
+def test_review_and_fix_ends_when_the_review_published_nothing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The fix loop has nothing to approve, so it must not be started at all."""
+    _init_repo(tmp_path)
+    monkeypatch.setattr(run_workflow.review_workflow, "run", _fake_review(False))
+    called: list[dict] = []
+    monkeypatch.setattr(
+        run_workflow.fix_workflow, "run", lambda **kwargs: called.append(kwargs) or 0
+    )
+    repo, aidt, workspace = _roots(tmp_path)
+
+    code = run_workflow.review_and_fix(pr=7, repo=repo, aidt=aidt, workspace=workspace)
+
+    assert code == 0
+    assert called == []
+
+
+def test_prompt_to_fix_ends_after_review_when_nothing_was_published(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Decision I2: an approving review that published nothing completes the chain.
+
+    The trigger: an ``Approve`` review publishes no follow-ups, so the PR has no
+    review-follow-up parent issue and `fix`'s entry stage failed closed with
+    ``could not read approval state (approve --dry-run exit 2): No review-follow-up
+    parent issue found``. The chain must end there, gracefully, and not auto-approve a
+    gate for a stage it never runs.
+    """
+    control, _worktree, _prompt = _chain_layout(tmp_path)
+    order: list[str] = []
+    monkeypatch.setattr(
+        run_workflow.prompt_workflow, "run", lambda **kwargs: order.append("prompt") or 0
+    )
+    monkeypatch.setattr(
+        run_workflow.implement_workflow,
+        "run",
+        lambda **kwargs: order.append("implement") or 0,
+    )
+    monkeypatch.setattr(
+        run_workflow.review_workflow, "run", _fake_review(False, order=order)
+    )
+    called: list[dict] = []
+    monkeypatch.setattr(
+        run_workflow.fix_workflow, "run", lambda **kwargs: called.append(kwargs) or 0
+    )
+    repo, aidt, workspace = _roots(control)
+    _record_pr(workspace, control, branch="03-E4.1", number=42)
+
+    code = run_workflow.prompt_to_fix(
+        phase="03", epic="E4", task="E4.1", repo=repo, aidt=aidt, workspace=workspace
+    )
+
+    assert code == 0
+    assert order == ["prompt", "implement", "review"]
+    assert called == []
+    out = capsys.readouterr().out
+    assert "review published no follow-ups for PR #42" in out
+    assert "chain complete." in out
+    assert f"auto-approving `{run_workflow.GATE_FOLLOWUPS}`" not in out
+
+
+def test_prompt_to_fix_still_runs_fix_when_followups_were_published(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A review that published follow-ups keeps the whole cycle (decision I2)."""
+    control, _worktree, _prompt = _chain_layout(tmp_path)
+    monkeypatch.setattr(run_workflow.prompt_workflow, "run", lambda **kwargs: 0)
+    monkeypatch.setattr(run_workflow.implement_workflow, "run", lambda **kwargs: 0)
+    monkeypatch.setattr(run_workflow.review_workflow, "run", _fake_review(True))
+    fixed: dict = {}
+    monkeypatch.setattr(
+        run_workflow.fix_workflow, "run", lambda **kwargs: fixed.update(kwargs) or 0
+    )
+    repo, aidt, workspace = _roots(control)
+    _record_pr(workspace, control, branch="03-E4.1", number=42)
+
+    code = run_workflow.prompt_to_fix(
+        phase="03", epic="E4", task="E4.1", repo=repo, aidt=aidt, workspace=workspace
+    )
+
+    assert code == 0
+    assert fixed["pr"] == 42
+    assert fixed["skip_gates"] == [run_workflow.GATE_FOLLOWUPS]

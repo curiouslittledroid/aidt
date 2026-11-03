@@ -532,6 +532,11 @@ preflight (PR exists, targets main, the PR head's worktree is located)
   so `R2` does not depend on session memory.
 - `R2` receives `$1=<pr>`; it invokes the bundled `publish_review_followups.py` with the manifest.
 - Output artifacts: `review_verdict`, `findings` (or none), `parent_issue`, `child_issues`.
+- Both successful exits write `pr.followups_published` into the run state — `true` after
+  `R2` published a parent issue, `false` for an approving review with nothing to publish —
+  so the §8.6 chain can tell them apart by re-reading the state it just wrote instead of
+  asking GitHub a second time (decision I2). The failed and blocked exits write nothing;
+  a non-zero exit already stops the chain.
 
 ### 8.4 `aidw fix --pr <n>`
 
@@ -594,6 +599,19 @@ it (`chain:  auto-approving \`approve-followups\` …`, decision I1). That is th
 auto-approves: `approve-implementation-pr` and `approve-fix-pr` keep normal
 `--yes`/`--gate-default`/interactive semantics, and `--deny-gates approve-followups` still
 refuses the auto-approval because `deny` is checked before `skip` in §6.
+
+A chain whose review published **nothing** ends gracefully (exit 0) after that review
+instead of running the fix loop into its entry postcondition (decision I2): with no
+review-follow-up parent issue there is nothing for `approve-followups` to approve and
+nothing for the fixer to fix, and `fix`'s entry stage fails closed with
+`could not read approval state (approve --dry-run exit 2): … No review-follow-up parent
+issue found`. After `review` succeeds, the chain reads `pr.followups_published` over every
+`review` run of that PR: any `true` keeps the loop (an earlier round's follow-ups outlive a
+later "nothing to publish" review), only `false` ends the chain with
+`chain:  review published no follow-ups …` / `chain complete.`, and an unreadable or absent
+record keeps the pre-I2 behaviour of running `fix`. Ending early also means the
+`approve-followups` auto-approval is never announced or recorded for a stage that does not
+run. `aidw fix` invoked directly is unchanged.
 
 ---
 
@@ -981,6 +999,7 @@ Exit codes: `0` success/approved, `1` stage or gate failure, `2` usage/config er
 | J1 | `aidw doctor` enforces `PI_MIN_VERSION = 0.85.0` and `FAIL`s below it, instead of reporting whatever `pi --version` prints. AIDW's Pi argv is verified against 0.85.x (§5.5), and below that floor a stage dies inside extension load *before* its first model call — `@earendil-works/pi-ai/compat` is a 0.85 addition, so a stale `pi` shadowed by an old `nvm` bin dir answers `--version` and then exits 1, which reaches the run record only as `exit code 1` with zero tokens, zero events and an empty stage JSONL. The finding names the floor, the offending path and `which -a pi`. (§12; `aidw/doctor.py`) |
 | K1 | `aidw review` resolves the **PR-head worktree** instead of comparing the invoking worktree's checked-out branch to the PR head (supersedes the pre-E2.6 "current branch is the PR head" preflight, which §8.3 now states as "the PR head's worktree is located"). `gh pr view` supplies base and head; `git.worktree_for_branch` locates the head's worktree, and `TargetRepo.resolve` re-resolves the target and agent cwds against it, so stages, `github.*` reads, the run lock and `state.json`'s `repo_root` all use the task worktree — mirroring `implement` (§8.2) and `fix` (§8.4). The invoking branch is never read. A known head with no local worktree refuses (exit 4) with the copy-pasteable §3.2 `git worktree add` command and writes no run state; under `--dry-run` the command is planned output and the plan falls back to the invoking worktree, so a dry run still plans without a worktree. `pr_view` now runs under `--dry-run` too, so the head resolves in both modes (§8.4's E2.6 req 6 precedent). Why: since E2.6 the task branch lives in a sibling worktree, so the control root a chain/operator invokes `review` from is on `main`; the old equality test could never pass, and `aidw run prompt-to-fix` stopped with ``chain stopped: `review` exited 4`` on the review stage of every worktree run. A single checkout is a worktree whose branch *is* the PR head, so it locates itself and behaves exactly as before. Review remains branch-blind about *which* worktree invoked it, which also makes the E2.7 run lock key the task worktree rather than the control root. (design §§8.3, 8.6, 14; `aidw/workflows/review.py`) |
 | I1 | `aidw run prompt-to-fix <phase> <epic> <task> [--pr <n>]` is the whole cycle — `prompt` → `implement` → `review` → `approve-followups` → `fix` — composed from the four existing orchestrators, so each keeps its own preflight, gates, state and resumability and the chain stops at the first non-zero exit. The PR number is read from the newest `implement` run's recorded `pr.number` (`--pr <n>` overrides it; `0` is the `--dry-run` placeholder, since a dry run opens no PR) instead of a new `gh` query. The chain auto-approves exactly one gate: it adds `approve-followups` to the `fix` stage's skip set and prints the mechanism. `approve-implementation-pr` and `approve-fix-pr` keep their normal `--yes`/`--gate-default`/interactive semantics, and `--deny-gates approve-followups` still refuses the auto-approval (`deny` is checked before `skip`, §6). `aidw run` also gains `--skip-gates` and `--force-model` for every chain. (design §8.6; §14 CLI reference; `aidw/workflows/run.py`) |
+| I2 | A `prompt-to-fix`/`review-and-fix` chain whose review published **no follow-ups** ends gracefully (exit 0) instead of running the fix loop into its entry postcondition. Trigger: an `Approve` review printed `review approved with no findings; nothing to publish`, the chain still auto-approved `approve-followups`, and `round1-approve-review-followups` failed with `postcondition not met: could not read approval state (approve --dry-run exit 2): error: No review-follow-up parent issue found for <pr-url>` — a red run for a review that had approved. `review` now records `pr.followups_published` (`true`/`false`) in its run state on both successful exits, and the chain re-reads that state instead of adding a second GitHub query (the same trade-off `find_pr_number` makes for the PR number). It skips `fix` only when **no** review run of that PR ever recorded `true`: an earlier round's published follow-ups outlive a later "nothing to publish" review and keep the loop, and an absent record (`--dry-run`, a state root this chain did not write) keeps the pre-I2 behaviour. Skipping `fix` also skips its gate, so nothing is auto-approved or recorded for a stage that never runs. `aidw fix --pr <n>` invoked directly is unchanged and still fails closed. (design §§8.3, 8.6; `aidw/workflows/run.py`, `aidw/workflows/review.py`) |
 
 ---
 
