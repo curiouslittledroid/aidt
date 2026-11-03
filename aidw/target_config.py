@@ -5,12 +5,24 @@ else. It is deliberately separate from :mod:`aidw.config`, which means **agent**
 (``agent-configs/*.yaml``, design §5, :func:`aidw.config.load_agent`); overloading that
 module with a second, unrelated schema would put two loaders behind one name.
 
-The dataclasses below are the normative §3.4 field names (fixed in task E3.1). What this
-module does *not* do, by design:
+The dataclasses below are the normative §3.4 field names (fixed in task E3.1).
 
-- It does not merge toolkit defaults into a config or record per-value provenance — that
-  is E3.2. A field that is absent stays ``None``/empty, so a near-empty config is not
-  inflated with Mythical Forge's layout values (E3.4 owns those defaults).
+Layered resolution is task E3.2: :func:`resolve_config` merges the toolkit defaults
+(:data:`TOOLKIT_DEFAULTS`) under a declared :class:`TargetConfig` and under per-invocation
+:class:`ConfigOverrides`, and records the ``source`` of every resolved value
+(``default`` | ``config`` | ``override``). The result is a flat, dotted-path
+:class:`ResolvedConfig` — ``max_revisions``, ``repo.base_branch``, ``paths.roadmap_dir``,
+``github.labels.<name>.color``, ``workflows.<name>.stages`` and so on — so ``aidw config
+show`` (EXTRACTION.md §3.3) and every later consumer share one addressing contract.
+
+The loader itself stays deliberately dumb, because resolution must never hide a broken
+config:
+
+- It does not inject defaults; a field that is absent stays ``None``/empty. Only
+  :func:`resolve_config` merges, so a near-empty config is never re-serialised inflated,
+  and a loader caller still sees what was actually declared (E3.1's round-trip). Default
+  *values* beyond ``max_revisions`` are E3.4/E6/E4.1's; the defaults structure carries the
+  empty slots so those tasks add values without touching the merge.
 - It does not compare or refuse ``schema_version``/``requires_toolkit`` — that is E3.3.
   The fields are loaded and type-checked; their values are not interpreted here.
 - It does not touch the filesystem beyond reading the one config file. ``paths:`` values
@@ -29,7 +41,7 @@ the config path (E3.2/E3.5); this loader takes the file path.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -675,3 +687,309 @@ def load_target_config(path: Path) -> TargetConfig:
         return TargetConfig(source_path=path, issues=issues)
 
     return _parse_target_config(dict(raw), source, path, issues)
+
+
+# --------------------------------------------------------------------------- #
+# Layered resolution with provenance (E3.2, EXTRACTION.md §3.3/§3.4, design §12)
+# --------------------------------------------------------------------------- #
+
+#: The revision budget's toolkit default (design §12/H8: "the toolkit default stays 3").
+#: This module is its single home. §12's "lives in ``aidw/workflows/prompt.py``" wording
+#: describes the pre-E3.1 interim state; keeping the definition there would force this
+#: low-level loader to import a workflow module, and with ``prompt.py`` importing the
+#: resolver back, that is a ``target_config -> workflows.prompt -> target_config`` cycle
+#: that breaks ``aidw.cli`` at import time.
+DEFAULT_MAX_REVISIONS = 3
+
+#: Provenance labels (EXTRACTION.md §3.3: "with the provenance of each value"; the
+#: roadmap's "default, the config file, or an override"). Deliberately the only three: a
+#: field with neither a default nor a declared value is *unset*, encoded as
+#: ``ResolvedValue(value=None, source=None)`` — there is no fourth label.
+SOURCE_DEFAULT = "default"
+SOURCE_CONFIG = "config"
+SOURCE_OVERRIDE = "override"
+
+#: Every label a resolved value can carry. ``source is None`` (unset) is the fourth state
+#: and deliberately not in here, so ``source in SOURCES`` is the "a value resolved" test.
+SOURCES = (SOURCE_DEFAULT, SOURCE_CONFIG, SOURCE_OVERRIDE)
+
+
+@dataclass(frozen=True)
+class ResolvedValue:
+    """One resolved §3.4 leaf: its value plus where that value came from.
+
+    ``source is None`` is the *unset* state (value ``None`` too): the config did not
+    declare the field and no default exists for it — E3.4 is what later flips the
+    ``paths:``/``repo:`` leaves from *unset* to ``default``. ``aidw config show`` renders
+    that state as ``unset`` and omits the ``source`` key in its JSON.
+    """
+
+    value: Any = None
+    source: str | None = None
+
+    @property
+    def is_set(self) -> bool:
+        """True when a value resolved (one of the three labels applies)."""
+        return self.source is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        """``{"value": ..., "source": ...}``, or ``{"value": None}`` when unset."""
+        if self.source is None:
+            return {"value": None}
+        return {"value": self.value, "source": self.source}
+
+
+@dataclass(frozen=True)
+class ResolvedConfig(Mapping[str, ResolvedValue]):
+    """The merged config as a flat ``dotted path -> ResolvedValue`` mapping.
+
+    Flat and dotted on purpose: ``schema_version``, ``max_revisions``,
+    ``repo.base_branch``, the six ``paths.<field>`` leaves,
+    ``github.markers.<name>``, ``github.labels.<name>.{color,description}``, and one
+    whole-list entry per declared ``workflows.<name>.{stages,parallel_groups}``.
+    Mirroring §3.4's YAML nesting would hand E3.4/E4.1/E6 a second addressing scheme, and
+    lists carry provenance only at their own path: the elements are copy-through, never
+    merged element-wise, so a repo's stage list replaces the default list rather than
+    being interleaved with it.
+    """
+
+    entries: Mapping[str, ResolvedValue] = field(default_factory=dict)
+
+    def __getitem__(self, path: str) -> ResolvedValue:
+        return self.entries[path]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.entries)
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def to_dict(self) -> dict[str, dict[str, Any]]:
+        """The ``aidw config show`` / JSON dump: one flat ``path -> {value, source}``."""
+        return {path: entry.to_dict() for path, entry in self.entries.items()}
+
+
+@dataclass(frozen=True)
+class ConfigOverrides:
+    """Per-invocation overrides, which beat both the config file and the defaults.
+
+    ``max_revisions`` is the only config value a CLI flag overrides today
+    (``aidw prompt --max-revisions``, design §12/H8), and ``aidw config show``
+    deliberately takes no override flag, so this surface is the one place
+    ``source == "override"`` can arise. A broader surface belongs to a later task.
+    """
+
+    max_revisions: int | None = None
+
+
+@dataclass(frozen=True)
+class ConfigDefaults:
+    """Toolkit defaults merged *below* a target repo's declared config (§3.4, D17).
+
+    Seeded with **only** ``max_revisions`` (design §12/H8). ``repo``/``paths``/``github``/
+    ``workflows`` are present but empty: an empty slot resolves *unset* rather than
+    inventing a Mythical-Forge value, because those defaults are E3.4's, E6's and E4.1's
+    to own — seeding ``repo.base_branch`` here would also put a second source of truth
+    next to ``aidw.paths.TargetRepo.base_branch``. A later task adds values by populating
+    a slot; :func:`resolve_config` already walks the slots, so the merge does not change.
+    ``schema_version`` is left empty on purpose: it is required *in* a config file, and
+    interpreting it is E3.3's, so a repo with no config file has no resolved version.
+    """
+
+    schema_version: int | None = None
+    requires_toolkit: str | None = None
+    max_revisions: int | None = DEFAULT_MAX_REVISIONS
+    repo: RepoConfig = field(default_factory=RepoConfig)
+    paths: PathsConfig = field(default_factory=PathsConfig)
+    # ``markers`` is materialised (not ``None``) so the merge can read its slots; every
+    # field is still ``None``, so markers stay unset until E6 seeds the frozen D5 values.
+    github: GitHubConfig = field(default_factory=lambda: GitHubConfig(markers=MarkersConfig()))
+    workflows: Mapping[str, WorkflowConfig] = field(default_factory=dict)
+
+
+#: The toolkit's defaults, resolved once at import; immutable and never mutated.
+TOOLKIT_DEFAULTS = ConfigDefaults()
+
+
+def _override_values(overrides: ConfigOverrides | None) -> dict[str, Any]:
+    """The dotted-path override map for this invocation (empty when nothing overrides)."""
+    if overrides is None:
+        return {}
+    values: dict[str, Any] = {}
+    if overrides.max_revisions is not None:
+        values["max_revisions"] = overrides.max_revisions
+    return values
+
+
+class _Merge:
+    """Accumulates ``path -> ResolvedValue`` for the three-source precedence walk."""
+
+    def __init__(self, overrides: Mapping[str, Any]) -> None:
+        self._overrides = overrides
+        self.entries: dict[str, ResolvedValue] = {}
+
+    def leaf(
+        self,
+        path: str,
+        *,
+        declared_value: Any,
+        default_value: Any,
+        declared: bool | None = None,
+    ) -> None:
+        """Record one leaf: ``override`` > ``config`` > ``default`` > *unset*.
+
+        ``declared`` is passed explicitly for containers, where an explicitly empty list
+        (``stages: []``) must still count as the config declaring the value; elsewhere it
+        defaults to "the loader produced a non-``None`` value", which is declared-ness and
+        not value equality — an explicit ``max_revisions: 3`` stays ``config``.
+        """
+        if path in self._overrides:
+            self.entries[path] = ResolvedValue(self._overrides[path], SOURCE_OVERRIDE)
+            return
+        if declared is None:
+            declared = declared_value is not None
+        if declared:
+            self.entries[path] = ResolvedValue(declared_value, SOURCE_CONFIG)
+        elif default_value is not None:
+            self.entries[path] = ResolvedValue(default_value, SOURCE_DEFAULT)
+        else:
+            self.entries[path] = ResolvedValue()
+
+
+def _workflow_value(workflow: WorkflowConfig, key: str) -> list[Any]:
+    """One workflow list as plain data: stage dicts, copied ``parallel_groups``.
+
+    Fresh containers on every call, so a resolved value never aliases the declared config
+    (or a global default) and mutating a result cannot corrupt a later resolution.
+    """
+    if key == "stages":
+        return [stage.to_dict() for stage in workflow.stages]
+    return [list(group) for group in workflow.parallel_groups]
+
+
+def resolve_config(
+    declared: TargetConfig, *, overrides: ConfigOverrides | None = None
+) -> ResolvedConfig:
+    """Merge toolkit defaults under ``declared``, recording each value's source (§3.4).
+
+    Precedence, highest first: an :class:`ConfigOverrides` value > a value the config file
+    declared > :data:`TOOLKIT_DEFAULTS` > *unset* (``value is None`` and ``source is
+    None``). ``source`` is exactly ``override``/``config``/``default``; there is no
+    fourth label.
+
+    Declared-ness, never value equality, decides ``config``: a config that explicitly sets
+    ``max_revisions: 3`` resolves with ``source == "config"`` even though the default is
+    also 3, which is what the loader's ``_declared`` bookkeeping exists for.
+
+    Pure: the input (including its nested dataclasses) is never mutated, no I/O happens,
+    and every container in the result is freshly built. Callers refuse a config carrying
+    ``ERROR`` issues *before* resolving — the merge does not re-validate, and resolving a
+    broken config would be exactly the silent-partial-state fallback §3.4 forbids.
+    """
+    merge = _Merge(_override_values(overrides))
+    defaults = TOOLKIT_DEFAULTS
+
+    merge.leaf(
+        "schema_version",
+        declared_value=declared.schema_version,
+        default_value=defaults.schema_version,
+    )
+    merge.leaf(
+        "requires_toolkit",
+        declared_value=declared.requires_toolkit,
+        default_value=defaults.requires_toolkit,
+    )
+    merge.leaf(
+        "max_revisions",
+        declared_value=declared.max_revisions,
+        default_value=defaults.max_revisions,
+    )
+
+    for name in REPO_FIELDS:
+        merge.leaf(
+            f"repo.{name}",
+            declared_value=(
+                getattr(declared.repo, name) if declared.repo is not None else None
+            ),
+            default_value=getattr(defaults.repo, name),
+        )
+
+    for name in PATH_FIELDS:
+        merge.leaf(
+            f"paths.{name}",
+            declared_value=(
+                getattr(declared.paths, name) if declared.paths is not None else None
+            ),
+            default_value=getattr(defaults.paths, name),
+        )
+
+    declared_markers = (
+        declared.github.markers if declared.github is not None else None
+    )
+    for name in MARKER_FIELDS:
+        merge.leaf(
+            f"github.markers.{name}",
+            declared_value=(
+                getattr(declared_markers, name)
+                if declared_markers is not None
+                else None
+            ),
+            default_value=getattr(defaults.github.markers, name),
+        )
+
+    # Open maps contribute an entry only for a key that exists on either side: the config
+    # file's declared labels, plus (once E6 seeds them) the toolkit's default labels.
+    declared_labels = declared.github.labels if declared.github is not None else {}
+    for name in sorted(set(declared_labels) | set(defaults.github.labels)):
+        declared_label = declared_labels.get(name)
+        default_label = defaults.github.labels.get(name)
+        for key in LABEL_KEYS:
+            merge.leaf(
+                f"github.labels.{name}.{key}",
+                declared_value=(
+                    getattr(declared_label, key)
+                    if declared_label is not None
+                    else None
+                ),
+                default_value=(
+                    getattr(default_label, key) if default_label is not None else None
+                ),
+            )
+
+    # Same rule for workflows: a repo-added workflow (D12) contributes its own entries and
+    # a workload name seeded by E4.1 would resolve ``default`` until the repo declares it.
+    for name in sorted(set(declared.workflows) | set(defaults.workflows)):
+        declared_workflow = declared.workflows.get(name)
+        default_workflow = defaults.workflows.get(name)
+        for key in WORKFLOW_KEYS:
+            declared_value = (
+                _workflow_value(declared_workflow, key)
+                if declared_workflow is not None
+                else None
+            )
+            default_value = (
+                _workflow_value(default_workflow, key)
+                if default_workflow is not None
+                else None
+            )
+            # A workflow built in code (not via the loader) carries no ``_declared``
+            # keys, so a non-empty list is the declared-ness signal there too. The
+            # ``_declared`` check is what keeps an explicit ``stages: []`` from looking
+            # absent on the round-trip path.
+            declared = declared_workflow is not None and (
+                key in declared_workflow._declared or bool(declared_value)
+            )
+            if not declared and default_value is None:
+                # Open maps contribute entries only for keys that exist: a workflow's
+                # undeclared sibling list is *absent*, not an ``unset`` entry. Otherwise
+                # every declared workflow would drag in a phantom
+                # ``<name>.parallel_groups`` line.
+                continue
+            merge.leaf(
+                f"workflows.{name}.{key}",
+                declared_value=declared_value,
+                default_value=default_value,
+                declared=declared,
+            )
+
+    return ResolvedConfig(merge.entries)

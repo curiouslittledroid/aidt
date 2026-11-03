@@ -228,7 +228,7 @@
   - Deliverable: loader + schema + round-trip tests.
   - Done when: valid configs load; unknown keys, wrong types and bad enum values fail with the offending path in the message.
 
-- [ ] **E3.2. Layered resolution with provenance**
+- [x] **E3.2. Layered resolution with provenance**
   Merge toolkit defaults → target config, recording the source of every resolved value.
   - Deliverable: a resolution API returning values plus provenance.
   - Done when: `aidw config show` reports, per value, whether it came from a default, the config file, or an override.

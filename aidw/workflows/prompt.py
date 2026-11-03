@@ -51,6 +51,11 @@ refusal is exit 4, both before any stage or run state (EXTRACTION.md §3.2/§3.4
 A ``--dry-run`` plans the stages without those preconditions, reports the incomplete
 predecessors and the planned ``worktree add``, and never touches the network or creates a
 worktree.
+Before any of that — and regardless of ``--dry-run`` — the target repo's
+``<target>/aidw/config.yaml`` is loaded and resolved (E3.2): its ``max_revisions`` is the
+budget under the CLI flag, and a config carrying validation ERRORs refuses with
+``format_issues`` on stderr and exit 2 rather than silently resolving to
+``DEFAULT_MAX_REVISIONS`` (design §12, H8; EXTRACTION.md §3.4).
 When the author's first output line is ``blocked: <reason>`` the run ends ``blocked``
 (exit 3) with the reason in the run log and on stderr; the created task worktree and any
 uncommitted change under ``docs/task-prompts/`` in it are reported, never repaired
@@ -91,6 +96,15 @@ from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
 from aidw.roadmap import DONE_RE, TASK_RE, RoadmapTask, find_task, load_tasks
 from aidw.runner import StageSpec, run_stage
+# ``DEFAULT_MAX_REVISIONS`` lives in ``aidw.target_config``, its single home (design
+# §12/H8). The direction must not be reversed: ``target_config`` is the low-level config
+# module, and importing this workflow module from it would be an import cycle.
+from aidw.target_config import (
+    DEFAULT_MAX_REVISIONS,
+    ConfigOverrides,
+    load_target_config,
+    resolve_config,
+)
 from aidw.state import (
     BLOCKED,
     FAILED,
@@ -114,17 +128,17 @@ REMOTE = "origin"
 #: Exit code for a preflight/safety refusal (design §14).
 EXIT_REFUSED = 4
 
-#: Default review-round budget, and the number of revision slots (design §12).
-#: ``max_revisions`` (CLI ``--max-revisions``, default 3); ``max_revisions - 1`` fix batches
+#: The revision budget, and the number of revision slots (design §12).
+#: ``max_revisions`` (CLI ``--max-revisions``, default 3): ``max_revisions - 1`` fix batches
 #: run (one stage per blocking finding, one combined stage for the could-fix findings) and
 #: the ``max_revisions``-th review is review-only (the terminal review), so a review is always
 #: the last stage for a non-approving prompt. A residual `Request changes` after that terminal
 #: review fails closed (``BLOCKED``, exit 3) with the findings on stderr — a reviewer that
 #: keeps requesting changes must not have its last fixes accepted unreviewed. A `Blocked`
 #: verdict short-circuits earlier and still fails closed, since it means a human must settle
-#: a material ambiguity. This is the floor default only; the effective value is
-#: ``max_revisions`` in :func:`run`, resolved CLI flag > target config > this default.
-DEFAULT_MAX_REVISIONS = 3
+#: a material ambiguity. The floor default is ``DEFAULT_MAX_REVISIONS``, imported above from
+#: its single home; the effective value is resolved in :func:`run` via ``resolve_config``:
+#: CLI flag > target config > ``DEFAULT_MAX_REVISIONS``.
 
 #: Instruction prepended to every review round after the first (L2.3, design §8.1). The
 #: three verdict tokens are literal because the reviewer must emit one of them per prior
@@ -1287,12 +1301,21 @@ def run(
 ) -> int:
     skip = set(skip_gates or [])
     deny = set(deny_gates or [])
-    # Resolution precedence (design §12): CLI `--max-revisions` > target config
-    # `<target>/aidw/config.yaml:max_revisions` > `DEFAULT_MAX_REVISIONS`. The config read is
-    # E3.1's work — no loader exists yet; insert it on the line below when it lands (E3.1).
-    max_revisions = (
-        max_revisions if max_revisions is not None else DEFAULT_MAX_REVISIONS
-    )
+    # Resolution precedence (design §12, H8): CLI `--max-revisions` > target config
+    # `<target>/aidw/config.yaml:max_revisions` > `DEFAULT_MAX_REVISIONS`, implemented in
+    # exactly one place — `resolve_config`. A malformed config must never hide behind the
+    # default, so its ERROR issues refuse here (exit 2, the same code and stderr contract
+    # as the `load_all` refusal below) before any run record, branch or worktree exists and
+    # regardless of `--dry-run`. The loader emits only ERROR issues today, so there is no
+    # WARNING path to gate behind `--strict`.
+    declared = load_target_config(repo.root / "aidw" / "config.yaml")
+    config_errors = [issue for issue in declared.issues if issue.level == ERROR]
+    if config_errors:
+        print(format_issues(config_errors), file=sys.stderr)
+        return 2
+    max_revisions = resolve_config(
+        declared, overrides=ConfigOverrides(max_revisions=max_revisions)
+    )["max_revisions"].value
     # ``aidt`` locates the toolkit's assets (prompts, agent configs); run state lives
     # under the per-repo state root (EXTRACTION.md §3.10), resolved once by ``_roots``
     # and threaded in as ``workspace`` so no workflow re-resolves it.
