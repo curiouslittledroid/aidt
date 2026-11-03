@@ -196,7 +196,7 @@
   - Deliverable: locking change plus a concurrency test.
   - Done when: two concurrent runs in the same worktree are refused; two runs in different worktrees proceed.
 
-- [ ] **E2.8. Doctor: worktree and git checks**
+- [x] **E2.8. Doctor: worktree and git checks**
   Add git ≥ 2.31, workspace root, state root, target-is-not-bare, and control-worktree checks.
   - Deliverable: doctor checks plus tests (follow the existing `gh version` check style, `FAIL` for hard blockers, `WARN` for advisory).
   - Done when: `uv run aidw doctor` diagnoses each rejected layout by name.

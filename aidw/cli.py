@@ -234,7 +234,13 @@ def version() -> None:
 @app.command()
 def doctor() -> None:
     """Validate the local environment and prerequisites."""
-    raise typer.Exit(run_doctor(verbose=bool(_state["verbose"])))
+    # The app-level ``--repo``/``$AIDW_REPO`` selection (E2.8, EXTRACTION.md §3.1/§3.3):
+    # ``--repo`` precedes the subcommand, so doctor takes no per-command flag. Doctor
+    # reports a bad or bare target as a named FAIL instead of refusing via ``_roots``.
+    explicit, _source = _resolve_target_selection()
+    raise typer.Exit(
+        run_doctor(verbose=bool(_state["verbose"]), explicit=explicit)
+    )
 
 
 # --------------------------------------------------------------------------- #
