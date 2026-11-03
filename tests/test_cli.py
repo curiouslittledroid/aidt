@@ -549,9 +549,10 @@ CONFIG_KEYS = {
 #: The six E1.6 root entries, kept intact by E3.2.
 CONFIG_ROOT_KEYS = CONFIG_KEYS - {"config"}
 
-#: Every §3.4 leaf resolved by ``resolve_config`` for a config that declares nothing
-#: beyond ``schema_version`` (the ``paths:``/``repo:``/``github:`` default values are
-#: E3.4/E6's, so they are *unset* here, and ``max_revisions`` is the one seeded default).
+#: Every §3.4 leaf resolved by ``resolve_config`` for a repo with no config file:
+#: ``max_revisions`` (E3.2), the eight ``repo:``/``paths:`` values (E3.4), and the
+#: ``github.markers`` leaves E6 still owns. Only the declared-only leaves are *unset*
+#: after E3.4.
 CONFIG_LEAF_PATHS = (
     "schema_version",
     "requires_toolkit",
@@ -564,6 +565,29 @@ CONFIG_LEAF_PATHS = (
     "paths.implementation_results_dir",
     "paths.build_results_template",
     "paths.architecture_dir",
+    "github.markers.parent",
+    "github.markers.child",
+    "github.markers.summary",
+)
+
+#: E3.4's eight §3.4 defaults (D17/R7), as ``config show`` must report them.
+CONFIG_DEFAULT_LEAVES = {
+    "repo.base_branch": "main",
+    "repo.branch_pattern": "{phase}-{task}",
+    "paths.roadmap_dir": "docs/tasks",
+    "paths.roadmap_glob": "[0-9]* - *.md",
+    "paths.task_prompts_dir": "docs/task-prompts",
+    "paths.implementation_results_dir": "docs/implementation-results",
+    "paths.build_results_template": "docs/implementation-results/TEMPLATE.md",
+    "paths.architecture_dir": "docs/architecture",
+}
+
+#: The leaves with **no** toolkit default: ``schema_version``/``requires_toolkit`` are
+#: declared-only (E3.1/E3.3) and the ``github.markers`` values are E6's. In a no-config
+#: repo they are the only leaves ``config show`` prints as ``unset``.
+CONFIG_UNSET_LEAVES = (
+    "schema_version",
+    "requires_toolkit",
     "github.markers.parent",
     "github.markers.child",
     "github.markers.summary",
@@ -666,11 +690,15 @@ def test_config_show_human_single_checkout(tmp_path: Path, monkeypatch) -> None:
     assert [line.split(":", 1)[0] for line in leaf_lines] == list(CONFIG_LEAF_PATHS)
     by_path = {line.split(":", 1)[0]: line for line in leaf_lines}
     assert by_path["max_revisions"] == "max_revisions: 3 (default)"
-    # No default exists for these yet (E3.4/E6), so they print ``unset`` with no source.
-    for path in CONFIG_LEAF_PATHS:
-        if path == "max_revisions":
-            continue
-        assert by_path[path] == f"{path}: unset"
+    # E3.4: a no-config repo reports the Mythical Forge layout as ``default``.
+    for path, value in CONFIG_DEFAULT_LEAVES.items():
+        assert by_path[path] == f"{path}: {value} (default)", path
+    # Only the declared-only leaves print ``unset`` with no source.
+    for path in CONFIG_UNSET_LEAVES:
+        assert by_path[path] == f"{path}: unset", path
+    assert set(CONFIG_DEFAULT_LEAVES) | set(CONFIG_UNSET_LEAVES) | {
+        "max_revisions"
+    } == set(CONFIG_LEAF_PATHS)
 
 
 def test_config_show_json_single_checkout(tmp_path: Path, monkeypatch) -> None:
@@ -689,11 +717,12 @@ def test_config_show_json_single_checkout(tmp_path: Path, monkeypatch) -> None:
     # The ``config`` section is the flat dotted-path dump, not a nested §3.4 shape.
     assert list(payload["config"]) == list(CONFIG_LEAF_PATHS)
     assert payload["config"]["max_revisions"] == {"value": 3, "source": "default"}
-    for path, entry in payload["config"].items():
-        if path == "max_revisions":
-            continue
+    # E3.4: the eight §3.4 leaves resolve as ``default`` with the Mythical Forge values.
+    for path, value in CONFIG_DEFAULT_LEAVES.items():
+        assert payload["config"][path] == {"value": value, "source": "default"}, path
+    for path in CONFIG_UNSET_LEAVES:
         # Unset: value null and *no* ``source`` key at all.
-        assert entry == {"value": None}
+        assert payload["config"][path] == {"value": None}, path
 
     assert payload["toolkit_root"] == {
         "value": str(ToolkitPaths.resolve().root),
@@ -782,11 +811,16 @@ def test_config_show_dumps_a_declared_config_by_dotted_path(
         "value": "B60205",
         "source": "config",
     }
-    # Undeclared leaves stay unset rather than gaining an invented default (E3.4/E6).
-    assert config["repo.branch_pattern"] == {"value": None}
-    # ...and the one seeded default still resolves as ``default``.
+    # E3.4: an undeclared sibling resolves its own §3.4 default, independently.
+    assert config["repo.branch_pattern"] == {
+        "value": "{phase}-{task}",
+        "source": "default",
+    }
+    assert config["paths.roadmap_dir"] == {"value": "docs/tasks", "source": "default"}
+    # ...and the E3.2 budget still resolves as ``default``, while E6's markers stay unset.
     assert config["max_revisions"] == {"value": 3, "source": "default"}
-    assert config["paths.roadmap_dir"] == {"value": None}
+    assert config["requires_toolkit"] == {"value": None}
+    assert config["github.markers.parent"] == {"value": None}
 
 
 def test_config_show_human_renders_declared_and_unset_leaves(
@@ -817,7 +851,16 @@ def test_config_show_human_renders_declared_and_unset_leaves(
     assert "repo.base_branch: trunk (config)" in lines
     assert 'workflows.prompt.stages: [{"id": "author"}] (config)' in lines
     assert "max_revisions: 3 (default)" in lines
-    assert "paths.roadmap_dir: unset" in lines
+    # E3.4: the undeclared base-branch sibling and the ``paths:`` block are defaults.
+    assert "repo.branch_pattern: {phase}-{task} (default)" in lines
+    assert "paths.roadmap_dir: docs/tasks (default)" in lines
+    assert (
+        "paths.build_results_template: "
+        "docs/implementation-results/TEMPLATE.md (default)" in lines
+    )
+    # The still-unseeded leaves (E3.3's optional pin, E6's markers) print ``unset``.
+    assert "requires_toolkit: unset" in lines
+    assert "github.markers.parent: unset" in lines
     assert f"config file: {config_path.resolve()} (target repo)" in lines
 
 
