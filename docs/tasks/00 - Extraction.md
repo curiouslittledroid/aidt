@@ -276,7 +276,7 @@
 
 ## Epic E4: Config-driven stages and prompt resolution (D2, D4, D12, D13, D14)
 
-- [ ] **E4.1. Stage registry and workflow definitions as data**
+- [x] **E4.1. Stage registry and workflow definitions as data**
   Turn the current hardcoded chains (`implement.py:104-148`, `prompt.py:170+`, `review.py:135`,
   `fix.py`, `approve.py:150`) into declarative defaults keyed by workflow and stage id, keeping the
   existing ids (`I1`…`I6`, `P1`, `R1`, `R2`). The `prompt.py` chain it converts is the
