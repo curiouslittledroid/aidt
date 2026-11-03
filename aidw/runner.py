@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
-from aidw.agents import build_argv, build_env
+from aidw.agents import build_argv, build_env, prompt_template_dirs
 from aidw.config import AgentConfig, load_all
 from aidw.log import RunLogger
 from aidw.pi import PiResult, execute, write_meta
@@ -45,6 +45,12 @@ class StageSpec:
     variables: list[str]
     workflow: str = "stage"
     extra: str = ""
+    #: The stage config's declared ``prompt:`` value as a plain string, or ``None`` when
+    #: the stage named its prompt by filename (D14). It rides on the spec next to the
+    #: *resolved* :attr:`prompt` so ``run_stage`` can hand Pi the same file as an
+    #: explicit ``--prompt-template`` root (EXTRACTION.md §3.6). Only the caller that
+    #: resolves the prompt can set it — the resolver must stay a leaf (E4.2).
+    explicit_prompt: str | None = None
     #: Optional postcondition, checked after Pi reports success. It must re-read the
     #: external state the stage was supposed to change and return a human-readable
     #: error when that state is wrong (``None`` when the stage's contract holds). A
@@ -69,17 +75,60 @@ DEFAULT_PROGRESS: bool | None = None
 _STATE_LOCK = threading.Lock()
 
 
-def resolve_prompt(toolkit_root: Path, value: str) -> Path:
-    """Resolve a prompt name (``code-review``) or path to a prompt file."""
-    candidate = Path(value)
-    if candidate.is_absolute() and candidate.is_file():
-        return candidate
-    if (candidate.parent != Path(".")) or candidate.suffix == ".md":
+def resolve_prompt(
+    toolkit_root: Path,
+    target_root: Path,
+    name: str,
+    explicit_path: str | None = None,
+) -> Path:
+    """Resolve one stage's prompt file by §3.4's four-level precedence (D14, E4.2).
+
+    In order, highest first:
+
+    1. the stage config's declared ``prompt:`` path (``explicit_path``), resolved against
+       the target root when relative (``aidw/prompts/update-traceability.md`` is the
+       §3.4 example) and used as-is when absolute;
+    2. a same-named file in ``<target>/aidw/prompts/`` — filename shadowing (D14);
+    3. the toolkit default ``<toolkit>/prompts/`` (D4);
+    4. failure. It never returns ``None`` and never skips a required prompt silently:
+       a declared-but-missing path does **not** fall through to levels 2–3.
+
+    ``name`` is normalised the way the old two-argument resolver did: one trailing
+    ``.md`` is accepted, so ``code-review`` and ``code-review.md`` name the same file.
+
+    The resolver is deliberately a leaf — it imports no target-config or workflow module
+    and performs nothing but ``Path`` existence checks. The caller unpacks the stage
+    config and passes the declared ``prompt:`` value as a plain string, which is what
+    keeps ``aidw.target_config`` free of a ``target_config -> runner -> workflows`` cycle
+    (E4.1's trap).
+    """
+    filename = name if name.endswith(".md") else f"{name}.md"
+
+    if explicit_path is not None:
+        declared = Path(explicit_path)
+        candidate = declared if declared.is_absolute() else target_root / declared
+        if candidate.is_file():
+            return declared if declared.is_absolute() else candidate.resolve()
+        raise FileNotFoundError(
+            f"prompt not found: the declared prompt path for '{name}' does not exist: "
+            f"{candidate} (explicit_path is set, so the declared path is the only "
+            "location searched; the target shadow and toolkit default are not "
+            "fallbacks for a declared prompt, EXTRACTION.md §3.4)"
+        )
+
+    searched = (
+        target_root / "aidw" / "prompts" / filename,
+        toolkit_root / "prompts" / filename,
+    )
+    for candidate in searched:
         if candidate.is_file():
             return candidate.resolve()
 
-    name = value if value.endswith(".md") else f"{value}.md"
-    return (toolkit_root / "prompts" / name).resolve()
+    locations = "; ".join(str(candidate) for candidate in searched)
+    raise FileNotFoundError(
+        f"prompt not found: no prompt resolves for '{name}' (explicit_path is None, "
+        f"so the target shadow and toolkit default were searched): {locations}"
+    )
 
 
 def run_stage(
@@ -125,7 +174,19 @@ def run_stage(
     rendered_path.write_text(rendered, encoding="utf-8")
 
     sid = session_id(state.run_id, agent.id, spec.name, shared=agent.session == "shared")
-    argv = build_argv(agent, session_id=sid)
+    # ``run_stage`` is the only place the target root is in scope, so it — not
+    # ``build_argv`` — composes Pi's complete template-root list (E4.2). The explicit
+    # path is the resolver's precedence-1 *return value*, passed only when the stage
+    # declared one: a filename-shadowed stage must not be turned into an explicit one.
+    argv = build_argv(
+        agent,
+        session_id=sid,
+        prompt_templates=prompt_template_dirs(
+            agent,
+            repo_root,
+            spec.prompt if spec.explicit_prompt is not None else None,
+        ),
+    )
     env = build_env(agent, dict(os.environ))
     # Prompts invoke the bundled helper scripts with `python3`; the subprocess working
     # directory is the *target* repo, where `aidt/prompts/scripts/...` does not exist

@@ -516,9 +516,12 @@ def test_exec_resolves_prompts_from_toolkit_and_state_from_target(
     real_resolve = cli.resolve_prompt
     resolved: list[Path] = []
 
-    def spy_resolve(root: Path, value: str) -> Path:
+    # E4.2: the resolver's contract is (toolkit_root, target_root, name, explicit_path).
+    def spy_resolve(
+        root: Path, target: Path, name: str, explicit_path: str | None = None
+    ) -> Path:
         resolved.append(root)
-        return real_resolve(root, value)
+        return real_resolve(root, target, name, explicit_path)
 
     monkeypatch.setattr(cli, "resolve_prompt", spy_resolve)
     calls = _spy_run_stage(monkeypatch, cli)

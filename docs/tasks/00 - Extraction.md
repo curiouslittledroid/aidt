@@ -286,7 +286,7 @@
   - Deliverable: a registry module plus a test asserting the default chains match today's order exactly.
   - Done when: the default resolution reproduces the current six-stage implement chain, byte for byte, including prompt filenames and agents.
 
-- [ ] **E4.2. Prompt resolver (D14)**
+- [x] **E4.2. Prompt resolver (D14)**
   Resolve in precedence order: explicit `prompt:` path → `<target>/aidw/prompts/<name>` → toolkit
   `prompts/<name>` → error. **Verify Pi's `--prompt-template` precedence empirically** and encode the
   finding; do not assume.

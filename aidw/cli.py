@@ -861,8 +861,25 @@ def exec_stage(
         typer.echo(format_issues(errors + (warnings if strict else [])))
         raise typer.Exit(EXIT_STAGE_FAILURE)
 
+    # `exec` accepts a prompt *name* or a *path* (D14 precedence 1). An absolute value,
+    # or one containing a directory separator, is the declared explicit prompt — the
+    # resolver resolves it against the target root (a bare path would otherwise be
+    # ambiguous with a name). A bare name, including the `code-review.md` form, goes
+    # through the shadow/toolkit levels after normalisation (E4.2). The raw declared
+    # value also rides on the spec so the same file reaches Pi's `--prompt-template`
+    # roots (EXTRACTION.md §3.6).
+    is_explicit = (
+        Path(prompt).is_absolute()
+        or os.sep in prompt
+        or (os.altsep is not None and os.altsep in prompt)
+    )
+    explicit_prompt = prompt if is_explicit else None
+    prompt_name = Path(prompt).stem if is_explicit else prompt
+
     try:
-        prompt_path = resolve_prompt(aidt.root, prompt)
+        prompt_path = resolve_prompt(
+            aidt.root, repo.root, prompt_name, explicit_prompt
+        )
     except Exception as exc:  # pragma: no cover - defensive
         typer.echo(str(exc), err=True)
         raise typer.Exit(EXIT_USAGE) from exc
@@ -883,6 +900,7 @@ def exec_stage(
         prompt=prompt_path,
         variables=list(var),
         workflow=workflow,
+        explicit_prompt=explicit_prompt,
     )
 
     try:
