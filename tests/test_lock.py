@@ -13,9 +13,9 @@ about *real* exclusion, not about a helper returning ``True``:
 * acquiring writes nothing but the lock file, and only under ``<state root>/locks``
   (§3.1: nothing generated is ever written into a target repo).
 
-Fixtures are local by design: E2.9 owns the shared bare+worktree fixture, so these build
-a real bare repo with a ``main`` control worktree and real task worktrees, mirroring
-``tests/test_worktree_cli.py::_make_bare_with_control``.
+Fixtures are local by design (E2.9's ``worktree_repo`` fixture covers only the bare +
+``main`` + ``task`` layout), so these build a real bare repo with a ``main`` control
+worktree and real task worktrees, mirroring the layout it builds.
 """
 
 from __future__ import annotations
