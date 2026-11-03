@@ -1159,7 +1159,11 @@ def test_second_round_gets_delta_brief_with_previous_review_and_diff(
     assert "@@" in extra
     assert "+<!-- fix round 1 -->" in extra
     assert "aidw-prompt-diff-" not in extra
-    assert "/tmp/" not in extra
+    # No random temp path **in the brief**. Scoped to the diff section because ``extra``
+    # also begins with the L2.4 evidence pointer, whose path is absolute under the state
+    # root by design (`_evidence_pointer`): on Linux that is `/tmp/pytest-of-runner/...`,
+    # which is the pointer, not the diff's `mkdtemp` directory.
+    assert "/tmp/" not in extra[extra.index("### Prompt diff") :]
 
 
 def test_third_round_diff_reflects_only_the_previous_fix_batch(

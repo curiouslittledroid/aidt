@@ -286,6 +286,11 @@ def test_approved_without_findings_stops(worktree_repo, monkeypatch) -> None:
 
     assert code == 0
     assert stages.names == ["code-review"]
+    # The chain's graceful-end guard reads this marker (decision I2): an approving review
+    # that published nothing is recorded explicitly, never left to be inferred.
+    directory = next(_runs_root(worktree_repo.control).iterdir())
+    recorded = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    assert recorded["pr"][review_workflow.PR_FOLLOWUPS] is False
 
 
 def test_request_changes_publishes_and_records(worktree_repo, monkeypatch) -> None:
@@ -303,6 +308,8 @@ def test_request_changes_publishes_and_records(worktree_repo, monkeypatch) -> No
     )
     assert manifest["findings"][0]["priority"] == "must-fix"
     assert manifest["findings"][0]["id"] == "F1"
+    recorded = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    assert recorded["pr"][review_workflow.PR_FOLLOWUPS] is True
 
 
 def test_preflight_rejects_non_main_base(worktree_repo, monkeypatch) -> None:

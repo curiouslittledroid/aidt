@@ -18,6 +18,13 @@ about (decision I1): that is what makes the cycle unattended, and it is scoped t
 normal --yes/interactive semantics. A ``--deny-gates approve-followups`` still refuses it
 (``deny`` wins over ``skip`` in ``aidw.gates.decide``).
 
+A chain whose review published nothing ends **gracefully** (exit 0) after that review
+rather than running the fix loop into its entry postcondition (decision I2). ``review``
+records ``pr.followups_published``; with no review-follow-up parent issue there is nothing
+for ``approve-followups`` to approve and nothing for the fixer to fix, so the chain prints
+``chain complete.`` and returns 0. That guard is evidence-based, never an assumption: an
+earlier round's follow-ups keep the loop, and an unreadable record keeps the old path.
+
 This module takes no run lock itself (EXTRACTION.md §3.2, E2.7): each workflow it calls
 acquires and releases its **own** worktree key in turn (``prompt`` the control worktree,
 then ``implement`` the task worktree it created, …), so the two are never held at once and
@@ -39,6 +46,9 @@ from aidw.workflows import review as review_workflow
 
 #: The ``fix`` gate this chain approves unattended (design §6, §8.6).
 GATE_FOLLOWUPS = fix_workflow.GATE_FOLLOWUPS
+
+#: ``state.pr`` key ``review`` records on both successful exits (decision I2).
+PR_FOLLOWUPS = review_workflow.PR_FOLLOWUPS
 
 
 def find_task_prompt(repo: Path, phase: str, task: str) -> Path | None:
@@ -132,6 +142,42 @@ def find_pr_number(runs_root: Path, branch: str | None) -> int | None:
         if isinstance(number, int) and not isinstance(number, bool) and number > 0:
             return number
     return None
+
+
+def review_published_followups(runs_root: Path, pr: int) -> bool | None:
+    """Whether any ``review`` run of ``pr`` published review follow-ups (decision I2).
+
+    ``review`` records ``pr.followups_published`` in its run state on both successful
+    exits, so the chain re-reads the state it just wrote instead of asking ``gh`` a
+    second time — the same trade-off ``find_pr_number`` makes for the PR number.
+
+    ``True`` as soon as one review of this PR published a parent issue: an earlier
+    round's follow-ups outlive a later "approving, nothing to publish" review, and the
+    fix loop must still run for them. ``False`` when the only recorded outcome is
+    "nothing to publish" — the PR has no review-follow-up parent issue, so the fix loop
+    has nothing to approve or fix. ``None`` when no review run of this PR is on disk
+    (a ``--dry-run``, or a state root this chain did not write), which keeps the
+    pre-I2 behaviour of running ``fix`` rather than guessing.
+    """
+    recorded = [
+        state.pr.get(PR_FOLLOWUPS)
+        for state in list_runs(runs_root)
+        if state.workflow == "review" and state.pr.get("number") == pr
+    ]
+    flags = [value for value in recorded if isinstance(value, bool)]
+    if not flags:
+        return None
+    return any(flags)
+
+
+def _ended_because_nothing_was_published(pr: int) -> int:
+    """Report the graceful end of a chain whose review published no follow-ups."""
+    print(
+        f"chain:  review published no follow-ups for PR #{pr}; nothing for the fix "
+        "loop to approve or fix."
+    )
+    print("chain complete.")
+    return 0
 
 
 def task_to_pr(
@@ -232,6 +278,9 @@ def review_and_fix(
     if code != 0:
         print(f"chain stopped: `review` exited {code}.", file=sys.stderr)
         return code
+
+    if review_published_followups(workspace.state_root / "runs", pr) is False:
+        return _ended_because_nothing_was_published(pr)
 
     if GATE_FOLLOWUPS in set(skip_gates or []):
         print(
@@ -376,6 +425,9 @@ def prompt_to_fix(
     if code != 0:
         print(f"chain stopped: `review` exited {code}.", file=sys.stderr)
         return code
+
+    if review_published_followups(workspace.state_root / "runs", pr_number) is False:
+        return _ended_because_nothing_was_published(pr_number)
 
     if GATE_FOLLOWUPS in set(deny_gates or []):
         print(

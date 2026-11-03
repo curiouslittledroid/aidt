@@ -86,3 +86,33 @@ def test_section_83_review_locates_the_pr_head_worktree() -> None:
     assert "exit 4" in k1
     assert "prompt-to-fix" in k1
     assert "PR-head worktree" in k1
+
+
+def _section_86_block(design: str) -> str:
+    """The §8.6 ``aidw run`` block: its heading up to the §9 separator."""
+    start = design.index("### 8.6 `aidw run <workflow>` (orchestrator)")
+    end = design.index("\n---\n", start)
+    return design[start:end]
+
+
+def test_section_86_chain_ends_gracefully_when_review_published_nothing() -> None:
+    """§8.6 and §17 I2 must state the graceful end, not only the auto-approval.
+
+    The trigger: an ``Approve`` review published no follow-ups, yet ``prompt-to-fix`` ran
+    ``fix``, whose entry stage failed closed on a missing review-follow-up parent issue —
+    a red run for a review that had approved. Decision I2 ends the chain at exit 0; this
+    pins the design wording (and the recorded marker it reads) to that behaviour.
+    """
+    design = _design_md()
+
+    block = _section_86_block(design)
+    assert "followups_published" in block
+    assert "chain complete." in block
+    assert "exit 0" in block
+
+    rows = [line for line in design.splitlines() if line.startswith("| I2 |")]
+    assert len(rows) == 1, f"expected exactly one §17 I2 row, found {len(rows)}"
+    i2 = rows[0]
+    assert "exit 0" in i2
+    assert "followups_published" in i2
+    assert "No review-follow-up parent issue found" in i2

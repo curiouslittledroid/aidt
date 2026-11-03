@@ -220,6 +220,20 @@
     worktree is refused with the copy-pasteable command and no run state, and the plan still
     prints under `--dry-run` with no worktree.
 
+- [x] **E2.11. A chain whose review published nothing ends gracefully**
+  An `Approve` review publishes no follow-ups, so the PR has no review-follow-up parent issue —
+  but `aidw run prompt-to-fix` still auto-approved `approve-followups` and ran `fix`, whose entry
+  stage failed closed with `could not read approval state (approve --dry-run exit 2): No
+  review-follow-up parent issue found`, turning an approving review into a red run (design §8.6,
+  decision I2).
+  - Deliverable: `review` records `pr.followups_published` in its run state on both successful
+    exits, and `prompt-to-fix`/`review-and-fix` read it after the review stage: only when no
+    review of that PR ever published follow-ups does the chain print `chain complete.` and exit 0
+    without invoking `fix` (or auto-approving its gate).
+  - Done when: an approving review with no findings ends the chain with exit 0 and no `fix` stage
+    or gate record, published follow-ups (this round or an earlier one) still run the loop, an
+    unreadable record keeps the pre-I2 behaviour, and `aidw fix --pr <n>` on its own is unchanged.
+
 ## Epic E3: Target-repo config (D3, D10, D11, D12, D17)
 
 - [x] **E3.1. Schema, loader, validation**
