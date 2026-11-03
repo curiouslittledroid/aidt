@@ -90,10 +90,29 @@ def _git_run(directory: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+#: The §3.4 ``paths:`` read-paths every fixture repo carries (E3.7). The defaults are
+#: Mythical Forge's layout (D17/R7), so ``target config`` validates them in a config-less
+#: repo too: a fixture without them is a FAIL, not a convenience. ``TEMPLATE.md``
+#: satisfies both ``implementation_results_dir`` and ``build_results_template``; the two
+#: ``.gitkeep`` files exist because git tracks no empty directory, so a placeholder is what
+#: makes ``docs/tasks/``/``docs/task-prompts/`` exist in a clone and its worktrees.
+_READ_PATH_FILES = {
+    "docs/tasks/.gitkeep": "",
+    "docs/task-prompts/.gitkeep": "",
+    "docs/implementation-results/TEMPLATE.md": "# Build results template\n",
+}
+
+
 def _init_committed_repo(directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     _git_run(directory, "init", "-q", "-b", "main")
     (directory / "f.txt").write_text("x", encoding="utf-8")
+    # Committed (not just written), so every bare clone and worktree built from this seed
+    # inherits the read-paths (E3.7).
+    for rel, text in _READ_PATH_FILES.items():
+        path = directory / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
     _git_run(directory, "add", ".")
     _git_run(directory, "commit", "-qm", "init")
 
@@ -859,6 +878,67 @@ def test_configless_repo_never_gains_an_aidw_directory(
 
     assert not (control / "aidw").exists()
     assert not (control / "aidw" / "config.yaml").exists()
+
+
+def test_nonexistent_read_path_fails_naming_the_field_and_the_path(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """E3.7/§3.4: a config naming a missing read-path is a FAIL naming both."""
+    _bare, control = _make_supported(tmp_path)
+    _write_target_config(
+        control,
+        "schema_version: 1\npaths:\n  task_prompts_dir: docs/no-prompt-dir\n",
+    )
+    missing = control / "docs" / "no-prompt-dir"
+
+    check = _named(collect_checks(explicit=control), "target config")
+
+    assert check.status == FAIL
+    assert "`paths.task_prompts_dir`" in check.detail
+    assert str(missing) in check.detail
+    assert "source: config" in check.detail
+    # §3.1: doctor is read-only, so it reports the absence instead of creating the dir.
+    assert not missing.exists()
+    assert run_doctor(explicit=control) == 1
+
+
+def test_default_read_path_missing_fails_closed_in_a_configless_repo(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """D17/R7: the defaults are validated too, so a repo without them FAILs."""
+    _bare, control = _make_supported(tmp_path)
+    assert not (control / "aidw" / "config.yaml").exists()
+    (control / "docs" / "tasks" / ".gitkeep").unlink()
+    (control / "docs" / "tasks").rmdir()
+
+    check = _named(collect_checks(explicit=control), "target config")
+
+    assert check.status == FAIL
+    assert "`paths.roadmap_dir`" in check.detail
+    assert str(control / "docs" / "tasks") in check.detail
+    assert "source: default" in check.detail
+    assert run_doctor(explicit=control) == 1
+
+
+def test_disabled_architecture_write_target_keeps_doctor_green(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """§3.4/roadmap E3.7: an absent write-target for a disabled stage passes."""
+    _bare, control = _make_supported(tmp_path)
+    assert not (control / "docs" / "architecture").exists()
+    _write_target_config(
+        control,
+        "schema_version: 1\nworkflows:\n  implement:\n    stages:\n"
+        "      - id: architecture\n        enabled: false\n",
+    )
+
+    check = _named(collect_checks(explicit=control), "target config")
+
+    assert check.status == OK, check.detail
+    assert "schema version 1 (config)" in check.detail
+    # Read-only: the write-target is a stage's to create, never doctor's.
+    assert not (control / "docs" / "architecture").exists()
+    assert run_doctor(explicit=control) == 0
 
 
 def test_target_config_verdict_is_invariant_to_the_working_directory(

@@ -155,6 +155,15 @@ def _init_repo(path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
 
 
+#: The §3.4 read-paths ``aidw prompt``'s preflight validates (E3.7), as ``path -> text``.
+#: Every committed fixture repo in this module carries them: the defaults name them (D17),
+#: so a repo without them refuses at the preflight rather than planning stages.
+READ_PATH_FILES = {
+    "docs/task-prompts/.gitkeep": "",
+    "docs/implementation-results/TEMPLATE.md": "# Build results template\n",
+}
+
+
 TASK_REVIEW_CHANGES = """\
 ## What I verified
 
@@ -256,6 +265,13 @@ def _make_control_repo(
     seed = workspace / "seed"
     seed.mkdir(parents=True)
     _run_git(["init", "-q", "-b", base_branch, str(seed)], workspace)
+    # The §3.4 read-paths ``aidw prompt``'s preflight validates (E3.7), committed so the
+    # control worktree stays clean and every task worktree inherits them. Without them
+    # every prompted run refuses at that preflight; ``TEMPLATE.md`` covers both
+    # ``implementation_results_dir`` and ``build_results_template``, and the placeholder
+    # file is what makes ``docs/task-prompts/`` exist (git tracks no empty directory).
+    for rel, text in READ_PATH_FILES.items():
+        files.setdefault(rel, text)
     for rel, text in files.items():
         path = seed / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1359,9 +1375,17 @@ def test_blocked_terminal_review_keeps_human_escalation_path(
     assert "a human must settle it" in captured.err
     assert "the dependency branch is the authority" in captured.err
     assert "task review did not approve within the revision budget" not in captured.err
-    assert git.status_short(
-        tmp_path, paths=["docs/task-prompts/03-E4.1-prompt.md"]
-    ) != ""
+    # The prompt a blocked run leaves *uncommitted for a human* lives in the task
+    # worktree (where the author writes), never in the control tree. Reading the control
+    # root made this assertion pass for the wrong reason: with no ``docs/task-prompts/``
+    # there, git printed "warning: could not open directory ..." and the non-empty string
+    # satisfied ``!= ""`` (found while E3.7 committed the read-path placeholders).
+    assert (
+        git.status_short(
+            _task_worktree(tmp_path), paths=["docs/task-prompts/03-E4.1-prompt.md"]
+        )
+        != ""
+    )
 
 
 def test_blocked_dependency_verdict_short_circuits_before_any_fix(
@@ -1566,6 +1590,11 @@ def _origin_and_clone(
     tasks_dir = seed / "docs" / "tasks"
     tasks_dir.mkdir(parents=True)
     (tasks_dir / "03 - Test Phase.md").write_text(roadmap, encoding="utf-8")
+    # The rest of the §3.4 read-paths the path preflight validates (E3.7).
+    for rel, text in READ_PATH_FILES.items():
+        path = seed / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
     _run_git(["add", "."], seed)
     _run_git(["commit", "-qm", "init"], seed)
     origin = tmp_path / "origin.git"
@@ -3940,6 +3969,107 @@ def test_e33_satisfied_pin_still_proceeds(tmp_path: Path, monkeypatch) -> None:
     assert code == 3  # the fake review requests changes; compatibility did not refuse
     assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
     assert state.list_runs(_runs_root(tmp_path)) != []
+
+
+# --------------------------------------------------------------------------- #
+# E3.7 path preflight: EXTRACTION.md §3.4 "Configured read-paths must exist"
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_e37_missing_configured_read_path_refuses_before_any_state(
+    tmp_path: Path, monkeypatch, capsys, dry_run: bool
+) -> None:
+    """A config naming a nonexistent read-path refuses (exit 2) before load_tasks.
+
+    Same site and contract as the two config refusals above: stderr via
+    :func:`format_issues`, exit 2, no run record, no branch and no worktree — and for a
+    plan as well as a real run, so ``--dry-run`` cannot hide a missing directory.
+    """
+    _patch_prompt_repo(
+        tmp_path,
+        monkeypatch,
+        config_text="schema_version: 1\npaths:\n  task_prompts_dir: docs/no-prompts\n",
+    )
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    def _must_not_run(*_args, **_kwargs):
+        raise AssertionError(
+            "a missing read-path must refuse before load_tasks/derive_branch_name"
+        )
+
+    monkeypatch.setattr(prompt_workflow, "load_tasks", _must_not_run)
+    monkeypatch.setattr(prompt_workflow, "derive_branch_name", _must_not_run)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        dry_run=dry_run,
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "error: config.yaml:" in err
+    # §3.4: the message names the field *and* the path, so the operator knows what to
+    # create or override.
+    assert "`paths.task_prompts_dir`" in err
+    assert str(tmp_path / "docs" / "no-prompts") in err
+    assert "source: config" in err
+    assert seen == []
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert not _runs_root(tmp_path).exists()
+    assert git.worktree_for_branch(tmp_path, "03-E4.1") is None
+    assert not _task_worktree(tmp_path).exists()
+
+
+def test_e37_missing_default_read_path_refuses_in_a_configless_repo(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """D17/R7: the defaults are validated too, and before the dirty-tree preflight.
+
+    The fixture commits ``docs/task-prompts/.gitkeep`` (so the default read-path exists);
+    removing it leaves the tree dirty *and* the path missing. The path refusal is exit 2
+    and the dirty-tree refusal is exit 4, so the exit code also pins the ordering.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    (tmp_path / "docs" / "task-prompts" / ".gitkeep").unlink()
+    (tmp_path / "docs" / "task-prompts").rmdir()
+    assert not (tmp_path / "aidw" / "config.yaml").exists()
+    assert git.is_clean(tmp_path) is False
+    # No model may be reached: the refusal precedes every stage (and the branch setup).
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "`paths.task_prompts_dir`" in err
+    assert str(tmp_path / "docs" / "task-prompts") in err
+    assert "source: default" in err
+
+
+def test_e37_complete_repo_passes_the_path_preflight(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The positive control: the fixture's four read-paths are enough to proceed."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL,
+        approve_all=True,
+    )
+
+    assert code == 0
+    assert [name for name, _, _ in seen][0] == "task-prompt"
 
 
 def test_l43_budget_four_runs_four_reviews(

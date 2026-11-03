@@ -83,7 +83,8 @@ In the tables below:
 ### `paths:` — per-repo path conventions
 
 Values are repo-relative path strings. The loader stores them verbatim and touches no other file;
-existence validation is E3.7's (see "Configured paths must exist").
+existence validation is a separate pass (`aidw.target_config.validate_paths` /
+`ensure_write_targets`, E3.7), described under "Configured paths must exist".
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
@@ -238,10 +239,15 @@ legible when it does not.
 - Either way there is **no silent fallback and no agent-side improvisation**: the record stage
   stops and reports a missing build-results template rather than inventing a structure.
 
-**Status.** This document states the contract. The classification, the existence checks and their
-wiring into `aidw doctor` and the stage preflight land in **E3.7**; the loader here only records
-the strings (it touches no file but the config itself), so a missing directory is not yet an
-error at load time.
+**Status.** Implemented in **E3.7**. `aidw.target_config.READ_PATHS` / `WRITE_TARGETS` hold the
+classification, `validate_paths` performs the read-path check (pure: it stats and writes nothing),
+and `ensure_write_targets` creates an enabled stage's write-target (`mkdir` only, disabled stages
+skipped). `aidw doctor`'s `target config` check reports a missing read-path as a failure naming the
+field and the path — for a default-sourced value too (D17/R7) — and is read-only, so it never
+creates a directory. `aidw prompt`'s preflight refuses (exit 2, issues on stderr) before any run
+state, branch or worktree. The loader itself still only records the strings, so a missing directory
+is not a *load-time* error: validation is the separate pass above. `ensure_write_targets`'s call
+site in the implement chain is E4.3's.
 
 ## Worked examples
 

@@ -70,6 +70,7 @@ from aidw.target_config import (
     LabelConfig,
     MarkersConfig,
     PathsConfig,
+    READ_PATHS,
     RepoConfig,
     ResolvedConfig,
     ResolvedValue,
@@ -77,11 +78,14 @@ from aidw.target_config import (
     StageConfig,
     TargetConfig,
     TOOLKIT_DEFAULTS,
+    WRITE_TARGETS,
     WorkflowConfig,
     check_compatibility,
+    ensure_write_targets,
     format_issues,
     load_target_config,
     resolve_config,
+    validate_paths,
 )
 
 #: The §3.4 example, with every field E3.1 owns populated. Deliberately declares an
@@ -1755,3 +1759,428 @@ def test_compatibility_refusal_property() -> None:
         assert issues is not check_compatibility(
             declared, toolkit_version=toolkit_version
         )
+
+
+# --------------------------------------------------------------------------- #
+# Path classification, read-path validation and write-target creation (E3.7,
+# EXTRACTION.md §3.4 "Configured read-paths must exist", D17/R7)
+# --------------------------------------------------------------------------- #
+#
+# The classification is the whole point: a read-path must exist when a *config or a
+# default* names it (so a config-less repo is validated against the Mythical Forge
+# defaults too), a write-target may be absent and is created only for an enabled stage,
+# and ``roadmap_glob`` is a pattern that is never stat'd. Hand-calculated vectors below,
+# one per behaviour path, plus a seeded property run over arbitrary
+# present/absent combinations.
+
+PATH_PROPERTY_SEED = 3711
+PATH_PROPERTY_RUNS = 64
+
+#: ``paths:`` fields that are neither read-paths nor write-targets (a pattern).
+PATTERN_FIELDS = ("roadmap_glob",)
+
+#: A field-specific nonexistent value per read-path, so an error message that named the
+#: wrong field would be caught by the parametrised vector rather than only by its count.
+MISSING_READ_PATH_VALUES = {
+    "build_results_template": "docs/implementation-results/MISSING.md",
+    "roadmap_dir": "docs/missing-roadmap",
+    "task_prompts_dir": "docs/missing-task-prompts",
+    "implementation_results_dir": "docs/missing-results",
+}
+
+
+def _make_read_paths_exist(root: Path) -> None:
+    """Create every §3.4 read-path under ``root`` (the D17 layout)."""
+    for rel in (
+        "docs/tasks",
+        "docs/task-prompts",
+        "docs/implementation-results",
+    ):
+        (root / rel).mkdir(parents=True, exist_ok=True)
+    (root / "docs" / "implementation-results" / "TEMPLATE.md").write_text(
+        "# t\n", encoding="utf-8"
+    )
+
+
+def _resolved_for(tmp_path: Path, config: dict[str, Any] | None = None) -> ResolvedConfig:
+    """Resolve a declared config (or a config-less one) without touching a real tree."""
+    declared = (
+        _load(tmp_path, config) if config is not None else TargetConfig()
+    )
+    assert declared.issues == [], format_issues(declared.issues)
+    return resolve_config(declared)
+
+
+def test_path_classification_is_the_roadmap_read_paths_and_the_architecture_write_target() -> (
+    None
+):
+    """E3.7's classification, verbatim: four read-paths, one write-target, no glob."""
+    assert READ_PATHS == (
+        "build_results_template",
+        "roadmap_dir",
+        "task_prompts_dir",
+        "implementation_results_dir",
+    )
+    assert WRITE_TARGETS == {"architecture_dir": "architecture"}
+    # Every classified field is a real §3.4 path field, and the two sets are disjoint.
+    assert set(READ_PATHS) | set(WRITE_TARGETS) <= PATHS_CONFIG_KEYS
+    assert not set(READ_PATHS) & set(WRITE_TARGETS)
+    # ``roadmap_glob`` is a glob pattern, not a path: validating it would stat a pattern.
+    for field in PATTERN_FIELDS:
+        assert field not in READ_PATHS
+        assert field not in WRITE_TARGETS
+
+
+def test_declared_read_path_that_does_not_exist_is_one_error_naming_field_and_path(
+    tmp_path: Path,
+) -> None:
+    """§3.4: a nonexistent read-path is an ERROR naming the field *and* the path."""
+    root = tmp_path / "target"
+    _make_read_paths_exist(root)
+    present = {"schema_version": 1, "paths": {"roadmap_dir": "docs/tasks"}}
+
+    for field, value in MISSING_READ_PATH_VALUES.items():
+        corrupted = {"schema_version": 1, "paths": {field: value}}
+        issues = validate_paths(_resolved_for(tmp_path, corrupted), root)
+        assert len(issues) == 1, (field, format_issues(issues))
+        issue = issues[0]
+        assert issue.level == ERROR
+        assert f"`paths.{field}`" in issue.message
+        assert str(root / value) in issue.message
+        assert issue.source == CONFIG_FILENAME
+        # The provenance is named too, so the operator knows the *config* named it.
+        assert "source: config" in issue.message
+
+    # A valid ``paths:`` override (= the default here) produces nothing.
+    assert validate_paths(_resolved_for(tmp_path, present), root) == []
+
+
+def test_default_sourced_read_paths_are_validated_not_skipped(tmp_path: Path) -> None:
+    """D17/R7: a config-less repo is validated against the defaults, fail closed.
+
+    ``docs/implementation-results/TEMPLATE.md`` and the two directories are created and
+    only ``docs/tasks`` is missing, so exactly one issue arises — for the default-sourced
+    ``paths.roadmap_dir``.
+    """
+    root = tmp_path / "target"
+    _make_read_paths_exist(root)
+    (root / "docs" / "tasks").rmdir()
+
+    # No config file at all: ``source_path is None`` and no loader issues.
+    declared = load_target_config(root / "aidw" / "config.yaml")
+    assert declared.source_path is None
+    assert declared.issues == []
+    resolved = resolve_config(declared)
+    assert resolved["paths.roadmap_dir"].source == SOURCE_DEFAULT
+
+    issues = validate_paths(resolved, root)
+
+    assert len(issues) == 1, format_issues(issues)
+    assert "`paths.roadmap_dir`" in issues[0].message
+    assert str(root / "docs" / "tasks") in issues[0].message
+    assert "source: default" in issues[0].message
+
+
+def test_every_read_path_resolves_with_no_issues_when_present(tmp_path: Path) -> None:
+    """All four present (the toolkit's own layout) → no issues, no error."""
+    root = tmp_path / "target"
+    _make_read_paths_exist(root)
+
+    assert validate_paths(resolve_config(TargetConfig()), root) == []
+
+
+def test_roadmap_glob_is_a_pattern_and_is_never_existence_checked(tmp_path: Path) -> None:
+    """A glob that matches nothing is not a missing path (``[0-9]* - *.md``)."""
+    root = tmp_path / "target"
+    _make_read_paths_exist(root)
+    config = {
+        "schema_version": 1,
+        "paths": {"roadmap_glob": "nowhere/[0-9]* - *.md", "roadmap_dir": "docs/tasks"},
+    }
+
+    assert validate_paths(_resolved_for(tmp_path, config), root) == []
+
+
+def test_absent_write_target_is_not_a_read_path_issue(tmp_path: Path) -> None:
+    """``architecture_dir`` is an output: absent means nothing to validate."""
+    root = tmp_path / "target"
+    _make_read_paths_exist(root)
+    assert not (root / "docs" / "architecture").exists()
+    resolved = resolve_config(TargetConfig())
+    assert resolved["paths.architecture_dir"].is_set
+
+    assert validate_paths(resolved, root) == []
+
+
+def test_validate_paths_skips_unset_leaves_defensively(tmp_path: Path) -> None:
+    """An unset leaf is never stat'd: there is no path to check, so no issue."""
+    resolved = ResolvedConfig(
+        {
+            "paths.roadmap_dir": ResolvedValue(),
+            "paths.task_prompts_dir": ResolvedValue(None, None),
+        }
+    )
+
+    assert validate_paths(resolved, tmp_path) == []
+
+
+def test_absolute_read_path_override_wins_over_the_target_root(tmp_path: Path) -> None:
+    """§3.4 allows an absolute override; ``target_root / value`` gives it to us free."""
+    root = tmp_path / "target"
+    _make_read_paths_exist(root)
+    outside = tmp_path / "shared-results"
+    outside.mkdir()
+    present = {
+        "schema_version": 1,
+        "paths": {"implementation_results_dir": str(outside)},
+    }
+    absent = {
+        "schema_version": 1,
+        "paths": {"implementation_results_dir": str(tmp_path / "gone")},
+    }
+
+    assert validate_paths(_resolved_for(tmp_path, present), root) == []
+    issues = validate_paths(_resolved_for(tmp_path, absent), root)
+    assert len(issues) == 1
+    assert str(tmp_path / "gone") in issues[0].message
+
+
+def test_validate_paths_is_pure_and_writes_nothing(tmp_path: Path) -> None:
+    """Read-only: the check stats, it never creates, repairs or mutates its input."""
+    root = tmp_path / "target"
+    _make_read_paths_exist(root)
+    (root / "docs" / "tasks").rmdir()
+    resolved = resolve_config(TargetConfig())
+    resolved_before = copy.deepcopy(resolved.to_dict())
+    before = sorted(p.relative_to(root) for p in root.rglob("*"))
+
+    first = validate_paths(resolved, root)
+    second = validate_paths(resolved, root)
+
+    assert len(first) == 1
+    assert first is not second
+    assert sorted(p.relative_to(root) for p in root.rglob("*")) == before
+    assert not (root / "docs" / "tasks").exists()
+    assert not (root / "docs" / "architecture").exists()
+    assert resolved.to_dict() == resolved_before
+
+
+def test_enabled_write_target_is_created_on_demand(tmp_path: Path) -> None:
+    """§3.4: an enabled stage's write-target is created, not required to pre-exist."""
+    root = tmp_path / "target"
+    root.mkdir()
+    declared = TargetConfig()
+    resolved = resolve_config(declared)
+    target = root / "docs" / "architecture"
+    assert not target.exists()
+
+    issues = ensure_write_targets(declared, resolved, root)
+
+    assert issues == []
+    assert target.is_dir()
+
+
+def test_write_target_uses_the_resolved_default_when_the_config_is_silent(
+    tmp_path: Path,
+) -> None:
+    """Every ``PathsConfig`` field is ``str | None``: enablement comes from ``declared``,
+    the path from ``resolved`` (the trap the task prompt names)."""
+    root = tmp_path / "target"
+    root.mkdir()
+    declared = load_target_config(root / "aidw" / "config.yaml")
+    assert declared.paths is None
+    assert declared.workflows == {}
+
+    assert ensure_write_targets(declared, resolve_config(declared), root) == []
+
+    assert (root / "docs" / "architecture").is_dir()
+
+
+def test_disabled_stage_skips_its_write_target_entirely(tmp_path: Path) -> None:
+    """A disabled stage's output directory is neither created nor reported."""
+    root = tmp_path / "target"
+    root.mkdir()
+    declared = TargetConfig(
+        workflows={
+            "implement": WorkflowConfig(
+                stages=[StageConfig(id="architecture", enabled=False)]
+            )
+        }
+    )
+
+    issues = ensure_write_targets(declared, resolve_config(declared), root)
+
+    assert issues == []
+    assert not (root / "docs" / "architecture").exists()
+
+
+def test_enabled_write_target_uses_the_configured_resolved_path(
+    tmp_path: Path,
+) -> None:
+    """The output location comes from ``resolved``, not from the default path."""
+    root = tmp_path / "target"
+    root.mkdir()
+    declared = _load(
+        root,
+        {"schema_version": 1, "paths": {"architecture_dir": "out/architecture"}},
+    )
+    assert declared.issues == []
+
+    issues = ensure_write_targets(declared, resolve_config(declared), root)
+
+    assert issues == []
+    assert (root / "out" / "architecture").is_dir()
+    assert not (root / "docs" / "architecture").exists()
+
+
+def test_write_target_does_not_swallow_non_oserror(tmp_path: Path, monkeypatch) -> None:
+    """Only filesystem ``OSError`` failures become issues; programming errors escape."""
+    root = tmp_path / "target"
+    root.mkdir()
+    declared = TargetConfig()
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("unexpected mkdir failure")
+
+    monkeypatch.setattr(Path, "mkdir", explode)
+
+    with pytest.raises(RuntimeError, match="unexpected mkdir failure"):
+        ensure_write_targets(declared, resolve_config(declared), root)
+
+
+def test_write_target_is_created_when_its_stage_is_enabled_explicitly(
+    tmp_path: Path,
+) -> None:
+    """``enabled: true`` and no ``enabled`` at all are both enabled (E4.1's chain)."""
+    root = tmp_path / "target"
+    root.mkdir()
+    for stages in ([StageConfig(id="architecture", enabled=True)], [StageConfig(id="architecture")]):
+        declared = TargetConfig(workflows={"implement": WorkflowConfig(stages=stages)})
+        issues = ensure_write_targets(declared, resolve_config(declared), root)
+        assert issues == []
+        assert (root / "docs" / "architecture").is_dir()
+        (root / "docs" / "architecture").rmdir()
+
+
+def test_impossible_creation_fails_naming_the_stage_and_the_path(tmp_path: Path) -> None:
+    """A parent that is a file is an ``OSError``: report it, never crash or skip."""
+    root = tmp_path / "target"
+    root.mkdir()
+    blocker = root / "docs"
+    blocker.write_text("not a directory", encoding="utf-8")
+    resolved = resolve_config(TargetConfig())
+
+    issues = ensure_write_targets(TargetConfig(), resolved, root)
+
+    assert len(issues) == 1, format_issues(issues)
+    issue = issues[0]
+    assert issue.level == ERROR
+    assert "architecture" in issue.message
+    assert "`paths.architecture_dir`" in issue.message
+    assert str(blocker / "architecture") in issue.message
+    # The blocker is untouched: nothing is invented around it.
+    assert blocker.read_text(encoding="utf-8") == "not a directory"
+
+
+def test_write_target_path_that_is_a_file_is_an_error_naming_the_stage(
+    tmp_path: Path,
+) -> None:
+    """"absent *or not a directory*": an existing file is not a usable write-target."""
+    root = tmp_path / "target"
+    (root / "docs").mkdir(parents=True)
+    target = root / "docs" / "architecture"
+    target.write_text("a file, not a directory", encoding="utf-8")
+    resolved = resolve_config(TargetConfig())
+
+    issues = ensure_write_targets(TargetConfig(), resolved, root)
+
+    assert len(issues) == 1, format_issues(issues)
+    assert "architecture" in issues[0].message
+    assert str(target) in issues[0].message
+    assert target.read_text(encoding="utf-8") == "a file, not a directory"
+
+
+def test_ensure_write_targets_is_idempotent_and_only_creates_the_target(
+    tmp_path: Path,
+) -> None:
+    """A second call is a no-op, and no other ``paths:`` entry is created."""
+    root = tmp_path / "target"
+    root.mkdir()
+    declared = TargetConfig()
+    resolved = resolve_config(declared)
+    target = root / "docs" / "architecture"
+
+    assert ensure_write_targets(declared, resolved, root) == []
+    first = sorted(p.relative_to(root) for p in root.rglob("*"))
+    assert ensure_write_targets(declared, resolved, root) == []
+
+    assert sorted(p.relative_to(root) for p in root.rglob("*")) == first
+    assert target.is_dir()
+    for name in ("tasks", "task-prompts", "implementation-results"):
+        assert not (root / "docs" / name).exists()
+
+
+def _random_path_case(rng: random.Random) -> dict[str, bool]:
+    """Which of the four read-paths exist, plus whether architecture is disabled.
+
+    ``build_results_template``'s default lives *inside* ``implementation_results_dir``, so
+    a present template implies a present directory; without that constraint the generated
+    "absent directory" case would be contradicted by the file just written into it.
+    """
+    case = {field: rng.random() < 0.5 for field in READ_PATHS}
+    case["architecture_disabled"] = rng.random() < 0.5
+    if case["build_results_template"]:
+        case["implementation_results_dir"] = True
+    return case
+
+
+def test_read_path_validation_property(tmp_path: Path) -> None:
+    """Seeded property run (seed/numRuns pinned above) over present/absent combinations.
+
+    Invariants: exactly one issue per absent read-path and none for a present one; each
+    message names its own field and its own resolved path; ``roadmap_glob`` never
+    contributes; ``validate_paths`` writes nothing; a disabled architecture stage never
+    creates its directory while an enabled one always does.
+    """
+    rng = random.Random(PATH_PROPERTY_SEED)
+
+    for index in range(PATH_PROPERTY_RUNS):
+        case = _random_path_case(rng)
+        root = tmp_path / f"run-{index}"
+        root.mkdir()
+        present = [field for field in READ_PATHS if case[field]]
+        absent = [field for field in READ_PATHS if not case[field]]
+        # ``build_results_template`` lives under ``implementation_results_dir``: create the
+        # directories only for the fields generated as present, then the template itself.
+        for field in present:
+            if field != "build_results_template":
+                (root / str(getattr(TOOLKIT_DEFAULTS.paths, field))).mkdir(parents=True)
+        if case["build_results_template"]:
+            template = root / str(TOOLKIT_DEFAULTS.paths.build_results_template)
+            template.parent.mkdir(parents=True, exist_ok=True)
+            template.write_text("# t\n", encoding="utf-8")
+        declared = TargetConfig(
+            workflows={
+                "implement": WorkflowConfig(
+                    stages=[
+                        StageConfig(id="architecture", enabled=not case["architecture_disabled"])
+                    ]
+                )
+            }
+        )
+        resolved = resolve_config(declared)
+        before = sorted(p.relative_to(root) for p in root.rglob("*"))
+
+        issues = validate_paths(resolved, root)
+
+        assert len(issues) == len(absent), (index, absent, format_issues(issues))
+        for field, issue in zip(absent, issues, strict=True):
+            assert f"`paths.{field}`" in issue.message, (field, issue.message)
+            assert str(root / str(getattr(TOOLKIT_DEFAULTS.paths, field))) in issue.message
+            assert issue.level == ERROR
+        assert sorted(p.relative_to(root) for p in root.rglob("*")) == before
+
+        write_issues = ensure_write_targets(declared, resolved, root)
+
+        assert write_issues == []
+        assert (root / "docs" / "architecture").is_dir() is not case["architecture_disabled"]
