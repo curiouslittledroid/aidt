@@ -20,14 +20,16 @@ before any run state), while approvals started in different worktrees both proce
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
+from pathlib import Path
 
-from aidw import git, github, lock
+from aidw import __version__, git, github, lock
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.runner import StageSpec, run_stage
+from aidw.runner import plan_stages, run_stage
 from aidw.state import (
     BLOCKED,
     FAILED,
@@ -38,11 +40,29 @@ from aidw.state import (
     save,
     utcnow_iso,
 )
+from aidw.target_config import resolve_workflow_config
 
 GATE = "approve-followups"
 STAGE = "approve-review-followups"
 PROMPT = "approve-review-followups.md"
 AGENT = "review-approver"
+
+
+def _planned_stage(*, pr: int, config, aidt: Path, repo: Path):
+    """The single A1 stage from the registry, with the approval postcondition (E4.3).
+
+    The postcondition stays workflow-side: only this module knows how to verify that the
+    approvals were actually applied, so it is attached to the planned spec rather than
+    being stage data the registry would have to carry.
+    """
+    (spec,) = plan_stages(
+        "approve",
+        config=config,
+        toolkit_root=aidt,
+        target_root=repo,
+        pr=pr,
+    )
+    return replace(spec, verify=lambda: github.verify_approvals(aidt, repo, pr))
 
 
 def _selection_summary(selection: github.ScriptResult) -> str:
@@ -90,6 +110,16 @@ def run(
     skip = set(skip_gates or [])
     deny = set(deny_gates or [])
     runs_root = workspace.state_root / "runs"
+
+    # Target config (E4.3, EXTRACTION.md §3.4/§3.11): `aidw prompt`'s two fail-closed
+    # refusals — validation ERRORs and `check_compatibility` — stderr + exit 2 before any
+    # run record and regardless of `--dry-run`. `validate_paths` stays prompt-only.
+    resolved_config, config_issues = resolve_workflow_config(
+        repo.root, toolkit_version=__version__
+    )
+    if config_issues:
+        print(format_issues(config_issues), file=sys.stderr)
+        return 2
 
     agents, issues = load_all(aidt.root, repo.root)
     errors = [i for i in issues if i.level == ERROR]
@@ -170,12 +200,11 @@ def run(
             else:
                 print("child:  unknown (`gh` not found)")
             record = run_stage(
-                StageSpec(
-                    STAGE,
-                    AGENT,
-                    aidt.prompts_dir / PROMPT,
-                    [str(pr)],
-                    verify=lambda: github.verify_approvals(aidt.root, repo.root, pr),
+                _planned_stage(
+                    pr=pr,
+                    config=resolved_config,
+                    aidt=aidt.root,
+                    repo=repo.root,
                 ),
                 repo_root=repo.root,
                 toolkit_root=aidt.root,
@@ -224,12 +253,11 @@ def run(
             return 3
 
         record = run_stage(
-            StageSpec(
-                STAGE,
-                AGENT,
-                aidt.prompts_dir / PROMPT,
-                [str(pr)],
-                verify=lambda: github.verify_approvals(aidt.root, repo.root, pr),
+            _planned_stage(
+                pr=pr,
+                config=resolved_config,
+                aidt=aidt.root,
+                repo=repo.root,
             ),
             repo_root=repo.root,
             toolkit_root=aidt.root,

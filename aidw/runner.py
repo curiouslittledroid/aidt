@@ -4,17 +4,25 @@ A stage is one Pi invocation with one prompt and one agent. Workflows orchestrat
 stages; this module performs the mechanics: resolve the prompt, render variables,
 compute the session id, run Pi, and record the stage in run state.
 
-``aidw exec`` exposes it directly for manual/dry-run use and for Phase 2 validation.
+It also owns :func:`plan_stages`, the single run-path plan builder: every workflow's stage
+list comes from the ``aidw.stage_registry`` defaults mapped through :func:`resolve_prompt`
+plus the target repo's ``prompt:`` overlay, never from a hand-built list (EXTRACTION.md
+§3.5, D2/D14, task E4.3).
+
+``aidw exec`` exposes the runner directly for manual/dry-run use and for Phase 2 validation.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import threading
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
+from aidw import stage_registry
 from aidw.agents import build_argv, build_env, prompt_template_dirs
 from aidw.config import AgentConfig, load_all
 from aidw.log import RunLogger
@@ -23,6 +31,7 @@ from aidw.paths import RUN_ID_ENV_VAR, SCRIPTS_DIR_ENV_VAR, STAGE_ENV_VAR
 from aidw.progress import ProgressIndicator, resolve_enabled
 from aidw.prompts import render_prompt_file
 from aidw.report import cost_note
+from aidw.target_config import SOURCE_CONFIG, ResolvedConfig
 from aidw.state import (
     FAILED,
     PLANNED,
@@ -58,6 +67,12 @@ class StageSpec:
     #: stop and report a problem in its final message while still exiting 0, so the
     #: stage is marked ``failed`` whenever the check does not pass (design §10).
     verify: Callable[[], str | None] | None = None
+    #: The retained §3.5 stage id (``"I1"``, ``"R2"``, ``"A1"``…). ``id`` and ``name`` are
+    #: different fields on purpose: run state and the run artifacts key on ``name``, while
+    #: the workflow's progress lines print the id (E4.3). :func:`plan_stages` sets it from
+    #: the registry's :class:`~aidw.stage_registry.PlannedStage`; it stays empty for a spec
+    #: a workflow builds for a stage the registry does not carry.
+    id: str = ""
 
 
 #: Retry a clearly transient Pi invocation error once (design E6, §10). ``aidw
@@ -129,6 +144,132 @@ def resolve_prompt(
         f"prompt not found: no prompt resolves for '{name}' (explicit_path is None, "
         f"so the target shadow and toolkit default were searched): {locations}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# The run-path plan builder (EXTRACTION.md §3.4/§3.5, D2/D14; task E4.3)
+# --------------------------------------------------------------------------- #
+
+#: Deferred §3.4 stage settings: declared on a stage entry, but ignored by this version.
+#: E4.5 owns core-vs-repo-optional enforcement (``enabled: false`` and repo-added stages)
+#: and E4.6 the agent/model/thinking overrides. E4.3 warns once per entry that carries one
+#: so a repo written against the §3.4 schema is never silently surprised by a no-op.
+_REASON_REPO_ADDED = "no such default stage, so a repo-added stage is deferred (E4.5)"
+_REASON_AGENT = "`agent` override (E4.6)"
+_REASON_DISABLED = "`enabled: false` (E4.5)"
+
+
+def plan_stages(
+    workflow: str,
+    *,
+    config: ResolvedConfig,
+    toolkit_root: Path,
+    target_root: Path,
+    **expand_fields: Any,
+) -> list[StageSpec]:
+    """The stages ``workflow`` runs, as runnable specs, from registry plus config (E4.3).
+
+    This is the **only** run-path plan builder for the five workflows. Every stage on
+    every run path derives from the registry here — the dynamic loops included, which
+    call it once per round/iteration with the state they have accumulated — so no stage
+    list is hand-built anywhere (EXTRACTION.md §3.5, D2).
+
+    ``expand_fields`` is exactly :func:`aidw.stage_registry.expand`'s documented
+    per-workflow field set: ``implement`` (``prompt_rel``/``branch``/``task_id``/
+    ``base_branch``), ``prompt`` (``phase``/``epic``/``task``/``rel``/``max_revisions``/
+    ``rounds``), ``review`` (``pr``/``manifest_rel``/``findings``), ``fix`` (``pr``/
+    ``round_index``/``iteration``/``manifest_rel``) and ``approve`` (``pr``). Each expanded
+    :class:`~aidw.stage_registry.PlannedStage` becomes one :class:`StageSpec`: its prompt is
+    resolved through :func:`resolve_prompt` (D4/D14), ``variables`` is a fresh ``list``
+    (the registry's tuples are frozen) and ``extra`` is carried byte for byte.
+
+    ``config`` is the :class:`~aidw.target_config.ResolvedConfig` the caller already
+    resolved — the builder never loads it, which keeps this module free of the resolution
+    preflight and stops ``aidw.target_config`` importing a workflow module (E4.1's trap).
+    Only a **repo-declared** ``workflows.<workflow>.stages`` entry (``source == config``)
+    overlays a planned stage, and only through its ``prompt:`` path (D14, level 1): the
+    entry is matched by ``id`` — never by list position, because the list is a whole-list
+    override (§3.4) and need not mirror the registry in order or size — and sets
+    ``explicit_prompt`` plus the resolved ``prompt``. A declared-but-missing path raises
+    :class:`FileNotFoundError` from :func:`resolve_prompt`; there is no shadow/toolkit
+    fallback for a declared prompt.
+
+    Deferred settings are reported, never honoured: one ``warning:`` line per declared
+    entry that carries ``agent`` (E4.6), ``enabled: false`` or an unknown ``id`` (E4.5),
+    naming the workflow, the stage id and every reason on that single line. Counting is by
+    entry, not by field, and ``prompt:`` is not deferred.
+
+    Performs no I/O beyond the prompt existence checks in :func:`resolve_prompt` and
+    mutates neither ``config`` nor the registry defaults.
+    """
+    planned = stage_registry.expand(workflow, **expand_fields)
+    overlays = _stage_prompt_overlays(workflow, config)
+
+    specs: list[StageSpec] = []
+    for stage in planned:
+        declared = overlays.get(stage.id)
+        specs.append(
+            StageSpec(
+                stage.name,
+                stage.agent,
+                resolve_prompt(
+                    toolkit_root,
+                    target_root,
+                    name=stage.prompt_file,
+                    explicit_path=declared,
+                ),
+                list(stage.variables),
+                workflow=workflow,
+                extra=stage.extra,
+                explicit_prompt=declared,
+                id=stage.id,
+            )
+        )
+    return specs
+
+
+def _stage_prompt_overlays(workflow: str, config: ResolvedConfig) -> dict[str, str]:
+    """The repo's declared ``prompt:`` paths by stage id, warning on deferred settings.
+
+    Iterates the resolved ``workflows.<workflow>.stages`` list as an overlay and never
+    assumes it mirrors the registry: an entry whose ``id`` has no default stage is a
+    deferred repo-added stage (E4.5), and the registry's own order/size is what
+    :func:`plan_stages` renders from.
+    """
+    resolved = config.get(f"workflows.{workflow}.stages")
+    if resolved is None or resolved.source != SOURCE_CONFIG:
+        # No repo-declared list: the registry defaults plan unchanged, with no warnings.
+        # ``ConfigDefaults.workflows`` stays empty on purpose (E4.3 req 2), so a
+        # ``source == default`` list cannot exist today — refusing anything but
+        # ``config`` is what makes this an overlay rather than a second source of truth.
+        return {}
+
+    known = stage_registry.stages_by_id(workflow)
+    overlays: dict[str, str] = {}
+    for entry in resolved.value or []:
+        if not isinstance(entry, Mapping):
+            continue
+        stage_id = str(entry.get("id") or "")
+        reasons: list[str] = []
+        if stage_id not in known:
+            reasons.append(_REASON_REPO_ADDED)
+        if entry.get("agent") is not None:
+            reasons.append(_REASON_AGENT)
+        # ``enabled`` defaults to true, so only an explicit ``false`` is deferred; the
+        # loader's ``to_dict`` keeps a declared ``true`` distinguishable but it changes
+        # nothing, so it is not a reason to warn.
+        if entry.get("enabled") is False:
+            reasons.append(_REASON_DISABLED)
+        if reasons:
+            print(
+                f"warning: workflow `{workflow}` stage `{stage_id}`: ignoring deferred "
+                f"settings ({'; '.join(reasons)})",
+                file=sys.stderr,
+            )
+        prompt = entry.get("prompt")
+        if stage_id in known and isinstance(prompt, str) and prompt:
+            overlays[stage_id] = prompt
+    return overlays
 
 
 def run_stage(

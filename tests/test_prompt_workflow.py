@@ -12,6 +12,7 @@ import pytest
 from typer.testing import CliRunner
 
 from aidw import __version__, git, lock, state
+from aidw import stage_registry
 from aidw.cli import app
 from aidw.config import ERROR, Issue
 from aidw.paths import ToolkitPaths, TargetRepo, WorkspacePaths, repo_root, toolkit_root
@@ -1229,19 +1230,26 @@ def test_delta_brief_temp_directories_are_removed(
 def test_delta_brief_preserves_previous_review_verbatim(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The prior review is carried byte-for-byte, including meaningful whitespace."""
+    """The prior review is carried byte-for-byte, including meaningful whitespace.
+
+    Since E4.3 the wording is the registry's (``render_delta_brief``); this workflow only
+    produces the diff it embeds, so the two are exercised together here.
+    """
     baseline = "prompt\n"
+    current = "prompt\n<!-- fix round 1 -->\n"
     previous_review = "Review text with trailing spaces  \n"
 
-    brief = prompt_workflow._render_delta_brief(
-        index=2,
-        previous_review=previous_review,
-        baseline=baseline,
-        current=baseline,
-        rel="docs/task-prompts/03-E4.1-prompt.md",
+    diff = prompt_workflow._prompt_diff(
+        baseline, current, name="03-E4.1-prompt.md"
+    )
+    brief = stage_registry.render_delta_brief(
+        previous_review=previous_review, diff=diff
     )
 
     assert previous_review in brief
+    assert "+<!-- fix round 1 -->" in brief
+    assert "### Previous review" in brief
+    assert "### Prompt diff since that review" in brief
 
 
 def test_unparseable_previous_review_still_primes_the_next_round(
@@ -3321,7 +3329,7 @@ def test_l34_reconcile_extra_carries_instruction_review_diff_and_pointer(
     # The evidence pointer is prepended, exactly as every review and fix stage (L2.4).
     assert extra.startswith("## Evidence bundle"), extra
     # A reconcile-specific instruction, never the reviewer's delta brief (L3.4 trap).
-    assert prompt_workflow._RECONCILE_INSTRUCTION in extra
+    assert stage_registry.RECONCILE_INSTRUCTION in extra
     assert "## Reconcile the fix batch" in extra
     assert "## Delta brief" not in extra
     # The *whole* review is passed verbatim, including its trailing round marker, not one
@@ -3396,34 +3404,45 @@ def test_l34_reconcile_failure_stops_the_run(
 def test_l34_render_reconcile_is_pure_and_degrades_when_unreadable(
     tmp_path: Path,
 ) -> None:
-    """``_render_reconcile`` never mutates its inputs and degrades, not raises (req 3)."""
+    """``render_reconcile`` never mutates its inputs and degrades, not raises (req 3).
+
+    E4.3 moved the wording to the registry; ``_brief_diff`` keeps the workflow-side half
+    (produce the diff, or ``None`` when a snapshot cannot be read).
+    """
     baseline = "prompt\n"
     current = "prompt\n<!-- fix round 1 -->\n"
     review = "Review text with trailing spaces  \n"
 
-    brief = prompt_workflow._render_reconcile(
+    diff = prompt_workflow._brief_diff(
         index=1,
-        review_text=review,
         baseline=baseline,
         current=current,
         rel="docs/task-prompts/03-E4.1-prompt.md",
+        verb="reconcile",
+        brief_name="reconcile brief",
     )
+    brief = stage_registry.render_reconcile(review=review, diff=diff)
 
-    assert prompt_workflow._RECONCILE_INSTRUCTION in brief
+    assert stage_registry.RECONCILE_INSTRUCTION in brief
     assert review in brief
     assert "+<!-- fix round 1 -->" in brief
     # Purity: the caller's strings are untouched.
     assert baseline == "prompt\n"
     assert current == "prompt\n<!-- fix round 1 -->\n"
     # An unreadable prompt degrades to the explicit unavailable note, never an empty diff.
-    degraded = prompt_workflow._render_reconcile(
-        index=1,
-        review_text=review,
-        baseline=None,
-        current=None,
-        rel="docs/task-prompts/03-E4.1-prompt.md",
+    assert (
+        prompt_workflow._brief_diff(
+            index=1,
+            baseline=None,
+            current=None,
+            rel="docs/task-prompts/03-E4.1-prompt.md",
+            verb="reconcile",
+            brief_name="reconcile brief",
+        )
+        is None
     )
-    assert prompt_workflow._DIFF_UNAVAILABLE in degraded
+    degraded = stage_registry.render_reconcile(review=review, diff=None)
+    assert stage_registry.DIFF_UNAVAILABLE in degraded
     assert review in degraded
     assert "diff --git" not in degraded
 

@@ -60,7 +60,16 @@ cannot *understand* refuses at the same site and with the same contract (E3.3, D
 :func:`aidw.target_config.check_compatibility` reports a ``schema_version`` newer than
 ``SUPPORTED_SCHEMA_VERSION`` or an unsatisfied ``requires_toolkit`` pin, and the issues go
 to stderr with exit 2 before ``load_tasks``/``derive_branch_name``, so the run leaves no
-state, branch or worktree (EXTRACTION.md §3.11 "refuses to run").
+state, branch or worktree (EXTRACTION.md §3.11 "refuses to run"). Both of those refusals
+live once, in :func:`aidw.target_config.resolve_workflow_config`, which all five workflows
+share so they cannot drift (E4.3).
+
+Every stage of every round — the author, each review, each fix stage and each reconcile —
+comes from :func:`aidw.runner.plan_stages` over the ``aidw.stage_registry`` defaults, with
+the target repo's ``prompt:`` overlay applied (E4.3, EXTRACTION.md §3.5). The loop
+re-expands per round as real verdicts accumulate, so there is no hand-built stage list here;
+the runtime-only parts (the L2.4 evidence pointer, the brief payloads, the L3.3 snapshots)
+stay workflow-side and are composed in front of the registry's body text.
 The same preflight then refuses (exit 2, stderr) when a resolved ``paths:`` read-path does
 not exist in the target — by default or by config, since D17's defaults are Mythical
 Forge's layout (E3.7, §3.4 "Configured read-paths must exist"). Every issue names the
@@ -90,6 +99,7 @@ from pathlib import Path
 from tempfile import mkdtemp
 
 from aidw import __version__, git, lock
+from aidw import stage_registry
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.findings import (
     ParsedFinding,
@@ -97,24 +107,21 @@ from aidw.findings import (
     finding_title,
     parse_review_findings,
     partition_findings,
-    render_could_fix_block,
-    render_finding_block,
 )
 from aidw.gates import GateOutcome, decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
 from aidw.roadmap import DONE_RE, TASK_RE, RoadmapTask, find_task, load_tasks
-from aidw.runner import StageSpec, run_stage
+from aidw.runner import StageSpec, plan_stages, run_stage
 # ``DEFAULT_MAX_REVISIONS`` lives in ``aidw.target_config``, its single home (design
 # §12/H8). The direction must not be reversed: ``target_config`` is the low-level config
 # module, and importing this workflow module from it would be an import cycle.
 from aidw.target_config import (
     DEFAULT_MAX_REVISIONS,
     ConfigOverrides,
-    check_compatibility,
-    load_target_config,
-    resolve_config,
+    ResolvedConfig,
+    resolve_workflow_config,
     validate_paths,
 )
 from aidw.state import (
@@ -152,49 +159,13 @@ EXIT_REFUSED = 4
 #: its single home; the effective value is resolved in :func:`run` via ``resolve_config``:
 #: CLI flag > target config > ``DEFAULT_MAX_REVISIONS``.
 
-#: Instruction prepended to every review round after the first (L2.3, design §8.1). The
-#: three verdict tokens are literal because the reviewer must emit one of them per prior
-#: finding before it may raise a new one. This lives here as toolkit runtime text rather
-#: than in ``prompts/task-review.md``: that prompt is bucket (i) generic and ships as-is
-#: (EXTRACTION.md §4.2), so the round-specific priming is assembly, not prompt copy.
-_DELTA_BRIEF_INSTRUCTION = """\
-## Delta brief — resolve the previous review before raising new findings
-
-This is a later review round, not the first. For **each** finding in the previous review
-below, state a per-finding resolution verdict of exactly `resolved`, `not resolved`, or
-`newly contradicted` before you raise any new finding. Judge `resolved` only from the
-current prompt and the diff that follows. New findings must be genuinely new: never
-re-litigate a finding you judged `resolved`."""
-
-#: Note used when the prompt diff cannot be produced. The brief must never present a
-#: silently empty diff section: the reviewer is told the evidence is missing instead (L2.3).
-_DIFF_UNAVAILABLE = (
-    "The prompt diff for this round is unavailable (`git diff` could not be produced); "
-    "review the prompt file itself for its current state."
-)
-
 #: Note used when the two prompt snapshots are byte-identical, so the reviewer is not left
 #: wondering whether a diff section went missing.
+#: The delta-brief and reconcile wording itself lives in ``aidw.stage_registry`` since E4.3
+#: (``DELTA_BRIEF_INSTRUCTION``/``RECONCILE_INSTRUCTION``/``DIFF_UNAVAILABLE`` and the pure
+#: ``render_delta_brief``/``render_reconcile``); this workflow now only produces the diff
+#: that those renderers embed, so the text has exactly one home.
 _DIFF_EMPTY = "The prompt is unchanged since the previous review."
-
-#: Instruction prepended to the single reconcile stage that follows a fix batch (L3.4,
-#: design §8.1). A fix batch edits the prompt one finding at a time (or one combined batch
-#: of non-blocking findings) and is told to prefer the smallest edit, so the batch can end
-#: internally inconsistent: a fix can leave a neighbouring section stale or leave a finding
-#: unaddressed. This stage compares the fixed prompt against the full review text and the
-#: combined diff and repairs both. It is deliberately *not* :data:`_DELTA_BRIEF_INSTRUCTION`:
-#: that orders the *reviewer* to emit a ``resolved``/``not resolved``/``newly contradicted``
-#: verdict per prior finding; the fixer must reconcile, not review. Like the delta brief it
-#: lives here as toolkit runtime text rather than in ``prompts/task-review-fixes.md``, which
-#: is bucket (i) generic and ships as-is (EXTRACTION.md §4.2).
-_RECONCILE_INSTRUCTION = """\
-## Reconcile the fix batch
-
-One or more fix stages have just edited this prompt in isolation. Compare the fixed
-prompt against the full review text and the combined diff below. Repair every
-cross-section contradiction the edits introduced and address any finding the batch left
-unaddressed. Do not review or re-litigate the findings; make the prompt internally
-consistent with the review."""
 
 #: Temp-directory prefix for the two stable-named diff snapshots. The directory is
 #: removed in a ``finally`` on every path; it is never the run directory (L3.3 owns
@@ -280,77 +251,32 @@ def _prompt_diff(baseline: str, current: str, *, name: str) -> str | None:
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def _render_delta_brief(
+def _brief_diff(
     *,
     index: int,
-    previous_review: str,
     baseline: str | None,
     current: str | None,
     rel: str,
-) -> str:
-    """Assemble round ``index``'s ``extra=`` (instruction, prior review, diff) (L2.3).
+    verb: str,
+    brief_name: str,
+) -> str | None:
+    """The diff payload a delta/reconcile brief embeds, or ``None`` when unavailable (L2.3/L3.4).
 
-    The previous review is passed verbatim: the roadmap says "pass them the previous
-    review", and the finding blocks are already the reviewer's own format. When the
-    baseline or the diff cannot be produced the instruction and the review still ship
-    plus an explicit unavailable note — never a silently empty diff section.
+    Only the workflow has the two prompt snapshots (a captured baseline plus the prompt as
+    it stands now), so producing the diff is its job; the *wording* around it is the
+    registry's (:func:`aidw.stage_registry.render_delta_brief`/
+    :func:`~aidw.stage_registry.render_reconcile`). ``None`` is passed through as-is, which
+    those renderers turn into an explicit unavailable note — never a silently empty diff
+    section. ``verb``/``brief_name`` only shape this warning.
     """
     if baseline is None or current is None:
         print(
-            f"warning: could not read the reviewed prompt `{rel}` to baseline review "
-            f"round {index}; the delta brief names the prompt diff unavailable.",
+            f"warning: could not read the reviewed prompt `{rel}` to {verb} review "
+            f"round {index}; the {brief_name} names the prompt diff unavailable.",
             file=sys.stderr,
         )
-        diff_text = _DIFF_UNAVAILABLE
-    else:
-        diff_text = _prompt_diff(baseline, current, name=Path(rel).name)
-        if diff_text is None:
-            diff_text = _DIFF_UNAVAILABLE
-
-    return "\n\n".join(
-        [
-            _DELTA_BRIEF_INSTRUCTION,
-            "### Previous review\n\n" + previous_review,
-            "### Prompt diff since that review\n\n" + diff_text,
-        ]
-    )
-
-
-def _render_reconcile(
-    *,
-    index: int,
-    review_text: str,
-    baseline: str | None,
-    current: str | None,
-    rel: str,
-) -> str:
-    """Assemble a reconcile stage's ``extra=`` (instruction, whole review, diff) (L3.4).
-
-    Mirrors :func:`_render_delta_brief`: the full review is passed verbatim, and when the
-    baseline or the diff cannot be produced the instruction and the review still ship with
-    an explicit unavailable note — never a silently empty diff section. The diff is the fix
-    batch's net effect: ``baseline`` is the in-memory capture taken before the fix stages
-    and ``current`` is captured before this stage edits anything.
-    """
-    if baseline is None or current is None:
-        print(
-            f"warning: could not read the reviewed prompt `{rel}` to reconcile review "
-            f"round {index}; the reconcile brief names the prompt diff unavailable.",
-            file=sys.stderr,
-        )
-        diff_text = _DIFF_UNAVAILABLE
-    else:
-        diff_text = _prompt_diff(baseline, current, name=Path(rel).name)
-        if diff_text is None:
-            diff_text = _DIFF_UNAVAILABLE
-
-    return "\n\n".join(
-        [
-            _RECONCILE_INSTRUCTION,
-            "### Full review\n\n" + review_text,
-            "### Combined diff for this fix batch\n\n" + diff_text,
-        ]
-    )
+        return None
+    return _prompt_diff(baseline, current, name=Path(rel).name)
 
 
 # ---------------------------------------------------------------------------
@@ -1290,6 +1216,71 @@ def _record_review_outcome(
     return summary
 
 
+def _prompt_plan(
+    *,
+    config: ResolvedConfig,
+    toolkit_root: Path,
+    target_root: Path,
+    phase: str,
+    epic: str,
+    task: str,
+    rel: str,
+    max_revisions: int,
+    rounds: list[stage_registry.FixBatch],
+) -> tuple[dict[str, StageSpec], dict[str, str]]:
+    """This round's stage specs plus the registry's ``brief`` markers, by stage name (E4.3).
+
+    The loop is driven by real verdicts, so it cannot plan the whole chain up front: each
+    round re-expands through :func:`aidw.runner.plan_stages` as the returned reviews'
+    :class:`~aidw.stage_registry.FixBatch` values accumulate in ``rounds``, and the stages
+    it has not reached yet are simply ignored. That is the registry expanding the chain,
+    not a hand-built list (EXTRACTION.md §3.5).
+
+    Two results because :class:`aidw.runner.StageSpec` deliberately has no ``brief`` field:
+    the marker (``BRIEF_DELTA``/``BRIEF_RECONCILE``, already unprimed on round 1 by the
+    registry) says *which* runtime text to render, and the workflow renders it with the
+    registry's pure helpers once it has the payload only the loop has — the previous
+    review and the batch's diff.
+    """
+    fields = {
+        "phase": phase,
+        "epic": epic,
+        "task": task,
+        "rel": rel,
+        "max_revisions": max_revisions,
+        "rounds": tuple(rounds),
+    }
+    specs = {
+        spec.name: spec
+        for spec in plan_stages(
+            "prompt",
+            config=config,
+            toolkit_root=toolkit_root,
+            target_root=target_root,
+            **fields,
+        )
+    }
+    briefs = {
+        planned.name: planned.brief
+        for planned in stage_registry.expand("prompt", **fields)
+    }
+    return specs, briefs
+
+
+def _with_pointer(spec: StageSpec, pointer: str, rendered: str = "") -> StageSpec:
+    """The stage spec with the L2.4 evidence pointer composed in front of its body.
+
+    The body is the registry-rendered :attr:`StageSpec.extra`, plus the runtime text the
+    registry's ``brief`` marker asked for (a delta brief or a reconcile brief). The pointer
+    is **prepended**, never substituted, so no run path clears or rewrites a
+    registry-rendered extra (E4.3 req 5).
+    """
+    body = spec.extra
+    if rendered:
+        body = f"{body}\n\n{rendered}" if body else rendered
+    return replace(spec, extra=_with_evidence(pointer, body))
+
+
 def run(
     *,
     phase: str,
@@ -1320,26 +1311,23 @@ def run(
     # as the `load_all` refusal below) before any run record, branch or worktree exists and
     # regardless of `--dry-run`. The loader emits only ERROR issues today, so there is no
     # WARNING path to gate behind `--strict`.
-    declared = load_target_config(repo.root / "aidw" / "config.yaml")
-    config_errors = [issue for issue in declared.issues if issue.level == ERROR]
-    if config_errors:
-        print(format_issues(config_errors), file=sys.stderr)
-        return 2
-    # Version/compatibility refusal (E3.3, D10, EXTRACTION.md §3.11) at the *same* site
-    # and with the same contract as the validation refusal above: stderr + exit 2 (a
-    # usage/config error, design §14), before `load_tasks`/`derive_branch_name`, any run
-    # record, branch or worktree, and regardless of `--dry-run`. `EXIT_REFUSED` (4) stays
-    # reserved for git/worktree/layout refusals, so both config refusals share one exit
-    # code. The toolkit version is this package's (`aidw.__version__`), passed in rather
-    # than hardcoded; the import direction stays one-way (`target_config` never imports a
-    # workflow module).
-    compatibility_issues = check_compatibility(declared, toolkit_version=__version__)
-    if compatibility_issues:
-        print(format_issues(compatibility_issues), file=sys.stderr)
-        return 2
-    resolved = resolve_config(
-        declared, overrides=ConfigOverrides(max_revisions=max_revisions)
+    # Version/compatibility refusal (E3.3, D10, EXTRACTION.md §3.11) at the *same* site and
+    # with the same contract: stderr + exit 2 (a usage/config error, design §14), before
+    # `load_tasks`/`derive_branch_name`, any run record, branch or worktree, and regardless
+    # of `--dry-run`. `EXIT_REFUSED` (4) stays reserved for git/worktree/layout refusals,
+    # so both config refusals share one exit code. The toolkit version is this package's
+    # (`aidw.__version__`); the import direction stays one-way (`target_config` never
+    # imports a workflow module). Both refusals — and only these two — live in
+    # :func:`aidw.target_config.resolve_workflow_config`, which the other four workflows
+    # share since E4.3 so they cannot drift from this contract.
+    resolved_config, config_issues = resolve_workflow_config(
+        repo.root,
+        toolkit_version=__version__,
+        overrides=ConfigOverrides(max_revisions=max_revisions),
     )
+    if config_issues:
+        print(format_issues(config_issues), file=sys.stderr)
+        return 2
     # Path preflight (E3.7, EXTRACTION.md §3.4/§3.11) at the *same* site and with the same
     # contract as the two refusals above: stderr + exit 2, before `load_tasks`,
     # `derive_branch_name`, any run record, branch or worktree, and regardless of
@@ -1348,11 +1336,11 @@ def run(
     # into the task-prompts directory — and failing here is what stops an agent from
     # improvising around a missing directory. Resolved once: `max_revisions` comes from
     # the same resolution the check validated.
-    path_issues = validate_paths(resolved, repo.root)
+    path_issues = validate_paths(resolved_config, repo.root)
     if path_issues:
         print(format_issues(path_issues), file=sys.stderr)
         return 2
-    max_revisions = resolved["max_revisions"].value
+    max_revisions = resolved_config["max_revisions"].value
     # ``aidt`` locates the toolkit's assets (prompts, agent configs); run state lives
     # under the per-repo state root (EXTRACTION.md §3.10), resolved once by ``_roots``
     # and threaded in as ``workspace`` so no workflow re-resolves it.
@@ -1515,12 +1503,23 @@ def run(
         print(f"run:    {state.run_id}")
         print(f"task:   {entry.title}")
 
-        author = StageSpec(
-            "task-prompt",
-            "task-author",
-            aidt.prompts_dir / "task-prompt.md",
-            [phase, epic, task],
+        # P1 and the first review come from the registry (E4.3). The dry run plans exactly
+        # what it can: `rounds=()` expands to the author plus one review (`task-review-1`),
+        # which is the unchanged dry-run baseline; the full post-phase-02 chain (a review per
+        # round, a reconcile per batch, a review-only terminal review) is what the loop
+        # re-expands above as real verdicts accumulate.
+        dry_specs, _dry_briefs = _prompt_plan(
+            config=resolved_config,
+            toolkit_root=aidt.root,
+            target_root=target.root,
+            phase=phase,
+            epic=epic,
+            task=task,
+            rel=default_rel,
+            max_revisions=max_revisions,
+            rounds=[],
         )
+        author = dry_specs["task-prompt"]
 
         # L1.3: the created worktree is deterministic, so the blocked report names it
         # unconditionally and the old before/after branch probe is gone. No branch probe runs.
@@ -1538,12 +1537,7 @@ def run(
 
         if dry_run:
             rec2 = run_stage(
-                StageSpec(
-                    "task-review-1",
-                    "task-reviewer",
-                    aidt.prompts_dir / "task-review.md",
-                    [default_rel],
-                ),
+                dry_specs["task-review-1"],
                 repo_root=target.root,
                 toolkit_root=aidt.root,
                 runs_root=runs_root,
@@ -1617,22 +1611,45 @@ def run(
         # accumulated in the loop so the gate detail and run.log carry the real per-round
         # counts rather than a number reconstructed from stage names.
         rounds: list[ReviewRound] = []
+        #: The fix batches this run has accumulated, one per fixing round. They are the
+        #: ``prompt`` loop's expansion input (E4.3 req 1/5): each round re-expands the chain
+        #: with the batches known so far, so the stages that have not been reached yet are
+        #: planned but ignored.
+        fix_batches: list[stage_registry.FixBatch] = []
         while True:
             review_index += 1
             name = f"task-review-{review_index}"
-            # Round 1 is deliberately unprimed (no delta brief): the independent first sample
-            # is what keeps the loop from anchoring on the previous review. It still receives
-            # its evidence pointer, which is gathered context, not prior findings. Rounds 2+
-            # add the delta brief, keyed off the stage counter rather than ``revisions`` (which
-            # is incremented later in the same iteration).
+            # This round's stages, expanded by the registry from the batches known so far.
+            # The review stage's prompt, variables and name come from there; so does the
+            # `brief` marker that decides whether this round gets a delta brief.
+            specs, briefs = _prompt_plan(
+                config=resolved_config,
+                toolkit_root=aidt.root,
+                target_root=target.root,
+                phase=phase,
+                epic=epic,
+                task=task,
+                rel=rel,
+                max_revisions=max_revisions,
+                rounds=fix_batches,
+            )
+            spec = specs[name]
+            # Round 1 is deliberately unprimed: the registry zeroes the marker on the first
+            # round (L2.3), so the independent first sample cannot anchor on a previous
+            # review. Every round still receives its evidence pointer — gathered context,
+            # not prior findings.
             delta = ""
-            if review_index >= 2 and previous_review_text is not None:
-                delta = _render_delta_brief(
-                    index=review_index,
-                    previous_review=previous_review_text,
-                    baseline=baseline_prompt,
-                    current=_capture_prompt(prompt_path),
-                    rel=rel,
+            if briefs.get(name) == stage_registry.BRIEF_DELTA:
+                delta = stage_registry.render_delta_brief(
+                    previous_review=previous_review_text or "",
+                    diff=_brief_diff(
+                        index=review_index,
+                        baseline=baseline_prompt,
+                        current=_capture_prompt(prompt_path),
+                        rel=rel,
+                        verb="baseline",
+                        brief_name="delta brief",
+                    ),
                 )
             pointer = _stage_evidence_pointer(
                 stage=name,
@@ -1643,13 +1660,7 @@ def run(
                 rel=rel,
             )
             rec = run_stage(
-                StageSpec(
-                    name,
-                    "task-reviewer",
-                    aidt.prompts_dir / "task-review.md",
-                    [rel],
-                    extra=_with_evidence(pointer, delta),
-                ),
+                _with_pointer(spec, pointer, delta),
                 repo_root=target.root,
                 toolkit_root=aidt.root,
                 runs_root=runs_root,
@@ -1742,65 +1753,98 @@ def run(
                 print(review_text, file=sys.stderr)
                 return 3
 
-            # L4.2: a fixing round's fix count comes from the in-loop partition, not from the
-            # stage names: the whole-review fallback runs one stage while a parsed review runs
-            # one per blocking finding plus one combined could-fix stage.
-            blocking, could_fix = partition_findings(findings)
-            fix_stage_count = (
-                1 if (not findings or problems) else len(blocking) + (1 if could_fix else 0)
-            )
-
             # Capture after the verdict and its Blocked/terminal exits, before the fix
             # stages run, so the next round's diff is exactly this fix batch's net effect and
             # not a cumulative diff across rounds (there is no per-round commit to diff against).
             baseline_prompt = _capture_prompt(prompt_path)
             previous_review_text = review_text
             revisions += 1
-            if not findings or problems:
+            # The round's fix work as registry input (E4.3): one batch, whose partition
+            # selects one stage per blocking finding, one combined could-fix stage, or the
+            # single whole-review fallback when nothing parsed cleanly.
+            blocking, could_fix = partition_findings(findings)
+            unparseable = not findings or bool(problems)
+            fix_batches.append(
+                stage_registry.FixBatch(
+                    review_text=review_text,
+                    blocking=tuple(blocking),
+                    could_fix=tuple(could_fix),
+                    unparseable=unparseable,
+                )
+            )
+            specs, briefs = _prompt_plan(
+                config=resolved_config,
+                toolkit_root=aidt.root,
+                target_root=target.root,
+                phase=phase,
+                epic=epic,
+                task=task,
+                rel=rel,
+                max_revisions=max_revisions,
+                rounds=fix_batches,
+            )
+            # This batch's stages: everything the expansion put after this round's review and
+            # before the next one — its fix stages plus its single reconcile stage (L3.4).
+            ordered = list(specs)
+            next_review = f"task-review-{review_index + 1}"
+            batch_specs = [
+                specs[stage_name]
+                for stage_name in ordered[
+                    ordered.index(name) + 1 : ordered.index(next_review)
+                ]
+            ]
+            fix_specs = [
+                spec
+                for spec in batch_specs
+                if spec.id != stage_registry.PROMPT_RECONCILE
+            ]
+            (reconcile_spec,) = [
+                spec
+                for spec in batch_specs
+                if spec.id == stage_registry.PROMPT_RECONCILE
+            ]
+            # L4.2: a fixing round's fix count comes from the expansion, so it cannot drift
+            # from the stages that actually run: the fallback is one stage, a parsed review
+            # one per blocking finding plus one combined could-fix stage.
+            fix_stage_count = len(fix_specs)
+
+            if unparseable:
                 if problems:
                     print(
                         f"         {len(problems)} finding block(s) did not parse cleanly "
                         f"({problems[0]}); reworking with the whole review instead"
                     )
-                fallback_name = f"task-review-fixes-{revisions}"
-                _snapshot_fix_stage(
-                    stage=fallback_name, directory=directory, prompt_path=prompt_path
-                )
-                rec_fix = run_stage(
-                    StageSpec(
-                        fallback_name,
-                        "task-fixer",
-                        aidt.prompts_dir / "task-review-fixes.md",
-                        [rel],
-                        extra=_with_evidence(
-                            _stage_evidence_pointer(
-                                stage=fallback_name,
-                                directory=directory,
-                                repo=target,
-                                entry=entry,
-                                entries=entries,
-                                rel=rel,
-                            ),
-                            f"## Review findings to address\n\n{review_text}",
-                        ),
-                    ),
-                    repo_root=target.root,
-                    toolkit_root=aidt.root,
-                    runs_root=runs_root,
-                    state=state,
-                    logger=logger,
-                    agents=agents,
-                )
-                print_stage(rec_fix, repo_root=target.root)
-                if rec_fix.status != SUCCEEDED:
-                    state.status = FAILED
-                    save(directory, state)
-                    return 1
+                for spec in fix_specs:
+                    _snapshot_fix_stage(
+                        stage=spec.name, directory=directory, prompt_path=prompt_path
+                    )
+                    pointer = _stage_evidence_pointer(
+                        stage=spec.name,
+                        directory=directory,
+                        repo=target,
+                        entry=entry,
+                        entries=entries,
+                        rel=rel,
+                    )
+                    rec_fix = run_stage(
+                        _with_pointer(spec, pointer),
+                        repo_root=target.root,
+                        toolkit_root=aidt.root,
+                        runs_root=runs_root,
+                        state=state,
+                        logger=logger,
+                        agents=agents,
+                    )
+                    print_stage(rec_fix, repo_root=target.root)
+                    if rec_fix.status != SUCCEEDED:
+                        state.status = FAILED
+                        save(directory, state)
+                        return 1
             else:
                 # Blocking findings are fixed one at a time so progress is visible per change;
                 # the non-blocking could-fix findings share a single stage, so they cost one
-                # invocation instead of one each. ``blocking``/``could_fix`` were partitioned
-                # above for the L4.2 round telemetry.
+                # invocation instead of one each. The registry renders each stage's finding
+                # block into `extra` from the same partition; the loop only reports on it.
                 steps: list[tuple[str, list[ParsedFinding]]] = [
                     ("finding", [finding]) for finding in blocking
                 ]
@@ -1808,39 +1852,32 @@ def run(
                     steps.append(("combined", could_fix))
                 total = len(steps)
 
-                for index, (kind, group) in enumerate(steps, start=1):
+                for index, (spec, (kind, group)) in enumerate(
+                    zip(fix_specs, steps, strict=True), start=1
+                ):
                     prefix = f"fix {revisions}.{index}/{total}:"
                     if kind == "finding":
-                        finding = group[0]
-                        print(f"{prefix} {finding_title(finding)} [{finding.priority}]")
-                        extra = render_finding_block(finding, index=index, total=total)
+                        print(
+                            f"{prefix} {finding_title(group[0])} "
+                            f"[{group[0].priority}]"
+                        )
                     else:
                         noun = "finding" if len(group) == 1 else "findings"
                         print(f"{prefix} {len(group)} could-fix {noun} combined")
-                        extra = render_could_fix_block(group)
 
-                    fix_name = f"task-review-fixes-{revisions}-{index}"
                     _snapshot_fix_stage(
-                        stage=fix_name, directory=directory, prompt_path=prompt_path
+                        stage=spec.name, directory=directory, prompt_path=prompt_path
+                    )
+                    pointer = _stage_evidence_pointer(
+                        stage=spec.name,
+                        directory=directory,
+                        repo=target,
+                        entry=entry,
+                        entries=entries,
+                        rel=rel,
                     )
                     rec_fix = run_stage(
-                        StageSpec(
-                            fix_name,
-                            "task-fixer",
-                            aidt.prompts_dir / "task-review-fixes.md",
-                            [rel],
-                            extra=_with_evidence(
-                                _stage_evidence_pointer(
-                                    stage=fix_name,
-                                    directory=directory,
-                                    repo=target,
-                                    entry=entry,
-                                    entries=entries,
-                                    rel=rel,
-                                ),
-                                extra,
-                            ),
-                        ),
+                        _with_pointer(spec, pointer),
                         repo_root=target.root,
                         toolkit_root=aidt.root,
                         runs_root=runs_root,
@@ -1858,37 +1895,35 @@ def run(
             # review. The fixers work one finding at a time and prefer the smallest edit, so the
             # batch can end internally inconsistent. After L4.1 there is no final fix batch to
             # reconcile: a review is always the last stage for a non-approving prompt, and
-            # ``max_revisions`` counts review rounds with the last one review-only. ``review_index``
-            # is the round number, so the name matches neither ``task-review-N`` nor
-            # ``task-review-fixes-*`` — the L3.3 snapshot writer, the ``_fix_round`` regex and
-            # the harness's ``fix_status`` branch all leave it alone.
-            reconcile_name = f"task-review-reconcile-{review_index}"
-            rec_reconcile = run_stage(
-                StageSpec(
-                    reconcile_name,
-                    "task-fixer",
-                    aidt.prompts_dir / "task-review-fixes.md",
-                    [rel],
-                    extra=_with_evidence(
-                        _stage_evidence_pointer(
-                            stage=reconcile_name,
-                            directory=directory,
-                            repo=target,
-                            entry=entry,
-                            entries=entries,
-                            rel=rel,
-                        ),
-                        _render_reconcile(
-                            index=review_index,
-                            review_text=review_text,
-                            baseline=baseline_prompt,
-                            # Captured here, before run_stage: this is the fix batch's net
-                            # effect, not a diff polluted by the reconcile edit itself.
-                            current=_capture_prompt(prompt_path),
-                            rel=rel,
-                        ),
+            # ``max_revisions`` counts review rounds with the last one review-only. Its name
+            # matches neither ``task-review-N`` nor ``task-review-fixes-*`` — the L3.3 snapshot
+            # writer, the ``_fix_round`` regex and the harness's ``fix_status`` branch all
+            # leave it alone.
+            reconcile_render = ""
+            if briefs.get(reconcile_spec.name) == stage_registry.BRIEF_RECONCILE:
+                reconcile_render = stage_registry.render_reconcile(
+                    review=review_text,
+                    diff=_brief_diff(
+                        index=review_index,
+                        baseline=baseline_prompt,
+                        # Captured here, before run_stage: this is the fix batch's net
+                        # effect, not a diff polluted by the reconcile edit itself.
+                        current=_capture_prompt(prompt_path),
+                        rel=rel,
+                        verb="reconcile",
+                        brief_name="reconcile brief",
                     ),
-                ),
+                )
+            pointer = _stage_evidence_pointer(
+                stage=reconcile_spec.name,
+                directory=directory,
+                repo=target,
+                entry=entry,
+                entries=entries,
+                rel=rel,
+            )
+            rec_reconcile = run_stage(
+                _with_pointer(reconcile_spec, pointer, reconcile_render),
                 repo_root=target.root,
                 toolkit_root=aidt.root,
                 runs_root=runs_root,

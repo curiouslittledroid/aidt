@@ -1,11 +1,15 @@
 """Contract and property tests for the default stage registry (EXTRACTION.md §3.5, E4.1).
 
 The registry is *data plus one pure expander*, so these tests are its executable
-specification: each workflow default is compared against the hardcoded chain the workflow
-module runs today (``implement.build_plan``, the ``prompt`` run loop's stage names,
-``review``'s R1/R2, ``fix``'s dry-run plan, ``approve``'s ``STAGE``/``AGENT``/``PROMPT``),
-including the ``extra`` text, which is part of "byte for byte". Nothing here edits or
-rewires a workflow: E4.3 owns that, and this file is what would catch it changing behaviour.
+specification: each workflow default is compared against the chain the workflow module runs
+(``implement.build_plan``, the ``prompt`` run loop's stage names, ``review``'s R1/R2,
+``fix``'s dry-run plan, ``approve``'s ``STAGE``/``AGENT``/``PROMPT``), including the
+``extra`` text, which is part of "byte for byte". E4.3 then wired every run path to the
+registry, so ``build_plan`` is now the expansion itself; the byte-level pins on what the
+workflows actually render are the real-run tests in ``tests/test_prompt_workflow.py`` and
+the stage-list pins in ``tests/test_plan_stages.py``. The delta/reconcile brief assertions
+here are structural: the wording has a single home in this module, so there is no second
+renderer left to compare against (E4.3 deleted ``prompt.py``'s copies).
 
 Structural tests are per-behaviour hand-calculated vectors (one per path of the prompt
 loop's ``if``/``⟳`` notation). The invariant sweep at the end is this module's property
@@ -37,7 +41,6 @@ from aidw.stage_registry import (
 )
 from aidw.workflows import approve as approve_workflow
 from aidw.workflows import implement as implement_workflow
-from aidw.workflows import prompt as prompt_workflow
 from aidw.workflows import review as review_workflow
 
 PROMPT_REL = "docs/task-prompts/03-E4.1-prompt.md"
@@ -118,9 +121,10 @@ def test_implement_default_reproduces_build_plan(base_branch: str) -> None:
         assert planned.name == expected.name
         assert planned.agent == expected.agent
         assert planned.prompt_file == expected.prompt_file
-        assert list(planned.variables) == expected.variables
-        # The `extra` is part of "byte for byte": I2's test context is exactly
-        # `implement.py`'s `_TEST_CONTEXT.format(...)`, and every other stage carries none.
+        # Both sides are `PlannedStage`s since E4.3 (``build_plan`` is the wrapper), so
+        # this compares the registry's frozen tuples directly (E4.3 req 4).
+        assert planned.variables == expected.variables
+        # The `extra` is part of "byte for byte": I2's test context, and none elsewhere.
         assert planned.extra == expected.extra
 
 
@@ -131,7 +135,7 @@ def test_implement_defaults_base_branch_to_main() -> None:
     stages = expand(
         "implement", prompt_rel=PROMPT_REL, branch=BRANCH, task_id=TASK_ID
     )
-    assert [list(s.variables) for s in stages] == [p.variables for p in plan]
+    assert [s.variables for s in stages] == [p.variables for p in plan]
     assert stages[3].variables == (BRANCH, "main")
 
 
@@ -290,56 +294,53 @@ def test_prompt_loop_fails_closed_beyond_the_revision_budget() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The data-dependent briefs must reproduce prompt.py's rendering exactly
+# The data-dependent briefs (the only renderers left after E4.3)
 # --------------------------------------------------------------------------- #
 
 
-def test_delta_brief_matches_the_workflow_rendering(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        prompt_workflow, "_prompt_diff", lambda baseline, current, *, name: DIFF
+def test_delta_brief_is_instruction_previous_review_and_diff_in_order() -> None:
+    """L2.3: instruction, then the previous review verbatim, then the real diff."""
+    previous = "previous review with trailing spaces  \n"
+    rendered = registry.render_delta_brief(previous_review=previous, diff=DIFF)
+
+    assert rendered.startswith(registry.DELTA_BRIEF_INSTRUCTION)
+    for token in ("`resolved`", "`not resolved`", "`newly contradicted`"):
+        assert token in rendered
+    assert "### Previous review\n\n" + previous in rendered
+    assert "### Prompt diff since that review\n\n" + DIFF in rendered
+    assert rendered.index("### Previous review") < rendered.index(
+        "### Prompt diff"
     )
-    expected = prompt_workflow._render_delta_brief(
-        index=2,
-        previous_review="previous review",
-        baseline="before",
-        current="after",
-        rel=REL,
-    )
-    assert registry.render_delta_brief(previous_review="previous review", diff=DIFF) == expected
+    # Purity: the caller's strings are untouched.
+    assert previous == "previous review with trailing spaces  \n"
 
 
-def test_delta_brief_unavailable_note_matches_the_workflow(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        prompt_workflow, "_prompt_diff", lambda baseline, current, *, name: None
-    )
-    expected = prompt_workflow._render_delta_brief(
-        index=2,
-        previous_review="previous review",
-        baseline="before",
-        current="after",
-        rel=REL,
-    )
+def test_delta_brief_degrades_to_the_unavailable_note() -> None:
+    """An unavailable diff is named, never rendered as a silently empty section."""
     rendered = registry.render_delta_brief(previous_review="previous review", diff=None)
-    assert rendered == expected
+
     assert registry.DIFF_UNAVAILABLE in rendered
+    assert "The prompt diff for this round is unavailable" in rendered
+    assert "diff --git" not in rendered
 
 
-def test_reconcile_brief_matches_the_workflow_rendering(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        prompt_workflow, "_prompt_diff", lambda baseline, current, *, name: DIFF
-    )
-    expected = prompt_workflow._render_reconcile(
-        index=1,
-        review_text="whole review",
-        baseline="before",
-        current="after",
-        rel=REL,
-    )
-    assert registry.render_reconcile(review="whole review", diff=DIFF) == expected
+def test_reconcile_brief_is_instruction_review_and_combined_diff() -> None:
+    """L3.4: the reconcile wording, never the reviewer's delta brief (the trap)."""
+    review = "whole review with trailing spaces  \n"
+    rendered = registry.render_reconcile(review=review, diff=DIFF)
+
+    assert rendered.startswith(registry.RECONCILE_INSTRUCTION)
+    assert "## Reconcile the fix batch" in rendered
+    assert "## Delta brief" not in rendered
+    assert "### Full review\n\n" + review in rendered
+    assert "### Combined diff for this fix batch\n\n" + DIFF in rendered
+    assert rendered.index("### Full review") < rendered.index("### Combined diff")
+
+    degraded = registry.render_reconcile(review=review, diff=None)
+    assert registry.DIFF_UNAVAILABLE in degraded
+    assert "diff --git" not in degraded
+    # Purity: the caller's string is untouched.
+    assert review == "whole review with trailing spaces  \n"
 
 
 # --------------------------------------------------------------------------- #

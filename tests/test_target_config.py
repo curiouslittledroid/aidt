@@ -1689,11 +1689,21 @@ def test_check_compatibility_is_pure(
 
 
 def test_compatibility_check_is_imported_by_the_workflow_not_reverse() -> None:
-    """Requirement 4 / trap: ``prompt.py`` imports the check, never the other way round."""
+    """Requirement 4 / trap: the workflow preflight imports the check, never the reverse.
+
+    Since E4.3 the compatibility check runs inside
+    :func:`aidw.target_config.resolve_workflow_config` — the one seam all five workflows use
+    so their two config refusals cannot drift — so that shared helper is what ``prompt.py``
+    imports from this module. The direction is unchanged: a workflow imports
+    ``target_config``, never the other way round.
+    """
     from aidw import target_config
     from aidw.workflows import prompt as prompt_workflow
 
-    assert prompt_workflow.check_compatibility is check_compatibility
+    assert (
+        prompt_workflow.resolve_workflow_config
+        is target_config.resolve_workflow_config
+    )
     assert not any(
         module.startswith("aidw.workflows")
         for module in _imported_modules(inspect.getsource(target_config))

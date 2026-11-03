@@ -8,14 +8,17 @@ filesystem, or imports a workflow module.
 
 Dependency direction (EXTRACTION.md §3.5, task E4.1's trap list):
 
-* :mod:`aidw.workflows.implement` → this module is the direction E4.3 installs
-  (``build_plan`` reads the registry), so importing :class:`PlanStage` back out of the
-  workflow would be a cycle. The registry therefore owns its own stage type,
-  :class:`StageDefinition`, carrying the same §3.5 fields.
+* :mod:`aidw.workflows.implement` → this module is the direction E4.3 installed:
+  ``build_plan`` is now a thin wrapper over :func:`expand` and ``PlanStage`` is gone, so
+  nothing is imported back out of a workflow (that would be a cycle). The registry owns
+  its own stage types, :class:`StageDefinition` and :class:`PlannedStage`, carrying the
+  same §3.5 fields.
 * :mod:`aidw.target_config` must never import a workflow module (its docstring states
   why), so the registry imports nothing from the config or workflow layers; it may be
   imported *by* both. ``workflows.<name>.stages`` config entries stay the separate
-  ``StageConfig`` shape — E4.3 merges them, this task only seeds the defaults.
+  ``StageConfig`` shape: since E4.3 :func:`aidw.runner.plan_stages` treats a repo-declared
+  list as a ``prompt:`` overlay over these defaults (the defaults themselves stay the only
+  source of stage order and size).
 * The only import is :mod:`aidw.findings`, a leaf module that renders the review-finding
   blocks and the publisher's manifest brief. Reusing it (rather than copying the prose)
   keeps one source of truth for text the fix and publisher stages receive.
@@ -54,9 +57,9 @@ Deliberate, prompt-fixed choices (the task prompt left these to the implementer)
   R2/F4's manifest pointer) are *templates in this module*, and the data-dependent briefs
   (the delta brief, the reconcile brief, the whole-review fallback) are rendered by the
   pure helpers :func:`render_delta_brief`, :func:`render_reconcile` and
-  :func:`render_whole_review_extra`. The workflow modules keep their own copies until E4.3
-  deletes them; ``tests/test_stage_registry.py`` pins the two against each other, so the
-  duplication can never drift silently.
+  :func:`render_whole_review_extra`. E4.3 deleted the workflow modules' copies, so this is
+  the single home for that wording; ``tests/test_stage_registry.py`` pins the rendering and
+  ``tests/test_prompt_workflow.py``'s real-run ``extra`` assertions pin it end to end.
 * **What stays in the workflow**: the L2.4 evidence pointer, the ``git diff`` that feeds a
   delta/reconcile brief, the L3.3 prompt snapshots and the gates (``◇``) are not stage
   data. ``extra`` here is the stage's *body* text; the workflow composes the pointer in
@@ -255,10 +258,11 @@ class PlannedStage:
 
 
 # --------------------------------------------------------------------------- #
-# `extra` text reproduced from the workflow modules (pinned by the tests)
+# Stage `extra` text (the single home since E4.3 deleted the workflows' copies)
 # --------------------------------------------------------------------------- #
 
-#: I2's test context — byte-identical to ``aidw/workflows/implement.py:_TEST_CONTEXT``.
+#: I2's test context. E4.3 uses this rendering on the implement run path and deleted
+#: ``implement.py``'s copy.
 TEST_CONTEXT_EXTRA = """\
 
 ## Stage context (provided by aidw)
@@ -271,7 +275,8 @@ Read the task prompt above, follow its acceptance criteria, and prove them. Leav
 changes uncommitted in the working tree.
 """
 
-#: F2's re-test context — byte-identical to ``aidw/workflows/fix.py:_TEST_EXTRA``.
+#: F2's re-test context. E4.3 uses this rendering on the fix run path and deleted
+#: ``fix.py``'s copy.
 FIX_TEST_CONTEXT_EXTRA = """\
 
 ## Stage context (provided by aidw)
@@ -282,8 +287,8 @@ report `Fail` and hand a real defect back to `/fix-next-review-followup`. Leave 
 uncommitted in the working tree.
 """
 
-#: Instruction prepended to every review round after the first (L2.3) — byte-identical to
-#: ``aidw/workflows/prompt.py:_DELTA_BRIEF_INSTRUCTION``.
+#: Instruction prepended to every review round after the first (L2.3). E4.3 deleted
+#: ``prompt.py``'s copy; the review loop renders this through :func:`render_delta_brief`.
 DELTA_BRIEF_INSTRUCTION = """\
 ## Delta brief — resolve the previous review before raising new findings
 
@@ -293,15 +298,14 @@ below, state a per-finding resolution verdict of exactly `resolved`, `not resolv
 current prompt and the diff that follows. New findings must be genuinely new: never
 re-litigate a finding you judged `resolved`."""
 
-#: Note used when the prompt diff cannot be produced — byte-identical to
-#: ``aidw/workflows/prompt.py:_DIFF_UNAVAILABLE``.
+#: Note used when the prompt diff cannot be produced. E4.3 deleted ``prompt.py``'s copy.
 DIFF_UNAVAILABLE = (
     "The prompt diff for this round is unavailable (`git diff` could not be produced); "
     "review the prompt file itself for its current state."
 )
 
-#: Instruction prepended to the single reconcile stage after a fix batch (L3.4) —
-#: byte-identical to ``aidw/workflows/prompt.py:_RECONCILE_INSTRUCTION``.
+#: Instruction prepended to the single reconcile stage after a fix batch (L3.4). E4.3
+#: deleted ``prompt.py``'s copy.
 RECONCILE_INSTRUCTION = """\
 ## Reconcile the fix batch
 
@@ -318,8 +322,8 @@ def render_delta_brief(*, previous_review: str, diff: str | None) -> str:
     Pure: ``diff`` is the already-produced unified diff (or ``None``/unavailable, which
     becomes :data:`DIFF_UNAVAILABLE`); producing it is the workflow's job, because only it
     has the two prompt snapshots. Mirrors
-    :func:`aidw.workflows.prompt._render_delta_brief` after that function has resolved its
-    inputs, so the wording is identical.
+    :func:`aidw.workflows.prompt`'s pre-E4.3 ``_render_delta_brief`` after that function had
+    resolved its inputs, so the wording of a delta brief is unchanged by the move.
     """
     return "\n\n".join(
         [

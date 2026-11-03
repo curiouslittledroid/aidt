@@ -16,6 +16,13 @@ I6 pr                             agent pr-publisher (fresh)
 ``I2`` and ``I4`` touch disjoint trees and are safe to run concurrently in principle,
 but v1 runs every stage serially (``--parallel`` is accepted and deferred to Phase 7).
 
+The six stages are not hardcoded here since E4.3: ``run()`` builds them with
+:func:`aidw.runner.plan_stages` over the ``aidw.stage_registry`` defaults, so the target
+repo's per-stage ``prompt:`` overlay applies and the prompts resolve against the located
+worktree (EXTRACTION.md §3.5, D2/D14). The target config's two fail-closed preflight
+refusals run first, sharing :func:`aidw.target_config.resolve_workflow_config` with the
+other four workflows.
+
 Branch setup is a Python stage: ``run()`` derives the branch/worktree name from
 ``repo.branch_pattern`` and **locates** the existing worktree (``git.worktree_for_branch``,
 EXTRACTION.md §3.2) — ``aidw prompt`` (E2.5) is what creates it and commits the task
@@ -41,16 +48,17 @@ import re
 import string
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from pathlib import Path
 
-from aidw import git, lock
+from aidw import __version__, git, lock
+from aidw import stage_registry
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.runner import StageSpec, run_stage
+from aidw.runner import StageSpec, plan_stages, run_stage
 from aidw.state import (
     BLOCKED,
     FAILED,
@@ -64,6 +72,7 @@ from aidw.state import (
     save,
     utcnow_iso,
 )
+from aidw.target_config import resolve_workflow_config
 
 GATE = "approve-implementation-pr"
 
@@ -73,39 +82,6 @@ _PROMPT_NAME = re.compile(
 )
 
 _PR_URL = re.compile(r"https?://\S*/pull/(\d+)")
-
-_TEST_CONTEXT = """\
-
-## Stage context (provided by aidw)
-
-- Task: {task_id}
-- Branch: {branch}
-- Task prompt: {prompt_rel}
-
-Read the task prompt above, follow its acceptance criteria, and prove them. Leave your
-changes uncommitted in the working tree.
-"""
-
-
-@dataclass
-class PlanStage:
-    """One planned stage: an id, its agent, prompt and prompt variables."""
-
-    id: str
-    name: str
-    agent: str
-    prompt_file: str
-    variables: list[str] = field(default_factory=list)
-    extra: str = ""
-
-    def spec(self, aidt: Path) -> StageSpec:
-        return StageSpec(
-            self.name,
-            self.agent,
-            aidt / "prompts" / self.prompt_file,
-            list(self.variables),
-            extra=self.extra,
-        )
 
 
 def worktree_add_command(
@@ -222,46 +198,30 @@ def derive_branch_name(pattern: str, *, phase: str, task: str) -> str | None:
 
 def build_plan(
     *, aidt: Path, prompt_rel: str, branch: str, task_id: str, base_branch: str = "main"
-) -> list[PlanStage]:
-    """The six stages, in order (I6 is the ``pr`` stage).
+) -> list[stage_registry.PlannedStage]:
+    """The six stages, in order, exactly as the registry expands them (compat wrapper).
 
     ``base_branch`` is I4's ``$2`` (``base_ref``): the architecture stage measures
     against the configured PR base, not a hardcoded ``main`` (EXTRACTION.md §3.4/R4).
+
+    Since E4.3 this is a thin wrapper over :func:`aidw.stage_registry.expand`, kept for the
+    one caller that needs only the stage **names** before the target config is resolved and
+    the prompt located (``run``'s ``--from`` validation). It is deliberately *not* on the
+    ``implement`` run path: ``run`` builds its stages with
+    :func:`aidw.runner.plan_stages`, so a repo's ``prompt:`` override (D14) applies and the
+    prompts resolve against the target repo rather than the toolkit unconditionally.
+    ``aidt`` is accepted and unused now that the plan carries prompt *names*: keeping it
+    keeps every existing call site (and its ``aidt=`` argument) working.
     """
-    return [
-        PlanStage("I1", "impliment-task", "implementer", "impliment-task.md", [prompt_rel]),
-        PlanStage(
-            "I2",
-            "test",
-            "tester",
-            "test.md",
-            extra=_TEST_CONTEXT.format(
-                task_id=task_id, branch=branch, prompt_rel=prompt_rel
-            ),
-        ),
-        PlanStage(
-            "I3",
-            "update-traceability",
-            "implementer",
-            "update-traceability.md",
-            [branch],
-        ),
-        PlanStage(
-            "I4",
-            "update-architecture",
-            "implementer",
-            "update-architecture.md",
-            [branch, base_branch],
-        ),
-        PlanStage(
-            "I5",
-            "record-implementation-results",
-            "recorder",
-            "record-implementation-results.md",
-            [branch],
-        ),
-        PlanStage("I6", "pr", "pr-publisher", "pr.md", [task_id]),
-    ]
+    return list(
+        stage_registry.expand(
+            "implement",
+            prompt_rel=prompt_rel,
+            branch=branch,
+            task_id=task_id,
+            base_branch=base_branch,
+        )
+    )
 
 
 def _read_out(record) -> str | None:
@@ -377,6 +337,21 @@ def run(
         )
         return 2
 
+    # --- target config (E4.3, EXTRACTION.md §3.4/§3.11, D10) --------------------- #
+    # The first two of `aidw prompt`'s config refusals, at the same site and with the same
+    # contract: stderr + exit 2, before the locate and before any run record or worktree,
+    # `--dry-run` included. The resolved config is what `plan_stages` needs for the
+    # per-stage `prompt:` overlay (D14); a repo with no `aidw/config.yaml` resolves the
+    # toolkit defaults and plans exactly as before. `validate_paths` stays prompt-only:
+    # its read-paths (`roadmap_dir`, the build-results template) need not exist in an
+    # implement tree, and a missing one surfaces fail-closed at the stage that reads it.
+    resolved_config, config_issues = resolve_workflow_config(
+        repo.root, toolkit_version=__version__
+    )
+    if config_issues:
+        print(format_issues(config_issues), file=sys.stderr)
+        return 2
+
     # --- agents/config ---------------------------------------------------------- #
     # Config validation stays in the preflight, before the locate: a combined
     # bad-config-plus-missing-worktree run is a usage/config error (exit 2, design §14),
@@ -407,9 +382,9 @@ def run(
     # --- --from validation (names only; before any lookup) ------------------ #
     # F1 (PR #49 review follow-up): validate `--from` against the planned stage
     # names before the locate and run-state creation, so a typo'd stage name refuses
-    # with exit 2 and leaves behind no run directory. ``build_plan`` is pure
-    # (constants only); the real ``prompt_rel`` is resolved after the locate and the
-    # plan is rebuilt with it.
+    # with exit 2 and leaves behind no run directory. ``build_plan`` is the registry
+    # expansion (pure); the real ``prompt_rel`` is resolved after the locate and the
+    # run-path plan is built with it by ``plan_stages``.
     names = [
         entry.name
         for entry in build_plan(
@@ -443,7 +418,7 @@ def run(
             return 4
 
     # --- locate the task worktree (EXTRACTION.md §3.2, E2.6 req 1) ---------- #
-    # Inline Python, not a PlanStage: I1..I6 stay the exact six stage ids (§3.5), and a
+    # Inline Python, not a plan stage: I1..I6 stay the exact six stage ids (§3.5), and a
     # refusal must leave no run state behind. ``aidw prompt`` (E2.5) created the worktree
     # and committed the task prompt inside it; implement only locates it. A missing
     # worktree is a preflight refusal (exit 4, design §14) in a real run; a dry run
@@ -502,8 +477,18 @@ def run(
             print(f"task prompt not found: {prompt_path}", file=sys.stderr)
             return 2
 
-    plan = build_plan(
-        aidt=aidt.root,
+    # The run-path plan: the registry's six stages mapped to specs through `resolve_prompt`,
+    # with the repo's `prompt:` overlay applied (E4.3). Prompts resolve against the tree the
+    # stages run in — the located worktree. A dry run with no worktree has no such tree yet,
+    # so it plans against the control root instead (the same fallback review/fix document):
+    # resolving against the planned-but-absent path would make every repo-declared `prompt:`
+    # fail closed in every dry run, a state the real run never sees.
+    plan_root = worktree_root if (worktree is not None or not dry_run) else repo.root
+    plan = plan_stages(
+        "implement",
+        config=resolved_config,
+        toolkit_root=aidt.root,
+        target_root=plan_root,
         prompt_rel=prompt_rel,
         branch=branch_name,
         task_id=task_id,
@@ -561,7 +546,7 @@ def run(
         if dry_run:
             for entry in plan:
                 record = run_stage(
-                    entry.spec(aidt.root),
+                    entry,
                     repo_root=target.root,
                     toolkit_root=aidt.root,
                     runs_root=runs_root,
@@ -591,13 +576,13 @@ def run(
             return not (record is not None and record.status == SUCCEEDED)
 
         # --- I1..I5 -------------------------------------------------------------- #
-        def execute(entry: PlanStage, index: int) -> bool:
+        def execute(entry: StageSpec, index: int) -> bool:
             """Run one stage unless it already succeeded; return its success."""
             if not should_run(index, entry.name):
                 print(f"stage:  {entry.id} {entry.name} [skipped]")
                 return True
             record = run_stage(
-                entry.spec(aidt.root),
+                entry,
                 repo_root=target.root,
                 toolkit_root=aidt.root,
                 runs_root=runs_root,
@@ -636,7 +621,7 @@ def run(
                     futures = {
                         pool.submit(
                             run_stage,
-                            entry.spec(aidt.root),
+                            entry,
                             repo_root=target.root,
                             toolkit_root=aidt.root,
                             runs_root=runs_root,
@@ -704,7 +689,7 @@ def run(
         # --- I6 ------------------------------------------------------------------ #
         if should_run(len(plan) - 1, pr_plan.name):
             record = run_stage(
-                pr_plan.spec(aidt.root),
+                pr_plan,
                 repo_root=target.root,
                 toolkit_root=aidt.root,
                 runs_root=runs_root,

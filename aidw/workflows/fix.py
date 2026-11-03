@@ -35,14 +35,14 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from aidw import findings as findings_mod
+from aidw import __version__, findings as findings_mod
 from aidw import git, github, lock
 from aidw.config import ERROR, WARNING, Issue, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.runner import StageSpec, run_stage
+from aidw.runner import StageSpec, plan_stages, run_stage
 from aidw.state import (
     BLOCKED,
     FAILED,
@@ -56,6 +56,7 @@ from aidw.state import (
     save,
     utcnow_iso,
 )
+from aidw.target_config import ResolvedConfig, resolve_workflow_config
 from aidw.verdict import APPROVE, BLOCKED as VERDICT_BLOCKED, parse_verdict
 from aidw.workflows.implement import worktree_add_command
 
@@ -63,15 +64,35 @@ GATE_FOLLOWUPS = "approve-followups"
 GATE_FIX_PR = "approve-fix-pr"
 DEFAULT_MAX_ITERATIONS = 10
 
-_TEST_EXTRA = """\
 
-## Stage context (provided by aidw)
+def _planned_iteration(
+    *,
+    pr: int,
+    round_index: int,
+    iteration: int,
+    config: ResolvedConfig,
+    aidt: Path,
+    repo: Path,
+) -> dict[str, StageSpec]:
+    """One fix iteration's stage specs from the registry, keyed by stage name (E4.3).
 
-This re-verifies a single approved review follow-up fix for PR #{pr} (iteration {iteration}).
-Prove the fix and its acceptance criteria. This stage does not fix implementation code:
-report `Fail` and hand a real defect back to `/fix-next-review-followup`. Leave changes
-uncommitted in the working tree.
-"""
+    The iteration count and the round index are external GitHub state, so the loop expands
+    the iteration it is about to run rather than a pre-built list (EXTRACTION.md §3.5,
+    design §8.4). ``manifest_rel`` is that iteration's real-run manifest path — the value
+    the registry renders into F4's pointer — so the dry run and a real run plan the same
+    ``extra``.
+    """
+    planned = plan_stages(
+        "fix",
+        config=config,
+        toolkit_root=aidt,
+        target_root=repo,
+        pr=pr,
+        round_index=round_index,
+        iteration=iteration,
+        manifest_rel=f"artifacts/iter{iteration}-review-manifest.json",
+    )
+    return {spec.name: spec for spec in planned}
 
 
 def _read_out(record) -> str | None:
@@ -151,13 +172,28 @@ def _approval_round(
     logger: RunLogger,
     directory: Path,
     runs_root: Path,
+    config: ResolvedConfig,
     approve_all: bool,
     skip: set[str],
     deny: set[str] | None = None,
     gate_default: str | None = None,
 ) -> int | None:
-    """Gate ``approve-followups`` and, on approval, run the approver agent."""
-    name = f"round{round_index}-approve-review-followups"
+    """Gate ``approve-followups`` and, on approval, run the approver agent.
+
+    The A1 stage itself comes from the registry through :func:`plan_stages` (E4.3): its
+    name carries the round index, which is the only part that varies per approval round, so
+    the plan is asked for ``iteration=1`` and only its A1 entry is used.
+    """
+    planned = _planned_iteration(
+        pr=pr,
+        round_index=round_index,
+        iteration=1,
+        config=config,
+        aidt=aidt,
+        repo=repo,
+    )
+    spec = planned[f"round{round_index}-approve-review-followups"]
+    name = spec.name
     selection = github.select_followups(aidt, repo, pr)
     outcome = decide(
         GATE_FOLLOWUPS,
@@ -186,13 +222,9 @@ def _approval_round(
         return 3
 
     record = run_stage(
-        StageSpec(
-            name,
-            "review-approver",
-            aidt / "prompts" / "approve-review-followups.md",
-            [str(pr)],
-            verify=lambda: github.verify_approvals(aidt, repo, pr),
-        ),
+        # The approval postcondition is workflow-side, not stage data (E4.3 req 5): the
+        # registry knows the stage, only this workflow knows how to verify the approvals.
+        replace(spec, verify=lambda: github.verify_approvals(aidt, repo, pr)),
         repo_root=repo,
         toolkit_root=aidt,
         runs_root=runs_root,
@@ -226,6 +258,16 @@ def run(
     skip = set(skip_gates or [])
     deny = set(deny_gates or [])
     runs_root = workspace.state_root / "runs"
+
+    # Target config (E4.3, EXTRACTION.md §3.4/§3.11): `aidw prompt`'s two fail-closed
+    # refusals — validation ERRORs and `check_compatibility` — stderr + exit 2 before any
+    # run record or worktree, `--dry-run` included. `validate_paths` stays prompt-only.
+    resolved_config, config_issues = resolve_workflow_config(
+        repo.root, toolkit_version=__version__
+    )
+    if config_issues:
+        print(format_issues(config_issues), file=sys.stderr)
+        return 2
 
     agents, issues = load_all(aidt.root, repo.root)
     errors = [i for i in issues if i.level == ERROR]
@@ -412,18 +454,20 @@ def run(
                 print("child:  unknown (`gh` not found)")
             print("select argv: " + " ".join(github.build_followup_argv(script, "select", pr)))
 
-            planned = [
-                ("round1-approve-review-followups", "review-approver", "approve-review-followups.md", [str(pr)], ""),
-                ("iter1-fix-next-review-followup", "fixer", "fix-next-review-followup.md", [str(pr)], ""),
-                ("iter1-test", "tester", "test.md", [], _TEST_EXTRA.format(pr=pr, iteration=1)),
-                ("iter1-code-review", "code-reviewer", "code-review.md", [], ""),
-                ("iter1-review-findings-to-github", "review-publisher", "review-findings-to-github.md", [str(pr)], ""),
-            ]
-            for name, agent, prompt, variables, extra in planned:
+            # The planned iteration's real-run field values (E4.3 req 5): round 1's
+            # approval plus iteration 1's F1–F4, with that iteration's manifest path so the
+            # dry-run F4 prompt already carries the pointer a real run would render.
+            planned = _planned_iteration(
+                pr=pr,
+                round_index=1,
+                iteration=1,
+                config=resolved_config,
+                aidt=aidt.root,
+                repo=repo.root,
+            )
+            for spec in planned.values():
                 record = run_stage(
-                    StageSpec(
-                        name, agent, aidt.prompts_dir / prompt, variables, extra=extra
-                    ),
+                    spec,
                     repo_root=repo.root,
                     toolkit_root=aidt.root,
                     runs_root=runs_root,
@@ -432,7 +476,11 @@ def run(
                     agents=agents,
                     dry_run=True,
                 )
-                note = " (only when F3 reports findings)" if name.endswith("review-findings-to-github") else ""
+                note = (
+                    " (only when F3 reports findings)"
+                    if spec.name.endswith("review-findings-to-github")
+                    else ""
+                )
                 print(f"{record.name} [{record.status}] (planned) agent={record.agent}{note}")
             print("gates (planned): approve-followups, approve-fix-pr")
             print(f"loop: bounded by --max-iterations={max_iterations}")
@@ -452,6 +500,7 @@ def run(
             logger=logger,
             directory=directory,
             runs_root=runs_root,
+            config=resolved_config,
             approve_all=approve_all,
             skip=skip,
             deny=deny,
@@ -499,14 +548,22 @@ def run(
                 f"({selected.get('priority')})"
             )
 
+            # This iteration's F1–F4, expanded from the registry once per iteration
+            # (E4.3): the stage names carry the iteration count and F2/F4 carry the
+            # registry-rendered context and manifest pointer. The loop is re-derived from
+            # GitHub state each iteration, so nothing here is pre-planned.
+            planned = _planned_iteration(
+                pr=pr,
+                round_index=round_index,
+                iteration=iterations,
+                config=resolved_config,
+                aidt=aidt.root,
+                repo=repo.root,
+            )
+
             # F1 — fix exactly one approved child.
             record = run_stage(
-                StageSpec(
-                    f"{prefix}-fix-next-review-followup",
-                    "fixer",
-                    aidt.prompts_dir / "fix-next-review-followup.md",
-                    [str(pr)],
-                ),
+                planned[f"{prefix}-fix-next-review-followup"],
                 repo_root=repo.root,
                 toolkit_root=aidt.root,
                 runs_root=runs_root,
@@ -523,13 +580,7 @@ def run(
 
             # F2 — independent re-test.
             record = run_stage(
-                StageSpec(
-                    f"{prefix}-test",
-                    "tester",
-                    aidt.prompts_dir / "test.md",
-                    [],
-                    extra=_TEST_EXTRA.format(pr=pr, iteration=iterations),
-                ),
+                planned[f"{prefix}-test"],
                 repo_root=repo.root,
                 toolkit_root=aidt.root,
                 runs_root=runs_root,
@@ -546,12 +597,7 @@ def run(
 
             # F3 — independent re-review.
             record = run_stage(
-                StageSpec(
-                    f"{prefix}-code-review",
-                    "code-reviewer",
-                    aidt.prompts_dir / "code-review.md",
-                    [],
-                ),
+                planned[f"{prefix}-code-review"],
                 repo_root=repo.root,
                 toolkit_root=aidt.root,
                 runs_root=runs_root,
@@ -616,13 +662,7 @@ def run(
                     findings_mod.to_manifest(parsed),
                 )
                 record = run_stage(
-                    StageSpec(
-                        f"{prefix}-review-findings-to-github",
-                        "review-publisher",
-                        aidt.prompts_dir / "review-findings-to-github.md",
-                        [str(pr)],
-                        extra=findings_mod.MANIFEST_EXTRA.format(manifest_rel=manifest_rel),
-                    ),
+                    planned[f"{prefix}-review-findings-to-github"],
                     repo_root=repo.root,
                     toolkit_root=aidt.root,
                     runs_root=runs_root,
@@ -648,6 +688,7 @@ def run(
                     logger=logger,
                     directory=directory,
                     runs_root=runs_root,
+                    config=resolved_config,
                     approve_all=approve_all,
                     skip=skip,
                     deny=deny,

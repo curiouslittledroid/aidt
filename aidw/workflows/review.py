@@ -29,13 +29,13 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from aidw import findings as findings_mod
+from aidw import __version__, findings as findings_mod
 from aidw import git, github, lock
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.runner import StageSpec, run_stage
+from aidw.runner import plan_stages, run_stage
 from aidw.state import (
     BLOCKED,
     FAILED,
@@ -44,11 +44,18 @@ from aidw.state import (
     run_dir,
     save,
 )
+from aidw.target_config import resolve_workflow_config
 from aidw.verdict import APPROVE, BLOCKED as VERDICT_BLOCKED, parse_verdict
 from aidw.workflows.implement import worktree_add_command
 
 R1 = "code-review"
 R2 = "review-findings-to-github"
+
+#: The findings manifest the publisher stage is told to read (§8.3). It is the run-dir
+#: relative path R1's findings are written to, and it is what the registry renders into
+#: R2's ``extra`` — the plan builder takes it as an expansion field (E4.3), so the dry run
+#: and the real run cannot disagree about it.
+MANIFEST_REL = "artifacts/review-manifest.json"
 
 #: ``state.pr`` key recording whether this review published follow-ups (decision I2).
 #: Both successful exits write it — ``True`` after R2 published a parent issue, ``False``
@@ -101,6 +108,17 @@ def run(
     stream: bool = False,
 ) -> int:
     runs_root = workspace.state_root / "runs"
+
+    # Target config (E4.3, EXTRACTION.md §3.4/§3.11): the same two fail-closed refusals
+    # `aidw prompt` performs (validation ERRORs and `check_compatibility`), stderr + exit
+    # 2 before any run record or worktree and regardless of `--dry-run`. `validate_paths`
+    # stays prompt-only: a review tree has no roadmap or build-results template to read.
+    resolved_config, config_issues = resolve_workflow_config(
+        repo.root, toolkit_version=__version__
+    )
+    if config_issues:
+        print(format_issues(config_issues), file=sys.stderr)
+        return 2
 
     agents, issues = load_all(aidt.root, repo.root)
     errors = [i for i in issues if i.level == ERROR]
@@ -226,12 +244,18 @@ def run(
         print(f"run:    {state.run_id}")
         print(f"pr:     #{pr}" + (f" {pr_info['url']}" if pr_info.get("url") else ""))
 
-        r1 = StageSpec(R1, "code-reviewer", aidt.prompts_dir / "code-review.md", [])
-        r2 = StageSpec(
-            R2,
-            "review-publisher",
-            aidt.prompts_dir / "review-findings-to-github.md",
-            [str(pr)],
+        # The R1/R2 pair comes from the registry (E4.3): `findings=True` plans both (the
+        # pair is "R2 only if R1 reports findings", and the dry run plans R2 as well); the
+        # manifest path is the expansion field that renders R2's extra, so the dry-run
+        # prompt already points at the manifest the real run writes.
+        r1, r2 = plan_stages(
+            "review",
+            config=resolved_config,
+            toolkit_root=aidt.root,
+            target_root=repo.root,
+            pr=pr,
+            manifest_rel=MANIFEST_REL,
+            findings=True,
         )
 
         if dry_run:
@@ -253,7 +277,7 @@ def run(
                     f"{record.name} [{record.status}] (planned) "
                     f"agent={record.agent} model={record.model}{suffix}"
                 )
-            manifest_path = directory / "artifacts" / "review-manifest.json"
+            manifest_path = directory / MANIFEST_REL
             publisher = github.script_path(aidt.root, github.PUBLISH_SCRIPT)
             argv = github.build_publish_argv(publisher, pr, manifest_path, dry_run=True)
             try:
@@ -344,22 +368,15 @@ def run(
                 print(f"  {problem}", file=sys.stderr)
             return 3
 
-        manifest_rel = "artifacts/review-manifest.json"
-        manifest_path = directory / "artifacts" / "review-manifest.json"
+        manifest_path = directory / MANIFEST_REL
         manifest_path.write_text(
             json.dumps(findings_mod.to_manifest(parsed), indent=2) + "\n", encoding="utf-8"
         )
-        print(f"findings: {len(parsed)} (manifest: {manifest_rel})")
+        print(f"findings: {len(parsed)} (manifest: {MANIFEST_REL})")
 
-        extra = findings_mod.MANIFEST_EXTRA.format(manifest_rel=manifest_rel)
+        # R2's `extra` is the registry-rendered manifest pointer (E4.3): never rebuilt here.
         rec2 = run_stage(
-            StageSpec(
-                R2,
-                "review-publisher",
-                aidt.prompts_dir / "review-findings-to-github.md",
-                [str(pr)],
-                extra=extra,
-            ),
+            r2,
             repo_root=repo.root,
             toolkit_root=aidt.root,
             runs_root=runs_root,
