@@ -1008,6 +1008,43 @@ def test_declared_empty_lists_stay_config_rather_than_unset(tmp_path: Path) -> N
     assert "workflows.implement.parallel_groups" not in resolved
 
 
+def test_two_declared_workflows_all_resolve(tmp_path: Path) -> None:
+    """A config with two or more workflows resolves without crashing.
+
+    Regression test for the PR #68 review follow-up (finding F1): the resolver
+    loop shadowed the ``declared`` TargetConfig parameter with a per-key
+    boolean, so the second workflow's iteration raised ``AttributeError`` —
+    the normative EXTRACTION.md §3.4 example declares both ``prompt`` and
+    ``implement`` and could not resolve at all.
+    """
+    resolved = _resolve_loaded(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "workflows": {
+                "prompt": {"stages": [{"id": "author"}, {"id": "review"}]},
+                "implement": {
+                    "stages": [{"id": "implement"}, {"id": "test"}],
+                    "parallel_groups": [["test", "architecture"]],
+                },
+            },
+        },
+    )
+
+    assert resolved["workflows.prompt.stages"] == ResolvedValue(
+        [{"id": "author"}, {"id": "review"}], SOURCE_CONFIG
+    )
+    assert resolved["workflows.implement.stages"] == ResolvedValue(
+        [{"id": "implement"}, {"id": "test"}], SOURCE_CONFIG
+    )
+    assert resolved["workflows.implement.parallel_groups"] == ResolvedValue(
+        [["test", "architecture"]], SOURCE_CONFIG
+    )
+    # The open-map rule holds for every workflow: an undeclared sibling list
+    # stays absent rather than contributing an ``unset`` entry.
+    assert "workflows.prompt.parallel_groups" not in resolved
+
+
 def test_resolver_is_pure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """No mutation of the input, no I/O, no aliased containers, stable across calls."""
     config_data = {
