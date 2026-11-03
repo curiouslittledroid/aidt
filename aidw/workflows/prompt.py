@@ -55,7 +55,12 @@ Before any of that — and regardless of ``--dry-run`` — the target repo's
 ``<target>/aidw/config.yaml`` is loaded and resolved (E3.2): its ``max_revisions`` is the
 budget under the CLI flag, and a config carrying validation ERRORs refuses with
 ``format_issues`` on stderr and exit 2 rather than silently resolving to
-``DEFAULT_MAX_REVISIONS`` (design §12, H8; EXTRACTION.md §3.4).
+``DEFAULT_MAX_REVISIONS`` (design §12, H8; EXTRACTION.md §3.4). A config this toolkit
+cannot *understand* refuses at the same site and with the same contract (E3.3, D10):
+:func:`aidw.target_config.check_compatibility` reports a ``schema_version`` newer than
+``SUPPORTED_SCHEMA_VERSION`` or an unsatisfied ``requires_toolkit`` pin, and the issues go
+to stderr with exit 2 before ``load_tasks``/``derive_branch_name``, so the run leaves no
+state, branch or worktree (EXTRACTION.md §3.11 "refuses to run").
 When the author's first output line is ``blocked: <reason>`` the run ends ``blocked``
 (exit 3) with the reason in the run log and on stderr; the created task worktree and any
 uncommitted change under ``docs/task-prompts/`` in it are reported, never repaired
@@ -79,7 +84,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import mkdtemp
 
-from aidw import git, lock
+from aidw import __version__, git, lock
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.findings import (
     ParsedFinding,
@@ -102,6 +107,7 @@ from aidw.runner import StageSpec, run_stage
 from aidw.target_config import (
     DEFAULT_MAX_REVISIONS,
     ConfigOverrides,
+    check_compatibility,
     load_target_config,
     resolve_config,
 )
@@ -1312,6 +1318,18 @@ def run(
     config_errors = [issue for issue in declared.issues if issue.level == ERROR]
     if config_errors:
         print(format_issues(config_errors), file=sys.stderr)
+        return 2
+    # Version/compatibility refusal (E3.3, D10, EXTRACTION.md §3.11) at the *same* site
+    # and with the same contract as the validation refusal above: stderr + exit 2 (a
+    # usage/config error, design §14), before `load_tasks`/`derive_branch_name`, any run
+    # record, branch or worktree, and regardless of `--dry-run`. `EXIT_REFUSED` (4) stays
+    # reserved for git/worktree/layout refusals, so both config refusals share one exit
+    # code. The toolkit version is this package's (`aidw.__version__`), passed in rather
+    # than hardcoded; the import direction stays one-way (`target_config` never imports a
+    # workflow module).
+    compatibility_issues = check_compatibility(declared, toolkit_version=__version__)
+    if compatibility_issues:
+        print(format_issues(compatibility_issues), file=sys.stderr)
         return 2
     max_revisions = resolve_config(
         declared, overrides=ConfigOverrides(max_revisions=max_revisions)

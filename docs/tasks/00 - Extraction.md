@@ -233,7 +233,7 @@
   - Deliverable: a resolution API returning values plus provenance.
   - Done when: `aidw config show` reports, per value, whether it came from a default, the config file, or an override.
 
-- [ ] **E3.3. Version and compatibility refusal (D10)**
+- [x] **E3.3. Version and compatibility refusal (D10)**
   Refuse to run when `schema_version` is newer than understood, or `requires_toolkit` is unsatisfied.
   - Deliverable: a preflight check with a clear, actionable message.
   - Done when: tests cover both refusals and the happy path.
