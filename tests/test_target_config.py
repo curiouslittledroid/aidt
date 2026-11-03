@@ -18,11 +18,17 @@ config and under per-invocation overrides, and the tests below pin the precedenc
 declared-ness-not-value-equality rule, and the resolver's purity (no input mutation, no
 I/O, no shared containers), plus a seeded property run over generated configs.
 
-The loader deliberately does not merge defaults (E3.4 seeds the values), compare versions
-(E3.3), validate path existence (E3.7), or own the stage-id vocabulary (E4.1/E4.5); no
-test here asks it to. ``aidw config show``'s rendering of these values is
-``tests/test_cli.py``'s, and the ``max_revisions`` consumer is
-``tests/test_prompt_workflow.py``'s.
+E3.3 adds the compatibility pass, :func:`aidw.target_config.check_compatibility`: the two
+independent refusals (§3.11's "newer than understood" ``schema_version`` and an
+unsatisfied ``requires_toolkit`` pin), their boundaries (``None`` and older numbers are
+*not* refusals), the no-traceback failure paths (an unparseable specifier, an unparseable
+toolkit version), the loader's ``path.name`` issue-source convention, purity, and a seeded
+property run over both rules together.
+
+The *loader* deliberately does not merge defaults (E3.4 seeds the values), validate path
+existence (E3.7), or own the stage-id vocabulary (E4.1/E4.5); no test here asks it to.
+``aidw config show``'s rendering of these values is ``tests/test_cli.py``'s, and the
+``max_revisions`` consumer is ``tests/test_prompt_workflow.py``'s.
 """
 
 from __future__ import annotations
@@ -39,10 +45,13 @@ from typing import Any
 
 import pytest
 import yaml
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 from aidw.config import ERROR
 from aidw.paths import toolkit_root
 from aidw.target_config import (
+    CONFIG_FILENAME,
     DEFAULT_MAX_REVISIONS,
     SOURCE_CONFIG,
     SOURCE_DEFAULT,
@@ -57,10 +66,12 @@ from aidw.target_config import (
     RepoConfig,
     ResolvedConfig,
     ResolvedValue,
+    SUPPORTED_SCHEMA_VERSION,
     StageConfig,
     TargetConfig,
     TOOLKIT_DEFAULTS,
     WorkflowConfig,
+    check_compatibility,
     format_issues,
     load_target_config,
     resolve_config,
@@ -1213,3 +1224,312 @@ def test_provenance_precedence_property(tmp_path: Path) -> None:
                 entry.value.clear()
         assert resolve_config(declared).to_dict() == expected
         assert declared.to_dict() == declared_before
+
+
+# --------------------------------------------------------------------------- #
+# Version and compatibility refusal (E3.3, EXTRACTION.md §3.11, D10)
+# --------------------------------------------------------------------------- #
+#
+# Hand-calculated vectors, one per behaviour path, plus a seeded property run. The check
+# has exactly two independent refusals, so the interesting cases are the *combination*
+# (both violated: two issues, never just the first), the boundaries (``None`` and ``0`` are
+# not "newer"), and the failure paths that must not become tracebacks (an unparseable
+# specifier, an unparseable toolkit version).
+
+#: Pinned seed and run count for the seeded property test below (same convention as the
+#: E3.2 property run: pytest only, no hypothesis, so a fixed sample and no shrinking).
+COMPAT_PROPERTY_SEED = 3311
+COMPAT_PROPERTY_RUNS = 64
+
+#: The toolkit version the hand-calculated vectors use. Deliberately *not*
+#: ``aidw.__version__``: the check must use the version it is handed, and pinning a
+#: literal here is what makes a hardcoded ``"0.1.0"`` inside the module fail.
+TOOLKIT_VERSION = "0.1.0"
+
+
+def _compat(
+    declaration: dict[str, Any] | None = None,
+    *,
+    toolkit_version: str = TOOLKIT_VERSION,
+    tmp_path: Path | None = None,
+) -> list[Any]:
+    """Load ``declaration`` (through the real loader when a path is given) and check it."""
+    if tmp_path is not None:
+        declared = TargetConfig() if declaration is None else _load(tmp_path, declaration)
+    else:
+        declared = TargetConfig(**(declaration or {}))
+    return check_compatibility(declared, toolkit_version=toolkit_version)
+
+
+def _messages(issues: list[Any]) -> list[str]:
+    return [issue.message for issue in issues]
+
+
+def test_supported_schema_version_is_one() -> None:
+    """The toolkit understands exactly the §3.4 schema in this module (E3.1's)."""
+    assert SUPPORTED_SCHEMA_VERSION == 1
+
+
+def test_current_schema_version_with_no_pin_is_compatible(tmp_path: Path) -> None:
+    """Requirement 2's happy path: ``schema_version: 1`` and no ``requires_toolkit``."""
+    issues = _compat({"schema_version": 1}, tmp_path=tmp_path)
+
+    assert issues == []
+
+
+def test_satisfied_requires_toolkit_is_compatible(tmp_path: Path) -> None:
+    """A pin the toolkit's own version satisfies is not a refusal (§3.4's ``>=1.0.0``)."""
+    assert _compat(
+        {"schema_version": 1, "requires_toolkit": ">=0.1.0"},
+        toolkit_version="0.1.0",
+        tmp_path=tmp_path,
+    ) == []
+    # PEP 440 semantics, not string semantics: "0.10.0" < "0.9.0" lexicographically.
+    assert _compat(
+        {"schema_version": 1, "requires_toolkit": ">=0.10.0"},
+        toolkit_version="0.9.0",
+    ) != []
+    assert _compat(
+        {"schema_version": 1, "requires_toolkit": ">=0.9.0"},
+        toolkit_version="0.10.0",
+    ) == []
+
+
+def test_newer_schema_version_refuses_naming_field_value_and_supported(
+    tmp_path: Path,
+) -> None:
+    """Refusal 1: a newer ``schema_version`` names the field, the value and the ceiling."""
+    issues = _compat({"schema_version": 2}, tmp_path=tmp_path)
+
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue.level == ERROR
+    assert issue.source == "config.yaml"
+    for token in ("schema_version", "2", str(SUPPORTED_SCHEMA_VERSION)):
+        assert token in issue.message
+    # Actionable remedy, both directions (§3.11 "refuses to run ... clear, actionable").
+    assert "upgrade `aidt`" in issue.message
+    assert "lower the config's `schema_version`" in issue.message
+    assert "error: config.yaml:" in format_issues(issues)
+
+
+def test_unsatisfied_requires_toolkit_refuses_naming_field_specifier_and_version(
+    tmp_path: Path,
+) -> None:
+    """Refusal 2: an unsatisfied pin names the field, the pin and the toolkit version."""
+    issues = _compat(
+        {"schema_version": 1, "requires_toolkit": ">=1.0.0"}, tmp_path=tmp_path
+    )
+
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue.level == ERROR
+    assert issue.source == "config.yaml"
+    for token in ("requires_toolkit", ">=1.0.0", TOOLKIT_VERSION):
+        assert token in issue.message
+    assert "upgrade `aidt`" in issue.message
+    assert "relax the pin" in issue.message
+
+
+def test_upper_bound_pin_also_refuses() -> None:
+    """The comparator is a PEP 440 specifier, not a "minimum version" special case."""
+    issues = _compat(
+        {"schema_version": 1, "requires_toolkit": "<=0.0.5"},
+        toolkit_version="0.1.0",
+    )
+
+    assert len(issues) == 1
+    assert "requires_toolkit" in issues[0].message
+    assert "<=0.0.5" in issues[0].message
+
+
+def test_both_refusals_are_independent_issues(tmp_path: Path) -> None:
+    """Requirement 1: a config violating both reports two issues, not just the first."""
+    issues = _compat(
+        {"schema_version": 2, "requires_toolkit": ">=1.0.0"}, tmp_path=tmp_path
+    )
+
+    assert len(issues) == 2
+    assert all(issue.level == ERROR for issue in issues)
+    assert {issue.source for issue in issues} == {"config.yaml"}
+    messages = _messages(issues)
+    assert "schema_version" in messages[0]
+    assert "requires_toolkit" in messages[1]
+
+
+def test_invalid_requires_toolkit_specifier_is_an_issue_not_an_exception() -> None:
+    """Requirement 3: ``SpecifierSet``'s ``InvalidSpecifier`` becomes an ERROR issue."""
+    issues = _compat(
+        {"schema_version": 1, "requires_toolkit": "banana"}, toolkit_version="0.1.0"
+    )
+
+    assert len(issues) == 1
+    assert issues[0].level == ERROR
+    for token in ("requires_toolkit", "banana", "not a valid version specifier"):
+        assert token in issues[0].message
+
+
+def test_invalid_toolkit_version_is_an_issue_not_an_exception() -> None:
+    """A malformed toolkit version is the toolkit's bug, so it also fails closed."""
+    issues = _compat(
+        {"schema_version": 1, "requires_toolkit": ">=1.0.0"},
+        toolkit_version="not-a-version",
+    )
+
+    assert len(issues) == 1
+    assert issues[0].level == ERROR
+    for token in ("requires_toolkit", "not-a-version"):
+        assert token in issues[0].message
+
+
+def test_missing_config_is_compatible() -> None:
+    """§3.4: no ``aidw/`` folder is the valid defaults-only case, never a refusal."""
+    assert check_compatibility(TargetConfig(), toolkit_version=TOOLKIT_VERSION) == []
+
+
+def test_missing_config_file_loads_and_is_compatible(tmp_path: Path) -> None:
+    """The same case through the real loader: no file => no issues, no refusal."""
+    path = tmp_path / "target" / "aidw" / "config.yaml"
+    declared = load_target_config(path)
+
+    assert declared.source_path is None
+    assert check_compatibility(declared, toolkit_version=TOOLKIT_VERSION) == []
+
+
+@pytest.mark.parametrize("schema_version", [0, -1, SUPPORTED_SCHEMA_VERSION])
+def test_older_or_current_schema_version_is_not_a_refusal(schema_version: int) -> None:
+    """The boundary is ``>``, not ``state.py:load``'s ``!=``: older is not "newer"."""
+    assert (
+        check_compatibility(
+            TargetConfig(schema_version=schema_version),
+            toolkit_version=TOOLKIT_VERSION,
+        )
+        == []
+    )
+
+
+def test_compatibility_issue_source_follows_the_loader_name_convention() -> None:
+    """The source is the config file's name, and the fallback when none was loaded."""
+    # A code-built config (no ``source_path``) still names ``config.yaml``, the loader's
+    # ``path.name`` for the canonical location.
+    issues = check_compatibility(
+        TargetConfig(schema_version=2), toolkit_version=TOOLKIT_VERSION
+    )
+
+    assert issues[0].source == CONFIG_FILENAME == "config.yaml"
+
+
+def test_compatibility_issue_source_uses_the_declared_source_path(tmp_path: Path) -> None:
+    declared = _load(tmp_path, {"schema_version": 2})
+
+    issues = check_compatibility(declared, toolkit_version=TOOLKIT_VERSION)
+
+    assert declared.source_path is not None
+    assert issues[0].source == declared.source_path.name
+
+
+def test_check_compatibility_is_pure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No I/O, no input mutation, a fresh list, and stable across calls."""
+    declared = _load(
+        tmp_path,
+        {
+            "schema_version": 2,
+            "requires_toolkit": ">=1.0.0",
+            "repo": {"base_branch": "trunk"},
+        },
+    )
+    before = copy.deepcopy(declared)
+    before_dict = copy.deepcopy(declared.to_dict())
+
+    def _no_io(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("check_compatibility must not touch the filesystem")
+
+    monkeypatch.setattr(pathlib.Path, "read_text", _no_io)
+    monkeypatch.setattr(pathlib.Path, "write_text", _no_io)
+    monkeypatch.setattr(pathlib.Path, "open", _no_io)
+
+    first = check_compatibility(declared, toolkit_version=TOOLKIT_VERSION)
+    second = check_compatibility(declared, toolkit_version=TOOLKIT_VERSION)
+
+    assert first == second
+    assert first is not second
+    assert declared == before
+    assert declared.to_dict() == before_dict
+    # The caller owns the list: mutating it cannot change a later result.
+    first.clear()
+    assert len(check_compatibility(declared, toolkit_version=TOOLKIT_VERSION)) == 2
+
+
+def test_compatibility_check_is_imported_by_the_workflow_not_reverse() -> None:
+    """Requirement 4 / trap: ``prompt.py`` imports the check, never the other way round."""
+    from aidw import target_config
+    from aidw.workflows import prompt as prompt_workflow
+
+    assert prompt_workflow.check_compatibility is check_compatibility
+    assert not any(
+        module.startswith("aidw.workflows")
+        for module in _imported_modules(inspect.getsource(target_config))
+    )
+
+
+def _random_compat_case(rng: random.Random) -> tuple[dict[str, Any], str]:
+    """A random (declaration, toolkit_version) pair, valid or intentionally broken."""
+    declaration: dict[str, Any] = {}
+    schema_version = rng.choice([None, -1, 0, 1, 2, 3, 99])
+    if schema_version is not None:
+        declaration["schema_version"] = schema_version
+    requires_toolkit = rng.choice(
+        [None, "", ">=1.0.0", "<=0.0.5", ">=0.1.0", "==0.1.0", "~=0.1", "!=0.1.0", "banana"]
+    )
+    if requires_toolkit is not None:
+        declaration["requires_toolkit"] = requires_toolkit
+    toolkit_version = rng.choice(
+        ["0.1.0", "0.2.0", "1.0.0", "1.0.0rc1", "2.5.0", "not-a-version"]
+    )
+    return declaration, toolkit_version
+
+
+def test_compatibility_refusal_property() -> None:
+    """Seeded property run (seed/numRuns pinned above) over both independent refusals.
+
+    Invariants for every generated case: no exception; the result is a fresh list holding
+    only ERROR issues; there is exactly one issue per violated rule, in
+    ``schema_version``-then-``requires_toolkit`` order, and none otherwise; each message
+    names its own field; and the input config is not mutated.
+    """
+    rng = random.Random(COMPAT_PROPERTY_SEED)
+
+    for _ in range(COMPAT_PROPERTY_RUNS):
+        declaration, toolkit_version = _random_compat_case(rng)
+        declared = TargetConfig(**declaration)
+        before = copy.deepcopy(declared)
+
+        issues = check_compatibility(declared, toolkit_version=toolkit_version)
+
+        schema_refused = (
+            declared.schema_version is not None
+            and declared.schema_version > SUPPORTED_SCHEMA_VERSION
+        )
+        requires_refused = False
+        if declared.requires_toolkit is not None:
+            try:
+                requirement = SpecifierSet(declared.requires_toolkit)
+                version = Version(toolkit_version)
+            except (InvalidSpecifier, InvalidVersion):
+                requires_refused = True
+            else:
+                requires_refused = version not in requirement
+
+        assert len(issues) == int(schema_refused) + int(requires_refused)
+        assert all(issue.level == ERROR for issue in issues)
+        assert all(issue.source == CONFIG_FILENAME for issue in issues)
+        if schema_refused:
+            assert "schema_version" in issues[0].message
+        if requires_refused:
+            assert "requires_toolkit" in issues[-1].message
+        assert declared == before
+        assert issues is not check_compatibility(
+            declared, toolkit_version=toolkit_version
+        )

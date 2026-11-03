@@ -23,8 +23,9 @@ config:
   and a loader caller still sees what was actually declared (E3.1's round-trip). Default
   *values* beyond ``max_revisions`` are E3.4/E6/E4.1's; the defaults structure carries the
   empty slots so those tasks add values without touching the merge.
-- It does not compare or refuse ``schema_version``/``requires_toolkit`` — that is E3.3.
-  The fields are loaded and type-checked; their values are not interpreted here.
+- The *loader* does not compare ``schema_version``/``requires_toolkit``: the fields are
+  loaded and type-checked there. Interpreting them is :func:`check_compatibility`
+  (E3.3, D10/§3.11), a separate pure pass a workflow preflight runs after the loader.
 - It does not touch the filesystem beyond reading the one config file. ``paths:`` values
   are opaque strings; existence validation is E3.7's.
 
@@ -37,6 +38,13 @@ format them with the agent-config issues.
 A missing config file is **not** an error: §3.4 says a target repo with no ``aidw/``
 folder is valid and gets the toolkit's defaults. The caller resolves the target root and
 the config path (E3.2/E3.5); this loader takes the file path.
+
+Version and compatibility (E3.3, D10/§3.11) is the third job: :func:`check_compatibility`
+refuses a config whose ``schema_version`` is newer than :data:`SUPPORTED_SCHEMA_VERSION`
+or whose ``requires_toolkit`` pin this toolkit's own version does not satisfy. It is pure
+and takes the toolkit version as an argument, so this module never imports ``aidw``'s
+version or a workflow module (``aidw.workflows.prompt`` imports *this* check, never the
+reverse).
 """
 
 from __future__ import annotations
@@ -47,6 +55,12 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+# PEP 440 version/specifier comparison (E3.3). Deliberately not ``str`` comparison:
+# ``"0.1.0" >= "1.0.0"`` is ``True`` lexicographically, and a hand-rolled
+# ``tuple(int(x) for x in v.split("."))`` gets pre-release and build metadata wrong.
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 # Issues are the agent-config ones on purpose: ``aidw doctor`` (E3.5) formats target-config
 # validation errors with the same helper. ``format_issues`` is re-exported for that caller.
@@ -687,6 +701,130 @@ def load_target_config(path: Path) -> TargetConfig:
         return TargetConfig(source_path=path, issues=issues)
 
     return _parse_target_config(dict(raw), source, path, issues)
+
+
+# --------------------------------------------------------------------------- #
+# Version and compatibility (E3.3, EXTRACTION.md §3.11, D10; design §14 exit codes)
+# --------------------------------------------------------------------------- #
+
+#: The newest target-config ``schema_version`` this toolkit understands. A config that
+#: declares a *higher* number is refused unchanged: §3.11's "exceeds what it
+#: understands" / the roadmap's "newer than understood". Deliberately ``>`` and not
+#: ``state.py:load``'s ``!=``: an older number (``0``) is not what the spec names, and
+#: refusing it would fail repos the spec calls valid.
+SUPPORTED_SCHEMA_VERSION = 1
+
+#: The issue ``source`` for a config object built in code (``source_path is None``). The
+#: loader labels its issues with ``path.name``; this is that name for the canonical
+#: ``<target>/aidw/config.yaml`` location, so both refusals read the same way.
+CONFIG_FILENAME = "config.yaml"
+
+
+def _compat_source(declared: TargetConfig) -> str:
+    """The loader's ``path.name`` convention, with a fallback for a code-built config."""
+    if declared.source_path is not None:
+        return declared.source_path.name
+    return CONFIG_FILENAME
+
+
+def _schema_version_issue(declared_version: int, source: str) -> Issue:
+    return Issue(
+        ERROR,
+        source,
+        f"`schema_version` {declared_version} is newer than this toolkit understands "
+        f"({SUPPORTED_SCHEMA_VERSION}); upgrade `aidt` to a version that supports "
+        f"schema version {declared_version}, or lower the config's `schema_version` "
+        f"to {SUPPORTED_SCHEMA_VERSION}.",
+    )
+
+
+def _requires_toolkit_issue(
+    specifier: str, toolkit_version: str, source: str
+) -> Issue:
+    return Issue(
+        ERROR,
+        source,
+        f"`requires_toolkit` {specifier!r} is not satisfied by this toolkit's "
+        f"version {toolkit_version}; upgrade `aidt` to a version matching "
+        f"{specifier!r}, or relax the pin in `{source}`.",
+    )
+
+
+def _invalid_requires_toolkit_issue(specifier: str, source: str) -> Issue:
+    return Issue(
+        ERROR,
+        source,
+        f"`requires_toolkit` {specifier!r} is not a valid version specifier; use a "
+        'PEP 440 specifier such as ">=1.0.0", or upgrade `aidt`.',
+    )
+
+
+def _invalid_toolkit_version_issue(
+    specifier: str, toolkit_version: str, source: str
+) -> Issue:
+    return Issue(
+        ERROR,
+        source,
+        f"`requires_toolkit` {specifier!r} cannot be evaluated: this toolkit's own "
+        f"version {toolkit_version!r} is not a valid PEP 440 version.",
+    )
+
+
+def check_compatibility(
+    declared: TargetConfig, *, toolkit_version: str
+) -> list[Issue]:
+    """Refuse an incompatible target config (E3.3, EXTRACTION.md §3.11, D10).
+
+    Returns a **fresh** list: empty when the config is compatible, otherwise one
+    :data:`~aidw.config.ERROR` issue per violated rule, so the caller can refuse through
+    the same ``format_issues`` path as the loader's errors.
+
+    Two independent refusals, both evaluated (a config can violate both):
+
+    1. ``schema_version`` is not ``None`` and is **greater than**
+       :data:`SUPPORTED_SCHEMA_VERSION` — "exceeds what it understands". ``None`` is the
+       valid defaults-only case (no config file, §3.4), never "newer"; ``0`` or a negative
+       number is not newer either.
+    2. ``requires_toolkit`` is not ``None`` and this toolkit's ``toolkit_version`` does
+       not satisfy it, compared with :mod:`packaging` (PEP 440). An unparseable specifier,
+       or an unparseable toolkit version, is a refusal with an actionable message rather
+       than a traceback.
+
+    Pure: no I/O, no mutation of ``declared`` (or of anything it references), and a list
+    the caller owns. The toolkit version is **passed in** — hardcoding it here would let
+    this module disagree with the package it ships in — and the issue ``source`` follows
+    the loader's ``path.name`` convention (:data:`CONFIG_FILENAME` when the config was
+    built in code rather than read from a file).
+    """
+    issues: list[Issue] = []
+    source = _compat_source(declared)
+
+    if (
+        declared.schema_version is not None
+        and declared.schema_version > SUPPORTED_SCHEMA_VERSION
+    ):
+        issues.append(_schema_version_issue(declared.schema_version, source))
+
+    if declared.requires_toolkit is not None:
+        specifier = declared.requires_toolkit
+        try:
+            requirement = SpecifierSet(specifier)
+        except InvalidSpecifier:
+            issues.append(_invalid_requires_toolkit_issue(specifier, source))
+        else:
+            try:
+                version = Version(toolkit_version)
+            except InvalidVersion:
+                issues.append(
+                    _invalid_toolkit_version_issue(specifier, toolkit_version, source)
+                )
+            else:
+                if version not in requirement:
+                    issues.append(
+                        _requires_toolkit_issue(specifier, toolkit_version, source)
+                    )
+
+    return issues
 
 
 # --------------------------------------------------------------------------- #

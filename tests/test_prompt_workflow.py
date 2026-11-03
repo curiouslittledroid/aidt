@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from aidw import git, lock, state
+from aidw import __version__, git, lock, state
 from aidw.cli import app
 from aidw.config import ERROR, Issue
 from aidw.paths import ToolkitPaths, TargetRepo, WorkspacePaths, repo_root, toolkit_root
@@ -3799,6 +3799,143 @@ def test_l43_unreadable_directory_config_refuses_before_dry_run(
     assert seen == []
     assert state.list_runs(_runs_root(tmp_path)) == []
     assert git.worktree_for_branch(tmp_path, "03-E4.1") is None
+
+
+# --------------------------------------------------------------------------- #
+# E3.3 — version and compatibility refusal (D10, EXTRACTION.md §3.11)
+# --------------------------------------------------------------------------- #
+#
+# The refusal belongs at the E3.2 config-refusal site: stderr + exit 2, before
+# `load_tasks`/`derive_branch_name`, any run record, branch or worktree, and regardless of
+# `--dry-run`. `EXIT_REFUSED` (4) would split the two config refusals into different
+# codes; requirement 5 keeps `config show` display-only (pinned in `tests/test_cli.py`).
+
+
+@pytest.mark.parametrize(
+    ("config_text", "expected_tokens"),
+    [
+        pytest.param(
+            "schema_version: 2\n",
+            ("schema_version", "2", "1"),
+            id="newer-schema-version",
+        ),
+        pytest.param(
+            'schema_version: 1\nrequires_toolkit: ">=1.0.0"\n',
+            ("requires_toolkit", ">=1.0.0", __version__),
+            id="unsatisfied-requires-toolkit",
+        ),
+        pytest.param(
+            'schema_version: 1\nrequires_toolkit: "banana"\n',
+            ("requires_toolkit", "banana"),
+            id="invalid-requires-toolkit",
+        ),
+    ],
+)
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_e33_incompatible_config_refuses_before_any_state(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    config_text: str,
+    expected_tokens: tuple[str, ...],
+    dry_run: bool,
+) -> None:
+    """Both refusals exit 2 with the issues on stderr, before tasks/branch/run state.
+
+    The toolkit version in the message is ``aidw.__version__`` (passed in, not
+    hardcoded), and the refusal must hold for a real run *and* a plan: a `--dry-run` that
+    silently planned an incompatible config would hide the incompatibility until the
+    first real run.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch, config_text=config_text)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    def _must_not_run(*_args, **_kwargs):
+        raise AssertionError(
+            "an incompatible config must refuse before load_tasks/derive_branch_name"
+        )
+
+    monkeypatch.setattr(prompt_workflow, "load_tasks", _must_not_run)
+    monkeypatch.setattr(prompt_workflow, "derive_branch_name", _must_not_run)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        max_revisions=1,
+        dry_run=dry_run,
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "error: config.yaml:" in err
+    for token in expected_tokens:
+        assert token in err
+    # Nothing was created: no stage ran, no run record, no branch and no worktree.
+    assert seen == []
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert not _runs_root(tmp_path).exists()
+    assert git.worktree_for_branch(tmp_path, "03-E4.1") is None
+    assert not _task_worktree(tmp_path).exists()
+
+
+def test_e33_both_refusals_are_reported(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A config that is both newer and pins an unsatisfied version reports both issues."""
+    _patch_prompt_repo(
+        tmp_path,
+        monkeypatch,
+        config_text='schema_version: 2\nrequires_toolkit: ">=1.0.0"\n',
+    )
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        max_revisions=1,
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert err.count("error: config.yaml:") == 2
+    assert "schema_version" in err
+    assert "requires_toolkit" in err
+    assert seen == []
+    assert state.list_runs(_runs_root(tmp_path)) == []
+
+
+def test_e33_satisfied_pin_still_proceeds(tmp_path: Path, monkeypatch) -> None:
+    """The happy path: a compatible pin must not refuse (or the refusal is unconditional)."""
+    _patch_prompt_repo(
+        tmp_path,
+        monkeypatch,
+        config_text=f'schema_version: 1\nrequires_toolkit: ">={__version__}"\n',
+    )
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        max_revisions=1,
+    )
+
+    assert code == 3  # the fake review requests changes; compatibility did not refuse
+    assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
+    assert state.list_runs(_runs_root(tmp_path)) != []
 
 
 def test_l43_budget_four_runs_four_reviews(

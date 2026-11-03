@@ -839,6 +839,36 @@ def test_config_show_override_provenance_is_not_reachable_here(
     assert sources == {"default", None}
 
 
+def test_config_show_does_not_refuse_an_incompatible_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Requirement 5 / E3.3: ``config show`` stays display-only, even when incompatible.
+
+    The refusal belongs to the workflow preflight (§3.11 "refuses to run"); this command
+    is the inspection aid that shows *why* a workflow refuses, so it exits 0 and reports
+    the resolved ``schema_version``/``requires_toolkit`` with ``config`` provenance. A
+    compatibility check wrongly added here fails this test.
+    """
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _init_repo(tmp_path)
+    config_path = tmp_path / "aidw" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        'schema_version: 2\nrequires_toolkit: ">=99.0.0"\n', encoding="utf-8"
+    )
+
+    result = _config_show_json()
+
+    assert result.exit_code == 0, result.output
+    # The single-checkout state-root warning is unrelated; no compatibility refusal.
+    assert "error: config.yaml:" not in result.stderr
+    config = json.loads(result.stdout)["config"]
+    assert config["schema_version"] == {"value": 2, "source": "config"}
+    assert config["requires_toolkit"] == {"value": ">=99.0.0", "source": "config"}
+
+
 def test_config_show_config_file_directory_fails_closed(tmp_path: Path, monkeypatch) -> None:
     """E3.2 flips E1.6's ``none``: a directory passes ``exists()`` but cannot be read.
 
