@@ -228,11 +228,13 @@ def test_build_plan_order_and_agents() -> None:
         "recorder",
         "pr-publisher",
     ]
-    assert plan[0].variables == ["docs/task-prompts/03-E4.1-prompt.md"]
-    assert plan[1].variables == [] and plan[1].extra
-    assert plan[2].variables == ["03-E4.1"]
-    assert plan[3].variables == ["03-E4.1", "main"]
-    assert plan[5].variables == ["03-E4.1"]
+    # Since E4.3 `build_plan` is the registry's expansion, so `variables` is the registry's
+    # frozen tuple (`aidw.stage_registry.PlannedStage`), not a mutable list.
+    assert plan[0].variables == ("docs/task-prompts/03-E4.1-prompt.md",)
+    assert plan[1].variables == () and plan[1].extra
+    assert plan[2].variables == ("03-E4.1",)
+    assert plan[3].variables == ("03-E4.1", "main")
+    assert plan[5].variables == ("03-E4.1",)
 
 
 def test_build_plan_uses_the_configured_base_branch() -> None:
@@ -240,7 +242,7 @@ def test_build_plan_uses_the_configured_base_branch() -> None:
         aidt=Path("/aidt"), prompt_rel="docs/task-prompts/03-E4.1-prompt.md",
         branch="03-E4.1", task_id="03-E4.1", base_branch="develop",
     )
-    assert plan[3].variables == ["03-E4.1", "develop"]
+    assert plan[3].variables == ("03-E4.1", "develop")
 
 
 # --------------------------------------------------------------------------- #
@@ -332,6 +334,53 @@ def test_dry_run_plans_locate_and_all_six_stages(
     assert not (tmp_path / "03-E4.1").exists()
     # The prompt argument is re-based onto the planned worktree (req 2/req 6).
     assert recorder.specs[0].variables == ["docs/task-prompts/03-E4.1-prompt.md"]
+    # The plan lines print the retained stage id, which since E4.3 rides on
+    # ``StageSpec.id`` (``id`` and ``name`` are different fields): a lost carrier would
+    # silently drop the ``I1 …`` prefix and change this output.
+    for line in (
+        "I1 impliment-task [succeeded] (planned)",
+        "I2 test [succeeded] (planned)",
+        "I3 update-traceability [succeeded] (planned)",
+        "I4 update-architecture [succeeded] (planned)",
+        "I5 record-implementation-results [succeeded] (planned)",
+        "I6 pr [succeeded] (planned)",
+    ):
+        assert line in out
+
+
+def test_dry_run_renders_a_repo_declared_prompt_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """E4.3: a config's D14 ``prompt:`` changes the prompt the planned stage renders."""
+    control, prompt = _layout(tmp_path)
+    override = control / "aidw" / "prompts" / "update-traceability.md"
+    override.parent.mkdir(parents=True)
+    override.write_text("# repo traceability rules\n", encoding="utf-8")
+    (control / "aidw" / "config.yaml").write_text(
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    stages:\n"
+        "      - id: I3\n"
+        "        prompt: aidw/prompts/update-traceability.md\n",
+        encoding="utf-8",
+    )
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 0
+    # I3 resolves to the repo's declared file; every other stage keeps the toolkit default.
+    assert recorder.specs[2].prompt == override.resolve()
+    assert recorder.specs[2].explicit_prompt == "aidw/prompts/update-traceability.md"
+    assert recorder.specs[1].prompt == (
+        ToolkitPaths.resolve().prompts_dir / "test.md"
+    )
+    assert recorder.specs[1].explicit_prompt is None
 
 
 def test_dry_run_writes_runs_under_the_state_root(tmp_path: Path, monkeypatch) -> None:

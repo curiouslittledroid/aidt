@@ -1180,6 +1180,41 @@ def resolve_config(
     return ResolvedConfig(merge.entries)
 
 
+def resolve_workflow_config(
+    target_root: Path,
+    *,
+    toolkit_version: str,
+    overrides: ConfigOverrides | None = None,
+) -> tuple[ResolvedConfig | None, list[Issue]]:
+    """Load, fail-closed and resolve a workflow's target config (E4.3, D10/§3.11).
+
+    Exactly the two refusals ``aidw prompt``'s ``run()`` preflight performs, shared so the
+    other workflows cannot drift from it: a config carrying validation ``ERROR`` issues,
+    and a :func:`check_compatibility` refusal (a ``schema_version`` newer than this toolkit
+    understands, or an unsatisfied ``requires_toolkit``). Both are usage/config errors
+    (exit 2, design §14) and both must happen before any run record or worktree, in every
+    mode including ``--dry-run``.
+
+    Returns ``(resolved, [])`` when the config is usable, or ``(None, issues)`` when the
+    caller must print :func:`aidw.config.format_issues` on stderr and stop with exit 2.
+    The third preflight of ``aidw prompt`` — :func:`validate_paths` — is deliberately
+    **not** part of this helper: its read-paths need not exist in a review/fix/approve
+    tree, and a missing path surfaces fail-closed at the stage that first reads it.
+
+    Pure apart from reading the config file; ``load_target_config`` treats a missing
+    ``aidw/config.yaml`` as an empty config, so a repo with no ``aidw/`` folder resolves
+    the toolkit defaults.
+    """
+    declared = load_target_config(target_root / "aidw" / "config.yaml")
+    config_errors = [issue for issue in declared.issues if issue.level == ERROR]
+    if config_errors:
+        return None, config_errors
+    compatibility_issues = check_compatibility(declared, toolkit_version=toolkit_version)
+    if compatibility_issues:
+        return None, list(compatibility_issues)
+    return resolve_config(declared, overrides=overrides), []
+
+
 # --------------------------------------------------------------------------- #
 # Path classification and existence validation (E3.7, EXTRACTION.md §3.4)
 # --------------------------------------------------------------------------- #
