@@ -263,7 +263,7 @@
   - Deliverable: doctor check plus tests.
   - Done when: a malformed config fails doctor with the field path, and a missing config passes with "defaults".
 
-- [ ] **E3.6. Document the config contract**
+- [x] **E3.6. Document the config contract**
   `docs/target-repo-config.md`: every field, its default, its effect, the override precedence, and a
   worked Minimal / Typical / Full example.
   - Deliverable: the doc.
