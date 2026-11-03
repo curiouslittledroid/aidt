@@ -783,6 +783,14 @@ def run(
             if any(entry.name == _ARCHITECTURE_STAGE for entry in active):
                 refusal = _ensure_architecture_dir(target.root)
                 if refusal is not None:
+                    # Post-`create_run` refusal (review follow-up #82): the run state is
+                    # already on disk as RUNNING, so this exit path must mark it FAILED
+                    # and save like a stage failure does — otherwise the next invocation
+                    # without `--resume` hits the still-running guard instead of retrying
+                    # the fixable config/filesystem error.
+                    state.status = FAILED
+                    state.resume = {"next_stage": _ARCHITECTURE_STAGE}
+                    save(directory, state)
                     return refusal
             failed = False
             if active:
@@ -825,6 +833,12 @@ def run(
                 if entry.name == _ARCHITECTURE_STAGE and should_run(index, entry.name):
                     refusal = _ensure_architecture_dir(target.root)
                     if refusal is not None:
+                        # Post-`create_run` refusal (review follow-up #82): same as the
+                        # parallel branch above — mark FAILED and save before returning,
+                        # so a clean retry is not refused by the still-running guard.
+                        state.status = FAILED
+                        state.resume = {"next_stage": _ARCHITECTURE_STAGE}
+                        save(directory, state)
                         return refusal
                 if not execute(entry, index):
                     return 1

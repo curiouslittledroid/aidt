@@ -26,9 +26,11 @@ from aidw.gates import GateOutcome
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import (
     FAILED,
+    RUNNING,
     SUCCEEDED,
     StageRecord,
     create_run,
+    latest_for_branch,
     run_dir,
     save,
 )
@@ -1445,6 +1447,47 @@ def test_e37_architecture_write_target_that_is_a_file_fails_naming_the_stage(
     # I4 itself never ran; the stages before it did.
     assert "update-architecture" not in recorder.names
     assert recorder.names == ["impliment-task", "test", "update-traceability"]
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_e37_architecture_dir_refusal_marks_the_run_failed_not_running(
+    tmp_path: Path, monkeypatch, parallel: bool
+) -> None:
+    """Review follow-up #82: the mkdir refusal must not leave the run marked RUNNING.
+
+    The refusal fires after `create_run` + `save` already wrote status RUNNING, so
+    without an explicit FAILED + save the next invocation without `--resume` hits the
+    still-running guard (exit 4) instead of retrying the fixable filesystem error. Both
+    insertion sites are covered: the serial loop and the `--parallel` pair.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    blocker = worktree / "docs" / "architecture"
+    blocker.write_text("not a directory\n", encoding="utf-8")
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True, parallel=parallel
+    )
+
+    assert code == 2
+    state = implement_workflow._latest_implement_run(_runs_root(control), "03-E4.1")
+    assert state is not None
+    assert state.status == FAILED
+    assert state.status != RUNNING
+    assert state.resume == {"next_stage": "update-architecture"}
+
+    # A clean retry (blocker removed, no `--resume`) is not refused by the still-running
+    # guard: the fresh run proceeds and I4 executes.
+    blocker.unlink()
+    retry = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", retry)
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True, parallel=parallel
+    )
+    assert code == 0
+    assert "update-architecture" in retry.names
 
 
 def test_e37_disabled_architecture_stage_passes_an_absent_write_target(
