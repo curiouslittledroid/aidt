@@ -258,7 +258,7 @@
   - Deliverable: defaults plus a test asserting each default value explicitly.
   - Done when: a config file containing only `schema_version: 1` produces the Mythical Forge layout.
 
-- [ ] **E3.5. `aidw/config.yaml` validation in doctor**
+- [x] **E3.5. `aidw/config.yaml` validation in doctor**
   Report the config path found (or none), the resolved schema version, and any validation error.
   - Deliverable: doctor check plus tests.
   - Done when: a malformed config fails doctor with the field path, and a missing config passes with "defaults".

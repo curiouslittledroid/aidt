@@ -1,16 +1,20 @@
 """``aidw doctor`` — environment and prerequisite validation.
 
 Checks the local environment, repository state, AIDT's own prompts and helper scripts,
-agent configs and optional external tooling. Reports ``OK`` / ``WARN`` / ``FAIL`` per
-check and exits non-zero only when at least one check fails.
+agent configs, the target repo's ``aidw/config.yaml`` and optional external tooling.
+Reports ``OK`` / ``WARN`` / ``FAIL`` per check and exits non-zero only when at least one
+check fails.
 
 The target side of the report is the §3.2 layout diagnosis (E2.8): the target is
 resolved through :meth:`aidw.paths.TargetRepo.resolve` (so ``--repo``/``AIDW_REPO`` are
 honoured and a bare directory is reachable), and the workspace root, state root and
 control worktree are classified by :func:`aidw.layout.check_layout` — the same guard
-``cli._roots`` uses — rather than by a doctor-local copy of its rules.
+``cli._roots`` uses — rather than by a doctor-local copy of its rules. Once a working
+tree exists, ``target config`` (E3.5) reports the ``<target>/aidw/config.yaml`` path, its
+resolved ``schema_version`` and any validation or compatibility error (§3.4/§3.11, D10).
 
-See ``design.md`` §12/§14 and ``docs/migration/EXTRACTION.md`` §3.1/§3.2/§3.10.
+See ``design.md`` §12/§14 and ``docs/migration/EXTRACTION.md``
+§3.1/§3.2/§3.4/§3.10/§3.11.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from aidw import inventory
+from aidw import __version__, inventory
 from aidw.layout import LayoutError, check_layout
 from aidw.paths import (
     BareRepositoryError,
@@ -34,10 +38,21 @@ from aidw.paths import (
     WorkspacePaths,
     toolkit_root,
 )
+from aidw.target_config import (
+    ERROR,
+    check_compatibility,
+    format_issues,
+    load_target_config,
+    resolve_config,
+)
 
 OK = "OK"
 WARN = "WARN"
 FAIL = "FAIL"
+
+#: How the target-config check renders "no ``aidw/config.yaml``": §3.4's valid default
+#: case. Shared by the path and the schema-version column so the wording cannot drift.
+NO_TARGET_CONFIG = "none (defaults)"
 
 _SYMBOL = {OK: "  ok  ", WARN: " warn ", FAIL: " fail "}
 
@@ -317,6 +332,59 @@ def _check_mcp(root: Path) -> Check:
     return Check("mcp config", WARN, f"missing {path}")
 
 
+def _check_target_config(root: Path) -> Check:
+    """Report the target repo's ``aidw/config.yaml``: path, schema version, errors.
+
+    EXTRACTION.md §3.4/§3.11 and roadmap E3.5: ``aidw doctor`` validates the target
+    config and reports per-value provenance. The config path is composed the way every
+    other consumer composes it (``root / "aidw" / "config.yaml"``) and loaded through
+    :func:`aidw.target_config.load_target_config`, so a missing file is the valid
+    defaults case — ``source_path is None`` and no issues — never a ``FAIL`` (§3.4: "a
+    target repo with no ``aidw/`` folder is valid").
+
+    The failure decision is the loader's ``ERROR`` issues unioned with
+    :func:`aidw.target_config.check_compatibility` (D10: an unsupported
+    ``schema_version`` or an unsatisfied ``requires_toolkit``). It never comes from the
+    merged output: ``resolve_config``'s contract is that callers refuse a broken config
+    *before* resolving, so the schema version is rendered only after that gate. The
+    loader's messages already name the full field path (``unknown key paths.foo``), and
+    :func:`format_issues` is the same formatter ``aidw config show`` and the workflow
+    preflights use, so the report names the field rather than paraphrasing it.
+
+    Read-only: one file read, nothing written (§3.1), and the toolkit version is passed
+    in from :data:`aidw.__version__` rather than hardcoded, so doctor cannot claim a
+    compatibility verdict for a version other than the one it ships in.
+    """
+    config_path = root / "aidw" / "config.yaml"
+    declared = load_target_config(config_path)
+
+    issues = [issue for issue in declared.issues if issue.level == ERROR]
+    issues.extend(check_compatibility(declared, toolkit_version=__version__))
+
+    source = (
+        str(declared.source_path.resolve())
+        if declared.source_path is not None
+        else NO_TARGET_CONFIG
+    )
+    if issues:
+        return Check("target config", FAIL, f"{source}\n{format_issues(issues)}")
+
+    # Resolved, not ``declared.schema_version`` (roadmap: "the resolved schema version"):
+    # the two are equal today only because ``schema_version`` has no toolkit default.
+    schema_version = resolve_config(declared)["schema_version"]
+    # Review follow-up #78: an unset resolved ``schema_version`` only happens when there
+    # is no config file at all, so ``source`` is already the NO_TARGET_CONFIG sentinel;
+    # appending the suffix would render the sentinel twice ("none (defaults) — schema
+    # version none (defaults)"). Render it once.
+    if not schema_version.is_set:
+        return Check("target config", OK, source)
+    return Check(
+        "target config",
+        OK,
+        f"{source} — schema version {schema_version.value} ({schema_version.source})",
+    )
+
+
 def _check_prompts(aidt: Path) -> Check:
     issues = inventory.check(aidt)
     errors = [issue for issue in issues if issue.level == "error"]
@@ -478,6 +546,9 @@ def collect_checks(explicit: Path | None = None) -> list[Check]:
     checks.extend(_layout_checks(target))
     checks.append(_check_git(target.root))
     checks.append(_check_mcp(target.root))
+    # After the early returns above: the config lives in the target's *working tree*, so
+    # a bare directory must short-circuit first (it has no ``aidw/`` to read).
+    checks.append(_check_target_config(target.root))
 
     aidt = toolkit_root()
     checks.append(_check_prompts(aidt))

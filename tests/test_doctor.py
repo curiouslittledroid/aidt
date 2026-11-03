@@ -1,10 +1,12 @@
 """Contract tests for ``aidw doctor``.
 
-Two halves: the environment checks (``pi``/``gh``/``git`` versions, dependencies) with
-faked binaries, and the E2.8 target-layout checks (``git version``, ``repo root``/
+Three halves: the environment checks (``pi``/``gh``/``git`` versions, dependencies) with
+faked binaries; the E2.8 target-layout checks (``git version``, ``repo root``/
 ``target repo``, ``workspace root``, ``state root``, ``control worktree``) against *real*
 temporary repositories — a bare repo, the supported bare + sibling-worktree layout, a
-single-checkout plain clone and the §3.2 clone-of-a-worktree trap.
+single-checkout plain clone and the §3.2 clone-of-a-worktree trap; and the E3.5
+``target config`` check against ``<target>/aidw/config.yaml`` (valid, missing, malformed
+and incompatible).
 
 The repo fixtures are deliberately local: E2.9's ``worktree_repo`` fixture covers only
 the bare + ``main`` + ``task`` layout, while these tests add the bare-only, trap and
@@ -25,6 +27,7 @@ from aidw import doctor, git
 from aidw.cli import app
 from aidw.doctor import (
     FAIL,
+    NO_TARGET_CONFIG,
     OK,
     WARN,
     _check_dependencies,
@@ -40,6 +43,7 @@ from aidw.doctor import (
     run_doctor,
 )
 from aidw.paths import TargetRepo, WorkspacePaths
+from aidw.target_config import load_target_config, resolve_config
 
 runner = CliRunner()
 
@@ -115,6 +119,21 @@ def _make_supported(
     if task_worktree:
         _git_run(bare, "worktree", "add", "-q", "-b", "task", str(tmp_path / "task"), "main")
     return bare, control
+
+
+def _write_target_config(repo: Path, text: str | bytes) -> Path:
+    """Write ``<repo>/aidw/config.yaml`` verbatim and return its path.
+
+    ``bytes`` are written raw so the non-UTF-8 vector (review follow-up #77) can put
+    undecodable bytes in the file the way an editor saving latin-1 would.
+    """
+    path = repo / "aidw" / "config.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(text, bytes):
+        path.write_bytes(text)
+    else:
+        path.write_text(text, encoding="utf-8")
+    return path
 
 
 def _make_plain_clone(tmp_path: Path, name: str = "plain") -> Path:
@@ -639,6 +658,227 @@ def test_supported_layout_reports_the_new_checks_ok_from_each_worktree(
             assert _named(checks, name).status == OK, (start, name)
         assert _named(checks, "workspace root").detail == str(tmp_path.resolve())
         assert run_doctor(explicit=start) == 0
+
+
+# ---------------------------------------------------------------------------
+# target config: EXTRACTION.md §3.4/§3.11, roadmap E3.5
+# ---------------------------------------------------------------------------
+
+
+def test_valid_target_config_reports_the_path_and_resolved_schema_version(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """§3.4: a valid config is ``OK`` and reports its resolved path and version."""
+    _bare, control = _make_supported(tmp_path)
+    config_path = _write_target_config(
+        control, "schema_version: 1\nrepo:\n  base_branch: trunk\n"
+    )
+
+    check = _named(collect_checks(explicit=control), "target config")
+
+    assert check.status == OK
+    assert str(config_path.resolve()) in check.detail
+    assert "schema version 1 (config)" in check.detail
+    # A valid config never breaks the gate: the dirty worktree is only a WARN.
+    assert run_doctor(explicit=control) == 0
+
+
+def test_missing_target_config_reports_defaults(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """§3.4: a target repo with no ``aidw/`` folder is valid, not an error."""
+    _bare, control = _make_supported(tmp_path)
+    config_path = control / "aidw" / "config.yaml"
+    assert not config_path.exists()
+
+    check = _named(collect_checks(explicit=control), "target config")
+
+    assert check.status == OK
+    # Review follow-up #78: the OK detail renders the sentinel exactly once — the
+    # schema-version suffix is dropped when the resolved schema version is unset,
+    # instead of doubling it to "none (defaults) — schema version none (defaults)".
+    assert check.detail == NO_TARGET_CONFIG
+    assert check.detail.count("none (defaults)") == 1
+    # The value the check renders comes from an *unset* resolved leaf, not a FAIL.
+    declared = load_target_config(config_path)
+    assert declared.source_path is None
+    assert declared.issues == []
+    assert resolve_config(declared)["schema_version"].is_set is False
+    assert run_doctor(explicit=control) == 0
+
+
+MALFORMED_CONFIG_CASES = [
+    pytest.param(
+        "schema_version: 1\npaths:\n  foo: bar\n",
+        "`paths.foo`",
+        id="unknown-key",
+    ),
+    pytest.param('schema_version: "1"\n', "`schema_version`", id="wrong-type"),
+    pytest.param(
+        "repo:\n  base_branch: trunk\n",
+        "`schema_version`",
+        id="missing-schema-version",
+    ),
+    # Review follow-up #77: byte 0xe9 is invalid UTF-8, so the loader fails at decode
+    # time (UnicodeDecodeError, a ValueError) rather than at parse time.
+    pytest.param(
+        b"schema_version: 1\nname: caf\xe9\n",
+        "cannot read/parse config",
+        id="non-utf-8",
+    ),
+]
+
+
+@pytest.mark.parametrize(("text", "field_path"), MALFORMED_CONFIG_CASES)
+def test_malformed_target_config_fails_naming_the_field_path(
+    tmp_path: Path,
+    fake_external_clis: None,  # noqa: ARG001
+    text: str | bytes,
+    field_path: str,
+) -> None:
+    """Fail closed: a malformed config is a FAIL whose detail names the field path."""
+    _bare, control = _make_supported(tmp_path)
+    _write_target_config(control, text)
+
+    check = _named(collect_checks(explicit=control), "target config")
+
+    assert check.status == FAIL
+    assert str((control / "aidw" / "config.yaml").resolve()) in check.detail
+    assert field_path in check.detail
+    assert run_doctor(explicit=control) == 1
+
+
+def test_cli_doctor_reports_malformed_target_config_and_exits_non_zero(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """The user-facing command names the config field when validation fails."""
+    _bare, control = _make_supported(tmp_path)
+    config_path = _write_target_config(control, "schema_version: 1\npaths:\n  foo: bar\n")
+
+    result = runner.invoke(app, ["--repo", str(control), "doctor"])
+
+    assert result.exit_code == 1, result.output
+    assert str(config_path.resolve()) in result.stdout
+    assert "`paths.foo`" in result.stdout
+    assert "Traceback" not in result.output
+
+
+def test_cli_doctor_reports_non_utf8_target_config_and_exits_non_zero(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """Review follow-up #77: an undecodable config fails closed at the CLI boundary."""
+    _bare, control = _make_supported(tmp_path)
+    config_path = _write_target_config(control, b"schema_version: 1\nname: caf\xe9\n")
+
+    result = runner.invoke(app, ["--repo", str(control), "doctor"])
+
+    assert result.exit_code == 1, result.output
+    assert str(config_path.resolve()) in result.stdout
+    assert "cannot read/parse config" in result.stdout
+    assert "Traceback" not in result.output
+
+
+INCOMPATIBLE_CONFIG_CASES = [
+    pytest.param("schema_version: 2\n", "schema_version", id="newer-schema"),
+    pytest.param(
+        'schema_version: 1\nrequires_toolkit: ">=99.0.0"\n',
+        "requires_toolkit",
+        id="unsatisfied-requires-toolkit",
+    ),
+]
+
+
+@pytest.mark.parametrize(("text", "field_name"), INCOMPATIBLE_CONFIG_CASES)
+def test_incompatible_target_config_fails_naming_the_field(
+    tmp_path: Path,
+    fake_external_clis: None,  # noqa: ARG001
+    text: str,
+    field_name: str,
+) -> None:
+    """§3.11/D10: doctor also refuses an incompatible config, naming the field."""
+    _bare, control = _make_supported(tmp_path)
+    _write_target_config(control, text)
+
+    check = _named(collect_checks(explicit=control), "target config")
+
+    assert check.status == FAIL
+    assert field_name in check.detail
+    assert run_doctor(explicit=control) == 1
+
+
+def test_malformed_and_incompatible_errors_are_both_reported(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """The loader's ERROR issues and the compatibility refusals are unioned, not either/or."""
+    _bare, control = _make_supported(tmp_path)
+    _write_target_config(control, "schema_version: 2\nbogus: true\n")
+
+    check = _named(collect_checks(explicit=control), "target config")
+
+    assert check.status == FAIL
+    assert "unknown key `bogus`" in check.detail
+    assert "`schema_version` 2 is newer" in check.detail
+
+
+def test_bare_target_does_not_run_the_target_config_check(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """A bare target has no working tree to read ``aidw/config.yaml`` from."""
+    bare = _make_bare(tmp_path)
+
+    checks = collect_checks(explicit=bare)
+
+    assert _named(checks, "target repo").status == FAIL
+    assert "target config" not in [check.name for check in checks]
+
+
+def test_target_config_check_is_read_only_and_leaves_the_config_untouched(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """§3.1: doctor reads the config and writes nothing into the target repo."""
+    _bare, control = _make_supported(tmp_path)
+    config_path = _write_target_config(control, "schema_version: 1\n")
+    before_text = config_path.read_text(encoding="utf-8")
+    before_listing = sorted((control / "aidw").iterdir())
+
+    collect_checks(explicit=control)
+
+    assert config_path.read_text(encoding="utf-8") == before_text
+    assert sorted((control / "aidw").iterdir()) == before_listing
+    assert not (control / "aidw" / "config.yaml.tmp").exists()
+
+
+def test_configless_repo_never_gains_an_aidw_directory(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """The defaults case must not create the folder it looked for (§3.4)."""
+    _bare, control = _make_supported(tmp_path)
+    assert not (control / "aidw").exists()
+
+    _named(collect_checks(explicit=control), "target config")
+
+    assert not (control / "aidw").exists()
+    assert not (control / "aidw" / "config.yaml").exists()
+
+
+def test_target_config_verdict_is_invariant_to_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """Metamorphic: the verdict follows the resolved target, never the cwd."""
+    _bare, control = _make_supported(tmp_path)
+    _write_target_config(control, "schema_version: 2\n")
+
+    from_control = _named(collect_checks(explicit=control), "target config")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    from_elsewhere = _named(collect_checks(explicit=control), "target config")
+
+    assert (from_elsewhere.name, from_elsewhere.status, from_elsewhere.detail) == (
+        from_control.name,
+        from_control.status,
+        from_control.detail,
+    )
 
 
 # ---------------------------------------------------------------------------

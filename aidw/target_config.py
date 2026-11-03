@@ -687,7 +687,10 @@ def load_target_config(path: Path) -> TargetConfig:
 
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    # Review follow-up #77: UnicodeDecodeError is a ValueError, not an OSError, so
+    # non-UTF-8 bytes in an operator-controlled config must be caught alongside
+    # OSError or the same fail-closed contract is violated with an uncaught crash.
+    except (OSError, UnicodeDecodeError) as exc:
         issues.append(Issue(ERROR, source, f"cannot read/parse config: {exc}"))
         return TargetConfig(source_path=path, issues=issues)
 

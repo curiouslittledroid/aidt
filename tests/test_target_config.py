@@ -364,6 +364,21 @@ def test_unparseable_yaml_is_an_error_not_an_exception(tmp_path: Path) -> None:
     assert "cannot read/parse config" in config.issues[0].message
 
 
+def test_non_utf8_bytes_are_an_error_not_an_exception(tmp_path: Path) -> None:
+    """Review follow-up #77: non-UTF-8 bytes are a decode error, not an uncaught
+    UnicodeDecodeError — UnicodeDecodeError is a ValueError, so the OSError handler
+    alone does not cover it.
+    """
+    path = tmp_path / "aidw" / "config.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"schema_version: 1\nname: caf\xe9\n")
+
+    config = load_target_config(path)
+
+    assert [issue.level for issue in config.issues] == [ERROR]
+    assert "cannot read/parse config" in config.issues[0].message
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed: unknown keys at every object level
 # ---------------------------------------------------------------------------
