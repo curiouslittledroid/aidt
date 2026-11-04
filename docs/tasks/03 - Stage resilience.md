@@ -69,6 +69,14 @@ fresh re-run refuses at branch-setup (`git.add_worktree` returns `None` for an a
 checked-out branch) — exit 4, before it reads the roadmap — until the operator deletes the
 worktree and branch by hand.
 
+A **blocked** run is worse off than a failed one. Design §9.2 sets `resume.next_stage` only when a
+*stage fails*, so a block records no continuation point at all: `20261103T202948Z-00-E4.3-prompt`
+ends `status: blocked` with `resume: {}` and a **successful** terminal review as its last stage.
+Its fifteen stages and $2.11 are unreachable by any supported path — although L4.1 makes exactly
+this outcome (`Request changes` at the budget, exit 3) an intended one that will keep recurring —
+and the only recovery is a blind re-roll whose first stage re-authors the prompt file the review
+was about.
+
 ## Gate: do not start before these are known
 
 | Prerequisite | Why it constrains phase 03 |
@@ -148,6 +156,33 @@ Every behaviour change here is proven by a fake Pi argv or a fake stage (AGENTS.
     check L1.1 and the predecessor check L1.2 belong to the run being resumed); the lock and the
     worktree identity are. Gates already recorded are not re-asked (design §9.3).
 
+- [ ] **H1.3. Give a blocked run a forward path** (Design 8.1, Design 9.2, Design 9.3)
+  H1.2 recovers a *failed* run at the stage that failed. A *blocked* run is not a failure and has
+  no such stage: design §9.2 sets `resume.next_stage` only when a stage fails, so a block records
+  nothing to resume from. E4.3 stopped one round short with findings 5 → 4 → 2, and the reviewed
+  prompt — plus any operator correction to it — is discarded by the next author stage.
+  - Deliverable: a continuation path on the blocked run's own state — `aidw prompt --resume` on a
+    `blocked` run runs one further cycle (a fix batch for the terminal review's findings, its
+    reconcile, then a review), and `--from-prompt <path>` starts at `task-review-1` on an
+    operator-supplied prompt; record the effective review budget and the supplied prompt's path
+    and content hash in `state.json`, so the extension is visible rather than inferred.
+  - Done when: resuming a `blocked` run never re-runs `task-prompt`, keeps the run id, and its
+    summary shows the effective budget and the added round; the continuation is a fix batch for
+    the terminal review's findings, its reconcile, then a review — never a fix without a following
+    review, so L4.1's invariant holds in a continuation too; `--from-prompt <path>` starts at
+    `task-review-1` with that file, records its path and hash, applies the tree preflights (clean
+    tree, current base) and skips the run-scoped one (L1.2's predecessor check); a blocked run
+    whose worktree no longer exists refuses with exit 4 naming the run, the missing worktree and
+    the command to re-author, never silently re-authoring; and the gate record keeps the original
+    `denied` decision in the run's history, distinguishable from the continuation's.
+  - Tests: `tests/test_prompt_workflow.py` with fake stages — the stage list after a block, the
+    single run id, the `--from-prompt` provenance, the recorded effective budget, and the
+    missing-worktree refusal.
+  - Notes: rejected alternative — unblock by treating the terminal review's findings as "known and
+    recorded"; that is L4.2's deleted `assumed_ok` path. The continuation is an explicit operator
+    decision about one run, which is why it is a `--resume` action on that run and not a larger
+    default budget.
+
 ## Epic H2: Bound the review context
 
 - [ ] **H2.1. Give the delta brief a size budget** (Design 8.1, Design 15)
@@ -184,5 +219,6 @@ Every behaviour change here is proven by a fake Pi argv or a fake stage (AGENTS.
   than buying a bigger context window.
 - Deciding that a task is too large to author in one prompt is an authoring concern (L5.1 and the
   E4.5 split); this phase makes a failure survivable, it does not prevent one.
-- Gate failures are never retried (design §10) — a `Request changes`, a `Blocked` verdict and the
-  revision budget's terminal review all keep failing closed.
+- Gate failures are never retried automatically (design §10) — a `Request changes`, a `Blocked`
+  verdict and the revision budget's terminal review all keep failing closed. H1.3's continuation
+  is an explicit operator action on one recorded run, not a retry.
