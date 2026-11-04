@@ -122,6 +122,7 @@ from aidw.target_config import (
     SOURCE_CONFIG,
     ConfigOverrides,
     ResolvedConfig,
+    agent_configs_override,
     resolve_workflow_config,
     validate_paths,
 )
@@ -1438,7 +1439,15 @@ def run(
         if refusal is not None:
             return refusal
 
-    agents, issues = load_all(aidt.root, repo.root)
+    # E4.6: a declared `paths.agent_configs_dir` shadows the toolkit's agent configs by
+    # id; unset passes `None` (toolkit defaults). It is a §3.4 read-path, so the
+    # `validate_paths` refusal above already refused a named-but-missing directory; the
+    # worktree reload below re-resolves it against the tree P1 runs in.
+    agents, issues = load_all(
+        aidt.root,
+        repo.root,
+        override_dir=agent_configs_override(resolved_config, repo.root),
+    )
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
     if errors or (strict and warnings):
@@ -1504,7 +1513,11 @@ def run(
             base_branch=repo.base_branch,
             branch_pattern=repo.branch_pattern,
         )
-        agents, _ = load_all(aidt.root, target.root)
+        agents, _ = load_all(
+            aidt.root,
+            target.root,
+            override_dir=agent_configs_override(resolved_config, target.root),
+        )
 
     # --- one run per worktree (EXTRACTION.md §3.2/§3.10, E2.7) ---------------- #
     # The key is the *resolved* worktree path -- ``target.root``, the same value

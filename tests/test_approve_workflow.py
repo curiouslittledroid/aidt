@@ -101,7 +101,7 @@ def _patch(
     monkeypatch, *, view: dict | None = None, agents: dict | None = None
 ) -> None:
     monkeypatch.setattr(
-        approve_workflow, "load_all", lambda aidt, repo: (agents or {}, [])
+        approve_workflow, "load_all", lambda aidt, repo, **_kwargs: (agents or {}, [])
     )
     monkeypatch.setattr(git, "current_branch", lambda repo: "03-E4.1")
     monkeypatch.setattr(github, "gh_available", lambda: True)

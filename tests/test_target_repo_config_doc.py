@@ -7,9 +7,9 @@ against the code, so prose drift fails here instead of at a reader's desk:
 
 - the field inventory names **exactly** the keys the loader accepts — every key in
   ``TOP_LEVEL_KEYS``/``REPO_FIELDS``/``PATH_FIELDS``/``WORKFLOW_KEYS``/``STAGE_KEYS``/
-  ``GITHUB_KEYS``/``MARKER_FIELDS``/``LABEL_KEYS`` and nothing else — and the three
-  stage fields the loader rejects (``model``/``thinking``/``timeout_seconds``, E4.6's)
-  are documented as rejected, never as configurable;
+  ``GITHUB_KEYS``/``MARKER_FIELDS``/``LABEL_KEYS`` and nothing else — including E4.6's
+  three stage metadata fields (``model``/``thinking``/``timeout_seconds``) and the global
+  ``paths.agent_configs_dir`` override, each documented with its real value space;
 - each documented default equals ``TOOLKIT_DEFAULTS`` / ``DEFAULT_MAX_REVISIONS`` (the
   literals ``tests/test_target_config.py::
   test_every_seeded_default_is_the_section_3_4_mythical_forge_value`` pins), with the
@@ -77,9 +77,9 @@ DOCUMENTED_KEYS: frozenset[str] = frozenset(
     for key in group
 )
 
-#: The stage fields E4.6 owns and the loader rejects (`STAGE_KEYS` excludes them). The doc
-#: must name them only to say so: listing them as configurable would contradict both.
-REJECTED_STAGE_KEYS = ("model", "thinking", "timeout_seconds")
+#: E4.6's three stage metadata fields: accepted by ``STAGE_KEYS``, documented as
+#: configurable, and validated (the tests below prove the doc's claims).
+STAGE_METADATA_KEYS = ("model", "thinking", "timeout_seconds")
 
 #: The expected ``Default`` cell for every documented key, given as a hand-checked vector.
 #: Value-bearing keys are derived from ``TOOLKIT_DEFAULTS``/``DEFAULT_MAX_REVISIONS`` — the
@@ -98,11 +98,14 @@ EXPECTED_DEFAULTS: dict[str, str] = {
     # repo:
     "base_branch": f"`{TOOLKIT_DEFAULTS.repo.base_branch}`",
     "branch_pattern": f"`{TOOLKIT_DEFAULTS.repo.branch_pattern}`",
-    # paths:
+    # paths: derived from the seeded defaults; E4.6's `agent_configs_dir` is seeded with
+    # nothing, so it is the one path field whose documented default is `unset`.
     **{
         name: f"`{getattr(TOOLKIT_DEFAULTS.paths, name)}`"
         for name in PATH_FIELDS
+        if getattr(TOOLKIT_DEFAULTS.paths, name) is not None
     },
+    "agent_configs_dir": "unset",
     # workflows: / stage entry
     "stages": "unset",
     "parallel_groups": "unset",
@@ -110,6 +113,9 @@ EXPECTED_DEFAULTS: dict[str, str] = {
     "enabled": "`true`",
     "prompt": "unset",
     "agent": "unset",
+    "model": "unset",
+    "thinking": "unset",
+    "timeout_seconds": "unset",
     # github: markers / labels (E6's defaults, unseeded today)
     "markers": "unset",
     "labels": "unset",
@@ -133,6 +139,7 @@ MINIMAL_PATHS = frozenset(
         "paths.implementation_results_dir",
         "paths.build_results_template",
         "paths.architecture_dir",
+        "paths.agent_configs_dir",
         "github.markers.parent",
         "github.markers.child",
         "github.markers.summary",
@@ -152,6 +159,7 @@ FULL_PATHS = frozenset(
         "paths.implementation_results_dir",
         "paths.build_results_template",
         "paths.architecture_dir",
+        "paths.agent_configs_dir",
         "github.markers.parent",
         "github.markers.child",
         "github.markers.summary",
@@ -284,7 +292,7 @@ def test_doc_states_the_tracked_layout_and_the_no_folder_case():
 
 
 def test_doc_states_the_read_path_contract_and_the_write_target_exemption():
-    """§3.4 + E3.7: all four read-paths, `architecture_dir` as write-target."""
+    """§3.4 + E3.7 + E4.6: every read-path, `architecture_dir` as write-target."""
     doc = _doc()
 
     for field in (
@@ -292,6 +300,7 @@ def test_doc_states_the_read_path_contract_and_the_write_target_exemption():
         "paths.roadmap_dir",
         "paths.task_prompts_dir",
         "paths.implementation_results_dir",
+        "paths.agent_configs_dir",
     ):
         assert field in doc
     assert "write-target" in doc
@@ -327,50 +336,53 @@ def test_documented_defaults_are_the_toolkit_defaults():
         )
 
 
-def test_stage_fields_the_loader_rejects_are_documented_as_rejected():
-    """`model`/`thinking`/`timeout_seconds` (E4.6's) are not configurable today."""
+def test_stage_metadata_fields_are_documented_as_configurable():
+    """E4.6: `model`/`thinking`/`timeout_seconds` are stage fields, not rejected keys."""
     doc = _doc()
     rows = _inventory_rows()
 
-    assert not set(REJECTED_STAGE_KEYS) & set(rows)
-
-    mentions = [
-        line
-        for line in doc.splitlines()
-        if all(key in line for key in REJECTED_STAGE_KEYS)
-    ]
-    assert len(mentions) == 1, "expected one sentence naming all three rejected keys"
-    sentence = mentions[0]
-    assert "not" in sentence
-    assert "reject" in sentence
+    assert set(STAGE_METADATA_KEYS) <= set(rows)
+    assert set(STAGE_METADATA_KEYS) <= set(STAGE_KEYS)
+    # The value spaces are stated, so an operator can write a valid entry from the doc.
+    assert "off" in doc and "xhigh" in doc and "max" in doc
+    assert "positive integer" in doc
+    # The pre-E4.6 "not stage fields" claim is gone.
+    assert "not** stage fields" not in doc
 
 
-def test_loader_fails_closed_on_the_stage_fields_the_doc_calls_rejected(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        pytest.param("model", "meta/muse-spark-1.3", id="model"),
+        pytest.param("thinking", "xhigh", id="thinking"),
+        pytest.param("timeout_seconds", 1800, id="timeout-seconds"),
+    ],
+)
+def test_loader_accepts_the_stage_fields_the_doc_documents(
+    tmp_path: Path, key: str, value: object
 ):
-    """Proves the doc's claim instead of restating it: each key is an ERROR issue."""
+    """Proves the doc's claim instead of restating it: each key loads and round-trips."""
     path = tmp_path / "aidw" / "config.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    stages:\n"
+        f"      - id: implement\n"
+        f"        {key}: {value}\n",
+        encoding="utf-8",
+    )
 
-    for key in REJECTED_STAGE_KEYS:
-        path.write_text(
-            "schema_version: 1\n"
-            "workflows:\n"
-            "  implement:\n"
-            "    stages:\n"
-            f"      - id: implement\n"
-            f"        {key}: x\n",
-            encoding="utf-8",
-        )
-        declared = load_target_config(path)
-        errors = [
-            issue.message
-            for issue in declared.issues
-            if issue.level == ERROR
-        ]
-        assert any(
-            f"workflows.implement.stages[0].{key}" in message for message in errors
-        ), f"{key}: expected an unknown-key error naming the field path, got {errors}"
+    declared = load_target_config(path)
+
+    assert [issue for issue in declared.issues if issue.level == ERROR] == []
+    stage = declared.workflows["implement"].stages[0]
+    assert getattr(stage, key) == value
+    assert declared.to_dict()["workflows"]["implement"]["stages"][0] == {
+        "id": "implement",
+        key: value,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -445,16 +457,20 @@ def test_minimal_resolves_to_the_mythical_forge_layout(tmp_path: Path):
         "paths.implementation_results_dir": "docs/implementation-results",
         "paths.build_results_template": "docs/implementation-results/TEMPLATE.md",
         "paths.architecture_dir": "docs/architecture",
+        "paths.agent_configs_dir": None,
         "github.markers.parent": None,
         "github.markers.child": None,
         "github.markers.summary": None,
     }
-    # Provenance: the eight repo/paths leaves and the budget come from the defaults, the
-    # declared schema version from the file, and the unseeded fields are unset.
+    # Provenance: the eight seeded repo/paths leaves and the budget come from the defaults,
+    # the declared schema version from the file, and the unseeded fields are unset —
+    # including E4.6's `paths.agent_configs_dir`, which has no toolkit default on purpose.
     for path, entry in resolved.items():
         if path == "schema_version":
             assert entry.source == SOURCE_CONFIG
-        elif path in {"requires_toolkit"} or path.startswith("github.markers."):
+        elif path in {"requires_toolkit", "paths.agent_configs_dir"} or path.startswith(
+            "github.markers."
+        ):
             assert entry.source is None, f"{path} must resolve unset"
         else:
             assert entry.source == SOURCE_DEFAULT, f"{path} must resolve from the defaults"
@@ -491,6 +507,7 @@ def test_full_example_declares_every_field_and_resolves_from_config(tmp_path: Pa
     assert values["paths.build_results_template"] == (
         "docs/implementation-results/TEMPLATE.md"
     )
+    assert values["paths.agent_configs_dir"] == "aidw/agent-configs"
     # D5 literals: the marker templates and every label survive verbatim.
     assert values["github.markers.parent"] == (
         "<!-- mythical-forge-review-followups: pr={pr_url} -->"

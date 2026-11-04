@@ -98,7 +98,7 @@ def _patch(
     agents: dict | None = None,
 ):
     monkeypatch.setattr(
-        review_workflow, "load_all", lambda aidt, repo: (agents or {}, [])
+        review_workflow, "load_all", lambda aidt, repo, **_kwargs: (agents or {}, [])
     )
     monkeypatch.setattr(github, "gh_available", lambda: gh)
     monkeypatch.setattr(
@@ -235,7 +235,7 @@ def test_a_config_error_in_the_worktree_is_a_usage_error(
     _patch(monkeypatch)
     calls: list[Path] = []
 
-    def _load_all(aidt, repo):
+    def _load_all(aidt, repo, **_kwargs):
         calls.append(repo)
         if repo == worktree_repo.task:
             return {}, [Issue(ERROR, "config", "bad config in the PR worktree")]

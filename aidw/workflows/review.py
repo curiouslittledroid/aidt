@@ -52,7 +52,11 @@ from aidw.state import (
     run_dir,
     save,
 )
-from aidw.target_config import SOURCE_CONFIG, resolve_workflow_config
+from aidw.target_config import (
+    SOURCE_CONFIG,
+    agent_configs_override,
+    resolve_workflow_config,
+)
 from aidw.verdict import APPROVE, BLOCKED as VERDICT_BLOCKED, parse_verdict
 from aidw.workflows.implement import worktree_add_command
 
@@ -154,7 +158,14 @@ def run(
             print(format_issues(stage_issues), file=sys.stderr)
             return 2
 
-    agents, issues = load_all(aidt.root, repo.root)
+    # E4.6: a declared `paths.agent_configs_dir` shadows the toolkit's agent configs by
+    # id; unset passes `None` (toolkit defaults). Re-resolved against the PR-head
+    # worktree below, the tree the review stages actually run in.
+    agents, issues = load_all(
+        aidt.root,
+        repo.root,
+        override_dir=agent_configs_override(resolved_config, repo.root),
+    )
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
     if force_model:
@@ -244,7 +255,11 @@ def run(
             base_branch=repo.base_branch,
             branch_pattern=repo.branch_pattern,
         )
-        agents, issues = load_all(aidt.root, repo.root)
+        agents, issues = load_all(
+            aidt.root,
+            repo.root,
+            override_dir=agent_configs_override(resolved_config, repo.root),
+        )
         errors = [i for i in issues if i.level == ERROR]
         warnings = [i for i in issues if i.level == WARNING]
         if force_model:

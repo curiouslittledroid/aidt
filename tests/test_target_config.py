@@ -80,6 +80,7 @@ from aidw.target_config import (
     TOOLKIT_DEFAULTS,
     WRITE_TARGETS,
     WorkflowConfig,
+    agent_configs_override,
     check_compatibility,
     ensure_write_targets,
     format_issues,
@@ -107,6 +108,7 @@ FULL_CONFIG: dict[str, Any] = {
         "implementation_results_dir": "docs/implementation-results",
         "build_results_template": "docs/implementation-results/TEMPLATE.md",
         "architecture_dir": "docs/architecture",
+        "agent_configs_dir": "aidw/agent-configs",
     },
     "workflows": {
         "prompt": {
@@ -123,6 +125,9 @@ FULL_CONFIG: dict[str, Any] = {
                     "enabled": True,
                     "prompt": "aidw/prompts/update-traceability.md",
                     "agent": "implementer",
+                    "model": "meta/muse-spark-1.3",
+                    "thinking": "high",
+                    "timeout_seconds": 1800,
                 },
                 {"id": "architecture", "enabled": False},
             ],
@@ -153,9 +158,18 @@ PATHS_CONFIG_KEYS = {
     "implementation_results_dir",
     "build_results_template",
     "architecture_dir",
+    "agent_configs_dir",
 }
 MARKERS_CONFIG_KEYS = {"parent", "child", "summary"}
-STAGE_CONFIG_KEYS = {"id", "enabled", "prompt", "agent"}
+STAGE_CONFIG_KEYS = {
+    "id",
+    "enabled",
+    "prompt",
+    "agent",
+    "model",
+    "thinking",
+    "timeout_seconds",
+}
 LABEL_CONFIG_KEYS = {"color", "description"}
 TOP_LEVEL_CONFIG_KEYS = {
     "schema_version",
@@ -225,6 +239,7 @@ def test_full_section_3_4_config_loads_with_every_field_populated(tmp_path: Path
         implementation_results_dir="docs/implementation-results",
         build_results_template="docs/implementation-results/TEMPLATE.md",
         architecture_dir="docs/architecture",
+        agent_configs_dir="aidw/agent-configs",
     )
 
     assert set(config.workflows) == {"prompt", "implement"}
@@ -246,6 +261,10 @@ def test_full_section_3_4_config_loads_with_every_field_populated(tmp_path: Path
     assert traceability.enabled is True
     assert traceability.prompt == "aidw/prompts/update-traceability.md"
     assert traceability.agent == "implementer"
+    # E4.6's per-stage metadata overrides round-trip with the rest of the entry.
+    assert traceability.model == "meta/muse-spark-1.3"
+    assert traceability.thinking == "high"
+    assert traceability.timeout_seconds == 1800
     assert implement.stages[5].enabled is False
     assert implement.parallel_groups == [["test", "architecture"]]
 
@@ -449,25 +468,91 @@ def test_unknown_key_is_an_error_naming_the_offending_path(
     ), format_issues(config.issues)
 
 
-@pytest.mark.parametrize("key", ["model", "thinking", "timeout_seconds"])
-def test_stage_override_fields_are_not_in_this_schema(
-    tmp_path: Path, key: str
+STAGE_OVERRIDE_VECTORS = [
+    pytest.param("model", "openrouter/deepseek/deepseek-v4.1-flash", id="model"),
+    pytest.param("thinking", "xhigh", id="thinking"),
+    pytest.param("timeout_seconds", 1800, id="timeout-seconds"),
+]
+
+
+@pytest.mark.parametrize(("key", "value"), STAGE_OVERRIDE_VECTORS)
+def test_stage_override_fields_are_accepted_and_round_trip(
+    tmp_path: Path, key: str, value: object
 ) -> None:
-    """E4.6 owns stage metadata overrides; until then they are unknown keys."""
+    """E4.6's stage metadata fields are part of the schema and survive a round-trip.
+
+    One hand-calculated vector per field: the loader accepts the value and serialises
+    exactly what was declared (an unseen field is never injected, so the entry keeps only
+    ``id`` plus the one key the vector names).
+    """
     config = _load(
         tmp_path,
         {
             "schema_version": 1,
             "workflows": {
-                "implement": {"stages": [{"id": "implement", key: "value"}]}
+                "implement": {"stages": [{"id": "implement", key: value}]}
             },
         },
     )
 
-    assert any(
-        f"workflows.implement.stages[0].{key}" in message
-        for message in _errors(config)
+    assert config.issues == []
+    stage = config.workflows["implement"].stages[0]
+    assert getattr(stage, key) == value
+    assert config.to_dict()["workflows"]["implement"]["stages"][0] == {
+        "id": "implement",
+        key: value,
+    }
+
+
+STAGE_OVERRIDE_FAILURE_VECTORS = [
+    pytest.param("model", "", "non-empty", id="model-empty"),
+    pytest.param("model", 7, "must be a string", id="model-int"),
+    pytest.param("thinking", "super", "must be one of", id="thinking-bad-level"),
+    pytest.param("thinking", 3, "must be a string", id="thinking-int"),
+    pytest.param("timeout_seconds", 0, "positive integer", id="timeout-zero"),
+    pytest.param("timeout_seconds", -5, "positive integer", id="timeout-negative"),
+    pytest.param("timeout_seconds", True, "must be an integer", id="timeout-bool"),
+    pytest.param("timeout_seconds", "600", "must be an integer", id="timeout-str"),
+]
+
+
+@pytest.mark.parametrize(("key", "value", "fragment"), STAGE_OVERRIDE_FAILURE_VECTORS)
+def test_stage_override_bad_value_fails_naming_the_field_path(
+    tmp_path: Path, key: str, value: object, fragment: str
+) -> None:
+    """E3.1's contract extended to E4.6's fields: field path, rule, fail closed."""
+    config = _load(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "workflows": {
+                "implement": {"stages": [{"id": "implement", key: value}]}
+            },
+        },
     )
+
+    errors = _errors(config)
+    assert any(
+        f"workflows.implement.stages[0].{key}" in message and fragment in message
+        for message in errors
+    ), format_issues(config.issues)
+
+
+def test_absent_stage_overrides_are_never_serialised_as_null(tmp_path: Path) -> None:
+    """Round-trip via the declared keys: a 2-field entry stays 2 fields."""
+    declared = {"id": "implement", "agent": "implementer"}
+    config = _load(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "workflows": {"implement": {"stages": [declared]}},
+        },
+    )
+
+    assert config.issues == []
+    stage = config.workflows["implement"].stages[0]
+    assert (stage.model, stage.thinking, stage.timeout_seconds) == (None, None, None)
+    assert config.to_dict()["workflows"]["implement"]["stages"] == [declared]
 
 
 # ---------------------------------------------------------------------------
@@ -1054,13 +1139,15 @@ def test_partial_config_resolves_defaults_and_leaves_only_unseeded_leaves_unset(
     assert resolved["repo.branch_pattern"] == ResolvedValue(
         "{phase}-{task}", SOURCE_DEFAULT
     )
-    # After E3.4 the only unseeded leaves are ``requires_toolkit`` and the E6 markers.
+    # After E3.4/E4.6 the only unseeded leaves are ``requires_toolkit``, E4.6's override
+    # directory (no default on purpose) and the E6 markers.
     assert {
         path
         for path, entry in resolved.items()
         if entry == ResolvedValue()
     } == {
         "requires_toolkit",
+        "paths.agent_configs_dir",
         "github.markers.parent",
         "github.markers.child",
         "github.markers.summary",
@@ -1093,12 +1180,14 @@ def test_schema_version_only_config_resolves_the_mythical_forge_layout() -> None
         assert resolved[path] == ResolvedValue(value, SOURCE_DEFAULT), path
         assert resolved[path].is_set is True
 
-    # Every other leaf is either the E3.2 budget or still unseeded; no E6/E4.1 value.
+    # Every other leaf is either the E3.2 budget, E4.6's unset override dir, or still
+    # unseeded; no E6/E4.1 value.
     assert set(resolved) == {
         "schema_version",
         "requires_toolkit",
         "max_revisions",
         * (path for path, _ in MYTHICAL_FORGE_LAYOUT),
+        "paths.agent_configs_dir",
         "github.markers.parent",
         "github.markers.child",
         "github.markers.summary",
@@ -1796,7 +1885,15 @@ MISSING_READ_PATH_VALUES = {
     "roadmap_dir": "docs/missing-roadmap",
     "task_prompts_dir": "docs/missing-task-prompts",
     "implementation_results_dir": "docs/missing-results",
+    "agent_configs_dir": "aidw/missing-agent-configs",
 }
+
+#: The read-paths whose *toolkit default* is a real value. ``agent_configs_dir`` has no
+#: default (unset = use the toolkit's own ``agent-configs/``), so the present/absent
+#: property generator only covers the defaulted ones; the declared case is the vector above.
+DEFAULTED_READ_PATHS = tuple(
+    field for field in READ_PATHS if getattr(TOOLKIT_DEFAULTS.paths, field) is not None
+)
 
 
 def _make_read_paths_exist(root: Path) -> None:
@@ -1824,13 +1921,25 @@ def _resolved_for(tmp_path: Path, config: dict[str, Any] | None = None) -> Resol
 def test_path_classification_is_the_roadmap_read_paths_and_the_architecture_write_target() -> (
     None
 ):
-    """E3.7's classification, verbatim: four read-paths, one write-target, no glob."""
+    """E3.7's classification plus E4.6's override dir: five read-paths, one write-target.
+
+    ``agent_configs_dir`` is a read-path but has **no default**, so it is only validated
+    when a repo names it (an unset leaf is skipped, never stat'd).
+    """
     assert READ_PATHS == (
         "build_results_template",
         "roadmap_dir",
         "task_prompts_dir",
         "implementation_results_dir",
+        "agent_configs_dir",
     )
+    assert DEFAULTED_READ_PATHS == (
+        "build_results_template",
+        "roadmap_dir",
+        "task_prompts_dir",
+        "implementation_results_dir",
+    )
+    assert getattr(TOOLKIT_DEFAULTS.paths, "agent_configs_dir") is None
     assert WRITE_TARGETS == {"architecture_dir": "architecture"}
     # Every classified field is a real §3.4 path field, and the two sets are disjoint.
     assert set(READ_PATHS) | set(WRITE_TARGETS) <= PATHS_CONFIG_KEYS
@@ -1932,6 +2041,42 @@ def test_validate_paths_skips_unset_leaves_defensively(tmp_path: Path) -> None:
     )
 
     assert validate_paths(resolved, tmp_path) == []
+
+
+def test_agent_configs_dir_is_unset_by_default_and_resolves_when_declared(
+    tmp_path: Path,
+) -> None:
+    """E4.6: the override dir has no default; when named it is a config read-path."""
+    default_entry = resolve_config(TargetConfig())["paths.agent_configs_dir"]
+    assert default_entry.value is None
+    assert default_entry.source is None  # unset, not defaulted
+
+    resolved = _resolve_loaded(
+        tmp_path,
+        {"schema_version": 1, "paths": {"agent_configs_dir": "aidw/agent-configs"}},
+    )
+    entry = resolved["paths.agent_configs_dir"]
+    assert entry.value == "aidw/agent-configs"
+    assert entry.source == SOURCE_CONFIG
+
+
+def test_agent_configs_override_resolves_against_the_target_root(tmp_path: Path) -> None:
+    """Req 2: `_target_path` semantics — relative joins the root, absolute wins."""
+    root = tmp_path / "target"
+    resolved = _resolve_loaded(
+        tmp_path,
+        {"schema_version": 1, "paths": {"agent_configs_dir": "aidw/agent-configs"}},
+    )
+    assert agent_configs_override(resolved, root) == root / "aidw" / "agent-configs"
+
+    outside = tmp_path / "shared-agent-configs"
+    absolute = _resolve_loaded(
+        tmp_path / "absolute",
+        {"schema_version": 1, "paths": {"agent_configs_dir": str(outside)}},
+    )
+    assert agent_configs_override(absolute, root) == outside
+    # Unset resolves to None, which is what makes `load_all` use the toolkit defaults.
+    assert agent_configs_override(resolve_config(TargetConfig()), root) is None
 
 
 def test_absolute_read_path_override_wins_over_the_target_root(tmp_path: Path) -> None:
@@ -2137,7 +2282,7 @@ def _random_path_case(rng: random.Random) -> dict[str, bool]:
     a present template implies a present directory; without that constraint the generated
     "absent directory" case would be contradicted by the file just written into it.
     """
-    case = {field: rng.random() < 0.5 for field in READ_PATHS}
+    case = {field: rng.random() < 0.5 for field in DEFAULTED_READ_PATHS}
     case["architecture_disabled"] = rng.random() < 0.5
     if case["build_results_template"]:
         case["implementation_results_dir"] = True
@@ -2158,8 +2303,8 @@ def test_read_path_validation_property(tmp_path: Path) -> None:
         case = _random_path_case(rng)
         root = tmp_path / f"run-{index}"
         root.mkdir()
-        present = [field for field in READ_PATHS if case[field]]
-        absent = [field for field in READ_PATHS if not case[field]]
+        present = [field for field in DEFAULTED_READ_PATHS if case[field]]
+        absent = [field for field in DEFAULTED_READ_PATHS if not case[field]]
         # ``build_results_template`` lives under ``implementation_results_dir``: create the
         # directories only for the fields generated as present, then the template itself.
         for field in present:

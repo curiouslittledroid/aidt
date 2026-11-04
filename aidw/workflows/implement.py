@@ -82,7 +82,12 @@ from aidw.state import (
     save,
     utcnow_iso,
 )
-from aidw.target_config import SOURCE_CONFIG, ResolvedConfig, resolve_workflow_config
+from aidw.target_config import (
+    SOURCE_CONFIG,
+    ResolvedConfig,
+    agent_configs_override,
+    resolve_workflow_config,
+)
 
 GATE = "approve-implementation-pr"
 
@@ -425,7 +430,15 @@ def run(
     # Config validation stays in the preflight, before the locate: a combined
     # bad-config-plus-missing-worktree run is a usage/config error (exit 2, design §14),
     # not a preflight refusal (exit 4).
-    agents, issues = load_all(aidt.root, repo.root)
+    # E4.6: a declared `paths.agent_configs_dir` is target-repo configuration, resolved
+    # against the control root here and re-resolved against the worktree below — the same
+    # tree the stages run in. Unset (the toolkit default) passes `None`, so the toolkit's
+    # own `agent-configs/` is used and nothing about a repo without overrides changes.
+    agents, issues = load_all(
+        aidt.root,
+        repo.root,
+        override_dir=agent_configs_override(resolved_config, repo.root),
+    )
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
     if errors or (strict and warnings):
@@ -537,7 +550,11 @@ def run(
             base_branch=repo.base_branch,
             branch_pattern=repo.branch_pattern,
         )
-        agents, issues = load_all(aidt.root, target.root)
+        agents, issues = load_all(
+            aidt.root,
+            target.root,
+            override_dir=agent_configs_override(resolved_config, target.root),
+        )
         reloaded_errors = [i for i in issues if i.level == ERROR]
         reloaded_warnings = [i for i in issues if i.level == WARNING]
         if reloaded_errors or (strict and reloaded_warnings):

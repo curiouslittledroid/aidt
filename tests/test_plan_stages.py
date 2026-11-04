@@ -19,9 +19,11 @@ specification:
 * refusal (E4.5b req 3): a declared list the validator rejects — a disabled core stage, a
   reordered core list, ``stages: []``, a declared loop id — raises ``StageListError``
   carrying the validator's ``format_issues`` text, never a shortened/reordered plan;
-* the remaining deferred-field warnings (``agent`` → E4.6; a repo-added stage in the
-  name-keyed ``prompt``/``fix``): one stderr line per entry, naming the workflow, the id and
-  every reason;
+* the remaining deferred-field warning (a repo-added stage in the name-keyed ``prompt``/
+  ``fix``): one stderr line per entry, naming the workflow, the id and the reason;
+* the E4.6 overrides are *honoured*, not deferred: a known stage's ``agent`` becomes
+  ``agent_id`` and ``model``/``thinking``/``timeout_seconds`` ride on the ``StageSpec`` —
+  uniformly for a repo-added stage — with no warning;
 * fail-closed and purity: a declared-but-missing prompt raises, no shadow/toolkit fallback,
   and neither the config nor the registry defaults are mutated.
 
@@ -594,6 +596,8 @@ def test_a_repo_added_stage_is_planned_in_declared_order_with_every_field(
     assert [spec.id for spec in specs] == ["I1", "X9", "I2", "I3", "I4", "I5", "I6"]
     added = specs[1]
     assert (added.id, added.name, added.agent_id) == ("X9", "X9", "implementer")
+    # E4.6: the same three metadata fields apply to a repo-added stage, uniformly.
+    assert (added.model, added.thinking, added.timeout_seconds) == (None, None, None)
     assert added.prompt == declared
     assert added.explicit_prompt == REPO_ADDED_PROMPT
     assert added.variables == []
@@ -601,6 +605,46 @@ def test_a_repo_added_stage_is_planned_in_declared_order_with_every_field(
     assert added.workflow == "implement"
     # Its `agent` is honoured, so nothing about it is deferred any more.
     assert capsys.readouterr().err == ""
+
+
+def test_a_repo_added_stage_honours_the_metadata_overrides(tmp_path: Path) -> None:
+    """Req 5: a repo-added stage carries ``model``/``thinking``/``timeout_seconds`` too."""
+    root = _target(
+        tmp_path,
+        _config(
+            "implement",
+            _stage_entries(
+                "implement",
+                added=[
+                    (
+                        1,
+                        {
+                            "id": "X9",
+                            "agent": "implementer",
+                            "prompt": REPO_ADDED_PROMPT,
+                            "model": "deepseek/deepseek-v4.1-flash",
+                            "thinking": "xhigh",
+                            "timeout_seconds": 120,
+                        },
+                    )
+                ],
+            ),
+        ),
+    )
+    _write_prompt(root, REPO_ADDED_PROMPT)
+
+    specs = _plan(
+        "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
+        branch=BRANCH, task_id=TASK_ID,
+    )
+
+    added = specs[1]
+    assert added.id == "X9"
+    assert (added.model, added.thinking, added.timeout_seconds) == (
+        "deepseek/deepseek-v4.1-flash",
+        "xhigh",
+        120,
+    )
 
 
 def test_a_repo_added_stage_shadows_by_its_declared_id(
@@ -772,14 +816,13 @@ def _warning_lines(err: str) -> list[str]:
     return [line for line in err.splitlines() if line.startswith("warning:")]
 
 
-def test_a_repo_optional_disabled_stage_is_omitted_and_the_agent_still_warns(
+def test_a_repo_optional_disabled_stage_is_omitted_with_no_warning(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """E4.5b: ``enabled: false`` is honoured (omission); the E4.6 ``agent`` still warns.
+    """E4.5b/E4.6: ``enabled: false`` is honoured and ``agent`` now applies.
 
-    Only the *known* id survives as a deferred reason: disabling is no longer ignored, so
-    a repo that disables I3 gets a plan without it plus exactly one line naming the agent
-    override this version still cannot apply.
+    Nothing about this entry is deferred any more, so the plan simply omits I3 and stderr
+    stays empty.
     """
     root = _target(
         tmp_path,
@@ -797,20 +840,18 @@ def test_a_repo_optional_disabled_stage_is_omitted_and_the_agent_still_warns(
     )
 
     assert [spec.id for spec in specs] == ["I1", "I2", "I4", "I5", "I6"]
-    lines = _warning_lines(capsys.readouterr().err)
-    assert len(lines) == 1, lines
-    (line,) = lines
-    # The workflow, the stage id, and *every* remaining deferred reason, on the one line.
-    assert "`implement`" in line
-    assert "`I3`" in line
-    assert "`agent` override (E4.6)" in line
-    # `enabled: false` is honoured now, so it is never reported as deferred.
-    assert "enabled" not in line
+    assert capsys.readouterr().err == ""
 
 
-def test_a_two_entries_are_counted_per_entry_not_per_field(
+def test_known_stage_metadata_overrides_are_honoured_silently(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """E4.6: a known stage's ``agent``/``model``/``thinking``/``timeout`` all take effect.
+
+    The pre-E4.6 deferred-setting line is gone: the two entries draw no warning, the
+    declared ``agent`` becomes ``agent_id``, and the three metadata values ride on the
+    spec for :func:`run_stage` to apply.
+    """
     root = _target(
         tmp_path,
         _config(
@@ -818,22 +859,38 @@ def test_a_two_entries_are_counted_per_entry_not_per_field(
             _stage_entries(
                 "implement",
                 overrides={
-                    "I3": {"agent": "implementer"},
+                    "I3": {
+                        "agent": "code-reviewer",
+                        "model": "meta/muse-spark-1.3",
+                        "thinking": "low",
+                        "timeout_seconds": 900,
+                    },
                     "I4": {"agent": "implementer"},
                 },
             ),
         ),
     )
 
-    _plan(
+    specs = _plan(
         "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
         branch=BRANCH, task_id=TASK_ID,
     )
 
-    lines = _warning_lines(capsys.readouterr().err)
-    assert len(lines) == 2, lines
-    assert any("`I3`" in line for line in lines)
-    assert any("`I4`" in line for line in lines)
+    by_id = {spec.id: spec for spec in specs}
+    assert by_id["I3"].agent_id == "code-reviewer"
+    assert (by_id["I3"].model, by_id["I3"].thinking, by_id["I3"].timeout_seconds) == (
+        "meta/muse-spark-1.3",
+        "low",
+        900,
+    )
+    assert by_id["I4"].agent_id == "implementer"
+    # A stage the config did not override keeps the registry agent and no metadata.
+    assert (by_id["I2"].agent_id, by_id["I2"].model, by_id["I2"].thinking) == (
+        "tester",
+        None,
+        None,
+    )
+    assert capsys.readouterr().err == ""
 
 
 def test_a_prompt_only_entry_draws_no_warning(
@@ -991,21 +1048,19 @@ def test_a_declared_overlay_never_changes_a_plans_shape(
 ) -> None:
     """Metamorphic: the overlay moves one stage's prompt, nothing else.
 
-    The declared entry also carries the deferred ``agent``, so this covers the "warn but
-    plan the registry's agent" path for every workflow: same stages, same order, same
-    ``extra`` — the declared list is not a second source of truth for the shape.
+    ``prompt:`` is a pure overlay for every workflow: same stages, same order, same
+    ``agent_id``, same ``extra`` — the declared list is not a second source of truth for
+    the shape. (E4.6's ``agent`` *does* change ``agent_id``; that is asserted separately.)
     """
     stage_id = _OVERLAY_ID[workflow]
     rel = f"aidw/prompts/{workflow}-override.md"
     # Every static stage in registry order (a whole-list declaration, E4.5a) with the
-    # ``prompt:`` and the still-deferred ``agent:`` on one of them.
+    # ``prompt:`` on one of them.
     root = _target(
         tmp_path,
         _config(
             workflow,
-            _stage_entries(
-                workflow, overrides={stage_id: {"prompt": rel, "agent": "implementer"}}
-            ),
+            _stage_entries(workflow, overrides={stage_id: {"prompt": rel}}),
         ),
     )
     declared = _write_prompt(root, rel)
@@ -1028,6 +1083,43 @@ def test_a_declared_overlay_never_changes_a_plans_shape(
 #: Every declared position a repo-added stage can occupy: before the first static stage,
 #: between any two, and after the last. This is the sweep's "seed": the enumeration is the
 #: generator (``hypothesis`` is not a dependency, AGENTS.md's no-new-deps rule).
+@pytest.mark.parametrize("workflow", sorted(_FIELDS))
+def test_a_declared_agent_override_changes_only_that_stage(
+    workflow: str, tmp_path: Path
+) -> None:
+    """E4.6 req 3: the declared ``agent`` replaces the registry's for one stage only.
+
+    Metamorphic over all five workflows: every other spec is untouched, and the overridden
+    one keeps its name, prompt, variables and ``extra`` — only ``agent_id`` moves.
+    """
+    stage_id = _OVERLAY_ID[workflow]
+    fields = _FIELDS[workflow]
+    plain_root = _target(tmp_path / "plain")
+    plain = _plan(workflow, root=plain_root, **fields)
+    override_agent = "implementer" if _stage_entry_agent(plain, stage_id) != "implementer" else "tester"
+
+    root = _target(
+        tmp_path / "override",
+        _config(
+            workflow,
+            _stage_entries(workflow, overrides={stage_id: {"agent": override_agent}}),
+        ),
+    )
+
+    overridden = _plan(workflow, config=_resolved(root), root=root, **fields)
+
+    assert _shape(overridden) == [
+        (spec.id, spec.name, override_agent if spec.id == stage_id else spec.agent_id,
+         spec.variables, spec.extra)
+        for spec in plain
+    ]
+    assert [spec.prompt for spec in overridden] == [spec.prompt for spec in plain]
+
+
+def _stage_entry_agent(specs: list[StageSpec], stage_id: str) -> str:
+    return next(spec.agent_id for spec in specs if spec.id == stage_id)
+
+
 @pytest.mark.parametrize("workflow", sorted(_FIELDS))
 def test_inserting_a_repo_added_stage_only_inserts(
     workflow: str, tmp_path: Path

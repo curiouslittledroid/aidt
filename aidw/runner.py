@@ -18,7 +18,7 @@ import os
 import sys
 import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -73,6 +73,17 @@ class StageSpec:
     #: the registry's :class:`~aidw.stage_registry.PlannedStage`; it stays empty for a spec
     #: a workflow builds for a stage the registry does not carry.
     id: str = ""
+    #: E4.6's per-stage metadata overrides (D12: "agent/model/timeout/thinking"), all
+    #: ``None`` when the stage declared none. :func:`run_stage` applies them to the
+    #: resolved :class:`~aidw.config.AgentConfig` **once**, before every consumer (argv,
+    #: timeout, run state, cost), so they cannot disagree about the effective model.
+    #: ``model`` keeps ``provider/model`` semantics (design §5.1): it replaces only
+    #: ``model`` — ``provider`` is not a stage field — so a provider change goes through
+    #: ``agent:`` or the global ``paths.agent_configs_dir`` override, never a per-stage
+    #: ``model``.
+    model: str | None = None
+    thinking: str | None = None
+    timeout_seconds: int | None = None
 
 
 #: Retry a clearly transient Pi invocation error once (design E6, §10). ``aidw
@@ -173,11 +184,10 @@ def declared_stage_issues(
       is what keeps :func:`resolve_prompt`'s :class:`FileNotFoundError` out of ``run()``:
       deliberately *not* a ``try``/``except`` at a call site (the roadmap forbids local
       call-site catches), and not a wrapper around ``plan_stages`` either.
-    * **a repo-added stage's ``agent`` exists** — the declared ``agent`` is the honoured
-      ``StageSpec.agent_id`` (E4.5b req 4), so an id that is missing or absent from the
-      loaded agent configs is refused here, never left to ``run_stage``'s
-      ``ValueError: unknown agent``. A known stage's ``agent`` is a deferred E4.6 override
-      and is deliberately not checked: the plan ignores it.
+    * **a declared ``agent`` exists** — the declared ``agent`` is the honoured
+      ``StageSpec.agent_id``, for a repo-added stage (E4.5b req 4) and since E4.6 for a
+      known stage too, so an id that is missing or absent from the loaded agent configs is
+      refused here, never left to ``run_stage``'s ``ValueError: unknown agent`` traceback.
 
     Pure apart from the prompt existence checks: no mutation of ``stages`` or ``agents``,
     no run state, no workflow import. The caller passes the resolved list and the agents
@@ -214,9 +224,22 @@ def declared_stage_issues(
                     f"stage `{stage_id}`: its prompt does not resolve: {exc}",
                 )
             )
-        if definition_entry is not None:
-            continue
         agent = entry.get("agent")
+        if definition_entry is not None:
+            # E4.6 honours a known stage's declared `agent` (it becomes the spec's
+            # agent_id), so it has to resolve for the same reason a repo-added one does.
+            # A declaration that is absent or non-string is not an override at all; the
+            # loader already refused a non-string.
+            if isinstance(agent, str) and agent and agent not in agents:
+                issues.append(
+                    Issue(
+                        ERROR,
+                        source,
+                        f"stage `{stage_id}`: unknown agent `{agent}`; known agents "
+                        f"are: {known_agents}",
+                    )
+                )
+            continue
         if not isinstance(agent, str) or not agent:
             issues.append(
                 Issue(
@@ -244,14 +267,13 @@ def declared_stage_issues(
 
 #: Deferred §3.4 stage settings: declared on a stage entry, but ignored by this version's
 #: *planning*. Since E4.5b ``enabled: false`` is **honoured** (a repo-optional stage is
-#: omitted), and a repo-added stage is **planned** in ``review``/``approve``/``implement``,
-#: so neither is a deferred reason any more. E4.6 owns the per-stage agent override, so a
-#: known stage's declared ``agent`` still warns. A repo-added stage in ``prompt``/``fix``
-#: keeps the E4.3 warning: those two consumers look their stages up by *name* and never run
-#: a repo-added stage (E4.5b's non-goal), so it is warned about rather than silently
-#: dropped.
+#: omitted), a repo-added stage is **planned** in ``review``/``approve``/``implement``, and
+#: since E4.6 a known stage's ``agent``/``model``/``thinking``/``timeout_seconds`` are all
+#: honoured, so none of those is a deferred reason any more. Only a repo-added stage in
+#: ``prompt``/``fix`` keeps the E4.3 warning: those two consumers look their stages up by
+#: *name* and never run a repo-added stage (E4.5b's non-goal), so it is warned about rather
+#: than silently dropped.
 _REASON_REPO_ADDED = "no such default stage, so a repo-added stage is deferred (E4.5)"
-_REASON_AGENT = "`agent` override (E4.6)"
 
 #: The workflows whose consumers resolve stages by *name* from the registry expansion
 #: (``fix._planned_iteration``, ``prompt._prompt_plan``) rather than walking the plan, so a
@@ -295,9 +317,11 @@ def plan_stages(
     plan's static stages are the declared entries **in declared order**, each one either
 
     * a known static id — rendered exactly as :func:`aidw.stage_registry.expand` renders it
-      (``name``/``variables``/``extra`` templated from ``expand_fields``, ``agent`` and
+      (``name``/``variables``/``extra`` templated from ``expand_fields`` and
       ``prompt_file`` from the registry) with the entry's ``prompt:`` as the D14
-      level-1 explicit path; the entry's ``agent`` stays deferred (E4.6);
+      level-1 explicit path; since E4.6 the entry's ``agent`` replaces the registry's
+      agent and its ``model``/``thinking``/``timeout_seconds`` ride on the spec. A stage
+      the entry does not mention keeps the registry's agent and no overrides.
     * a repo-optional id with ``enabled: false`` — omitted (E4.5a already refused this on a
       core id);
     * a repo-added id — the §3.5 repo-added stage: ``name`` = the declared id,
@@ -323,13 +347,13 @@ def plan_stages(
     ``ERROR`` through :func:`declared_stage_issues` before ``run()`` reaches this builder.
 
     Deferred settings are still reported for what this version cannot honour, one
-    ``warning:`` line per declared entry naming the workflow, the stage id and every reason
-    on that single line: a known stage's ``agent`` (E4.6), and a repo-added stage in a
-    name-keyed workflow (:data:`_NAME_KEYED_WORKFLOWS` — it is planned here so the plan
-    reflects the declaration, but ``prompt``/``fix`` resolve stages by name and never run
-    it; E4.5b's non-goal). ``enabled: false`` and ``prompt:`` are no longer deferred
-    reasons, and a repo-added stage in a consumer that walks the plan (review / approve /
-    implement) draws no warning at all.
+    ``warning:`` line per declared entry naming the workflow and the stage id: a repo-added
+    stage in a name-keyed workflow (:data:`_NAME_KEYED_WORKFLOWS` — it is planned here so
+    the plan reflects the declaration, but ``prompt``/``fix`` resolve stages by name and
+    never run it; E4.5b's non-goal). ``enabled: false``, ``prompt:`` and (E4.6) a known
+    stage's ``agent``/``model``/``thinking``/``timeout_seconds`` are no longer deferred, and
+    a repo-added stage in a consumer that walks the plan (review / approve / implement)
+    draws no warning at all.
 
     Performs no I/O beyond the prompt existence checks in :func:`resolve_prompt` and
     mutates neither ``config`` nor the registry defaults.
@@ -385,7 +409,7 @@ def plan_stages(
                 _spec_from_planned(
                     rendered,
                     workflow,
-                    _declared_prompt(entry),
+                    entry,
                     toolkit_root,
                     target_root,
                 )
@@ -429,23 +453,55 @@ def _declared_stage_list(
     return list(resolved.value or [])
 
 
+def _stage_metadata_overrides(
+    entry: Mapping[str, Any] | None,
+) -> tuple[str | None, str | None, int | None]:
+    """A declared entry's ``model``/``thinking``/``timeout_seconds`` (E4.6), or ``None``s.
+
+    Type-guarded rather than trusted: the loader validates these on the config path, but
+    ``plan_stages`` is also called directly (``aidw exec``, tests) with plain dicts, and a
+    wrong-typed value must degrade to "no override" instead of reaching a Pi argv.
+    ``bool`` is rejected for the int field for the same reason the loader rejects it.
+    """
+    if entry is None:
+        return None, None, None
+    model = entry.get("model")
+    thinking = entry.get("thinking")
+    timeout_seconds = entry.get("timeout_seconds")
+    return (
+        model if isinstance(model, str) and model else None,
+        thinking if isinstance(thinking, str) and thinking else None,
+        timeout_seconds
+        if isinstance(timeout_seconds, int) and not isinstance(timeout_seconds, bool)
+        else None,
+    )
+
+
 def _spec_from_planned(
     stage: stage_registry.PlannedStage,
     workflow: str,
-    declared_prompt: str | None,
+    entry: Mapping[str, Any] | None,
     toolkit_root: Path,
     target_root: Path,
 ) -> StageSpec:
-    """One registry stage as a runnable spec (D4/D14), the E4.3 mapping.
+    """One registry stage as a runnable spec (D4/D14), the E4.3/E4.6 mapping.
 
     The prompt resolves by the stage's **prompt file name** (filename shadowing, D14 level
     2) unless the entry declared an explicit path (level 1); ``variables`` is a fresh
     ``list`` because the registry's tuples are frozen, and ``extra`` is carried byte for
     byte.
+
+    ``entry`` is the declared stage entry, or ``None`` for a registry stage no declared
+    list mentions. Since E4.6 its ``agent`` is the honoured base agent (an override), and
+    its ``model``/``thinking``/``timeout_seconds`` ride on the spec for :func:`run_stage`
+    to apply. A stage with no entry keeps the registry's agent and no metadata overrides.
     """
+    declared_prompt = _declared_prompt(entry) if entry is not None else None
+    agent = entry.get("agent") if entry is not None else None
+    model, thinking, timeout_seconds = _stage_metadata_overrides(entry)
     return StageSpec(
         stage.name,
-        stage.agent,
+        agent if isinstance(agent, str) and agent else stage.agent,
         resolve_prompt(
             toolkit_root,
             target_root,
@@ -457,6 +513,9 @@ def _spec_from_planned(
         extra=stage.extra,
         explicit_prompt=declared_prompt,
         id=stage.id,
+        model=model,
+        thinking=thinking,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -478,6 +537,7 @@ def _repo_added_spec(
     """
     declared_prompt = _declared_prompt(entry)
     agent = entry.get("agent")
+    model, thinking, timeout_seconds = _stage_metadata_overrides(entry)
     return StageSpec(
         stage_id,
         agent if isinstance(agent, str) else "",
@@ -492,6 +552,9 @@ def _repo_added_spec(
         extra="",
         explicit_prompt=declared_prompt,
         id=stage_id,
+        model=model,
+        thinking=thinking,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -500,11 +563,12 @@ def _warn_deferred_settings(
 ) -> None:
     """One ``warning:`` line per declared entry this version cannot honour (E4.3/E4.5b).
 
-    Counting is by entry, not by field, and only the two surviving deferrals are named:
-    a known stage's ``agent`` override (E4.6) and a repo-added stage in a name-keyed
-    workflow (:data:`_NAME_KEYED_WORKFLOWS`), which those consumers would otherwise drop
-    silently. ``enabled: false`` is honoured by omission and ``prompt:`` is applied, so
-    neither is a reason any more.
+    Counting is by entry, not by field, and only the one surviving deferral is named: a
+    repo-added stage in a name-keyed workflow (:data:`_NAME_KEYED_WORKFLOWS`), which those
+    consumers would otherwise drop silently. ``enabled: false`` is honoured by omission,
+    ``prompt:`` is applied, and since E4.6 a known stage's ``agent``/``model``/
+    ``thinking``/``timeout_seconds`` all take effect, so none of those is a reason any
+    more.
     """
     static_ids = {item.id for item in stage_registry.get_workflow(workflow).stages}
     for entry in declared:
@@ -516,8 +580,6 @@ def _warn_deferred_settings(
         reasons: list[str] = []
         if stage_id not in static_ids and workflow in _NAME_KEYED_WORKFLOWS:
             reasons.append(_REASON_REPO_ADDED)
-        if stage_id in static_ids and entry.get("agent") is not None:
-            reasons.append(_REASON_AGENT)
         if reasons:
             print(
                 f"warning: workflow `{workflow}` stage `{stage_id}`: ignoring deferred "
@@ -539,7 +601,13 @@ def run_stage(
     show_progress: bool | None = None,
     runs_root: Path,
 ) -> StageRecord:
-    """Execute (or plan) one stage and persist its record in ``state``."""
+    """Execute (or plan) one stage and persist its record in ``state``.
+
+    E4.6: the spec's ``model``/``thinking``/``timeout_seconds`` are applied to the resolved
+    agent config once (:func:`_effective_agent`), so the rendered argv, Pi's timeout, run
+    state, stage metadata and the cost note all describe the same invocation. The loaded
+    config and every other stage's are left untouched.
+    """
     if retry_transient is None:
         retry_transient = DEFAULT_RETRY_TRANSIENT
     if show_progress is None:
@@ -555,6 +623,13 @@ def run_stage(
     agent = agents.get(spec.agent_id)
     if agent is None:
         raise ValueError(f"unknown agent: {spec.agent_id}")
+    # E4.6: the stage's declared metadata applies for this invocation only. Build the
+    # effective config **once, here**, before any consumer reads ``agent.model`` —
+    # ``build_argv``, ``execute(timeout=…)``, ``StageRecord(model=…)``, ``write_meta``,
+    # ``logger.info`` and ``progress.start`` all read it — so argv, run state and the
+    # recorded cost (§9) can never disagree about which model ran. ``dataclasses.replace``
+    # is what keeps the loaded config (and every other stage's) unchanged.
+    agent = _effective_agent(agent, spec)
 
     if not spec.prompt.is_file():
         raise FileNotFoundError(f"prompt not found: {spec.prompt}")
@@ -719,6 +794,35 @@ def run_stage(
     if unpriced:
         logger.warn(f"stage {spec.name}: {unpriced}")
     return record
+
+
+def _effective_agent(agent: AgentConfig, spec: StageSpec) -> AgentConfig:
+    """The agent config this stage actually runs: ``agent`` with E4.6's overrides applied.
+
+    ``model`` replaces only ``model``, never ``provider``: D12's override surface is
+    agent/model/timeout/thinking and the §3.4 stage entry has no ``provider`` key, so a
+    per-stage ``model`` is a model-only override riding the base agent's provider. The
+    ``provider/model`` split that follows is design §5.1's and already lives in
+    :meth:`~aidw.config.AgentConfig.qualified_model` and
+    :func:`aidw.agents.model_name`: a value carrying the agent's **own** ``provider/``
+    prefix is qualified as-is (and stripped once for ``--model``), while any other
+    spelling — a bare slug, or a vendor-namespace slug such as ``meta/muse-spark-1.3``
+    under ``openrouter`` — is passed whole to ``--model`` and qualified as
+    ``<provider>/<value>``. That is why the override is applied to ``model`` and never
+    split here.
+
+    ``thinking`` and ``timeout_seconds`` are design §5.1's fields verbatim. Pure: the
+    input config is not mutated (``replace`` copies), and a spec with no overrides returns
+    the very same object so nothing downstream changes for an un-overridden stage.
+    """
+    changes: dict[str, Any] = {}
+    if spec.model is not None:
+        changes["model"] = spec.model
+    if spec.thinking is not None:
+        changes["thinking"] = spec.thinking
+    if spec.timeout_seconds is not None:
+        changes["timeout_seconds"] = spec.timeout_seconds
+    return replace(agent, **changes) if changes else agent
 
 
 def _redact_argv(argv: list[str]) -> str:

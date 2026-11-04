@@ -43,7 +43,11 @@
         "task_prompts_dir": { "type": "string" },
         "implementation_results_dir": { "type": "string" },
         "build_results_template": { "type": "string" },
-        "architecture_dir": { "type": "string" }
+        "architecture_dir": { "type": "string" },
+        "agent_configs_dir": {
+          "type": "string",
+          "description": "Optional target-repo agent-config directory whose *.yaml files shadow the toolkit's agent-configs/ by id (E4.6). A read-path when named; unset means the toolkit defaults."
+        }
       }
     },
     "workflows": {
@@ -104,7 +108,22 @@
           "description": "Repo-optional stages are disabled explicitly with false (§3.5, D12)."
         },
         "prompt": { "type": "string" },
-        "agent": { "type": "string" }
+        "agent": { "type": "string" },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Per-stage model override (E4.6): a provider/model id applied to the stage's agent for this stage only. Replaces model, never provider."
+        },
+        "thinking": {
+          "type": "string",
+          "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+          "description": "Per-stage thinking level (design §5.1), applied for this stage only (E4.6)."
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-stage wall-clock timeout in seconds (E4.6); must be positive."
+        }
       }
     },
     "label": {

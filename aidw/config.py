@@ -4,6 +4,14 @@ One YAML file per agent under ``aidt/agent-configs/``. Configuration is validate
 load; :func:`load_all` returns both the parsed agents and a list of issues so callers
 can decide whether warnings are fatal (``--strict``).
 
+A target repo may also carry an agent-config directory of its own (E4.6,
+``<target>/aidw/config.yaml``'s ``paths.agent_configs_dir``): :func:`load_all` loads it
+**after** the toolkit's and shadows by ``id``, so a repo overrides only the agents it
+differs on, a brand-new id is additive, and an empty directory is the toolkit defaults.
+The workflow preflights resolve that path and pass it in; ``aidw agents`` and
+``run_stage``'s defensive fallback deliberately keep the toolkit default, because they
+validate the toolkit's own configs rather than a target's overrides.
+
 Path resolution (design §5.1):
 
 - ``cwd`` is relative to the **repository root** (default ``.``).
@@ -318,13 +326,63 @@ def load_agent(
     )
 
 
+def _load_agent_dir(
+    config_dir: Path,
+    toolkit_root: Path,
+    repo_root: Path,
+    agents: dict[str, AgentConfig],
+    issues: list[Issue],
+) -> None:
+    """Load one directory's ``*.yaml`` into ``agents``, reporting issues in place.
+
+    Duplicate ids are an error **within** a directory only: across directories an id
+    collision is the E4.6 override's shadow (the later directory wins by design), so it
+    must not be reported as a duplicate. ``load_agent`` keys each config by its ``id`` and
+    already errors when ``id`` != filename stem, which is what makes "shadow by id" and
+    "the filename names the agent" the same contract.
+    """
+    seen: set[str] = set()
+    for path in sorted(config_dir.glob("*.yaml")):
+        agent = load_agent(path, toolkit_root, repo_root)
+        if agent.id in seen:
+            issues.append(Issue(ERROR, path.name, f"duplicate agent id `{agent.id}`"))
+        seen.add(agent.id)
+        agents[agent.id] = agent
+        issues.extend(agent.issues)
+
+
 def load_all(
-    toolkit_root: Path, repo_root: Path
+    toolkit_root: Path,
+    repo_root: Path,
+    override_dir: Path | None = None,
 ) -> tuple[dict[str, AgentConfig], list[Issue]]:
-    """Load every ``*.yaml`` under ``aidt/agent-configs/``.
+    """Load every ``*.yaml`` under ``aidt/agent-configs/``, then the override directory.
 
     Returns the agents keyed by id and the combined issue list (per-agent errors plus
     cross-agent independence checks).
+
+    ``override_dir`` is E4.6's global override (EXTRACTION.md §2 D12 "override agent
+    config globally"): the caller resolves the target config's ``paths.agent_configs_dir``
+    against the target root and passes it here, or passes ``None`` for the toolkit
+    defaults. Semantics, all prompt-fixed:
+
+    - **shadow by id** — a file in ``override_dir`` replaces the toolkit agent with the
+      same ``id``; un-overridden toolkit ids still load;
+    - **additive** — an id the toolkit does not define loads as an additional agent (a
+      legal target for a declared ``agent``);
+    - **empty dir = toolkit defaults** — nothing to shadow, nothing to add;
+    - a **named-but-missing** directory is an ``ERROR`` issue with the same shape as the
+      toolkit's own dir-not-found path. That refusal is deliberate: §3.4 requires a
+      configured read-path to exist, and the implement/review/fix/approve preflights do
+      not run ``validate_paths`` (it is ``aidw prompt``-only), so this is where those
+      workflows refuse (exit 2) instead of silently falling back to the toolkit defaults.
+
+    ``check_independence``/``check_read_only`` run on the **merged, shadowed** dict on
+    purpose (design §5.4): a repo that sets ``implementer.model == code-reviewer.model``
+    through an override must draw the reviewer≠author warning for the value actually used.
+    A file in ``override_dir`` resolves its own path fields exactly as ``load_agent``
+    documents — against ``toolkit_root``/``repo_root`` — so an override can keep pointing
+    at the toolkit's shared ``agents/`` fragments.
     """
     config_dir = toolkit_root / "agent-configs"
     agents: dict[str, AgentConfig] = {}
@@ -334,12 +392,15 @@ def load_all(
         issues.append(Issue(ERROR, str(config_dir), "agent-configs directory not found"))
         return agents, issues
 
-    for path in sorted(config_dir.glob("*.yaml")):
-        agent = load_agent(path, toolkit_root, repo_root)
-        if agent.id in agents:
-            issues.append(Issue(ERROR, path.name, f"duplicate agent id `{agent.id}`"))
-        agents[agent.id] = agent
-        issues.extend(agent.issues)
+    _load_agent_dir(config_dir, toolkit_root, repo_root, agents, issues)
+
+    if override_dir is not None:
+        if not override_dir.is_dir():
+            issues.append(
+                Issue(ERROR, str(override_dir), "agent-configs directory not found")
+            )
+            return agents, issues
+        _load_agent_dir(override_dir, toolkit_root, repo_root, agents, issues)
 
     issues.extend(check_independence(agents))
     for agent in agents.values():

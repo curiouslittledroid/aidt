@@ -163,7 +163,7 @@ class _Recorder:
 
 
 def _patch(monkeypatch) -> None:
-    monkeypatch.setattr(implement_workflow, "load_all", lambda aidt, repo: ({}, []))
+    monkeypatch.setattr(implement_workflow, "load_all", lambda aidt, repo, **_kwargs: ({}, []))
 
 
 def _write_config(control: Path, body: str) -> None:
@@ -535,7 +535,7 @@ def test_agents_are_reloaded_against_the_located_worktree(
     control, worktree, prompt = _located_layout(tmp_path)
     load_roots: list[Path] = []
 
-    def record_load(_aidt: Path, repo_root: Path):
+    def record_load(_aidt: Path, repo_root: Path, **_kwargs):
         load_roots.append(repo_root)
         return {}, []
 
@@ -587,7 +587,7 @@ def test_config_error_wins_over_missing_worktree(tmp_path: Path, monkeypatch) ->
     """Config validation stays pre-locate, so bad config is exit 2, not exit 4."""
     control, _prompt = _layout(tmp_path)  # no task worktree
     issue = Issue(ERROR, "config", "bad config")
-    monkeypatch.setattr(implement_workflow, "load_all", lambda aidt, repo: ({}, [issue]))
+    monkeypatch.setattr(implement_workflow, "load_all", lambda aidt, repo, **_kwargs: ({}, [issue]))
     recorder = _Recorder()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
@@ -606,7 +606,7 @@ def test_reloaded_worktree_config_error_is_usage_error(
     control, worktree, prompt = _located_layout(tmp_path)
     calls: list[Path] = []
 
-    def load_for_root(_aidt: Path, repo_root: Path):
+    def load_for_root(_aidt: Path, repo_root: Path, **_kwargs):
         calls.append(repo_root)
         if repo_root == worktree:
             return {}, [Issue(ERROR, "config", "bad config in task worktree")]
@@ -1596,7 +1596,7 @@ def _patch_with_agents(monkeypatch) -> None:
     """``_patch`` plus the agent configs a repo-added stage's declared ``agent`` needs."""
     _patch(monkeypatch)
     monkeypatch.setattr(
-        implement_workflow, "load_all", lambda aidt, repo: (_AGENTS, [])
+        implement_workflow, "load_all", lambda aidt, repo, **_kwargs: (_AGENTS, [])
     )
 
 
@@ -1825,6 +1825,60 @@ def test_a_repo_added_stage_with_a_missing_prompt_is_refused(
     assert "workflows.implement.stages" in err
     assert "`X9`" in err
     assert "prompt does not resolve" in err
+    assert recorder.names == []
+
+
+def test_named_missing_agent_config_dir_refuses_before_worktree_lookup(
+    tmp_path: Path, capsys
+) -> None:
+    """E4.6: a named global override is an exit-2 preflight error, not a fallback."""
+    control, prompt = _layout(tmp_path)
+    _write_config(
+        control,
+        "schema_version: 1\n"
+        "paths:\n"
+        "  agent_configs_dir: aidw/missing-agent-configs\n",
+    )
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "agent-configs directory not found" in err
+    assert str(control / "aidw" / "missing-agent-configs") in err
+    # The refusal happens before the locate/run-state side effects.
+    assert not (control.parent / "aidt-state" / "runs").exists()
+
+
+def test_a_known_stage_with_an_unknown_agent_is_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """E4.6 req 3: a known id's declared `agent` is existence-checked too.
+
+    It becomes the plan's `agent_id`, so an unknown id must refuse exit 2 here rather than
+    surface as `run_stage`'s `ValueError: unknown agent` traceback.
+    """
+    control, prompt = _layout(tmp_path)
+    entries: list[dict[str, object]] = [
+        {"id": stage_id} for stage_id in IMPLEMENT_STAGE_IDS
+    ]
+    entries[0]["agent"] = "no-such-agent"
+    _write_config(control, _declared_stages(entries))
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "workflows.implement.stages" in err
+    assert "`I1`" in err
+    assert "unknown agent `no-such-agent`" in err
     assert recorder.names == []
 
 

@@ -69,7 +69,7 @@ In the tables below:
 | `requires_toolkit` | string | unset | An optional minimum toolkit version as a PEP 440 specifier (`">=1.0.0"`), compared with `packaging`; the toolkit refuses to run when its own version does not satisfy it, or when the specifier is not valid PEP 440 (D10, §3.11). |
 | `max_revisions` | integer | `3` | The revision budget of the `prompt` workflow (design §12): how many author→review→fix rounds run before the run blocks. `aidw prompt --max-revisions` overrides it; see the precedence section. |
 | `repo` | mapping | unset | Repository and branch conventions (two fields below). |
-| `paths` | mapping | unset | Per-repo path conventions (six fields below). |
+| `paths` | mapping | unset | Per-repo path conventions (seven fields below). |
 | `workflows` | mapping, open | unset | Workflow overrides keyed by workflow name. An open map, so a repo may add its own workflow as well as override `prompt`/`implement` (D12). |
 | `github` | mapping | unset | The strings persisted to GitHub (D5, §3.9). |
 
@@ -94,6 +94,7 @@ existence validation is a separate pass (`aidw.target_config.validate_paths` /
 | `implementation_results_dir` | string | `docs/implementation-results` | Where the record stage writes `<branch>/build-results.md`. A read-path. |
 | `build_results_template` | string | `docs/implementation-results/TEMPLATE.md` | The template the record stage fills in to produce the results document. When it is missing the record stage stops and reports it instead of inventing a structure. A read-path. |
 | `architecture_dir` | string | `docs/architecture` | Where the `update-architecture` stage reads and writes the architecture documents. A **write-target**: it may legitimately be absent and is created on demand. |
+| `agent_configs_dir` | string | unset | A target-repo directory of agent configs (`*.yaml`) that **shadow the toolkit's `agent-configs/` by `id`** for every workflow of that repo (D12 "override agent config globally", E4.6). A **read-path** when named, so the directory must exist. Un-overridden toolkit ids still load, a brand-new id loads as an additional agent (a legal `agent:` target), and an empty directory equals the toolkit defaults. When unset the toolkit's own `agent-configs/` is used. |
 
 ### `workflows:` — stage and workflow overrides
 
@@ -116,9 +117,12 @@ merged element-wise, so a stage you omit is not inherited from the default.
 | `id` | string | required | The stage id (`author`, `implement`, `test`, `record`, `pr`, …). Required and non-empty. |
 | `enabled` | boolean | `true` | Whether the stage runs. A repo-optional stage (D13) is disabled with an explicit `false`; a core stage cannot be disabled or reordered (D12). |
 | `prompt` | string | unset | The prompt for this stage, as a path — step 1 of the prompt-resolution order. When unset, resolution falls through to `aidw/prompts/` shadowing and then the toolkit default. |
-| `agent` | string | unset | The agent the stage runs as, naming an agent config (`agent-configs/<id>.yaml`, `aidw.config.load_agent`). When unset, the toolkit's default agent for that stage applies. |
+| `agent` | string | unset | The agent the stage runs as, naming an agent config (`agent-configs/<id>.yaml` or a `paths.agent_configs_dir` override, `aidw.config.load_agent`). When unset, the toolkit's default agent for that stage applies. A declared id must resolve: an unknown one is refused in preflight. |
+| `model` | string, non-empty | unset | Per-stage model override for this stage's invocation only (E4.6). It replaces the agent's `model` and never its `provider`: a value carrying the agent's own `provider/` prefix is qualified as-is, while a bare slug or another vendor-namespace slug (for example `meta/muse-spark-1.3` under `openrouter`) rides the agent's `--provider`. A provider change goes through `agent:` or `paths.agent_configs_dir`, not here. |
+| `thinking` | string | unset | Per-stage `thinking` level for this stage's invocation only, one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (design §5.1, E4.6). |
+| `timeout_seconds` | integer | unset | Per-stage wall-clock timeout for this stage's invocation only, a positive integer (design §5.1, E4.6). |
 
-`model`, `thinking` and `timeout_seconds` are **not** stage fields: `STAGE_KEYS` is exactly `id`/`enabled`/`prompt`/`agent`, so the loader rejects them as unknown keys (E4.6 owns stage `model`/`thinking`/`timeout` overrides).
+**Precedence (E4.6).** For one stage's invocation: the per-stage override wins over an agent loaded from `paths.agent_configs_dir`, which wins over the toolkit's `agent-configs/` default. A per-stage `model`/`thinking`/`timeout_seconds` is applied to the resolved agent for that stage only and is **not** re-run through the design §5.4 independence check — that check runs on the loaded (shadowed) agent dict, while a per-stage override is an explicit operator choice recorded in the argv and the stage's `state.json` record. Repo-added stages honour the same three fields uniformly.
 
 ### `github:` — persisted GitHub strings
 
@@ -164,18 +168,24 @@ set is exactly design §12's revision budget plus the eight `repo:`/`paths:` lea
 - `paths.build_results_template` = `docs/implementation-results/TEMPLATE.md`.
 - `paths.architecture_dir` = `docs/architecture`.
 
+`paths.agent_configs_dir` is deliberately **not** seeded: its consumer falls back to
+`<toolkit>/agent-configs/`, and seeding a repo-relative directory would make every repo
+without that folder fail the read-path check.
+
 These are Mythical Forge's current layout, not neutral placeholders (D17/R7) — which is why a
 Mythical-Forge-shaped config file is near-empty and doubles as the Typical example below. A repo
 that differs must override the fields it differs on; the defaults are not guesses about what a
 generic repo might want.
 
-**Unset, not defaulted.** Four things have **no toolkit default**, and a document that presented
+**Unset, not defaulted.** Five things have **no toolkit default**, and a document that presented
 them as already-defaulting would be wrong about `resolve_config`'s output today:
 
 - `schema_version` — required *in* a config file, and unset when there is no file at all. It is
   therefore **not** defaulted to `1`: `max_revisions` and `schema_version` are different kinds of
   value, and only the former resolves when absent.
 - `requires_toolkit` — an optional pin, never a default.
+- `paths.agent_configs_dir` — optional, and unset means "use the toolkit's own
+  `agent-configs/`" rather than a repo-relative default (E4.6).
 - `github.markers.*` and `github.labels.*` — the frozen D5 values become defaults in **E6**.
   Until then a config that does not declare them resolves them unset.
 - `workflows.*` — the default stage registry is **E4.1's**. Until then a workflow the config does
@@ -228,11 +238,12 @@ have Mythical Forge's files must supply them or override the field, and the fail
 legible when it does not.
 
 - **Read-paths** must exist when a config or a default names them:
-  `paths.build_results_template`, `paths.roadmap_dir`, `paths.task_prompts_dir` and
-  `paths.implementation_results_dir`. A missing one is an error naming the field **and** the
-  path, reported by `aidw doctor` and by the preflight of the stage that first needs it. (§3.4's
-  own paragraph lists three of these; E3.7's roadmap entry makes `implementation_results_dir` the
-  fourth and is the exhaustive set.)
+  `paths.build_results_template`, `paths.roadmap_dir`, `paths.task_prompts_dir`,
+  `paths.implementation_results_dir` and, when named, `paths.agent_configs_dir`. A missing one
+  is an error naming the field **and** the path, reported by `aidw doctor` and by the preflight
+  of the stage that first needs it. (§3.4's own paragraph lists three of these; E3.7's roadmap
+  entry makes `implementation_results_dir` the fourth and E4.6 adds `agent_configs_dir`, which
+  is unset by default so it is only checked when a repo names it.)
 - **Write-targets** are outputs of a stage and may legitimately be absent: `paths.architecture_dir`
   today, and any repo-added stage's directory. They are created on demand and required only when
   a stage that writes there is enabled.
@@ -264,9 +275,10 @@ defaults.
 schema_version: 1
 ```
 
-Resolves to the full Mythical Forge layout — `repo.*` and all six `paths.*` leaves from
+Resolves to the full Mythical Forge layout — `repo.*` and the six defaulted `paths.*` leaves from
 `TOOLKIT_DEFAULTS` with source `default`, `max_revisions` `3` (`default`) and `schema_version` `1`
-(`config`). `requires_toolkit`, `github.markers.*` and every `workflows.*` entry resolve `unset`.
+(`config`). `requires_toolkit`, `paths.agent_configs_dir`, `github.markers.*` and every
+`workflows.*` entry resolve `unset`.
 
 ### Typical — the defaults echoed explicitly
 
@@ -310,6 +322,7 @@ paths:
   implementation_results_dir: docs/implementation-results
   build_results_template: docs/implementation-results/TEMPLATE.md
   architecture_dir: docs/architecture
+  agent_configs_dir: aidw/agent-configs   # global agent-config override (E4.6)
 
 workflows:
   prompt:
