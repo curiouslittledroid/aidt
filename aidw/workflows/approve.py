@@ -41,7 +41,11 @@ from aidw.state import (
     save,
     utcnow_iso,
 )
-from aidw.target_config import SOURCE_CONFIG, resolve_workflow_config
+from aidw.target_config import (
+    SOURCE_CONFIG,
+    agent_configs_override,
+    resolve_workflow_config,
+)
 
 GATE = "approve-followups"
 STAGE = "approve-review-followups"
@@ -149,7 +153,14 @@ def run(
             print(format_issues(stage_issues), file=sys.stderr)
             return 2
 
-    agents, issues = load_all(aidt.root, repo.root)
+    # E4.6: a declared `paths.agent_configs_dir` shadows the toolkit's agent configs by
+    # id; unset passes `None` (toolkit defaults). `approve` runs in the invoking
+    # worktree, so the resolved path is target-root relative to it.
+    agents, issues = load_all(
+        aidt.root,
+        repo.root,
+        override_dir=agent_configs_override(resolved_config, repo.root),
+    )
     errors = [i for i in issues if i.level == ERROR]
     warnings = [i for i in issues if i.level == WARNING]
     if errors or (strict and warnings):

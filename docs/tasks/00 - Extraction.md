@@ -366,7 +366,7 @@
   - Predecessor: E4.5a (its rule set is what this plans for). Both halves came out of one E4.5
     prompt that never converged: six round-1 findings, then a truncated second review.
 
-- [ ] **E4.6. Agent and model overrides**
+- [x] **E4.6. Agent and model overrides**
   Allow per-stage `agent`/`model`/`thinking`/`timeout_seconds` and a global agent-config override,
   defaulting to the toolkit's `agent-configs/`.
   - Deliverable: merge logic plus tests.

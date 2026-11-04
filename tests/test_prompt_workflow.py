@@ -554,7 +554,7 @@ def test_invalid_agent_config_refuses_before_worktree_or_run_state(
     monkeypatch.setattr(
         prompt_workflow,
         "load_all",
-        lambda _aidt_root, _repo_root: (
+        lambda _aidt_root, _repo_root, **_kwargs: (
             {},
             [Issue(ERROR, "task-author.yaml", "invalid test configuration")],
         ),

@@ -75,7 +75,10 @@ from packaging.version import InvalidVersion, Version
 
 # Issues are the agent-config ones on purpose: ``aidw doctor`` (E3.5) formats target-config
 # validation errors with the same helper. ``format_issues`` is re-exported for that caller.
-from aidw.config import ERROR, Issue, format_issues
+# ``THINKING_LEVELS`` is design §5.1's value space, reused rather than restated: a per-stage
+# ``thinking`` override (E4.6) must accept exactly the levels an agent config accepts, and a
+# second literal tuple would let the two drift.
+from aidw.config import ERROR, THINKING_LEVELS, Issue, format_issues
 
 #: Top-level keys of the §3.4 schema. ``max_revisions`` is design.md §12's key (also
 #: carried forward by L4.3); §3.4's YAML example omits it, so a loader that rejects it
@@ -99,6 +102,9 @@ PATH_FIELDS = (
     "implementation_results_dir",
     "build_results_template",
     "architecture_dir",
+    # E4.6's global agent-config override (D12 "override agent config globally"): a
+    # target-repo directory whose ``*.yaml`` files shadow the toolkit's by id.
+    "agent_configs_dir",
 )
 
 #: ``github.markers`` is a fixed three-key object (D5 / §3.9); any other marker key is a
@@ -107,9 +113,18 @@ MARKER_FIELDS = ("parent", "child", "summary")
 
 WORKFLOW_KEYS = ("stages", "parallel_groups")
 
-#: Stage fields E3.1 owns. ``model``/``thinking``/``timeout_seconds`` are E4.6's stage
-#: overrides and are intentionally absent, so a config using them fails loudly here.
-STAGE_KEYS = ("id", "enabled", "prompt", "agent")
+#: Stage fields. E3.1 owns ``id``/``enabled``/``prompt``/``agent``; E4.6 adds the three
+#: stage-metadata overrides D12 names (``agent/model/timeout/thinking``) minus ``agent``,
+#: which E4.5b already carried. They are validated here and honoured by the runner.
+STAGE_KEYS = (
+    "id",
+    "enabled",
+    "prompt",
+    "agent",
+    "model",
+    "thinking",
+    "timeout_seconds",
+)
 
 GITHUB_KEYS = ("markers", "labels")
 
@@ -259,6 +274,12 @@ class StageConfig:
     enabled: bool = True
     prompt: str | None = None
     agent: str | None = None
+    #: E4.6's per-stage metadata overrides (D12): a ``provider/model``-shaped model id, a
+    #: design §5.1 ``thinking`` level, and a positive wall-clock timeout. All ``None`` when
+    #: the stage declared none, so an absent override is never serialised as ``null``.
+    model: str | None = None
+    thinking: str | None = None
+    timeout_seconds: int | None = None
     _declared: frozenset[str] = field(
         default_factory=frozenset, compare=False, repr=False
     )
@@ -269,10 +290,12 @@ class StageConfig:
         # distinguishable through the declared-key set (§3.4 "disabled with enabled: false").
         if not self.enabled or "enabled" in self._declared:
             data["enabled"] = self.enabled
-        if self.prompt is not None:
-            data["prompt"] = self.prompt
-        if self.agent is not None:
-            data["agent"] = self.agent
+        # Every optional field is ``None`` when absent, so the declared config round-trips
+        # exactly: no ``null`` is injected for a setting the file did not name.
+        for name in ("prompt", "agent", "model", "thinking", "timeout_seconds"):
+            value = getattr(self, name)
+            if value is not None:
+                data[name] = value
         return data
 
 
@@ -317,6 +340,11 @@ class PathsConfig:
     implementation_results_dir: str | None = None
     build_results_template: str | None = None
     architecture_dir: str | None = None
+    #: E4.6's global agent-config override: a target-repo directory whose ``*.yaml`` files
+    #: shadow the toolkit's ``agent-configs/`` by id. Deliberately **unset, not defaulted**
+    #: (no value in :data:`TOOLKIT_DEFAULTS`): the consumer falls back to the toolkit
+    #: directory, so a repo with no such folder never validates a path it does not have.
+    agent_configs_dir: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -427,12 +455,60 @@ class TargetConfig:
 def _parse_stage(
     raw: Mapping[str, Any], path: str, source: str, issues: list[Issue]
 ) -> StageConfig:
+    """One stage entry, with E4.6's three metadata overrides validated on load.
+
+    Each value space is the one the consumer already has: ``thinking`` is design §5.1's
+    :data:`~aidw.config.THINKING_LEVELS`, ``timeout_seconds`` is a positive integer and
+    ``model`` a non-empty string. The failure names the dotted field path
+    (``workflows.implement.stages[0].thinking``), matching the loader's unknown-key and
+    wrong-type contract, and the value is dropped (``None``) so a refused config can never
+    be resolved into a half-applied override.
+    """
     _flag_unknown(raw, STAGE_KEYS, path, source, issues)
+
+    model = _read_str(raw, "model", path, source, issues)
+    if model is not None and not model:
+        issues.append(
+            Issue(
+                ERROR,
+                source,
+                f"`{_join(path, 'model')}` must be a non-empty string",
+            )
+        )
+        model = None
+
+    thinking = _read_str(raw, "thinking", path, source, issues)
+    if thinking is not None and thinking not in THINKING_LEVELS:
+        issues.append(
+            Issue(
+                ERROR,
+                source,
+                f"`{_join(path, 'thinking')}` must be one of {THINKING_LEVELS}, "
+                f"got {thinking!r}",
+            )
+        )
+        thinking = None
+
+    timeout_seconds = _read_int(raw, "timeout_seconds", path, source, issues)
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        issues.append(
+            Issue(
+                ERROR,
+                source,
+                f"`{_join(path, 'timeout_seconds')}` must be a positive integer, "
+                f"got {timeout_seconds}",
+            )
+        )
+        timeout_seconds = None
+
     return StageConfig(
         id=_read_str(raw, "id", path, source, issues, required=True) or "",
         enabled=_read_bool(raw, "enabled", path, source, issues, default=True),
         prompt=_read_str(raw, "prompt", path, source, issues),
         agent=_read_str(raw, "agent", path, source, issues),
+        model=model,
+        thinking=thinking,
+        timeout_seconds=timeout_seconds,
         _declared=_declared_keys(raw),
     )
 
@@ -898,7 +974,8 @@ class ResolvedConfig(Mapping[str, ResolvedValue]):
     """The merged config as a flat ``dotted path -> ResolvedValue`` mapping.
 
     Flat and dotted on purpose: ``schema_version``, ``max_revisions``,
-    ``repo.base_branch``, the six ``paths.<field>`` leaves,
+    ``repo.base_branch``, the seven ``paths.<field>`` leaves (six seeded defaults plus
+    E4.6's unset ``agent_configs_dir``),
     ``github.markers.<name>``, ``github.labels.<name>.{color,description}``, and one
     whole-list entry per declared ``workflows.<name>.{stages,parallel_groups}``.
     Mirroring §3.4's YAML nesting would hand E3.4/E4.1/E6 a second addressing scheme, and
@@ -949,6 +1026,12 @@ class ConfigDefaults:
     defaults. That is a second home *by design* until E4/E5 wire the resolved config
     through: this module must not import ``aidw.paths`` (layering), so the equality is
     pinned by the tests rather than derived from one shared constant.
+
+    ``paths.agent_configs_dir`` is deliberately absent from the seeded block even though
+    the field exists (§3.4's ``paths:`` example does not name it either): it is
+    "unset, not defaulted", because its consumer falls back to ``<toolkit>/agent-configs``
+    and a seeded repo-relative path would make every repo without that folder fail
+    :func:`validate_paths`. Seeding nothing is what keeps a config-less repo valid.
 
     ``github``/``workflows`` are present but empty: an empty slot resolves *unset* rather
     than inventing a value, because those defaults are E6's and E4.1's to own. A later
@@ -1221,9 +1304,10 @@ def resolve_workflow_config(
 
 #: §3.4 read-paths: values the toolkit *reads*, so a missing one is always an error.
 #: §3.4 lists three of these; E3.7's roadmap entry adds ``implementation_results_dir``,
-#: and the roadmap's four are the classification of record. Deliberately not merged with
-#: §3.4's *other* use of "write-target" (the gate-scope declaration: R18's
-#: ``implementation_results_dir``/``architecture_dir``/``roadmap_dir``/
+#: and E4.6 adds ``agent_configs_dir`` — a directory of agent configs the workflow reads
+#: whenever a repo names it (it has no default, so an unset leaf is skipped, not stat'd).
+#: Deliberately not merged with §3.4's *other* use of "write-target" (the gate-scope
+#: declaration: R18's ``implementation_results_dir``/``architecture_dir``/``roadmap_dir``/
 #: ``task_prompts_dir``), which asks a different question — what a gate cannot read —
 #: about a partly overlapping set.
 READ_PATHS = (
@@ -1231,6 +1315,7 @@ READ_PATHS = (
     "roadmap_dir",
     "task_prompts_dir",
     "implementation_results_dir",
+    "agent_configs_dir",
 )
 
 #: §3.4 write-targets, as ``field -> id of the stage that writes there``. A write-target
@@ -1271,6 +1356,25 @@ def _target_path(target_root: Path, value: str) -> Path:
     same code path.
     """
     return Path(target_root) / value
+
+
+def agent_configs_override(
+    resolved: ResolvedConfig, target_root: Path
+) -> Path | None:
+    """The resolved ``paths.agent_configs_dir`` as a filesystem path, or ``None`` (E4.6).
+
+    One place for the "relative to the target root, absolute wins" rule
+    (:func:`_target_path`), shared by every workflow's ``load_all`` call site: a global
+    override is *target-repo configuration*, so it resolves against the tree the stages run
+    in — the located worktree once one exists — exactly like the other §3.4 read-paths.
+    Unset (the toolkit default, which is deliberately absent) returns ``None``: the caller
+    then loads only ``<toolkit>/agent-configs/``. Pure: no ``exists()`` and no I/O; whether
+    the named directory is present is :func:`validate_paths`' and ``load_all``'s question.
+    """
+    entry = _resolved_path(resolved, "agent_configs_dir")
+    if entry is None:
+        return None
+    return _target_path(target_root, str(entry.value))
 
 
 def validate_paths(resolved: ResolvedConfig, target_root: Path) -> list[Issue]:

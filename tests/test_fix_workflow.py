@@ -149,7 +149,7 @@ class _FakeStages:
 
 
 def _patch(monkeypatch, *, branch="03-E4.1", select_impl=None, view=None, gh=True):
-    monkeypatch.setattr(fix_workflow, "load_all", lambda aidt, repo: ({}, []))
+    monkeypatch.setattr(fix_workflow, "load_all", lambda aidt, repo, **_kwargs: ({}, []))
     monkeypatch.setattr(github, "gh_available", lambda: gh)
     monkeypatch.setattr(
         github,
@@ -239,7 +239,7 @@ def test_reloaded_worktree_config_error_is_usage_error(
     _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
     calls: list[Path] = []
 
-    def load_for_root(_aidt: Path, repo_root: Path):
+    def load_for_root(_aidt: Path, repo_root: Path, **_kwargs):
         calls.append(repo_root)
         if repo_root == worktree:
             return {}, [Issue(ERROR, "config", "bad config in PR worktree")]
@@ -275,7 +275,7 @@ def test_strict_independence_warning_refuses_without_force_model(
     control, _worktree = _fix_layout(tmp_path)
     _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
     monkeypatch.setattr(
-        fix_workflow, "load_all", lambda _aidt, _repo: ({}, [_independence_warning()])
+        fix_workflow, "load_all", lambda _aidt, _repo, **_kwargs: ({}, [_independence_warning()])
     )
     stages = _FakeStages()
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
@@ -295,7 +295,7 @@ def test_force_model_overrides_reloaded_worktree_independence_warning(
     _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
     calls: list[Path] = []
 
-    def load_for_root(_aidt: Path, repo_root: Path):
+    def load_for_root(_aidt: Path, repo_root: Path, **_kwargs):
         calls.append(repo_root)
         return {}, [_independence_warning()]
 
@@ -710,7 +710,7 @@ def test_a_repo_added_stage_is_accepted_and_warned_about(
     _write_repo_added_prompt(control, worktree)
     _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
     monkeypatch.setattr(
-        fix_workflow, "load_all", lambda aidt, repo: (_AGENTS, [])
+        fix_workflow, "load_all", lambda aidt, repo, **_kwargs: (_AGENTS, [])
     )
     stages = _FakeStages()
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
@@ -733,7 +733,7 @@ def test_a_repo_added_stage_never_runs_in_a_real_fix_run(
     _write_repo_added_prompt(control, worktree)
     _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
     monkeypatch.setattr(
-        fix_workflow, "load_all", lambda aidt, repo: (_AGENTS, [])
+        fix_workflow, "load_all", lambda aidt, repo, **_kwargs: (_AGENTS, [])
     )
     stages = _FakeStages(APPROVE_REVIEW)
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
@@ -752,7 +752,7 @@ def test_a_repo_added_stage_with_a_missing_prompt_is_refused(
     _write_stages_config(control, _CONFIG_WITH_REPO_ADDED)
     _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
     monkeypatch.setattr(
-        fix_workflow, "load_all", lambda aidt, repo: (_AGENTS, [])
+        fix_workflow, "load_all", lambda aidt, repo, **_kwargs: (_AGENTS, [])
     )
     stages = _FakeStages()
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
@@ -780,7 +780,7 @@ def test_a_repo_added_stage_with_an_unknown_agent_is_refused(
     _write_repo_added_prompt(control, worktree)
     _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
     monkeypatch.setattr(
-        fix_workflow, "load_all", lambda aidt, repo: (_AGENTS, [])
+        fix_workflow, "load_all", lambda aidt, repo, **_kwargs: (_AGENTS, [])
     )
     stages = _FakeStages()
     monkeypatch.setattr(fix_workflow, "run_stage", stages)

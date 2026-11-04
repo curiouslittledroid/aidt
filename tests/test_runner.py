@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+import yaml
+
 from aidw.config import load_all
 from aidw.log import RunLogger
 from aidw.paths import (
@@ -15,7 +18,7 @@ from aidw.paths import (
 )
 from aidw.pi import PiResult, Usage
 from aidw import runner as runner_mod
-from aidw.runner import StageSpec, resolve_prompt, run_stage
+from aidw.runner import StageSpec, declared_stage_issues, resolve_prompt, run_stage
 from aidw.state import FAILED, SUCCEEDED, create_run
 
 
@@ -444,3 +447,291 @@ def test_stage_record_carries_generation_speed(tmp_path: Path, monkeypatch) -> N
     assert record.tool_seconds == 7.5
     assert record.tool_breakdown == {"read": 7.5}
     assert record.output_tokens_per_second == 50.0
+
+
+# --------------------------------------------------------------------------- #
+# E4.6: per-stage model/thinking/timeout_seconds reach the effective agent
+# --------------------------------------------------------------------------- #
+
+
+def _dry_run(tmp_path: Path, spec: StageSpec):
+    """Run one dry-run stage against the real agent configs; return record/log/agents."""
+    agents, _ = load_all(toolkit_root(), repo_root())
+    run = create_run(tmp_path, repo_root(), "stage", label="overrides")
+    logger = RunLogger(tmp_path / run.run_id)
+    record = run_stage(
+        spec,
+        repo_root=repo_root(),
+        toolkit_root=toolkit_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        dry_run=True,
+        runs_root=tmp_path,
+    )
+    return record, (tmp_path / run.run_id / "run.log").read_text(), agents
+
+
+#: One hand-calculated vector per ``model`` spelling (E4.6 req 4). ``--model`` is the argv
+#: slug and ``record.model`` is the *qualified* effective model: only a prefix matching the
+#: agent's own ``provider`` (``openrouter`` for ``code-reviewer``) is stripped, so a bare
+#: slug and a vendor-namespace slug both ride ``--provider openrouter`` whole.
+MODEL_OVERRIDE_VECTORS = [
+    pytest.param("muse-spark-2.0", "muse-spark-2.0", "openrouter/muse-spark-2.0", id="bare"),
+    pytest.param(
+        "deepseek/deepseek-v4.1-flash",
+        "deepseek/deepseek-v4.1-flash",
+        "openrouter/deepseek/deepseek-v4.1-flash",
+        id="vendor-namespace",
+    ),
+    pytest.param(
+        "openrouter/anthropic/claude-x",
+        "anthropic/claude-x",
+        "openrouter/anthropic/claude-x",
+        id="own-provider-prefix",
+    ),
+]
+
+
+@pytest.mark.parametrize(("override", "argv_model", "record_model"), MODEL_OVERRIDE_VECTORS)
+def test_dry_run_argv_and_record_use_the_per_stage_model(
+    tmp_path: Path, override: str, argv_model: str, record_model: str
+) -> None:
+    """Req 4/Done-when: the new model reaches the argv; the record keeps the qualified one."""
+    record, log, agents = _dry_run(
+        tmp_path,
+        StageSpec(
+            name="noop",
+            agent_id="code-reviewer",
+            prompt=_noop_prompt(),
+            variables=[],
+            model=override,
+        ),
+    )
+
+    argv_line = next(line for line in log.splitlines() if "argv:" in line)
+    assert "--provider openrouter" in argv_line
+    assert f"--model {argv_model}" in argv_line
+    # No doubled prefix and no provider switch; the record is the qualified effective model.
+    assert f"--model openrouter/{argv_model}" not in argv_line
+    assert record.model == record_model
+    assert f"model={record_model}" in log
+    # Purity: the loaded config another stage would use is untouched.
+    assert agents["code-reviewer"].model == "openrouter/meta/muse-spark-1.3"
+
+
+def test_an_un_overridden_stage_keeps_the_toolkit_model(tmp_path: Path) -> None:
+    """Sibling check: the override is for that stage's invocation only."""
+    agents, _ = load_all(toolkit_root(), repo_root())
+    run = create_run(tmp_path, repo_root(), "stage", label="siblings")
+    logger = RunLogger(tmp_path / run.run_id)
+
+    def run_one(name: str, model: str | None) -> object:
+        return run_stage(
+            StageSpec(
+                name=name,
+                agent_id="code-reviewer",
+                prompt=_noop_prompt(),
+                variables=[],
+                model=model,
+            ),
+            repo_root=repo_root(),
+            toolkit_root=toolkit_root(),
+            state=run,
+            logger=logger,
+            agents=agents,
+            dry_run=True,
+            runs_root=tmp_path,
+        )
+
+    overridden = run_one("overridden", "muse-spark-2.0")
+    sibling = run_one("sibling", None)
+
+    assert overridden.model == "openrouter/muse-spark-2.0"
+    assert sibling.model == agents["code-reviewer"].qualified_model
+    assert sibling.model == "openrouter/meta/muse-spark-1.3"
+    log = (tmp_path / run.run_id / "run.log").read_text()
+    assert "model=openrouter/meta/muse-spark-1.3" in log
+
+
+def test_stage_thinking_and_timeout_override_the_effective_agent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``thinking`` reaches the argv and ``timeout_seconds`` reaches ``execute``."""
+    agents, _ = load_all(toolkit_root(), repo_root())
+    captured: dict = {}
+
+    def _capture(argv, prompt, **kwargs):
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return _result(0.0)
+
+    monkeypatch.setattr(runner_mod, "execute", _capture)
+    run = create_run(tmp_path, repo_root(), "stage", label="thinking")
+    logger = RunLogger(tmp_path / run.run_id)
+
+    record = run_stage(
+        StageSpec(
+            name="noop",
+            agent_id="code-reviewer",
+            prompt=_noop_prompt(),
+            variables=[],
+            thinking="low",
+            timeout_seconds=42,
+        ),
+        repo_root=repo_root(),
+        toolkit_root=toolkit_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        runs_root=tmp_path,
+    )
+
+    argv = captured["argv"]
+    assert argv[argv.index("--thinking") + 1] == "low"
+    assert captured["timeout"] == 42.0
+    # An un-overridden model still comes from the agent config.
+    assert record.model == "openrouter/meta/muse-spark-1.3"
+
+
+def test_state_meta_and_log_all_carry_the_effective_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The trap: five consumers must read the same effective config, not just ``build_argv``."""
+    import json
+
+    agents, _ = load_all(toolkit_root(), repo_root())
+    captured: dict = {}
+
+    def _capture(argv, prompt, **kwargs):
+        captured["argv"] = argv
+        return _result(0.0)
+
+    monkeypatch.setattr(runner_mod, "execute", _capture)
+    run = create_run(tmp_path, repo_root(), "stage", label="effective")
+    logger = RunLogger(tmp_path / run.run_id)
+
+    record = run_stage(
+        StageSpec(
+            name="noop",
+            agent_id="code-reviewer",
+            prompt=_noop_prompt(),
+            variables=[],
+            model="openrouter/anthropic/claude-x",
+        ),
+        repo_root=repo_root(),
+        toolkit_root=toolkit_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        runs_root=tmp_path,
+    )
+
+    argv = captured["argv"]
+    assert argv[argv.index("--model") + 1] == "anthropic/claude-x"
+    assert record.model == "openrouter/anthropic/claude-x"
+    directory = tmp_path / run.run_id
+    meta = json.loads((directory / "stages" / "noop.meta.json").read_text())
+    assert meta["model"] == "openrouter/anthropic/claude-x"
+    assert (directory / "run.log").read_text().count(
+        "model=openrouter/anthropic/claude-x"
+    ) >= 1
+
+
+# --------------------------------------------------------------------------- #
+# E4.6: the preflight existence-checks a *known* stage's declared agent
+# --------------------------------------------------------------------------- #
+
+
+def test_declared_stage_issues_refuses_an_unknown_agent_on_a_known_stage(
+    tmp_path: Path,
+) -> None:
+    """Req 3: no `ValueError: unknown agent` traceback may escape `run_stage`."""
+    issues = declared_stage_issues(
+        "implement",
+        [{"id": "I1", "agent": "ghost"}],
+        toolkit_root=toolkit_root(),
+        target_root=tmp_path,
+        agents={"implementer": object()},
+    )
+
+    assert any(
+        "stage `I1`" in issue.message
+        and "unknown agent `ghost`" in issue.message
+        and issue.level == "error"
+        for issue in issues
+    ), issues
+
+
+def test_declared_stage_issues_accepts_a_known_stage_agent(tmp_path: Path) -> None:
+    """The same check passes for an agent the loaded configs define (E4.6 req 3)."""
+    issues = declared_stage_issues(
+        "implement",
+        [{"id": "I1", "agent": "implementer"}],
+        toolkit_root=toolkit_root(),
+        target_root=tmp_path,
+        agents={"implementer": object()},
+    )
+
+    assert issues == []
+
+
+def test_global_override_then_per_stage_model_precedence(tmp_path: Path) -> None:
+    """Req 5: per-stage > global override-dir shadow > toolkit, in the rendered argv.
+
+    The override directory supplies an effective ``code-reviewer``; a stage that declares
+    nothing uses it, and a stage that declares ``model`` wins over it. The toolkit's own
+    ``agent-configs/`` remains the third layer (asserted by the un-shadowed value).
+    """
+    override = tmp_path / "target" / "aidw" / "agent-configs"
+    override.mkdir(parents=True)
+    (override / "code-reviewer.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "id": "code-reviewer",
+                "description": "override",
+                "provider": "openrouter",
+                "model": "vendor/global-override",
+                "thinking": "minimal",
+                "tools": ["read", "bash"],
+                "session": "fresh",
+                "timeout_seconds": 60,
+            }
+        ),
+        encoding="utf-8",
+    )
+    agents, issues = load_all(toolkit_root(), repo_root(), override)
+    assert [issue for issue in issues if issue.level == "error"] == []
+    assert agents["code-reviewer"].qualified_model == "openrouter/vendor/global-override"
+
+    run = create_run(tmp_path, repo_root(), "stage", label="precedence")
+    logger = RunLogger(tmp_path / run.run_id)
+
+    def run_one(name: str, model: str | None) -> object:
+        return run_stage(
+            StageSpec(
+                name=name,
+                agent_id="code-reviewer",
+                prompt=_noop_prompt(),
+                variables=[],
+                model=model,
+            ),
+            repo_root=repo_root(),
+            toolkit_root=toolkit_root(),
+            state=run,
+            logger=logger,
+            agents=agents,
+            dry_run=True,
+            runs_root=tmp_path,
+        )
+
+    global_layer = run_one("global-layer", None)
+    per_stage = run_one("per-stage", "vendor/stage-winner")
+    toolkit_layer = load_all(toolkit_root(), repo_root())[0]["code-reviewer"]
+
+    assert global_layer.model == "openrouter/vendor/global-override"
+    assert per_stage.model == "openrouter/vendor/stage-winner"
+    assert toolkit_layer.qualified_model == "openrouter/meta/muse-spark-1.3"
+    log = (tmp_path / run.run_id / "run.log").read_text()
+    assert "--model vendor/global-override" in log
+    assert "--model vendor/stage-winner" in log
