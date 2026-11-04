@@ -30,7 +30,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from aidw import __version__, findings as findings_mod
-from aidw import git, github, lock
+from aidw import git, github, lock, stage_registry
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
@@ -44,7 +44,7 @@ from aidw.state import (
     run_dir,
     save,
 )
-from aidw.target_config import resolve_workflow_config
+from aidw.target_config import SOURCE_CONFIG, resolve_workflow_config
 from aidw.verdict import APPROVE, BLOCKED as VERDICT_BLOCKED, parse_verdict
 from aidw.workflows.implement import worktree_add_command
 
@@ -119,6 +119,23 @@ def run(
     if config_issues:
         print(format_issues(config_issues), file=sys.stderr)
         return 2
+
+    # --- core vs repo-optional stages (E4.5a, D12/D13, EXTRACTION.md §3.5) ------ #
+    # Only a *declared* `workflows.review.stages` list is validated: it replaces the
+    # toolkit's list wholesale (§3.4), so a missing core id is a removal. Declared-ness
+    # (`source == "config"`) is the test — an undeclared list is absent from the resolved
+    # config and the registry defaults plan unchanged, while an explicit `stages: []`
+    # must report every core stage removed. Runs immediately after the config refusal,
+    # before `load_all`, any run record/worktree, and in `--dry-run`: stderr + exit 2, the
+    # same contract as every other config refusal.
+    stages_entry = resolved_config.get("workflows.review.stages")
+    if stages_entry is not None and stages_entry.source == SOURCE_CONFIG:
+        stage_issues = stage_registry.validate_stage_list(
+            "review", stages_entry.value or []
+        )
+        if stage_issues:
+            print(format_issues(stage_issues), file=sys.stderr)
+            return 2
 
     agents, issues = load_all(aidt.root, repo.root)
     errors = [i for i in issues if i.level == ERROR]

@@ -27,7 +27,10 @@ The six stages are not hardcoded here since E4.3: ``run()`` builds them with
 repo's per-stage ``prompt:`` overlay applies and the prompts resolve against the located
 worktree (EXTRACTION.md §3.5, D2/D14). The target config's two fail-closed preflight
 refusals run first, sharing :func:`aidw.target_config.resolve_workflow_config` with the
-other four workflows.
+other four workflows. The same preflight validates a **declared**
+``workflows.implement.stages`` list (E4.5a, D12/D13): disabling, removing or reordering a
+core stage is one ``ERROR`` per violation (stderr + exit 2, before any run record or
+worktree), while a repo-optional ``enabled: false`` and a repo-added stage are accepted.
 
 Branch setup is a Python stage: ``run()`` derives the branch/worktree name from
 ``repo.branch_pattern`` and **locates** the existing worktree (``git.worktree_for_branch``,
@@ -84,6 +87,9 @@ GATE = "approve-implementation-pr"
 
 #: The resolved §3.4 path of the config-driven parallel groups (R11/E4.4).
 PARALLEL_GROUPS_PATH = "workflows.implement.parallel_groups"
+
+#: The resolved §3.4 path of the declared stage list (D12/D13, E4.5a).
+STAGES_PATH = "workflows.implement.stages"
 
 #: ``03-E4.1-prompt.md`` → phase ``03``, task ``E4.1``, branch ``03-E4.1``.
 _PROMPT_NAME = re.compile(
@@ -394,6 +400,25 @@ def run(
     if group_issues:
         print(format_issues(group_issues), file=sys.stderr)
         return 2
+
+    # --- core vs repo-optional stages (E4.5a, D12/D13, EXTRACTION.md §3.5) ------ #
+    # A declared list **replaces** the registry's list wholesale (§3.4), so a repo that
+    # omits a core stage has removed it; validate that list right after the config
+    # resolution and the E4.4 groups, before `load_all`, any run record or worktree, and
+    # in `--dry-run`: a D12/D13 violation is a config error either way, with the same
+    # stderr + exit 2 contract as the refusals above. Declared-ness, never value
+    # equality, decides (matching `effective_parallel_groups`): an undeclared list is
+    # absent from the resolved config and the registry defaults plan unchanged, while an
+    # explicit `stages: []` carries `source == "config"` and reports every core stage
+    # removed.
+    stages_entry = resolved_config.get(STAGES_PATH)
+    if stages_entry is not None and stages_entry.source == SOURCE_CONFIG:
+        stage_issues = stage_registry.validate_stage_list(
+            "implement", stages_entry.value or []
+        )
+        if stage_issues:
+            print(format_issues(stage_issues), file=sys.stderr)
+            return 2
 
     # --- agents/config ---------------------------------------------------------- #
     # Config validation stays in the preflight, before the locate: a combined

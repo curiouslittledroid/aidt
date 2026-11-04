@@ -405,3 +405,39 @@ def test_the_lock_is_released_on_every_exit_path(
 
     with lock.acquire(roots["workspace"].state_root, worktree_repo.task):
         pass
+
+
+# --------------------------------------------------------------------------- #
+# core vs repo-optional preflight (E4.5a, D12/D13, EXTRACTION.md §3.5)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_disabled_core_publisher_is_refused_before_any_side_effect(
+    worktree_repo, monkeypatch, capsys
+) -> None:
+    """Prompt-fixed: R2 (the review publisher) is core — only I3/I4 are repo-optional."""
+    config = worktree_repo.control / "aidw" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  review:\n"
+        "    stages:\n"
+        "      - id: R1\n"
+        "      - id: R2\n"
+        "        enabled: false\n",
+        encoding="utf-8",
+    )
+    _patch(monkeypatch)
+    stages = _FakeStages(APPROVED_REVIEW)
+    monkeypatch.setattr(review_workflow, "run_stage", stages)
+
+    code = review_workflow.run(pr=7, **_roots(worktree_repo.control), dry_run=True)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "workflows.review.stages" in err
+    assert "R2" in err
+    assert "core stage cannot be disabled" in err
+    assert stages.names == []
+    _no_run_state(worktree_repo.control)
