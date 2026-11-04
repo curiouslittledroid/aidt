@@ -17,14 +17,14 @@ from __future__ import annotations
 import os
 import sys
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from aidw import stage_registry
 from aidw.agents import build_argv, build_env, prompt_template_dirs
-from aidw.config import AgentConfig, load_all
+from aidw.config import ERROR, AgentConfig, Issue, format_issues, load_all
 from aidw.log import RunLogger
 from aidw.pi import PiResult, execute, write_meta
 from aidw.paths import RUN_ID_ENV_VAR, SCRIPTS_DIR_ENV_VAR, STAGE_ENV_VAR
@@ -146,21 +146,120 @@ def resolve_prompt(
     )
 
 
+def _declared_prompt(entry: Mapping[str, Any]) -> str | None:
+    """An entry's ``prompt:`` as a plain string, or ``None`` when it declared none."""
+    prompt = entry.get("prompt")
+    return prompt if isinstance(prompt, str) and prompt else None
+
+
+def declared_stage_issues(
+    workflow: str,
+    stages: Sequence[Mapping[str, Any]],
+    *,
+    toolkit_root: Path,
+    target_root: Path,
+    agents: Mapping[str, Any],
+) -> list[Issue]:
+    """Fail-closed preflight checks on a declared stage list's per-entry settings (E4.5b).
+
+    The two things the plan builder would otherwise discover too late, turned into config
+    ``ERROR`` issues (the ``workflows.<workflow>.stages`` dotted path, the stage id and the
+    rule) so every preflight prints them through ``format_issues`` with exit 2 before any
+    run record or worktree:
+
+    * **the prompt resolves** — every declared entry's prompt is resolved exactly as
+      :func:`plan_stages` resolves it (a known id by its registry prompt-file name, a
+      repo-added id by its declared id) with the entry's ``prompt:`` as D14 level 1. This
+      is what keeps :func:`resolve_prompt`'s :class:`FileNotFoundError` out of ``run()``:
+      deliberately *not* a ``try``/``except`` at a call site (the roadmap forbids local
+      call-site catches), and not a wrapper around ``plan_stages`` either.
+    * **a repo-added stage's ``agent`` exists** — the declared ``agent`` is the honoured
+      ``StageSpec.agent_id`` (E4.5b req 4), so an id that is missing or absent from the
+      loaded agent configs is refused here, never left to ``run_stage``'s
+      ``ValueError: unknown agent``. A known stage's ``agent`` is a deferred E4.6 override
+      and is deliberately not checked: the plan ignores it.
+
+    Pure apart from the prompt existence checks: no mutation of ``stages`` or ``agents``,
+    no run state, no workflow import. The caller passes the resolved list and the agents
+    dict it already loaded — which is why this runs **after** ``load_all`` and not at the
+    ``validate_stage_list`` site, where the agents dict does not exist yet.
+    """
+    definition = stage_registry.get_workflow(workflow)
+    static = {item.id: item for item in definition.stages}
+    source = f"workflows.{workflow}.stages"
+    known_agents = ", ".join(sorted(agents)) or "(none configured)"
+    issues: list[Issue] = []
+    for entry in stages:
+        if not isinstance(entry, Mapping):
+            # The loader already refused this entry; `validate_stage_list` skips it too.
+            continue
+        stage_id = entry.get("id")
+        if not isinstance(stage_id, str) or not stage_id:
+            continue
+        declared = _declared_prompt(entry)
+        definition_entry = static.get(stage_id)
+        prompt_name = definition_entry.prompt_file if definition_entry else stage_id
+        try:
+            resolve_prompt(
+                toolkit_root,
+                target_root,
+                name=prompt_name,
+                explicit_path=declared,
+            )
+        except FileNotFoundError as exc:
+            issues.append(
+                Issue(
+                    ERROR,
+                    source,
+                    f"stage `{stage_id}`: its prompt does not resolve: {exc}",
+                )
+            )
+        if definition_entry is not None:
+            continue
+        agent = entry.get("agent")
+        if not isinstance(agent, str) or not agent:
+            issues.append(
+                Issue(
+                    ERROR,
+                    source,
+                    f"stage `{stage_id}`: a repo-added stage must declare `agent` "
+                    "(EXTRACTION.md §3.5)",
+                )
+            )
+        elif agent not in agents:
+            issues.append(
+                Issue(
+                    ERROR,
+                    source,
+                    f"stage `{stage_id}`: unknown agent `{agent}`; known agents are: "
+                    f"{known_agents}",
+                )
+            )
+    return issues
+
+
 # --------------------------------------------------------------------------- #
-# The run-path plan builder (EXTRACTION.md §3.4/§3.5, D2/D14; task E4.3)
+# The run-path plan builder (EXTRACTION.md §3.4/§3.5, D2/D14; tasks E4.3/E4.5b)
 # --------------------------------------------------------------------------- #
 
 #: Deferred §3.4 stage settings: declared on a stage entry, but ignored by this version's
-#: *planning*. Since E4.5a the workflow preflights **validate** ``enabled: false`` and
-#: repo-added stages (:func:`aidw.stage_registry.validate_stage_list`): disabling a core
-#: stage is refused, while a repo-optional ``enabled: false`` and a repo-added stage are
-#: accepted — yet the plan still ignores them, because E4.5b owns honouring
-#: ``enabled: false`` and constructing repo-added ``StageSpec``s. E4.6 owns the
-#: agent/model/thinking overrides. E4.3 warns once per entry that carries one so a repo
-#: written against the §3.4 schema is never silently surprised by a no-op.
+#: *planning*. Since E4.5b ``enabled: false`` is **honoured** (a repo-optional stage is
+#: omitted), and a repo-added stage is **planned** in ``review``/``approve``/``implement``,
+#: so neither is a deferred reason any more. E4.6 owns the per-stage agent override, so a
+#: known stage's declared ``agent`` still warns. A repo-added stage in ``prompt``/``fix``
+#: keeps the E4.3 warning: those two consumers look their stages up by *name* and never run
+#: a repo-added stage (E4.5b's non-goal), so it is warned about rather than silently
+#: dropped.
 _REASON_REPO_ADDED = "no such default stage, so a repo-added stage is deferred (E4.5)"
 _REASON_AGENT = "`agent` override (E4.6)"
-_REASON_DISABLED = "`enabled: false` (E4.5)"
+
+#: The workflows whose consumers resolve stages by *name* from the registry expansion
+#: (``fix._planned_iteration``, ``prompt._prompt_plan``) rather than walking the plan, so a
+#: repo-added entry cannot be run there: it is planned (the declaration is honoured on the
+#: run path) but draws a warning, because those two consumers look their stages up by name
+#: and never run it (E4.5b's non-goal — running it there is a consumer rewrite this task
+#: does not own).
+_NAME_KEYED_WORKFLOWS = frozenset({"prompt", "fix"})
 
 
 def plan_stages(
@@ -190,90 +289,241 @@ def plan_stages(
     ``config`` is the :class:`~aidw.target_config.ResolvedConfig` the caller already
     resolved — the builder never loads it, which keeps this module free of the resolution
     preflight and stops ``aidw.target_config`` importing a workflow module (E4.1's trap).
-    Only a **repo-declared** ``workflows.<workflow>.stages`` entry (``source == config``)
-    overlays a planned stage, and only through its ``prompt:`` path (D14, level 1): the
-    entry is matched by ``id`` — never by list position, because the list is a whole-list
-    override (§3.4) and need not mirror the registry in order or size — and sets
-    ``explicit_prompt`` plus the resolved ``prompt``. A declared-but-missing path raises
-    :class:`FileNotFoundError` from :func:`resolve_prompt`; there is no shadow/toolkit
-    fallback for a declared prompt.
 
-    Deferred settings are reported, never honoured: one ``warning:`` line per declared
-    entry that carries ``agent`` (E4.6), ``enabled: false`` or an unknown ``id`` (E4.5),
-    naming the workflow, the stage id and every reason on that single line. Counting is by
-    entry, not by field, and ``prompt:`` is not deferred.
+    A **repo-declared** ``workflows.<workflow>.stages`` list (``source == config``) is a
+    whole-list override (§3.4): it replaces the registry's *static* half wholesale, so the
+    plan's static stages are the declared entries **in declared order**, each one either
+
+    * a known static id — rendered exactly as :func:`aidw.stage_registry.expand` renders it
+      (``name``/``variables``/``extra`` templated from ``expand_fields``, ``agent`` and
+      ``prompt_file`` from the registry) with the entry's ``prompt:`` as the D14
+      level-1 explicit path; the entry's ``agent`` stays deferred (E4.6);
+    * a repo-optional id with ``enabled: false`` — omitted (E4.5a already refused this on a
+      core id);
+    * a repo-added id — the §3.5 repo-added stage: ``name`` = the declared id,
+      ``agent_id`` = the declared ``agent``, its prompt resolved by §3.6 with
+      ``name=`` the declared id (so ``<target>/aidw/prompts/<id>.md`` shadows) and the
+      declared ``prompt:`` as level 1, ``variables == []``, ``extra == ""``.
+
+    The registry's **loop** portion is appended unchanged. Static and loop stages are split
+    **by stage id** — loop ids are ``stages_by_id(workflow)`` minus the static
+    ``definition.stages`` ids (E4.5a's formula), never a ``len(definition.stages)`` slice:
+    ``review``'s ``R2`` is ``when=findings``, so ``expand``'s static half is one or two
+    stages and a count slice would misclassify a loop stage. A declared loop id never
+    reaches the plan because :func:`validate_stage_list` refuses it.
+
+    A declared list is validated here too: any ``ERROR`` from
+    :func:`aidw.stage_registry.validate_stage_list` raises
+    :class:`aidw.stage_registry.StageListError` carrying the validator's own
+    ``format_issues`` text. The preflight is expected to have refused first; a direct
+    caller (``tests/test_plan_stages.py``, ``aidw exec``) still never gets a silently
+    shortened or reordered plan. A declared-but-missing ``prompt:`` raises
+    :class:`FileNotFoundError` from :func:`resolve_prompt`; there is no shadow/toolkit
+    fallback for a declared prompt. The workflow preflights turn that into a config
+    ``ERROR`` through :func:`declared_stage_issues` before ``run()`` reaches this builder.
+
+    Deferred settings are still reported for what this version cannot honour, one
+    ``warning:`` line per declared entry naming the workflow, the stage id and every reason
+    on that single line: a known stage's ``agent`` (E4.6), and a repo-added stage in a
+    name-keyed workflow (:data:`_NAME_KEYED_WORKFLOWS` — it is planned here so the plan
+    reflects the declaration, but ``prompt``/``fix`` resolve stages by name and never run
+    it; E4.5b's non-goal). ``enabled: false`` and ``prompt:`` are no longer deferred
+    reasons, and a repo-added stage in a consumer that walks the plan (review / approve /
+    implement) draws no warning at all.
 
     Performs no I/O beyond the prompt existence checks in :func:`resolve_prompt` and
     mutates neither ``config`` nor the registry defaults.
     """
     planned = stage_registry.expand(workflow, **expand_fields)
-    overlays = _stage_prompt_overlays(workflow, config)
+    declared = _declared_stage_list(workflow, config)
+    if declared is None:
+        # No repo-declared list: the registry defaults plan unchanged, byte for byte.
+        return [
+            _spec_from_planned(stage, workflow, None, toolkit_root, target_root)
+            for stage in planned
+        ]
+
+    errors = [
+        issue
+        for issue in stage_registry.validate_stage_list(workflow, declared)
+        if issue.level == ERROR
+    ]
+    if errors:
+        raise stage_registry.StageListError(format_issues(errors))
+
+    _warn_deferred_settings(workflow, declared)
+
+    definition = stage_registry.get_workflow(workflow)
+    static_ids = [item.id for item in definition.stages]
+    # The loop portion is the expansion's id set minus the static definitions (E4.5a's
+    # formula), never a slice of the expansion by length.
+    loop_ids = set(stage_registry.stages_by_id(workflow)) - set(static_ids)
+    rendered_static = {
+        stage.id: stage for stage in planned if stage.id in static_ids
+    }
+    loop_stages = [stage for stage in planned if stage.id in loop_ids]
 
     specs: list[StageSpec] = []
-    for stage in planned:
-        declared = overlays.get(stage.id)
-        specs.append(
-            StageSpec(
-                stage.name,
-                stage.agent,
-                resolve_prompt(
+    for entry in declared:
+        if not isinstance(entry, Mapping):
+            # The loader already refused this entry; `validate_stage_list` skips it too.
+            continue
+        stage_id = entry.get("id")
+        if not isinstance(stage_id, str) or not stage_id:
+            continue
+        if stage_id in loop_ids:
+            # Refused above: a declared loop id can never be planned.
+            continue
+        enabled = entry.get("enabled", True)
+        rendered = rendered_static.get(stage_id)
+        if rendered is not None:
+            if enabled is False:
+                # Repo-optional `enabled: false` is honoured by omission (a core id would
+                # have been refused above).
+                continue
+            specs.append(
+                _spec_from_planned(
+                    rendered,
+                    workflow,
+                    _declared_prompt(entry),
                     toolkit_root,
                     target_root,
-                    name=stage.prompt_file,
-                    explicit_path=declared,
-                ),
-                list(stage.variables),
-                workflow=workflow,
-                extra=stage.extra,
-                explicit_prompt=declared,
-                id=stage.id,
+                )
             )
-        )
+        elif stage_id in static_ids:
+            # A static stage `expand` withheld for this call (`when=findings` with
+            # `findings=False`): the plan stays exactly as short as the expansion is.
+            continue
+        elif enabled is False:
+            # `enabled: false` on a repo-added stage is the same as omitting it.
+            continue
+        else:
+            specs.append(
+                _repo_added_spec(
+                    workflow, stage_id, entry, toolkit_root, target_root
+                )
+            )
+
+    specs.extend(
+        _spec_from_planned(stage, workflow, None, toolkit_root, target_root)
+        for stage in loop_stages
+    )
     return specs
 
 
-def _stage_prompt_overlays(workflow: str, config: ResolvedConfig) -> dict[str, str]:
-    """The repo's declared ``prompt:`` paths by stage id, warning on deferred settings.
+def _declared_stage_list(
+    workflow: str, config: ResolvedConfig
+) -> list[Any] | None:
+    """The repo-declared ``workflows.<workflow>.stages`` list, or ``None`` when absent.
 
-    Iterates the resolved ``workflows.<workflow>.stages`` list as an overlay and never
-    assumes it mirrors the registry: an entry whose ``id`` has no default stage is a
-    deferred repo-added stage (E4.5), and the registry's own order/size is what
-    :func:`plan_stages` renders from.
+    Declared-ness — ``source == config`` — is the test, never truthiness: an explicit
+    ``stages: []`` is a declared list (and is refused as "every core stage removed"),
+    while an undeclared list is absent from the resolved config. ``ConfigDefaults``
+    keeps ``workflows`` empty on purpose (E4.3 req 2), so a ``source == default`` list
+    cannot exist today; refusing anything but ``config`` is what makes the plan path the
+    single source of truth.
     """
     resolved = config.get(f"workflows.{workflow}.stages")
     if resolved is None or resolved.source != SOURCE_CONFIG:
-        # No repo-declared list: the registry defaults plan unchanged, with no warnings.
-        # ``ConfigDefaults.workflows`` stays empty on purpose (E4.3 req 2), so a
-        # ``source == default`` list cannot exist today — refusing anything but
-        # ``config`` is what makes this an overlay rather than a second source of truth.
-        return {}
+        return None
+    return list(resolved.value or [])
 
-    known = stage_registry.stages_by_id(workflow)
-    overlays: dict[str, str] = {}
-    for entry in resolved.value or []:
+
+def _spec_from_planned(
+    stage: stage_registry.PlannedStage,
+    workflow: str,
+    declared_prompt: str | None,
+    toolkit_root: Path,
+    target_root: Path,
+) -> StageSpec:
+    """One registry stage as a runnable spec (D4/D14), the E4.3 mapping.
+
+    The prompt resolves by the stage's **prompt file name** (filename shadowing, D14 level
+    2) unless the entry declared an explicit path (level 1); ``variables`` is a fresh
+    ``list`` because the registry's tuples are frozen, and ``extra`` is carried byte for
+    byte.
+    """
+    return StageSpec(
+        stage.name,
+        stage.agent,
+        resolve_prompt(
+            toolkit_root,
+            target_root,
+            name=stage.prompt_file,
+            explicit_path=declared_prompt,
+        ),
+        list(stage.variables),
+        workflow=workflow,
+        extra=stage.extra,
+        explicit_prompt=declared_prompt,
+        id=stage.id,
+    )
+
+
+def _repo_added_spec(
+    workflow: str,
+    stage_id: str,
+    entry: Mapping[str, Any],
+    toolkit_root: Path,
+    target_root: Path,
+) -> StageSpec:
+    """A §3.5 repo-added stage as a runnable spec (E4.5b req 4).
+
+    ``id`` and ``name`` are both the declared id (a repo-added stage declares no runtime
+    name), ``agent_id`` is the declared ``agent`` — the one per-stage setting this version
+    *honours*, existence-checked in the preflight — and the prompt resolves with
+    ``name=`` the declared id, so §3.6's shadow is ``<target>/aidw/prompts/<id>.md`` and a
+    declared relative ``prompt:`` resolves against the **target** root. A repo-added stage
+    declares no variables and no ``extra``; those are the registry's to render.
+    """
+    declared_prompt = _declared_prompt(entry)
+    agent = entry.get("agent")
+    return StageSpec(
+        stage_id,
+        agent if isinstance(agent, str) else "",
+        resolve_prompt(
+            toolkit_root,
+            target_root,
+            name=stage_id,
+            explicit_path=declared_prompt,
+        ),
+        [],
+        workflow=workflow,
+        extra="",
+        explicit_prompt=declared_prompt,
+        id=stage_id,
+    )
+
+
+def _warn_deferred_settings(
+    workflow: str, declared: list[Any]
+) -> None:
+    """One ``warning:`` line per declared entry this version cannot honour (E4.3/E4.5b).
+
+    Counting is by entry, not by field, and only the two surviving deferrals are named:
+    a known stage's ``agent`` override (E4.6) and a repo-added stage in a name-keyed
+    workflow (:data:`_NAME_KEYED_WORKFLOWS`), which those consumers would otherwise drop
+    silently. ``enabled: false`` is honoured by omission and ``prompt:`` is applied, so
+    neither is a reason any more.
+    """
+    static_ids = {item.id for item in stage_registry.get_workflow(workflow).stages}
+    for entry in declared:
         if not isinstance(entry, Mapping):
             continue
-        stage_id = str(entry.get("id") or "")
+        stage_id = entry.get("id")
+        if not isinstance(stage_id, str) or not stage_id:
+            continue
         reasons: list[str] = []
-        if stage_id not in known:
+        if stage_id not in static_ids and workflow in _NAME_KEYED_WORKFLOWS:
             reasons.append(_REASON_REPO_ADDED)
-        if entry.get("agent") is not None:
+        if stage_id in static_ids and entry.get("agent") is not None:
             reasons.append(_REASON_AGENT)
-        # ``enabled`` defaults to true, so only an explicit ``false`` is deferred; the
-        # loader's ``to_dict`` keeps a declared ``true`` distinguishable but it changes
-        # nothing, so it is not a reason to warn.
-        if entry.get("enabled") is False:
-            reasons.append(_REASON_DISABLED)
         if reasons:
             print(
                 f"warning: workflow `{workflow}` stage `{stage_id}`: ignoring deferred "
                 f"settings ({'; '.join(reasons)})",
                 file=sys.stderr,
             )
-        prompt = entry.get("prompt")
-        if stage_id in known and isinstance(prompt, str) and prompt:
-            overlays[stage_id] = prompt
-    return overlays
 
 
 def run_stage(

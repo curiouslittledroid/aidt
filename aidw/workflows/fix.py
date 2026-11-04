@@ -42,7 +42,7 @@ from aidw.gates import decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.runner import StageSpec, plan_stages, run_stage
+from aidw.runner import StageSpec, declared_stage_issues, plan_stages, run_stage
 from aidw.state import (
     BLOCKED,
     FAILED,
@@ -315,6 +315,29 @@ def run(
     if errors or (strict and warnings):
         print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
         return 2
+
+    # --- declared stage settings (E4.5b, EXTRACTION.md §3.5/§3.6) --------------- #
+    # After `load_all` (and its refusal), because the agents dict is what a repo-added
+    # stage's `agent` is checked against — the validator above runs before it.
+    # `validate_stage_list` stays the first stage-list refusal; this one covers the two
+    # settings a plan needs and turns them into config ERRORs (stderr + exit 2) before any
+    # run record or worktree, so a missing declared prompt or an unknown repo-added agent
+    # never escapes `run()` as a traceback. Control-root only: the reloaded-agents refusal
+    # in the worktree branch keeps its own `load_all` check and, like `validate_stage_list`,
+    # is not re-run — this workflow runs no repo-added stage (its consumer is name-keyed,
+    # E4.5b's non-goal), but the declaration is still checked and warned about, never a
+    # silent drop.
+    if stages_entry is not None and stages_entry.source == SOURCE_CONFIG:
+        declaration_issues = declared_stage_issues(
+            "fix",
+            stages_entry.value or [],
+            toolkit_root=aidt.root,
+            target_root=repo.root,
+            agents=agents,
+        )
+        if declaration_issues:
+            print(format_issues(declaration_issues), file=sys.stderr)
+            return 2
 
     # --- preflight: gh, PR exists, targets main (design §8.4) ---------------- #
     # ``gh`` missing and a missing PR are read failures: the refusals stay real-run

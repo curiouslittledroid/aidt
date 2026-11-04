@@ -11,6 +11,7 @@ I4 update-architecture            agent implementer (session shared)
 I5 record-implementation-results  agent recorder    (fresh)  SYNC POINT
 ◇  approve-implementation-pr
 I6 pr                             agent pr-publisher (fresh)
+…  any repo-added stages the repo declared before / after I6 (E4.5b)
 ```
 
 ``--parallel`` runs the target config's ``workflows.implement.parallel_groups``
@@ -67,7 +68,7 @@ from aidw.gates import decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.runner import StageSpec, plan_stages, run_stage
+from aidw.runner import StageSpec, declared_stage_issues, plan_stages, run_stage
 from aidw.state import (
     BLOCKED,
     FAILED,
@@ -431,6 +432,26 @@ def run(
         print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
         return 2
 
+    # --- declared stage settings (E4.5b, EXTRACTION.md §3.5/§3.6) --------------- #
+    # After `load_all`, because the agents dict is what a repo-added stage's `agent` is
+    # checked against — the validator above runs before it. `validate_stage_list` stays
+    # the first stage-list refusal; this one covers the two settings the plan needs and
+    # turns them into config ERRORs (stderr + exit 2) before the locate, any run record or
+    # worktree, and in `--dry-run`, so a missing declared prompt or an unknown repo-added
+    # agent never escapes `run()` as a traceback. Control-root only: the worktree reload
+    # below keeps its own `load_all` refusal and, like `validate_stage_list`, is not re-run.
+    if stages_entry is not None and stages_entry.source == SOURCE_CONFIG:
+        declaration_issues = declared_stage_issues(
+            "implement",
+            stages_entry.value or [],
+            toolkit_root=aidt.root,
+            target_root=repo.root,
+            agents=agents,
+        )
+        if declaration_issues:
+            print(format_issues(declaration_issues), file=sys.stderr)
+            return 2
+
     # --- retained preflight: one live run per branch ------------------------ #
     # The old main/branch-mismatch guards are gone: the task worktree is located, so
     # `aidw implement` no longer requires being on the task branch. The still-running
@@ -562,8 +583,16 @@ def run(
         task_id=task_id,
         base_branch=repo.base_branch,
     )
-    pre_pr = plan[:-1]
-    pr_plan = plan[-1]
+    # I6 is the PR stage, located **by id** (E4.5b): a declared list may carry repo-added
+    # stages before or after it, so a positional ``plan[:-1]``/``plan[-1]`` split would
+    # mistake a trailing stage for the PR stage (or drop it). Everything before I6 is the
+    # pre-PR block the gate sits behind; everything after it runs once I6 succeeded.
+    pr_index = next(
+        index for index, spec in enumerate(plan) if spec.id == "I6"
+    )
+    pre_pr = plan[:pr_index]
+    pr_plan = plan[pr_index]
+    post_pr = plan[pr_index + 1 :]
 
     # --- one run per worktree (EXTRACTION.md §3.2/§3.10, E2.7) ---------------- #
     # The key is the *resolved* worktree path -- ``target.root``, the same value
@@ -632,10 +661,24 @@ def run(
             return 0
 
         # --- stage selection (resume / --from) ---------------------------------- #
-        # ``from_index`` was validated before branch setup; the log line waits for
-        # the run's logger to exist.
-        if from_index is not None:
-            logger.info(f"--from {from_stage}: re-running from {names[from_index]}")
+        # ``from_stage`` was validated against the registry names before branch setup;
+        # the log line waits for the run's logger to exist. Its index is re-derived from
+        # the run-path plan (E4.5b): ``should_run`` compares full-plan positions, and a
+        # repo-added stage declared before the named one shifts them, so the registry-name
+        # index would re-run the wrong stages. ``from_stage`` is always a registry name,
+        # so it is present in the plan.
+        if from_stage is not None:
+            plan_names = [spec.name for spec in plan]
+            if from_stage in plan_names:
+                from_index = plan_names.index(from_stage)
+                logger.info(f"--from {from_stage}: re-running from {from_stage}")
+            else:
+                # The named stage is not in this run's plan — a repo-optional stage the
+                # repo disabled, or one `build_plan` knows but the declared list dropped.
+                # Nothing to re-run from, so every stage keeps its own succeeded-skip
+                # decision instead of crashing on a missing position.
+                from_index = None
+                logger.info(f"--from {from_stage}: stage is not in this run's plan")
 
         def should_run(index: int, name: str) -> bool:
             if from_index is not None and index >= from_index:
@@ -793,7 +836,10 @@ def run(
             print(f"gate:   {GATE} [{outcome.mechanism}]")
 
         # --- I6 ------------------------------------------------------------------ #
-        if should_run(len(plan) - 1, pr_plan.name):
+        # I6's own plan index (E4.5b): ``len(plan) - 1`` is only I6 when nothing is
+        # declared after it, so a trailing repo-added stage would make the skip/resume test
+        # ask about the wrong stage.
+        if should_run(pr_index, pr_plan.name):
             record = run_stage(
                 pr_plan,
                 repo_root=target.root,
@@ -810,6 +856,32 @@ def run(
             _record_pr(state, target, record)
         else:
             print(f"stage:  {pr_plan.id} {pr_plan.name} [skipped]")
+
+        # --- stages declared after I6 (E4.5b) ------------------------------------- #
+        # After a successful (or skipped-because-resumed) I6 only: a denied gate returns 3
+        # and a failed I6 returns 1 above, so nothing declared after I6 runs on either —
+        # exactly as a trailing stage did not exist before E4.5b. They run in declared
+        # order under the same ``should_run`` skip, at their full-plan positions.
+        for offset, spec in enumerate(post_pr, start=1):
+            if not should_run(pr_index + offset, spec.name):
+                print(f"stage:  {spec.id} {spec.name} [skipped]")
+                continue
+            record = run_stage(
+                spec,
+                repo_root=target.root,
+                toolkit_root=aidt.root,
+                runs_root=runs_root,
+                state=state,
+                logger=logger,
+                agents=agents,
+            )
+            print_stage(record, repo_root=target.root, prefix=spec.id)
+            if record.status != SUCCEEDED:
+                print(f"stage {spec.name} failed: {record.error}", file=sys.stderr)
+                state.status = FAILED
+                state.resume = {"next_stage": spec.name}
+                save(directory, state)
+                return 1
 
         _write_artifacts(directory, state, branch_name)
         state.status = SUCCEEDED

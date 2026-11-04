@@ -89,8 +89,17 @@ class _FakeStages:
         return record
 
 
-def _patch(monkeypatch, *, branch=BRANCH, view: dict | None = None, gh: bool = True):
-    monkeypatch.setattr(review_workflow, "load_all", lambda aidt, repo: ({}, []))
+def _patch(
+    monkeypatch,
+    *,
+    branch=BRANCH,
+    view: dict | None = None,
+    gh: bool = True,
+    agents: dict | None = None,
+):
+    monkeypatch.setattr(
+        review_workflow, "load_all", lambda aidt, repo: (agents or {}, [])
+    )
     monkeypatch.setattr(github, "gh_available", lambda: gh)
     monkeypatch.setattr(
         github,
@@ -441,3 +450,190 @@ def test_a_disabled_core_publisher_is_refused_before_any_side_effect(
     assert "core stage cannot be disabled" in err
     assert stages.names == []
     _no_run_state(worktree_repo.control)
+
+
+# --------------------------------------------------------------------------- #
+# repo-added stages (E4.5b req 1/req 6, EXTRACTION.md §3.5)
+# --------------------------------------------------------------------------- #
+
+#: The declared `prompt:` of a repo-added review stage, relative to the target root.
+REPO_ADDED_PROMPT = "aidw/prompts/repo-added.md"
+
+#: Stand-in agent configs: `load_all` is faked, so only the ids matter — a repo-added
+#: stage's declared `agent` is *existence*-checked against this dict (E4.5b req 4).
+_AGENTS = {"code-reviewer": object(), "review-publisher": object()}
+
+
+def _declared_review_stages(entries: list[dict[str, object]]) -> str:
+    """``aidw/config.yaml`` text declaring ``workflows.review.stages = entries``."""
+    lines = ["schema_version: 1", "workflows:", "  review:", "    stages:"]
+    for entry in entries:
+        for index, (key, value) in enumerate(entry.items()):
+            prefix = "      - " if index == 0 else "        "
+            rendered = (
+                ("true" if value else "false") if isinstance(value, bool) else str(value)
+            )
+            lines.append(f"{prefix}{key}: {rendered}")
+    return "\n".join(lines) + "\n"
+
+
+def _write_repo_added_prompt(*roots: Path) -> None:
+    """Write the repo-added stage's prompt into each root.
+
+    The preflight resolves it against the **control** root (the tree under check) and the
+    plan against the located **worktree**, so a real-run test needs it in both — exactly
+    as a committed repo prompt file is.
+    """
+    for root in roots:
+        path = root / REPO_ADDED_PROMPT
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# repo-added stage\n", encoding="utf-8")
+
+
+def _write_stages_config(root: Path, entries: list[dict[str, object]]) -> None:
+    config = root / "aidw" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(_declared_review_stages(entries), encoding="utf-8")
+
+
+def _repo_added(stage_id: str) -> dict[str, object]:
+    return {"id": stage_id, "agent": "code-reviewer", "prompt": REPO_ADDED_PROMPT}
+
+
+#: R1/R2 in registry order, one repo-added stage before R1, one between R1 and R2, one
+#: after R2 — the whole declared order req 6 fixes.
+_ENTRIES_AROUND_R1_R2 = [
+    _repo_added("review-lint"),
+    {"id": "R1"},
+    _repo_added("review-notes"),
+    {"id": "R2"},
+    _repo_added("review-digest"),
+]
+
+
+def test_a_repo_added_stage_is_planned_in_declared_order_in_the_dry_run(
+    worktree_repo, monkeypatch, capsys
+) -> None:
+    """Req 6: the dry run walks the full plan — no ``too many values to unpack``."""
+    _write_stages_config(worktree_repo.control, _ENTRIES_AROUND_R1_R2)
+    _write_repo_added_prompt(worktree_repo.control, worktree_repo.task)
+    _patch(monkeypatch, agents=_AGENTS)
+    stages = _FakeStages(APPROVED_REVIEW)
+    monkeypatch.setattr(review_workflow, "run_stage", stages)
+
+    code = review_workflow.run(pr=7, **_roots(worktree_repo.control), dry_run=True)
+
+    assert code == 0
+    assert stages.names == [
+        "review-lint",
+        "code-review",
+        "review-notes",
+        "review-findings-to-github",
+        "review-digest",
+    ]
+    out = capsys.readouterr().out
+    assert "review-lint [succeeded] (planned)" in out
+    # R2 keeps its §8.3 suffix; a repo-added stage never gets one.
+    assert "review-findings-to-github [succeeded] (planned)" in out
+    assert "(runs only when R1 reports findings)" in out
+    assert "review-digest [succeeded] (planned)" in out
+
+
+def test_repo_added_stages_run_in_declared_order_on_the_findings_path(
+    worktree_repo, monkeypatch
+) -> None:
+    """Req 6: before R1, between R1 and R2 (after the verdict/artifacts), then after R2."""
+    _write_stages_config(worktree_repo.control, _ENTRIES_AROUND_R1_R2)
+    _write_repo_added_prompt(worktree_repo.control, worktree_repo.task)
+    _patch(monkeypatch, agents=_AGENTS)
+    stages = _FakeStages(FINDINGS_REVIEW)
+    monkeypatch.setattr(review_workflow, "run_stage", stages)
+
+    code = review_workflow.run(pr=7, **_roots(worktree_repo.control))
+
+    assert code == 0
+    assert stages.names == [
+        "review-lint",
+        "code-review",
+        "review-notes",
+        "review-findings-to-github",
+        "review-digest",
+    ]
+    # R2 published, and the trailing stage did not disturb the recorded state.
+    directory = next(_runs_root(worktree_repo.control).iterdir())
+    recorded = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    assert recorded["pr"][review_workflow.PR_FOLLOWUPS] is True
+    assert recorded["status"] == "succeeded"
+
+
+def test_an_approving_review_stops_before_every_later_repo_added_stage(
+    worktree_repo, monkeypatch
+) -> None:
+    """Req 6: §8.3's else-stop — nothing declared after R1 runs on the Approve path."""
+    _write_stages_config(worktree_repo.control, _ENTRIES_AROUND_R1_R2)
+    _write_repo_added_prompt(worktree_repo.control, worktree_repo.task)
+    _patch(monkeypatch, agents=_AGENTS)
+    stages = _FakeStages(APPROVED_REVIEW)
+    monkeypatch.setattr(review_workflow, "run_stage", stages)
+
+    code = review_workflow.run(pr=7, **_roots(worktree_repo.control))
+
+    assert code == 0
+    # Only what is declared before R1 runs; the between/after stages never do.
+    assert stages.names == ["review-lint", "code-review"]
+
+
+def test_a_blocked_review_stops_before_every_later_repo_added_stage(
+    worktree_repo, monkeypatch
+) -> None:
+    """Req 6: a Blocked verdict keeps its exit 3 and stops before R2's neighbours."""
+    _write_stages_config(worktree_repo.control, _ENTRIES_AROUND_R1_R2)
+    _write_repo_added_prompt(worktree_repo.control, worktree_repo.task)
+    _patch(monkeypatch, agents=_AGENTS)
+    stages = _FakeStages(BLOCKED_REVIEW)
+    monkeypatch.setattr(review_workflow, "run_stage", stages)
+
+    code = review_workflow.run(pr=7, **_roots(worktree_repo.control))
+
+    assert code == 3
+    assert stages.names == ["review-lint", "code-review"]
+
+
+def test_a_repo_added_stage_with_a_missing_prompt_is_refused(
+    worktree_repo, monkeypatch, capsys
+) -> None:
+    """Req 5: the preflight refuses exit 2 with ``format_issues`` text, no traceback."""
+    _write_stages_config(worktree_repo.control, _ENTRIES_AROUND_R1_R2)
+    _patch(monkeypatch, agents=_AGENTS)
+    stages = _FakeStages(APPROVED_REVIEW)
+    monkeypatch.setattr(review_workflow, "run_stage", stages)
+
+    code = review_workflow.run(pr=7, **_roots(worktree_repo.control), dry_run=True)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "workflows.review.stages" in err
+    assert "`review-lint`" in err
+    assert "prompt does not resolve" in err
+    assert stages.names == []
+    _no_run_state(worktree_repo.control)
+
+
+def test_a_repo_added_stage_with_an_unknown_agent_is_refused(
+    worktree_repo, monkeypatch, capsys
+) -> None:
+    """Req 4/req 5: an unknown declared ``agent`` refuses here, not in ``run_stage``."""
+    entries = [dict(entry) for entry in _ENTRIES_AROUND_R1_R2]
+    entries[0]["agent"] = "no-such-agent"
+    _write_stages_config(worktree_repo.control, entries)
+    _write_repo_added_prompt(worktree_repo.control, worktree_repo.task)
+    _patch(monkeypatch, agents=_AGENTS)
+    stages = _FakeStages(APPROVED_REVIEW)
+    monkeypatch.setattr(review_workflow, "run_stage", stages)
+
+    code = review_workflow.run(pr=7, **_roots(worktree_repo.control), dry_run=True)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "unknown agent `no-such-agent`" in err
+    assert stages.names == []

@@ -329,7 +329,7 @@
   - Done when: each rejection names the stage and the rule; a repo-optional `enabled: false` is
     accepted while a core one is refused; the validator reads no filesystem.
 
-- [ ] **E4.5b. Plan the shapes E4.5a accepts**
+- [x] **E4.5b. Plan the shapes E4.5a accepts**
   The second half of the former E4.5: an accepted config must become a plan the workflows can
   consume without crashing on their own arity assumptions.
   - Contract, `plan_stages` construction: build the static specs from the declared list (it replaces

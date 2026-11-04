@@ -80,10 +80,13 @@ means "no parallel groups" (serial), never a fallback to the default. Since E4.5
 workflow's preflight runs :func:`validate_stage_list` over a **declared**
 ``workflows.<name>.stages`` list, so a reordered, removed or disabled core stage is
 refused with stderr + exit 2 before any run record — while a repo-optional
-``enabled: false`` and a repo-added stage are accepted. Planning the shapes E4.5a accepts
-(repo-added stage specs, honouring ``enabled: false`` in the plan) is E4.5b; still not
-wired by design: agent/model/thinking overrides (E4.6) and the fixture integration test
-(E4.7).
+``enabled: false`` and a repo-added stage are accepted. Since E4.5b
+:func:`aidw.runner.plan_stages` plans exactly those shapes — it refuses a declared list the
+validator rejects (:class:`StageListError`), builds the static half from the declared list
+in declared order and honours a repo-optional ``enabled: false`` by omission — while a
+repo-added stage's ``agent`` is still only *existence*-checked (moving a default stage's
+agent, and the model/thinking overrides, are E4.6). Still not wired by design:
+agent/model/thinking overrides (E4.6) and the fixture integration test (E4.7).
 """
 
 from __future__ import annotations
@@ -187,6 +190,17 @@ class StageFieldError(StageRegistryError):
 
 class RevisionBudgetError(StageRegistryError):
     """The requested expansion would exceed the loop's revision budget."""
+
+
+class StageListError(StageRegistryError):
+    """A declared ``workflows.<name>.stages`` list violates D12/D13 (E4.5b).
+
+    Raised by :func:`aidw.runner.plan_stages` when
+    :func:`validate_stage_list` reports one or more ``ERROR`` issues: the run path never
+    builds a silently shortened or reordered plan just because the preflight is expected
+    to have refused it first. The message is the validator's own ``format_issues`` text,
+    so a direct caller (``aidw exec``, a test) sees exactly what the preflight prints.
+    """
 
 
 # --------------------------------------------------------------------------- #

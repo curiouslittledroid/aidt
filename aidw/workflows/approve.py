@@ -4,6 +4,7 @@
 preflight (PR exists; `gh` available)
   ◇  approve-followups   show the open children and confirm
   →  approve-review-followups   agent review-approver
+  →  … repo-added stages, in the declared list's order (E4.5b)
 ```
 
 This extracts the approval step that ``aidw fix`` performs at its entry, so a human can
@@ -29,7 +30,7 @@ from aidw.gates import decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.runner import plan_stages, run_stage
+from aidw.runner import StageSpec, declared_stage_issues, plan_stages, run_stage
 from aidw.state import (
     BLOCKED,
     FAILED,
@@ -48,21 +49,31 @@ PROMPT = "approve-review-followups.md"
 AGENT = "review-approver"
 
 
-def _planned_stage(*, pr: int, config, aidt: Path, repo: Path):
-    """The single A1 stage from the registry, with the approval postcondition (E4.3).
+def _planned_stage(*, pr: int, config, aidt: Path, repo: Path) -> list[StageSpec]:
+    """The approve plan — every stage, in declared order — from the registry (E4.3/E4.5b).
+
+    §8.5 fixes one core stage (A1); a declared list may add repo-added stages anywhere, so
+    the plan is returned whole and A1 is located **by id**, never by position: only A1
+    carries the approval postcondition, and a repo-added stage runs without it.
 
     The postcondition stays workflow-side: only this module knows how to verify that the
     approvals were actually applied, so it is attached to the planned spec rather than
-    being stage data the registry would have to carry.
+    being stage data the registry would have to carry. The gate itself is decided in
+    :func:`run` before any stage, so a repo-added stage never gates the approval.
     """
-    (spec,) = plan_stages(
+    plan = plan_stages(
         "approve",
         config=config,
         toolkit_root=aidt,
         target_root=repo,
         pr=pr,
     )
-    return replace(spec, verify=lambda: github.verify_approvals(aidt, repo, pr))
+    return [
+        replace(spec, verify=lambda: github.verify_approvals(aidt, repo, pr))
+        if spec.id == "A1"
+        else spec
+        for spec in plan
+    ]
 
 
 def _selection_summary(selection: github.ScriptResult) -> str:
@@ -145,6 +156,24 @@ def run(
         print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
         return 2
 
+    # --- declared stage settings (E4.5b, EXTRACTION.md §3.5/§3.6) --------------- #
+    # After `load_all`, because the agents dict is what a repo-added stage's `agent` is
+    # checked against — the validator above runs before it. `validate_stage_list` stays
+    # the first stage-list refusal; this one covers the two settings the plan needs and
+    # turns them into config ERRORs (stderr + exit 2) before any run record, so a missing
+    # declared prompt or an unknown repo-added agent never escapes `run()` as a traceback.
+    if stages_entry is not None and stages_entry.source == SOURCE_CONFIG:
+        declaration_issues = declared_stage_issues(
+            "approve",
+            stages_entry.value or [],
+            toolkit_root=aidt.root,
+            target_root=repo.root,
+            agents=agents,
+        )
+        if declaration_issues:
+            print(format_issues(declaration_issues), file=sys.stderr)
+            return 2
+
     branch = git.current_branch(repo.root)
     pr_info: dict = {}
 
@@ -216,25 +245,26 @@ def run(
                     )
             else:
                 print("child:  unknown (`gh` not found)")
-            record = run_stage(
-                _planned_stage(
-                    pr=pr,
-                    config=resolved_config,
-                    aidt=aidt.root,
-                    repo=repo.root,
-                ),
-                repo_root=repo.root,
-                toolkit_root=aidt.root,
-                runs_root=runs_root,
-                state=state,
-                logger=logger,
-                agents=agents,
-                dry_run=True,
-            )
-            print(
-                f"{record.name} [{record.status}] (planned) "
-                f"agent={record.agent} model={record.model}"
-            )
+            for spec in _planned_stage(
+                pr=pr,
+                config=resolved_config,
+                aidt=aidt.root,
+                repo=repo.root,
+            ):
+                record = run_stage(
+                    spec,
+                    repo_root=repo.root,
+                    toolkit_root=aidt.root,
+                    runs_root=runs_root,
+                    state=state,
+                    logger=logger,
+                    agents=agents,
+                    dry_run=True,
+                )
+                print(
+                    f"{record.name} [{record.status}] (planned) "
+                    f"agent={record.agent} model={record.model}"
+                )
             print(f"gate (planned): {GATE}")
             state.status = SUCCEEDED
             save(directory, state)
@@ -269,26 +299,29 @@ def run(
             )
             return 3
 
-        record = run_stage(
-            _planned_stage(
-                pr=pr,
-                config=resolved_config,
-                aidt=aidt.root,
-                repo=repo.root,
-            ),
-            repo_root=repo.root,
-            toolkit_root=aidt.root,
-            runs_root=runs_root,
-            state=state,
-            logger=logger,
-            agents=agents,
-        )
-        print_stage(record, repo_root=repo.root)
-        if record.status != SUCCEEDED:
-            state.status = FAILED
-            save(directory, state)
-            print(f"stage {STAGE} failed: {record.error}", file=sys.stderr)
-            return 1
+        # A1 runs in its declared position: a repo-added stage declared before it runs
+        # before it and before the approval verification, one declared after it runs after.
+        for spec in _planned_stage(
+            pr=pr,
+            config=resolved_config,
+            aidt=aidt.root,
+            repo=repo.root,
+        ):
+            record = run_stage(
+                spec,
+                repo_root=repo.root,
+                toolkit_root=aidt.root,
+                runs_root=runs_root,
+                state=state,
+                logger=logger,
+                agents=agents,
+            )
+            print_stage(record, repo_root=repo.root)
+            if record.status != SUCCEEDED:
+                state.status = FAILED
+                save(directory, state)
+                print(f"stage {spec.name} failed: {record.error}", file=sys.stderr)
+                return 1
 
         state.status = SUCCEEDED
         save(directory, state)

@@ -1524,7 +1524,7 @@ def test_a_disabled_core_stage_is_refused_before_any_side_effect(
 def test_a_disabled_repo_optional_stage_passes_the_preflight(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """D13: I3 (traceability) is repo-optional, so ``enabled: false`` is accepted."""
+    """D13/E4.5b: I3 (traceability) is repo-optional, and disabling it means omitting it."""
     control, prompt = _layout(tmp_path)
     _write_config(control, _declared_implement_stages({"I3"}))
     _patch(monkeypatch)
@@ -1536,4 +1536,318 @@ def test_a_disabled_repo_optional_stage_passes_the_preflight(
     )
 
     assert code == 0
-    assert recorder.names == DEFAULT_ORDER
+    # E4.5b req 2: `enabled: false` is honoured by omission, never warned about.
+    assert recorder.names == [
+        name for name in DEFAULT_ORDER if name != "update-traceability"
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# repo-added stages in the plan and the schedule (E4.5b req 1/req 8)
+# --------------------------------------------------------------------------- #
+
+#: The declared `prompt:` of a repo-added implement stage, relative to the target root.
+REPO_ADDED_PROMPT = "aidw/prompts/repo-added.md"
+
+
+def _declared_stages(entries: list[dict[str, object]]) -> str:
+    """``aidw/config.yaml`` declaring ``workflows.implement.stages = entries``."""
+    lines = ["schema_version: 1", "workflows:", "  implement:", "    stages:"]
+    for entry in entries:
+        for index, (key, value) in enumerate(entry.items()):
+            prefix = "      - " if index == 0 else "        "
+            rendered = (
+                ("true" if value else "false") if isinstance(value, bool) else str(value)
+            )
+            lines.append(f"{prefix}{key}: {rendered}")
+    return "\n".join(lines) + "\n"
+
+
+def _stages_with_repo_added(position: int) -> list[dict[str, object]]:
+    """Every core/optional implement id in registry order, plus ``X9`` after ``position``."""
+    entries: list[dict[str, object]] = [
+        {"id": stage_id} for stage_id in IMPLEMENT_STAGE_IDS
+    ]
+    entries.insert(
+        position, {"id": "X9", "agent": "implementer", "prompt": REPO_ADDED_PROMPT}
+    )
+    return entries
+
+
+def _write_repo_added_prompt(*roots: Path) -> None:
+    """Write the repo-added stage's prompt into each root.
+
+    The preflight resolves it against the **control** root (that is the tree under check)
+    while the plan resolves it against the located **worktree**, so a real-run test needs
+    it in both — exactly as a committed repo prompt file is.
+    """
+    for root in roots:
+        path = root / REPO_ADDED_PROMPT
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# repo-added stage\n", encoding="utf-8")
+
+
+#: Stand-in agent configs: `load_all` is faked, so only the ids matter — a repo-added
+#: stage's declared `agent` is *existence*-checked against this dict (E4.5b req 4).
+_AGENTS = {"implementer": object(), "tester": object(), "recorder": object()}
+
+
+def _patch_with_agents(monkeypatch) -> None:
+    """``_patch`` plus the agent configs a repo-added stage's declared ``agent`` needs."""
+    _patch(monkeypatch)
+    monkeypatch.setattr(
+        implement_workflow, "load_all", lambda aidt, repo: (_AGENTS, [])
+    )
+
+
+def test_a_trailing_repo_added_stage_is_planned_after_i6(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 8: the pr split still targets I6; a trailing stage is not mistaken for it."""
+    control, prompt = _layout(tmp_path)
+    _write_config(control, _declared_stages(_stages_with_repo_added(len(IMPLEMENT_STAGE_IDS))))
+    _write_repo_added_prompt(control)
+    _patch_with_agents(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 0
+    assert recorder.names == [*DEFAULT_ORDER, "X9"]
+    out = capsys.readouterr().out
+    # Both id and name are the declared id (§3.5: a repo-added stage declares no name).
+    assert "X9 X9 [succeeded] (planned)" in out
+
+
+def test_a_trailing_repo_added_stage_runs_after_i6(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 8: declared order — I6, then the trailing stage; the PR record stays on I6."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control, _declared_stages(_stages_with_repo_added(len(IMPLEMENT_STAGE_IDS)))
+    )
+    _write_repo_added_prompt(control, worktree)
+    _patch_with_agents(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert recorder.names == [*DEFAULT_ORDER, "X9"]
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert state.status == SUCCEEDED
+    # `_record_pr` read I6's output, not the trailing stage's.
+    assert state.pr.get("number") == 42
+
+
+def test_a_denied_gate_stops_before_a_trailing_repo_added_stage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 8: a denied gate (exit 3) stops before anything declared after I6 runs."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control, _declared_stages(_stages_with_repo_added(len(IMPLEMENT_STAGE_IDS)))
+    )
+    _write_repo_added_prompt(control, worktree)
+    _patch_with_agents(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    # No --yes and a non-interactive session: the gate fails closed.
+    code = implement_workflow.run(task_prompt_path=prompt, **_roots(control))
+
+    assert code == 3
+    assert "pr" not in recorder.names
+    assert "X9" not in recorder.names
+
+
+def test_a_failed_i6_stops_before_a_trailing_repo_added_stage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 8: a failed I6 (exit 1) stops too, exactly as without a trailing stage."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control, _declared_stages(_stages_with_repo_added(len(IMPLEMENT_STAGE_IDS)))
+    )
+    _write_repo_added_prompt(control, worktree)
+    _patch_with_agents(monkeypatch)
+    monkeypatch.setattr(
+        implement_workflow, "run_stage", _Recorder(fail={"pr"})
+    )
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 1
+
+
+def test_a_repo_added_stage_before_i6_is_scheduled_in_declared_order(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 8: a pre-I6 repo-added stage runs at its full-plan position, serially."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_stages(_stages_with_repo_added(2)))
+    _write_repo_added_prompt(control, worktree)
+    _patch_with_agents(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert recorder.names == [
+        "impliment-task",
+        "test",
+        "X9",
+        "update-traceability",
+        "update-architecture",
+        "record-implementation-results",
+        "pr",
+    ]
+
+
+def test_a_repo_added_stage_before_i6_is_scheduled_in_parallel_mode(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 8: ``--parallel`` covers the repo-added stage at its full-plan position."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_stages(_stages_with_repo_added(2)))
+    _write_repo_added_prompt(control, worktree)
+    _patch_with_agents(monkeypatch)
+    recorder = _TrackingStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt,
+        **_roots(control),
+        approve_all=True,
+        parallel=True,
+    )
+
+    assert code == 0
+    assert recorder.max_active >= 2
+    # The default pair overlaps at I2's position; X9 keeps its declared slot after them.
+    assert set(recorder.names[:3]) == {"impliment-task", "test", "update-architecture"}
+    assert recorder.names[3:] == [
+        "X9",
+        "update-traceability",
+        "record-implementation-results",
+        "pr",
+    ]
+
+
+def test_a_repo_added_stage_before_i6_skips_on_resume(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 8: resume skips it exactly as a core stage that already succeeded."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_stages(_stages_with_repo_added(2)))
+    _write_repo_added_prompt(control, worktree)
+    _patch_with_agents(monkeypatch)
+    runs_dir = _runs_root(control)
+    state = create_run(
+        runs_dir, control, "implement", label="03-E4.1", branch="03-E4.1"
+    )
+    directory = run_dir(runs_dir, state.run_id)
+    for name in ("impliment-task", "X9"):
+        state.record_stage(
+            StageRecord(name=name, agent="implementer", model="m", status=SUCCEEDED)
+        )
+    save(directory, state)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), resume=True, approve_all=True
+    )
+
+    assert code == 0
+    assert recorder.names[0] == "test"
+    assert "X9" not in recorder.names
+    assert "impliment-task" not in recorder.names
+
+
+def test_from_a_disabled_repo_optional_stage_keeps_the_run_coherent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A ``--from`` naming a stage the declared list dropped must not crash the run.
+
+    ``--from`` is validated against the registry names before the locate (it is a *name*
+    check), so a repo-optional stage the repo disabled passes validation but is absent from
+    the run-path plan. There is no position to re-run from, so every stage keeps its own
+    succeeded-skip decision — never a ``StopIteration`` traceback out of ``run()``.
+    """
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_implement_stages({"I3"}))
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt,
+        **_roots(control),
+        from_stage="update-traceability",
+        approve_all=True,
+    )
+
+    assert code == 0
+    assert recorder.names == [
+        name for name in DEFAULT_ORDER if name != "update-traceability"
+    ]
+
+
+def test_a_repo_added_stage_with_a_missing_prompt_is_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 5: an unresolvable declared prompt is a config refusal, never a traceback."""
+    control, prompt = _layout(tmp_path)
+    _write_config(control, _declared_stages(_stages_with_repo_added(2)))
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "workflows.implement.stages" in err
+    assert "`X9`" in err
+    assert "prompt does not resolve" in err
+    assert recorder.names == []
+
+
+def test_a_repo_added_stage_with_an_unknown_agent_is_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 4/req 5: an unknown declared ``agent`` refuses here, not in ``run_stage``."""
+    control, prompt = _layout(tmp_path)
+    entries = _stages_with_repo_added(2)
+    entries[2] = {"id": "X9", "agent": "no-such-agent", "prompt": REPO_ADDED_PROMPT}
+    _write_config(control, _declared_stages(entries))
+    _write_repo_added_prompt(control)
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "workflows.implement.stages" in err
+    assert "`X9`" in err
+    assert "unknown agent `no-such-agent`" in err
+    assert recorder.names == []
