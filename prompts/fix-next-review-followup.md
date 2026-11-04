@@ -168,19 +168,37 @@ pnpm --filter <affected-package> test -- <focused pattern>   # must PASS
 
 Always restore the file and confirm `git diff` still shows your fix before continuing. A path-scoped `git stash push -- <paths you modified in this run>` followed immediately by `git stash pop` is also acceptable. Never stash, reset, or check out paths you did not modify in this run.
 
+These two invocations stay **bare commands** — deliberately *not* `aidw gate run`. The first is **meant to fail**: it is the red-before half of the proof. Wrapping it would record a `failed` gate outcome that is never cited, only noise in `aidw gate list`, and section 6's outcomes are the evidence this prompt records.
+
 ## 6. Verify the fix
 
 Run the narrowest meaningful checks first, then broader checks required by the affected package or issue. Use the repository’s package manager and report the real commands and outcomes.
 
-At minimum, where applicable, run:
+Run each command through `aidw gate run <key> $SCOPE -- <command>`, so its outcome is recorded against the exact tree it verified and a later stage of this run cites it instead of buying the same run twice. At minimum, where applicable:
 
 ```bash
-pnpm --filter <affected-package> build
-pnpm --filter <affected-package> lint
-pnpm --filter <affected-package> test
+# what these gates' commands cannot read: the documents the *other* stages write
+SCOPE="--ignore docs/implementation-results --ignore docs/architecture --ignore docs/tasks --ignore docs/task-prompts"
+aidw gate run build $SCOPE -- pnpm --filter <affected-package> build
+aidw gate run lint  $SCOPE -- pnpm --filter <affected-package> lint
+aidw gate run smoke $SCOPE -- pnpm --filter <affected-package> test
 ```
 
-Also run focused tests for the selected issue. Do not claim tests passed unless they actually passed. If a check cannot run because it requires unavailable AWS credentials, deployed infrastructure, or another external dependency, report it clearly and do not close the issue unless the user explicitly accepts that limitation.
+Keys name gates the way `pr.md` names them: `suite` for the full test gate, `lint`, `build`, and `smoke` for a package-scoped check (as `test.md` uses). The same command from every stage must carry the same key.
+
+`--ignore` declares paths the gate’s command cannot read. The four above are the write-targets of the other stages (`implementation_results_dir`, `architecture_dir`, `roadmap_dir`, `task_prompts_dir`; `docs/implementation-results`, `docs/architecture`, `docs/tasks`, `docs/task-prompts` by default): a document those stages wrote cannot change a build, lint or test result. If a stage of this workflow writes anywhere else, add that too — the list is every path a stage *writes* and no path a gate *reads*. **Never ignore anything else**: source, tests, config and lockfiles must always re-run the gate.
+
+Every stage of a run that asks for a gate must pass the same key, command and `--ignore` scope, or the outcomes cannot line up and the gate re-runs instead of being cited.
+
+Reuse is **same-run only**. A gate outcome is evidence about *this* run’s tree, never about another run’s, so a `reused:` line here can only cite an outcome an earlier stage of this same fix run recorded — the fix chain’s `test` stage (F2, `test.md`) is the citing consumer of the gates recorded here, and it asks for the same keys and the same scope. An outcome from the implement chain, or from an earlier fix run, is a number to reproduce, not one to copy.
+
+Asking again for the same key, command and scope against content that differs only inside that scope prints
+
+`reused: gate '<key>' passed for tree <id> at <time> by stage '<stage>' (<summary>) [scope excludes: ...]`
+
+and exits 0 **without re-running** — cite that line, with its origin (key, tree, stage, timestamp), as evidence rather than re-running the gate, and never transcribe a number you did not observe. `--force` re-runs when you doubt the outcome; a `failed:` line is never evidence — fix the failure and ask again.
+
+Also run focused tests for the selected issue: bare when the point is the red-before/green-after proof (section 5), or through `aidw gate run smoke $SCOPE -- <focused command>` when the result is evidence to record. Do not claim tests passed unless they actually passed. If a check cannot run because it requires unavailable AWS credentials, deployed infrastructure, or another external dependency, report it clearly and do not close the issue unless the user explicitly accepts that limitation.
 
 Inspect the final diff and check for accidental changes:
 
@@ -193,7 +211,7 @@ git status --short --untracked-files=all
 
 ### Pre-existing failures
 
-If a broader check fails, reproduce that failure on the unmodified branch tip before attributing it to your change. Report pre-existing failures and new failures separately, and never report a pre-existing failure as caused by your fix.
+If a broader check fails, reproduce that failure on the unmodified branch tip before attributing it to your change. Run that reproduction as a **bare command**, not through `aidw gate run`: the failure is expected there, and a recorded `failed` outcome is never cited. Report pre-existing failures and new failures separately, and never report a pre-existing failure as caused by your fix.
 
 “Verification fails” in this prompt means **the selected issue’s acceptance checks fail** — not an unrelated, pre-existing failure elsewhere in the repository. An unrelated failure does not by itself prevent closing a correctly fixed issue; it must be reported as a limitation instead.
 
@@ -218,6 +236,8 @@ Implemented on the current PR branch.
 **Verification**
 - `<exact command>` — passed
 - `<exact command>` — 12 passed, 0 failed
+- `reused: gate '<key>' passed for tree <id> at <time> by stage '<stage>' (<summary>)`
+  — cited, not re-run
 
 **Remaining limitations**
 - ... or `None.`
@@ -264,7 +284,8 @@ Report:
 - Selected child issue number, URL, title, and priority.
 - Children skipped and why.
 - Files changed.
-- Exact verification commands and their real results.
+- Exact verification commands and their real results, naming the origin (key, tree, stage,
+  timestamp) of any outcome cited from `aidw gate` rather than run.
 - Confirmation that `Status: fixed` was recorded and the selected issue was closed.
 - Any remaining limitation or unverified check.
 
