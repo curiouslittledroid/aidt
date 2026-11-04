@@ -1100,6 +1100,96 @@ def test_approve_on_the_terminal_review_succeeds(
     assert "verdict=Approve" in _run_log(tmp_path, latest.run_id)
 
 
+def test_approve_with_blocking_findings_fails_closed(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """M2: `Approve` contradicting its own must-fix findings is not an approval.
+
+    E4.5b regression (2026-11-04): the loop broke on `Approve` before partitioning, so a
+    `Must fix` finding was dropped, no fix stage ran, the gate was approved, and the
+    reviewed prompt was committed.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    body = TASK_REVIEW_CHANGES + "\n**Verdict: Approve**\n"
+    seen, fake = _fake_stages(body, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 3
+    # The contradiction stops the loop before any rework or second review.
+    assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    assert "verdict=Approve" in gate.detail
+    assert "fixes=0" in gate.detail
+    # The findings are handed to the human, not silently dropped.
+    captured = capsys.readouterr()
+    assert "approved but reported 2 blocking finding(s)" in captured.err
+    assert "2 should-fix" in captured.err
+    assert "The deliverable leaves a stale path reference." in captured.err
+    # An unsettled review must not leave the prompt committed.
+    worktree = _task_worktree(tmp_path)
+    assert git.status_short(worktree, paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
+
+
+def test_ambiguous_verdict_still_reworks_and_never_approves(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """M2 keeps L4.2's ambiguous-round behaviour: rework, then fail closed at the end.
+
+    Only the *contradiction* (``Approve`` plus blocking findings) stops the loop early.
+    A verdict-less review is still reworked and still cannot approve.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    body = TASK_REVIEW_CHANGES.replace(
+        "## Verdict\n\nRequest changes — two should-fix items remain.\n", ""
+    )
+    seen, fake = _fake_stages(body, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 3
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    assert "verdict=ambiguous" in gate.detail
+    assert "approved=no" in gate.detail
+    assert "verdict: ambiguous" in capsys.readouterr().out
+
+
+def test_approve_with_only_could_fix_findings_is_still_an_approval(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """M2 must not turn non-blocking nits into a stop: only blocking findings contradict."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    only_could = "\n".join(
+        [line for line in TASK_REVIEW_MULTI_COULD.splitlines() if "Must fix" not in line]
+    )
+    seen, fake = _fake_stages(only_could + "\n**Verdict: Approve**\n", approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "approved"
+    assert "verdict=Approve" in gate.detail
+    assert "fixes=0" in gate.detail
+
+
 def _extra_for(seen: list[tuple[str, list[str], str]], name: str) -> str:
     """The ``extra`` the workflow passed to stage ``name``."""
     return next(extra for stage, _, extra in seen if stage == name)

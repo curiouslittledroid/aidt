@@ -1707,6 +1707,39 @@ def run(
             else:
                 print(f"verdict: {verdict or 'ambiguous'} — {findings_summary(findings)}")
 
+            blocking, could_fix = partition_findings(findings)
+            if verdict == APPROVE and blocking:
+                # M2: `Approve` while reporting must-fix/should-fix findings is a
+                # self-contradicting review — the mirror image of `review`'s "requires
+                # changes but no findings could be extracted" refusal. The evidence is not
+                # silently dropped and the verdict is not silently overridden: the run
+                # stops so a human can decide which half of the report to trust. Without
+                # this, E4.5b approved a prompt whose first finding made its central
+                # construction requirement a `TypeError` (2026-11-04).
+                _record_round(rounds, review_index, findings_count, 0)
+                logger.error(
+                    f"task review approved but reported {len(blocking)} blocking "
+                    "finding(s); failing closed."
+                )
+                _record_review_outcome(
+                    state,
+                    logger,
+                    verdict=verdict,
+                    revisions=revisions,
+                    max_revisions=max_revisions,
+                    rounds=rounds,
+                    decision="denied",
+                    mechanism="review-loop",
+                )
+                state.status = BLOCKED
+                save(directory, state)
+                print(
+                    f"task review approved but reported {len(blocking)} blocking "
+                    f"finding(s) ({findings_summary(blocking)}); a human must settle it.",
+                    file=sys.stderr,
+                )
+                print(review_text, file=sys.stderr)
+                return 3
             if verdict == APPROVE:
                 # L4.2: an approving round ran no fix stage, so its fix count is 0.
                 _record_round(rounds, review_index, findings_count, 0)
@@ -1775,9 +1808,9 @@ def run(
             previous_review_text = review_text
             revisions += 1
             # The round's fix work as registry input (E4.3): one batch, whose partition
-            # selects one stage per blocking finding, one combined could-fix stage, or the
-            # single whole-review fallback when nothing parsed cleanly.
-            blocking, could_fix = partition_findings(findings)
+            # (computed above, before the approve/ambiguous exits) selects one stage per
+            # blocking finding, one combined could-fix stage, or the single whole-review
+            # fallback when nothing parsed cleanly.
             unparseable = not findings or bool(problems)
             fix_batches.append(
                 stage_registry.FixBatch(
