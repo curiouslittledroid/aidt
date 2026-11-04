@@ -674,6 +674,78 @@ def test_cli_gate_run_records_into_the_env_run(
     assert reloaded.gate_outcomes[0].summary == "439 passed"
 
 
+def test_a_run_cites_the_suite_across_the_record_stage_and_reruns_after_a_code_edit(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E4.8 end to end through the CLI: ``test`` gates, ``record`` cites, an edit re-runs.
+
+    The gate command appends a line to a counter **outside** the repository, and derives
+    its summary from that counter. The side effect is the proof: it counts how many times
+    the suite was really bought, which output text alone cannot show. A counter *inside*
+    the repo would change the tree identity and defeat the very reuse under test, so it
+    deliberately lives in ``tmp_path``.
+
+    The recorded row is asserted for origin, not for a transcribed number: stage, tree and
+    timestamp come from the first stage that passed the gate, and the summary is the count
+    that run produced. ``record`` writing its results document inside the declared scope is
+    what I5 does after gating; a source edit outside the scope must invalidate the citation.
+    """
+    state_root = _state_base(tmp_path, repo, monkeypatch)
+    state = create_run(state_root / "runs", repo, "implement", label="task", branch="task")
+    monkeypatch.setenv(RUN_ID_ENV_VAR, state.run_id)
+
+    counter = tmp_path / "gate-counter.txt"
+    command = [
+        "sh",
+        "-c",
+        f'echo run >> "{counter}"; '
+        f'printf "%s\\n" "$(wc -l < "{counter}" | tr -d " ") checks passed"',
+    ]
+    scope = ["--ignore", "docs/implementation-results"]
+
+    def gate(stage: str):
+        monkeypatch.setenv(STAGE_ENV_VAR, stage)
+        result = cli.invoke(app, ["gate", "run", "suite", *scope, "--", *command])
+        assert result.exit_code == 0, result.output
+        return result
+
+    first = gate("test")
+    assert "passed: gate 'suite' passed" in first.output
+    assert counter.read_text(encoding="utf-8").splitlines() == ["run"]
+
+    # I5's deliverable, written *after* the gate it reports on, inside the declared scope.
+    results = repo / "docs" / "implementation-results" / "task"
+    results.mkdir(parents=True)
+    (results / "build-results.md").write_text("# results\n", encoding="utf-8")
+
+    cited = gate("record")
+
+    assert "reused: gate 'suite' passed" in cited.output
+    assert "scope excludes: docs/implementation-results" in cited.output
+    assert len(counter.read_text(encoding="utf-8").splitlines()) == 1  # no second run
+
+    reloaded = load(state_root / "runs" / state.run_id)
+    assert len(reloaded.gate_outcomes) == 1
+    origin = reloaded.gate_outcomes[0]
+    assert origin.stage == "test"
+    assert origin.summary == "1 checks passed"
+    assert origin.at
+    assert verification.short_tree(origin.tree) in cited.output
+    assert origin.at in cited.output
+
+    # A change outside the declared scope is a changed gate input: the suite must re-run.
+    (repo / "app.py").write_text("x = 3\n", encoding="utf-8")
+
+    fresh = gate("record")
+
+    assert "passed: gate 'suite' passed" in fresh.output
+    assert "reused:" not in fresh.output
+    assert len(counter.read_text(encoding="utf-8").splitlines()) == 2
+    rerun = load(state_root / "runs" / state.run_id).gate_outcomes
+    assert [outcome.stage for outcome in rerun] == ["test", "record"]
+    assert rerun[-1].summary == "2 checks passed"
+
+
 def test_cli_gate_run_propagates_a_failing_exit_code(
     tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
