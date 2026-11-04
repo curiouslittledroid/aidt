@@ -379,7 +379,7 @@
   - Deliverable: an integration test asserting resolved prompt paths, agents and argv per stage.
   - Done when: the test fails if any of the six behaviours regresses.
 
-- [ ] **E4.8. Run each whole-repo gate once per tree**
+- [x] **E4.8. Run each whole-repo gate once per tree**
   Today `test` (I2), `record` (I5) and the implementer each run the full suite against the same tree, and `record` re-runs subsets to fill its own rows — roughly 1000s of duplicated work in one E1.6 run. Record the gated tree identity alongside each gate outcome, and let a later stage in the same run cite that outcome for the same tree instead of re-running it. This deliberately narrows the record prompt's "never copy numbers from an earlier run": a same-run, same-tree outcome is evidence, not a stale number, and it must be cited with its origin (stage, command, timestamp). Differing trees always re-run. Depends on the identity recording in E8.2; if E8.2 has not landed, hash `HEAD` plus the working-tree state as the interim identity.
   - Deliverable: gate-outcome recording in state plus the reuse rule and tests.
   - Done when: a run whose `test` stage gated tree `T` performs no second full-suite run for `T` in `record`, the recorded row still carries real numbers with their origin, and a changed tree forces a fresh run.
