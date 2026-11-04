@@ -1,0 +1,40 @@
+# E4.7 fixture target repo: the override surface, as configuration (EXTRACTION.md §3.4/§3.5).
+#
+# This is the integration fixture for the override mechanism (D4/D12/D13/D14), not a usable
+# workflow configuration: the prompts it points at are markers, and the read-paths a real
+# target repo needs are deliberately absent (path validation is E3.7's concern, and nothing
+# here runs a workflow preflight). Every value below is load-bearing — `tests/
+# test_override_integration.py` perturbs each one and asserts the behaviour it owns.
+schema_version: 1
+
+paths:
+  # E4.6's global override (D12 "override agent config globally", N1): the directory's yaml
+  # files shadow the toolkit's agent configs *by id*, so `tester`/`recorder` keep their
+  # toolkit models while `implementer` is the fixture's.
+  agent_configs_dir: aidw/agent-configs
+
+workflows:
+  implement:
+    # A declared `stages:` list replaces the toolkit's static half wholesale (§3.4), so all
+    # six core ids I1–I6 are declared **in registry order** and the repo-optional I3 is
+    # disabled with `enabled: false` rather than omitted (D12/D13). An omitted or
+    # reordered core id would be a `StageListError`, not a smaller plan.
+    stages:
+      # I1 impliment-task — default fallback: no `prompt:`, no `aidw/prompts/impliment-task.md`.
+      - id: I1
+      # I2 test — filename override (D14 level 2): `aidw/prompts/test.md`.
+      - id: I2
+      # I3 update-traceability — repo-optional, disabled (D12/D13).
+      - id: I3
+        enabled: false
+      # I4 update-architecture — explicit path (D14 level 1).
+      - id: I4
+        prompt: aidw/prompts/architecture-explicit.md
+      # I5/I6 — default fallback again: the sibling proof that fallback is not one stage.
+      - id: I5
+      - id: I6
+      # Repo-added stage (§3.5): a fresh id that collides with no registry or loop id, a
+      # toolkit-known `agent`, and a prompt resolved from `aidw/prompts/lint.md` — the
+      # filename shadow, not an explicit path.
+      - id: lint
+        agent: tester

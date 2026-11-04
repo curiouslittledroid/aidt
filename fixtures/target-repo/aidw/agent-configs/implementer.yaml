@@ -1,0 +1,22 @@
+# E4.7 fixture global agent-config override (E4.6's `paths.agent_configs_dir`, N1).
+#
+# Same `id` as the toolkit's implementer, so it *shadows* it by id (load_all's override-dir
+# semantics) rather than replacing the directory wholesale: every toolkit agent this file
+# does not name — `tester`, `recorder`, … — still loads with its toolkit model. The model
+# below is the evidence that the override reached an implementer stage's argv, and no toolkit
+# agent may share it, so a test cannot mistake the two.
+id: implementer
+description: E4.7 fixture override — an implementer whose model proves the override took effect.
+provider: openrouter
+model: openrouter/fixture/e4-override-implementer
+thinking: low
+tools:
+  - read
+  - bash
+  - write
+  - edit
+prompt_templates:
+  - prompts
+session: shared
+timeout_seconds: 900
+output: json

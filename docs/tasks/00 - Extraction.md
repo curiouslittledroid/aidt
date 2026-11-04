@@ -372,7 +372,7 @@
   - Deliverable: merge logic plus tests.
   - Done when: a fixture override changes the model used in the rendered Pi argv.
 
-- [ ] **E4.7. Override integration test (the acceptance test for E3+E4)**
+- [x] **E4.7. Override integration test (the acceptance test for E3+E4)**
   Against `fixtures/target-repo/`: one stage overridden by filename, one by explicit path, one
   falling back to the default, one repo-optional stage disabled, one repo-added stage, and a global
   model override.
