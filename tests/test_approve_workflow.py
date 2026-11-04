@@ -424,3 +424,40 @@ def test_approvals_in_different_worktrees_share_state_but_not_a_lock(
     assert lock_files == {lock.lock_filename(first), lock.lock_filename(second)}
     runs = list(roots["first"]["workspace"].state_root.joinpath("runs").iterdir())
     assert len(runs) == 2
+
+
+# --------------------------------------------------------------------------- #
+# core vs repo-optional preflight (E4.5a, D12/D13, EXTRACTION.md §3.5)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_disabled_core_approver_is_refused_before_any_side_effect(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Prompt-fixed: A1 (approve) is core — only I3/I4 are repo-optional."""
+    _init_repo(tmp_path)
+    config = tmp_path / "aidw" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  approve:\n"
+        "    stages:\n"
+        "      - id: A1\n"
+        "        enabled: false\n",
+        encoding="utf-8",
+    )
+    _patch(monkeypatch)
+    stages = _FakeStages()
+    monkeypatch.setattr(approve_workflow, "run_stage", stages)
+
+    code = approve_workflow.run(pr=7, **_roots(tmp_path), dry_run=True)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "workflows.approve.stages" in err
+    assert "A1" in err
+    assert "core stage cannot be disabled" in err
+    assert stages.names == []
+    runs_root = _runs_root(tmp_path)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []

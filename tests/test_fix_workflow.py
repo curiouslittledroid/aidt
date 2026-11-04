@@ -618,3 +618,40 @@ def test_the_worktree_lock_is_released_after_the_run(
 
     with lock.acquire(roots["workspace"].state_root, worktree):
         pass
+
+
+# --------------------------------------------------------------------------- #
+# core vs repo-optional preflight (E4.5a, D12/D13, EXTRACTION.md §3.5)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_disabled_core_approver_is_refused_before_any_side_effect(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Prompt-fixed: A1 (approve) is core — only I3/I4 are repo-optional."""
+    control, _worktree = _fix_layout(tmp_path)
+    config = control / "aidw" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  fix:\n"
+        "    stages:\n"
+        "      - id: A1\n"
+        "        enabled: false\n",
+        encoding="utf-8",
+    )
+    _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), dry_run=True)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "workflows.fix.stages" in err
+    assert "A1" in err
+    assert "core stage cannot be disabled" in err
+    assert stages.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []

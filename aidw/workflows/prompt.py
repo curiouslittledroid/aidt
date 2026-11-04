@@ -119,6 +119,7 @@ from aidw.runner import StageSpec, plan_stages, run_stage
 # module, and importing this workflow module from it would be an import cycle.
 from aidw.target_config import (
     DEFAULT_MAX_REVISIONS,
+    SOURCE_CONFIG,
     ConfigOverrides,
     ResolvedConfig,
     resolve_workflow_config,
@@ -1328,6 +1329,20 @@ def run(
     if config_issues:
         print(format_issues(config_issues), file=sys.stderr)
         return 2
+    # Core vs repo-optional stages (E4.5a, D12/D13, EXTRACTION.md §3.5): only a *declared*
+    # `workflows.prompt.stages` list is validated. It replaces the toolkit's list wholesale
+    # (§3.4), so a missing core id is a removal, while an undeclared list is absent from the
+    # resolved config and the registry defaults plan unchanged. Runs at the same site and
+    # with the same stderr + exit 2 contract as the config refusal above: before
+    # `validate_paths`, `load_tasks`, any run record or worktree, and in `--dry-run`.
+    stages_entry = resolved_config.get("workflows.prompt.stages")
+    if stages_entry is not None and stages_entry.source == SOURCE_CONFIG:
+        stage_issues = stage_registry.validate_stage_list(
+            "prompt", stages_entry.value or []
+        )
+        if stage_issues:
+            print(format_issues(stage_issues), file=sys.stderr)
+            return 2
     # Path preflight (E3.7, EXTRACTION.md §3.4/§3.11) at the *same* site and with the same
     # contract as the two refusals above: stderr + exit 2, before `load_tasks`,
     # `derive_branch_name`, any run record, branch or worktree, and regardless of

@@ -150,10 +150,14 @@ def resolve_prompt(
 # The run-path plan builder (EXTRACTION.md §3.4/§3.5, D2/D14; task E4.3)
 # --------------------------------------------------------------------------- #
 
-#: Deferred §3.4 stage settings: declared on a stage entry, but ignored by this version.
-#: E4.5 owns core-vs-repo-optional enforcement (``enabled: false`` and repo-added stages)
-#: and E4.6 the agent/model/thinking overrides. E4.3 warns once per entry that carries one
-#: so a repo written against the §3.4 schema is never silently surprised by a no-op.
+#: Deferred §3.4 stage settings: declared on a stage entry, but ignored by this version's
+#: *planning*. Since E4.5a the workflow preflights **validate** ``enabled: false`` and
+#: repo-added stages (:func:`aidw.stage_registry.validate_stage_list`): disabling a core
+#: stage is refused, while a repo-optional ``enabled: false`` and a repo-added stage are
+#: accepted — yet the plan still ignores them, because E4.5b owns honouring
+#: ``enabled: false`` and constructing repo-added ``StageSpec``s. E4.6 owns the
+#: agent/model/thinking overrides. E4.3 warns once per entry that carries one so a repo
+#: written against the §3.4 schema is never silently surprised by a no-op.
 _REASON_REPO_ADDED = "no such default stage, so a repo-added stage is deferred (E4.5)"
 _REASON_AGENT = "`agent` override (E4.6)"
 _REASON_DISABLED = "`enabled: false` (E4.5)"

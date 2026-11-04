@@ -306,7 +306,7 @@
   - Deliverable: config field + validation + tests.
   - Done when: a configured group runs concurrently and an invalid group fails validation.
 
-- [ ] **E4.5a. Enforce core vs repo-optional — the rules and their messages (D12, D13)**
+- [x] **E4.5a. Enforce core vs repo-optional — the rules and their messages (D12, D13)**
   Split of the former E4.5; the planning consequences are E4.5b. Reject attempts to reorder a core
   stage or to disable one with `enabled: false`; allow `enabled: false` only for repo-optional
   stages; allow repo-added stages — each as an `ERROR` issue naming the stage and the rule, refused

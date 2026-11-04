@@ -5083,3 +5083,44 @@ def test_the_task_worktree_key_is_held_for_the_whole_run_and_free_after(
     # Released on exit: the same worktree can start its next run.
     with lock.acquire(state_root, task_worktree) as guard:
         assert guard.held
+
+
+# --------------------------------------------------------------------------- #
+# core vs repo-optional preflight (E4.5a, D12/D13, EXTRACTION.md §3.5)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_disabled_core_stage_is_refused_before_any_side_effect(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """D12/D13: P1 (the author) is core for the prompt workflow."""
+    _patch_prompt_repo(
+        tmp_path,
+        monkeypatch,
+        config_text=(
+            "schema_version: 1\n"
+            "workflows:\n"
+            "  prompt:\n"
+            "    stages:\n"
+            "      - id: P1\n"
+            "        enabled: false\n"
+        ),
+    )
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        dry_run=True,
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "workflows.prompt.stages" in err
+    assert "P1" in err
+    assert "core stage cannot be disabled" in err
+    # Before any run record or worktree, `--dry-run` included.
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert not _task_worktree(tmp_path).exists()

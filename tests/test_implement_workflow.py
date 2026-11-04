@@ -375,13 +375,20 @@ def test_dry_run_renders_a_repo_declared_prompt_override(
     override = control / "aidw" / "prompts" / "update-traceability.md"
     override.parent.mkdir(parents=True)
     override.write_text("# repo traceability rules\n", encoding="utf-8")
+    # A declared list replaces the registry's wholesale (§3.4), so it must carry every
+    # core stage (E4.5a's removal rule) — the prompt: override rides on I3's entry.
     (control / "aidw" / "config.yaml").write_text(
         "schema_version: 1\n"
         "workflows:\n"
         "  implement:\n"
         "    stages:\n"
+        "      - id: I1\n"
+        "      - id: I2\n"
         "      - id: I3\n"
-        "        prompt: aidw/prompts/update-traceability.md\n",
+        "        prompt: aidw/prompts/update-traceability.md\n"
+        "      - id: I4\n"
+        "      - id: I5\n"
+        "      - id: I6\n",
         encoding="utf-8",
     )
     _patch(monkeypatch)
@@ -1460,3 +1467,73 @@ def test_the_worktree_lock_is_released_on_every_exit_path(
     assert code == expected
     with lock.acquire(roots["workspace"].state_root, worktree):
         pass
+
+
+# --------------------------------------------------------------------------- #
+# core vs repo-optional preflight (E4.5a, D12/D13, EXTRACTION.md §3.5)
+# --------------------------------------------------------------------------- #
+
+#: The registry's implement order (R6 ids, §3.5's inventory table).
+IMPLEMENT_STAGE_IDS = ("I1", "I2", "I3", "I4", "I5", "I6")
+
+
+def _declared_implement_stages(disabled: set[str] | None = None) -> str:
+    """A declared implement list carrying every id, optionally disabling some of them.
+
+    The full list is not optional: §3.4's declared list **replaces** the toolkit's
+    wholesale, so a minimal list would trip E4.5a's removal rule instead of the rule a
+    test is about.
+    """
+    disabled = disabled or set()
+    lines = ["schema_version: 1", "workflows:", "  implement:", "    stages:"]
+    for stage_id in IMPLEMENT_STAGE_IDS:
+        lines.append(f"      - id: {stage_id}")
+        if stage_id in disabled:
+            lines.append("        enabled: false")
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_a_disabled_core_stage_is_refused_before_any_side_effect(
+    tmp_path: Path, monkeypatch, capsys, dry_run: bool
+) -> None:
+    """D12/D13: I5 (record-results) is core, so ``enabled: false`` is a config refusal."""
+    control, prompt = _layout(tmp_path)
+    _write_config(control, _declared_implement_stages({"I5"}))
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+    roots = _roots(control)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **roots, dry_run=dry_run
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "workflows.implement.stages" in err
+    assert "I5" in err
+    assert "core stage cannot be disabled" in err
+    # Before any stage, run record or worktree — `--dry-run` included.
+    assert recorder.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    assert not (roots["workspace"].workspace_root / "03-E4.1").exists()
+
+
+def test_a_disabled_repo_optional_stage_passes_the_preflight(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """D13: I3 (traceability) is repo-optional, so ``enabled: false`` is accepted."""
+    control, prompt = _layout(tmp_path)
+    _write_config(control, _declared_implement_stages({"I3"}))
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 0
+    assert recorder.names == DEFAULT_ORDER
