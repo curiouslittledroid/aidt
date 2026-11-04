@@ -300,7 +300,7 @@
   - Deliverable: `implement`, `prompt`, `review`, `fix`, `approve` all config-driven.
   - Done when: `--dry-run` output for each workflow is unchanged against the baseline with the Mythical-Forge-shaped config. The `--dry-run` baseline for `prompt` is taken **after phase 02**: it includes the `task-review-reconcile-N` stage (one per fix batch) and the review-only **terminal review**, so "unchanged against the baseline" compares the post-phase-02 chain, not a pre-phase-02 one.
 
-- [ ] **E4.4. `parallel_groups`**
+- [x] **E4.4. `parallel_groups`**
   Replace the hardcoded `[test, update-architecture]` pair. Validate members exist and are not
   ordered against one another.
   - Deliverable: config field + validation + tests.
