@@ -2614,7 +2614,9 @@ def test_l21_rendered_reviewer_prompt_states_dependency_and_blocked_rules() -> N
         "Must fix / Should fix / Could fix"
     }
     assert "Priority: Blocked" not in rendered
-    assert "End with exactly one of `Approve`, `Request changes`, or `Blocked`" in rendered
+    # M3: the verdict is a declaration line, not a token inside a sentence or a span —
+    # `parse_verdict`'s first pass (§18) reads exactly this shape.
+    assert "\nVerdict: Approve\n" in rendered
 
 
 def test_l22_rendered_reviewer_prompt_requires_verified_revision() -> None:
@@ -2663,7 +2665,9 @@ def test_l22_rendered_reviewer_prompt_requires_verified_revision() -> None:
     assert "Confidence: 0 to 5" in rendered
     for token in ("`Approve`", "`Request changes`", "`Blocked`"):
         assert token in rendered, token
-    assert "End with exactly one of `Approve`, `Request changes`, or `Blocked`" in rendered
+    # M3: the tokens are still byte-stable, and the prompt now fixes the line that
+    # `parse_verdict`'s declaration pass reads instead of leaving the shape to the model.
+    assert "\nVerdict: Approve\n" in rendered
 
     # Rendering contract: the prompt references exactly `$1`.
     with pytest.raises(PromptError):

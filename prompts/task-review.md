@@ -108,7 +108,11 @@ Implementation review: Not performed; this was a pre-implementation task-prompt 
 
 Then list findings in priority order. If there are no findings, say so explicitly. Also list material areas that remain unverified, such as an external AWS behavior, a missing prerequisite branch, or a spec section that could not be located.
 
-End with exactly one of `Approve`, `Request changes`, or `Blocked`, followed by a brief statement of what remains unverified.
+End with a declaration line of exactly this form, on its own line:
+
+Verdict: Approve
+
+Write `Approve`, `Request changes`, or `Blocked` after the label, followed by a brief statement of what remains unverified. The orchestrator reads that declaration mechanically, so do not put the verdict in a heading, a code span, or a sentence.
 
 - A `Must fix` or `Should fix` finding requires `Request changes`.
 - `Could fix` findings do not prevent `Approve`.

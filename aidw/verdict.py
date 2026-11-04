@@ -19,7 +19,17 @@ truncated reviewer report found five defects, one of them `Must fix`, and the lo
 approved it without a single fix stage. So fenced code blocks are blanked, a token counts
 only when it is not part of a path or module name, and passes 2-3 ignore inline code
 spans unless the span is the line's whole content (`` `Approve` ``, but not
-`` `approve`'s ``).
+`` `approve`'s ``) — a rule M3 then narrows by exactly one case.
+
+M1 rejected one shape too many, so **M3** narrows the rule: pass 2 accepts an inline
+code span that *answers* the line when the span closes immediately after the token,
+what follows is a sentence separator or nothing, and the token is capitalised —
+`` `Approve` — nothing material remains ``. Every reviewer prompt quotes the verdict
+capitalised, while a symbol named in a span (`` `approve` — the function that
+publishes ``) is lowercase; requiring the capital keeps M1's guarantee that a
+module name is never read as a verdict. A span that continues into a symbol
+(`` `approve`'s ``) or into prose (`` `Approve` is what I would say if … ``) still
+does not count.
 
 When none is found it returns ``None`` and the workflow fails closed.
 """
@@ -45,6 +55,16 @@ _FENCE_RE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
 #: Markdown decoration and punctuation around a token: allowed around a verdict, never
 #: what makes one.
 _DECORATION = " \t`*_#>-–—()[].,;:!?\"'"
+
+#: Markdown emphasis and spacing that may sit between a closing backtick and the separator
+#: ending the verdict element: `` **`Approve`** — reason ``.
+_SPAN_TAIL_MARKUP = " \t*_`"
+
+#: Separators that end the verdict element: a sentence end or a dash that introduces the
+#: "say what remains unverified" clause. A comma, colon or apostrophe is deliberately
+#: absent, because `` `approve`, the publisher `` and `` `approve`'s `` are symbols named
+#: in a list or a sentence, not conclusions (M3).
+_ELEMENT_END = ".!?\u2026\u2013\u2014"
 
 #: ``Verdict: Request changes`` / ``**Verdict:** `Approve` `` on a single line. The label
 #: carries the meaning, so a backticked or bolded token is accepted here.
@@ -96,6 +116,24 @@ def _whole_line(text: str, match: re.Match[str]) -> bool:
     return line.strip(_DECORATION) == match.group(1)
 
 
+def _span_concludes_line(text: str, match: re.Match[str]) -> bool:
+    """True when the token closes an inline code span that answers the line (M3).
+
+    `` `Approve` — nothing material remains `` is a conclusion with its reason, the
+    shape every reviewer prompt asks for; `` `approve` — the publisher `` names a
+    symbol. Capitalisation is the discriminator, and the span must close right after
+    the token so `` `approve`'s `` (a symbol mentioned in a sentence) stays rejected.
+    """
+    if not match.group(1)[:1].isupper():
+        return False
+    if match.end() >= len(text) or text[match.end()] != "`":
+        return False
+    end = text.find("\n", match.end())
+    rest = text[match.end() + 1 :] if end == -1 else text[match.end() + 1 : end]
+    rest = rest.lstrip(_SPAN_TAIL_MARKUP)
+    return bool(rest) and rest[0] in _ELEMENT_END
+
+
 def parse_verdict(text: str) -> str | None:
     """Return the final verdict in ``text``, or ``None`` when it is ambiguous."""
     prose = _blank_fences(text)
@@ -104,12 +142,16 @@ def parse_verdict(text: str) -> str | None:
     verdict = _last(list(DECLARATION_RE.finditer(prose)))
     if verdict is not None:
         return verdict
-    # 2. A verdict on its own line. A code span qualifies only when it *is* the line
-    #    (`` `Approve` ``); a span with more content names a symbol (`approve`'s `x`).
+    # 2. A verdict on its own line. A code span qualifies when it *is* the line
+    #    (`` `Approve` ``) or when it is the capitalised element the line answers
+    #    (`` `Approve` — reason ``, M3); a span with more content names a symbol
+    #    (`approve`'s `x`).
     line_matches = [
         match
         for match in LEADING_RE.finditer(prose)
-        if not _backticked(prose, match) or _whole_line(prose, match)
+        if not _backticked(prose, match)
+        or _whole_line(prose, match)
+        or _span_concludes_line(prose, match)
     ]
     verdict = _last(line_matches)
     if verdict is not None:

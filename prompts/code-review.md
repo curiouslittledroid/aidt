@@ -72,7 +72,11 @@ Use plain words. State what breaks, when it breaks, and who it affects. Omit sty
 
 ## Verdict
 
-If there are no findings, say so. End with `Approve`, `Request changes`, or `Blocked`, then state what remains unverified. A Must fix or Should fix finding requires `Request changes`. Could fix findings do not prevent `Approve`.
+If there are no findings, say so. Then end with a declaration line of exactly this form, on its own line:
+
+Verdict: Approve
+
+Write `Approve`, `Request changes`, or `Blocked` after the label, then state in the sentence after it what remains unverified. The orchestrator reads that declaration mechanically, so do not put the verdict in a heading, a code span, or a sentence. A Must fix or Should fix finding requires `Request changes`. Could fix findings do not prevent `Approve`.
 
 ## Boundaries
 
