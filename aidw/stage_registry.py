@@ -3,8 +3,9 @@
 This module is the single declarative home of *which stage runs where*: the six-stage
 ``implement`` chain (design §8.2), the post-phase-02 ``prompt`` review loop (§8.1), the
 ``review`` pair (§8.3), the ``fix`` iteration loop (§8.4) and the single ``approve`` stage
-(§8.5). It is **data plus one pure expander**: nothing here spawns a process, touches the
-filesystem, or imports a workflow module.
+(§8.5). It is **data plus pure helpers** (the expander and the ``parallel_groups``
+validator): nothing here spawns a process, touches the filesystem, or imports a workflow
+module.
 
 Dependency direction (EXTRACTION.md §3.5, task E4.1's trap list):
 
@@ -19,9 +20,16 @@ Dependency direction (EXTRACTION.md §3.5, task E4.1's trap list):
   ``StageConfig`` shape: since E4.3 :func:`aidw.runner.plan_stages` treats a repo-declared
   list as a ``prompt:`` overlay over these defaults (the defaults themselves stay the only
   source of stage order and size).
-* The only import is :mod:`aidw.findings`, a leaf module that renders the review-finding
-  blocks and the publisher's manifest brief. Reusing it (rather than copying the prose)
-  keeps one source of truth for text the fix and publisher stages receive.
+* The only imports are two leaf modules: :mod:`aidw.findings`, which renders the
+  review-finding blocks and the publisher's manifest brief (reusing it rather than copying
+  the prose keeps one source of truth for text the fix and publisher stages receive), and
+  :mod:`aidw.config`, for the ``Issue``/``ERROR`` pair :func:`validate_parallel_groups`
+  returns (E4.4) — so the workflow's preflight prints a bad ``parallel_groups`` through the
+  same ``format_issues`` as every other config refusal. Both are safe: neither imports a
+  workflow or a target-config module. Anything that would need the resolved config, a
+  workflow module or the filesystem stays out — the validator takes the **effective**
+  groups as an argument, exactly as :func:`aidw.runner.plan_stages` takes the resolved
+  config.
 
 Stage-id vocabulary (R6 — ids are *retained*, never renamed to the semantic
 ``author``/``review``/``implement`` of §3.4's illustrative YAML): ``I1``–``I6``, ``P1``,
@@ -65,11 +73,12 @@ Deliberate, prompt-fixed choices (the task prompt left these to the implementer)
   data. ``extra`` here is the stage's *body* text; the workflow composes the pointer in
   front of it, exactly as :func:`aidw.workflows.prompt._with_evidence` does today.
 
-Not wired yet by design: ``ConfigDefaults.workflows``/``resolve_config`` (E4.3),
-``parallel_groups`` validation and replacement (E4.4), core-vs-repo-optional enforcement
-(E4.5), agent/model/thinking overrides (E4.6) and the fixture integration test (E4.7).
-The ``implement`` default's :attr:`WorkflowDefinition.parallel_groups` is recorded here as
-data only; ``implement.py`` keeps its hardcoded pair until E4.4.
+Since E4.4 ``implement.py`` schedules the target config's effective ``parallel_groups``
+(this default when the config does not declare the list) and runs
+:func:`validate_parallel_groups` over them in its preflight; a config's explicit ``[]``
+means "no parallel groups" (serial), never a fallback to the default. Still not wired by
+design: core-vs-repo-optional enforcement (E4.5), agent/model/thinking overrides (E4.6)
+and the fixture integration test (E4.7).
 """
 
 from __future__ import annotations
@@ -79,6 +88,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
+from aidw.config import ERROR, Issue
 from aidw.findings import (
     MANIFEST_EXTRA,
     ParsedFinding,
@@ -222,8 +232,9 @@ class WorkflowDefinition:
     stages: tuple[StageDefinition, ...] = ()
     loop: LoopDefinition | None = None
     #: R11/§3.4 ``parallel_groups``: stage *names*, not ids, because that is what
-    #: ``implement.py``'s ``by_name`` lookup keys on. Recorded as data; E4.4 owns wiring
-    #: and validation.
+    #: ``implement.py``'s ``by_name`` lookup keys on. This default is what ``implement.py``
+    #: schedules when a target repo does not declare the list (E4.4);
+    #: :func:`validate_parallel_groups` checks whatever list the caller resolves.
     parallel_groups: tuple[tuple[str, ...], ...] = ()
 
 
@@ -399,8 +410,8 @@ _IMPLEMENT = WorkflowDefinition(
         ),
         StageDefinition("I6", "pr", "pr-publisher", "pr.md", ("{task_id}",)),
     ),
-    # §3.4 ``parallel_groups`` / R11. Today's pair in ``implement.py``'s ``by_name``
-    # lookup: I2 and I4 touch disjoint trees. Data only until E4.4.
+    # §3.4 ``parallel_groups`` / R11: the safe pair ``implement.py`` used to hardcode. I2
+    # and I4 touch disjoint trees; E4.4 schedules it when the config declares no groups.
     parallel_groups=(("test", "update-architecture"),),
 )
 
@@ -605,6 +616,93 @@ def stages_by_id(workflow: str) -> Mapping[str, StageDefinition]:
         for candidate in (*definition.loop.head, *definition.loop.body, *definition.loop.tail):
             found[candidate.id] = candidate
     return MappingProxyType(found)
+
+
+def validate_parallel_groups(
+    workflow: str, groups: Sequence[Sequence[str]]
+) -> list[Issue]:
+    """Fail-closed checks on a workflow's ``parallel_groups`` (R11, EXTRACTION.md §3.5).
+
+    §3.5's rule is "validate that every member exists and is not ordered against another
+    member". Pure: no I/O, no mutation of ``groups``, no workflow import — the caller
+    passes the **effective** groups in (a target repo's declared list, or the registry
+    default above), exactly as :func:`aidw.runner.plan_stages` takes the resolved config.
+
+    *Every member exists*: each member must be a stage **name**
+    (:attr:`StageDefinition.name`, R6) of ``workflow``'s default ``stages`` — never a
+    stage id, never §3.4's illustrative semantic ids. An unknown member is one ``ERROR``
+    naming the workflow, the group index and the member.
+
+    *Not ordered against another member*: the spec fixes the rule, not the mechanism
+    (R11 forbids inferring more safety than is declared), so the rejections are exactly the
+    two a single-trigger scheduler cannot honour — a member listed more than once in one
+    group, and a member appearing in more than one group. Both order one stage against a
+    conflicting concurrency set (or against itself).
+
+    An empty *inner* group has no schedulable position, so it is one ``ERROR`` naming the
+    workflow and the group index; an empty *list* of groups (``[]``) is valid and means
+    "no parallel groups" (serial). Deliberately **not** validated: file-ownership safety,
+    adjacency and semantic dependencies such as ``test`` before ``update-traceability`` —
+    none is inferable, and R11 leaves them to the repo's declaration.
+
+    Raises :class:`UnknownWorkflowError` for a workflow with no default chain: that is a
+    programming error, not a config one.
+    """
+    definition = get_workflow(workflow)
+    names = [stage.name for stage in definition.stages]
+    known = set(names)
+    #: ``error: workflows.<name>.parallel_groups: group [i]: …`` — the same shape as the
+    #: target-config loader's dotted-path issues, so ``format_issues`` output is uniform.
+    source = f"workflows.{workflow}.parallel_groups"
+    issues: list[Issue] = []
+    #: First group each member appeared in, for the cross-group rejection.
+    seen_in: dict[str, int] = {}
+    for index, group in enumerate(groups):
+        members = list(group)
+        if not members:
+            issues.append(
+                Issue(
+                    ERROR,
+                    source,
+                    f"group [{index}] names no stage; a parallel group must have at "
+                    "least one member",
+                )
+            )
+            continue
+        in_group: set[str] = set()
+        for member in members:
+            if not isinstance(member, str) or member not in known:
+                issues.append(
+                    Issue(
+                        ERROR,
+                        source,
+                        f"group [{index}]: unknown stage name `{member}`; "
+                        f"`{workflow}` stages are: {', '.join(names)}",
+                    )
+                )
+                continue
+            if member in in_group:
+                issues.append(
+                    Issue(
+                        ERROR,
+                        source,
+                        f"group [{index}]: stage `{member}` is listed more than once",
+                    )
+                )
+                continue
+            in_group.add(member)
+            if member in seen_in:
+                issues.append(
+                    Issue(
+                        ERROR,
+                        source,
+                        f"group [{index}]: stage `{member}` already appears in "
+                        f"group [{seen_in[member]}]",
+                    )
+                )
+                continue
+            seen_in[member] = index
+    return issues
 
 
 # --------------------------------------------------------------------------- #

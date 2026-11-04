@@ -13,8 +13,14 @@ I5 record-implementation-results  agent recorder    (fresh)  SYNC POINT
 I6 pr                             agent pr-publisher (fresh)
 ```
 
-``I2`` and ``I4`` touch disjoint trees and are safe to run concurrently in principle,
-but v1 runs every stage serially (``--parallel`` is accepted and deferred to Phase 7).
+``--parallel`` runs the target config's ``workflows.implement.parallel_groups``
+(EXTRACTION.md §3.4/§3.5, R11): each group's members run concurrently at the position of
+the group's earliest member, every non-member keeps registry order, and the registry
+default is the one pair known to be safe — ``I2 test`` and ``I4 update-architecture``,
+which touch disjoint trees. Without ``--parallel``, or with a declared
+``parallel_groups: []``, every stage runs serially. The effective groups are validated in
+the preflight (§3.5: every member exists and is not ordered against another member); an
+invalid list is a config refusal (stderr + exit 2) before any run record or worktree.
 
 The six stages are not hardcoded here since E4.3: ``run()`` builds them with
 :func:`aidw.runner.plan_stages` over the ``aidw.stage_registry`` defaults, so the target
@@ -72,9 +78,12 @@ from aidw.state import (
     save,
     utcnow_iso,
 )
-from aidw.target_config import resolve_workflow_config
+from aidw.target_config import SOURCE_CONFIG, ResolvedConfig, resolve_workflow_config
 
 GATE = "approve-implementation-pr"
+
+#: The resolved §3.4 path of the config-driven parallel groups (R11/E4.4).
+PARALLEL_GROUPS_PATH = "workflows.implement.parallel_groups"
 
 #: ``03-E4.1-prompt.md`` → phase ``03``, task ``E4.1``, branch ``03-E4.1``.
 _PROMPT_NAME = re.compile(
@@ -240,6 +249,28 @@ def _latest_implement_run(runs_root: Path, branch: str) -> RunState | None:
     return matches[-1] if matches else None
 
 
+def effective_parallel_groups(
+    config: ResolvedConfig | None,
+) -> tuple[tuple[str, ...], ...]:
+    """The groups ``--parallel`` schedules: the repo's declared list, else the default (E4.4).
+
+    Declared-ness decides, never value equality (matching :func:`resolve_config`'s
+    whole-list semantics): a config that declares ``parallel_groups: []`` resolves with
+    ``source == "config"`` and means "no parallel groups" — serial, never a fallback to
+    the default. When the config did not declare the list the entry is **absent** from the
+    resolved config (not an ``unset`` entry), and the registry default (E4.1's
+    ``(('test', 'update-architecture'),)``) applies. Members are stage *names* (R6/R11),
+    which is what the ``by_name``/``index_of`` lookups below key on.
+
+    Pure; ``config`` is ``None`` only for a caller that has not resolved one — the
+    preflight refuses before that can happen — and then the registry default is used.
+    """
+    entry = None if config is None else config.get(PARALLEL_GROUPS_PATH)
+    if entry is None or entry.source != SOURCE_CONFIG:
+        return stage_registry.get_workflow("implement").parallel_groups
+    return tuple(tuple(group) for group in (entry.value or []))
+
+
 def _confirm_resume(assume_yes: bool) -> bool:
     if assume_yes:
         return True
@@ -350,6 +381,18 @@ def run(
     )
     if config_issues:
         print(format_issues(config_issues), file=sys.stderr)
+        return 2
+
+    # --- parallel groups (E4.4, EXTRACTION.md §3.5, R11) ------------------------ #
+    # Validate the *effective* groups (the repo's declared list or the registry default)
+    # immediately after the config resolution, before any run record, worktree or stage —
+    # and in `--dry-run` too: a broken group list is a config error either way, with the
+    # same stderr + exit 2 contract as the two refusals above. `parallel_groups: []` (the
+    # empty list of groups) is valid and means serial; an empty *inner* group is not.
+    parallel_groups = effective_parallel_groups(resolved_config)
+    group_issues = stage_registry.validate_parallel_groups("implement", parallel_groups)
+    if group_issues:
+        print(format_issues(group_issues), file=sys.stderr)
         return 2
 
     # --- agents/config ---------------------------------------------------------- #
@@ -603,50 +646,88 @@ def run(
         by_name = {entry.name: entry for entry in pre_pr}
 
         if parallel:
-            # The one pair docs/workflow.md calls safe to parallelize: /test writes package
-            # tests, /update-architecture writes docs/architecture/**. They share no files,
-            # so they may run concurrently in the same working tree. The run-state writes are
-            # serialized inside run_stage.
-            logger.info("--parallel: running test and update-architecture concurrently")
-            if not execute(by_name["impliment-task"], index_of["impliment-task"]):
-                return 1
-            pair = [by_name["test"], by_name["update-architecture"]]
-            active = [entry for entry in pair if should_run(index_of[entry.name], entry.name)]
-            for entry in pair:
-                if entry not in active:
-                    print(f"stage:  {entry.id} {entry.name} [skipped]")
-            failed = False
-            if active:
+            # The config-driven groups (E4.4, R11). Every member of a group runs
+            # concurrently at the position of the group's *earliest* member (registry
+            # order), and every non-member stage keeps its registry order — so the default
+            # pair still schedules I1 → {I2, I4} → I3 → I5 → I6. The preflight proved each
+            # member exists and is not ordered against another member; file-ownership
+            # safety is the repo's declaration, not something the toolkit infers (R11),
+            # and the groups must still touch disjoint trees because every member runs in
+            # the same working tree. ``pr`` (I6) is the post-gate sync point and always
+            # runs alone below, so a group naming it only schedules its other members.
+            # Run-state writes are serialized inside ``run_stage`` (``_STATE_LOCK``).
+            logger.info(
+                "--parallel: groups: "
+                + (
+                    "; ".join(", ".join(group) for group in parallel_groups)
+                    or "none (every stage serially)"
+                )
+            )
+            group_of: dict[str, int] = {}
+            for group_index, group in enumerate(parallel_groups):
+                for member in group:
+                    group_of.setdefault(member, group_index)
+            handled: set[str] = set()
+            for index, entry in enumerate(pre_pr):
+                if entry.name in handled:
+                    continue
+                group_index = group_of.get(entry.name)
+                if group_index is None:
+                    if not execute(entry, index):
+                        return 1
+                    continue
+                # This stage is its group's earliest pre-PR member: run the whole group
+                # here. Members that already succeeded are reported and left out of the
+                # pool, exactly as the serial path skips them (resume/--from).
+                members = [
+                    by_name[name]
+                    for name in parallel_groups[group_index]
+                    if name in by_name
+                ]
+                handled.update(member.name for member in members)
+                active = [
+                    member
+                    for member in members
+                    if should_run(index_of[member.name], member.name)
+                ]
+                for member in members:
+                    if member not in active:
+                        print(f"stage:  {member.id} {member.name} [skipped]")
+                if not active:
+                    continue
+                failed: list[StageSpec] = []
                 with ThreadPoolExecutor(max_workers=len(active)) as pool:
                     futures = {
                         pool.submit(
                             run_stage,
-                            entry,
+                            member,
                             repo_root=target.root,
                             toolkit_root=aidt.root,
                             runs_root=runs_root,
                             state=state,
                             logger=logger,
                             agents=agents,
-                        ): entry
-                        for entry in active
+                        ): member
+                        for member in active
                     }
                     for future in as_completed(futures):
-                        entry = futures[future]
+                        member = futures[future]
                         record = future.result()
-                        print_stage(record, repo_root=target.root, prefix=entry.id)
+                        print_stage(record, repo_root=target.root, prefix=member.id)
                         if record.status != SUCCEEDED:
                             print(
-                                f"stage {entry.name} failed: {record.error}",
+                                f"stage {member.name} failed: {record.error}",
                                 file=sys.stderr,
                             )
-                            failed = True
-            if failed:
-                state.status = FAILED
-                save(directory, state)
-                return 1
-            for name in ("update-traceability", "record-implementation-results"):
-                if not execute(by_name[name], index_of[name]):
+                            failed.append(member)
+                if failed:
+                    # The earliest failed member in registry order (not whichever the pool
+                    # happened to finish first), so the resume hint is deterministic. No
+                    # later stage runs: the same failure contract as the serial path.
+                    first = min(failed, key=lambda item: index_of[item.name])
+                    state.status = FAILED
+                    state.resume = {"next_stage": first.name}
+                    save(directory, state)
                     return 1
         else:
             for index, entry in enumerate(pre_pr):

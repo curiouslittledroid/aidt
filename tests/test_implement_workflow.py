@@ -31,6 +31,7 @@ from aidw.state import (
     run_dir,
     save,
 )
+from aidw.target_config import load_target_config, resolve_config
 from aidw.workflows import implement as implement_workflow
 
 
@@ -163,6 +164,24 @@ class _Recorder:
 
 def _patch(monkeypatch) -> None:
     monkeypatch.setattr(implement_workflow, "load_all", lambda aidt, repo: ({}, []))
+
+
+def _write_config(control: Path, body: str) -> None:
+    """Write the target config the preflight reads (``<target>/aidw/config.yaml``, §3.4)."""
+    config = control / "aidw" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(body, encoding="utf-8")
+
+
+#: The registry's implement order (I1..I6), the serial schedule.
+DEFAULT_ORDER = [
+    "impliment-task",
+    "test",
+    "update-traceability",
+    "update-architecture",
+    "record-implementation-results",
+    "pr",
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -904,20 +923,26 @@ def test_resume_declined_leaves_no_worktree(tmp_path: Path, monkeypatch, capsys)
 
 
 class _TrackingStages(_Recorder):
-    """Recorder that tracks how many stages run at the same time."""
+    """Recorder that tracks how many stages run at the same time.
 
-    def __init__(self) -> None:
+    ``slow`` names the stages that park briefly so a group of them overlaps measurably;
+    it defaults to the registry's safe pair and is widened by the E4.4 tests that
+    configure a different group.
+    """
+
+    def __init__(self, slow: set[str] | None = None) -> None:
         super().__init__()
         self._guard = threading.Lock()
         self.active = 0
         self.max_active = 0
+        self.slow = {"test", "update-architecture"} if slow is None else slow
 
     def __call__(self, spec, **kwargs):
         with self._guard:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
         try:
-            if spec.name in ("test", "update-architecture"):
+            if spec.name in self.slow:
                 time.sleep(0.05)
             return super().__call__(spec, **kwargs)
         finally:
@@ -968,6 +993,243 @@ def test_parallel_runs_test_and_architecture_concurrently(
         "record-implementation-results",
         "pr",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# --parallel: config-driven parallel_groups (E4.4, EXTRACTION.md §3.4/§3.5, R11)
+# --------------------------------------------------------------------------- #
+
+
+def test_effective_parallel_groups_distinguishes_absent_from_declared_empty(
+    tmp_path: Path,
+) -> None:
+    """Absent entry → the registry default; an explicit ``[]`` → no groups (serial)."""
+    resolved = resolve_config(load_target_config(tmp_path / "aidw" / "config.yaml"))
+    assert "workflows.implement.parallel_groups" not in resolved
+    assert implement_workflow.effective_parallel_groups(resolved) == (
+        ("test", "update-architecture"),
+    )
+
+    _write_config(
+        tmp_path,
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    parallel_groups: []\n",
+    )
+    resolved = resolve_config(load_target_config(tmp_path / "aidw" / "config.yaml"))
+    assert resolved["workflows.implement.parallel_groups"].source == "config"
+    assert implement_workflow.effective_parallel_groups(resolved) == ()
+
+
+def test_parallel_runs_a_configured_group_instead_of_the_default_pair(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    parallel_groups:\n"
+        "      - [test, record-implementation-results]\n",
+    )
+    _patch(monkeypatch)
+    # Slow the non-member too: an implementation that accidentally retained the default
+    # pair would overlap all three, making this exact bound fail.
+    recorder = _TrackingStages(
+        slow={"test", "record-implementation-results", "update-architecture"}
+    )
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True, parallel=True
+    )
+
+    assert code == 0
+    assert recorder.max_active == 2
+    assert set(recorder.names[:3]) == {
+        "impliment-task",
+        "test",
+        "record-implementation-results",
+    }
+    # The default pair's other member is no longer grouped: it keeps registry order and
+    # runs on its own. Nothing hardcoded survived the replacement.
+    assert recorder.names[3:] == ["update-traceability", "update-architecture", "pr"]
+
+
+def test_parallel_group_runs_at_its_earliest_member_not_its_first_listed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A group's members run at the position of its *earliest* member (I2 here)."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    parallel_groups:\n"
+        "      - [update-architecture, test]\n",
+    )
+    _patch(monkeypatch)
+    recorder = _TrackingStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True, parallel=True
+    )
+
+    assert code == 0
+    assert recorder.max_active >= 2
+    assert set(recorder.names[:3]) == {
+        "impliment-task",
+        "test",
+        "update-architecture",
+    }
+    assert recorder.names[3:] == [
+        "update-traceability",
+        "record-implementation-results",
+        "pr",
+    ]
+
+
+def test_parallel_with_an_explicit_empty_group_list_runs_serially(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``parallel_groups: []`` means serial — never a fallback to the default pair."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    parallel_groups: []\n",
+    )
+    _patch(monkeypatch)
+    recorder = _TrackingStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True, parallel=True
+    )
+
+    assert code == 0
+    # The default pair would have overlapped here; the declared empty list does not.
+    assert recorder.max_active == 1
+    assert recorder.names == DEFAULT_ORDER
+
+
+def test_a_group_naming_the_pr_stage_leaves_pr_in_its_post_gate_slot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``pr`` is a valid stage name but the post-gate sync point, so it still runs alone."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    parallel_groups:\n"
+        "      - [test, pr]\n",
+    )
+    _patch(monkeypatch)
+    recorder = _TrackingStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True, parallel=True
+    )
+
+    assert code == 0
+    assert recorder.names == DEFAULT_ORDER
+    assert recorder.max_active == 1
+
+
+def test_a_group_member_failure_stops_the_run_with_a_resume_hint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _TrackingStages()
+    recorder.fail = {"update-architecture"}
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True, parallel=True
+    )
+
+    assert code == 1
+    # No later stage ran: the tail and I6 are absent.
+    assert set(recorder.names) == {"impliment-task", "test", "update-architecture"}
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    # By name, not by position: the two group members record in completion order.
+    assert state.stage("update-architecture").status == FAILED
+    assert state.stage("test").status == SUCCEEDED
+    assert state.status == FAILED
+    # Deterministic: the earliest failed member in registry order, not completion order.
+    assert state.resume == {"next_stage": "update-architecture"}
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_unknown_parallel_group_member_fails_closed_before_any_run_state(
+    tmp_path: Path, monkeypatch, capsys, dry_run: bool
+) -> None:
+    control, prompt = _layout(tmp_path)
+    _write_config(
+        control,
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    parallel_groups:\n"
+        "      - [test, nonesuch]\n",
+    )
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=dry_run
+    )
+
+    assert code == 2
+    assert recorder.names == []
+    # Before any worktree or run record: the refusal precedes branch setup.
+    assert not (tmp_path / "03-E4.1").exists()
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    err = capsys.readouterr().err
+    assert "workflows.implement.parallel_groups" in err
+    assert "group [0]" in err
+    assert "nonesuch" in err
+
+
+def test_empty_inner_parallel_group_fails_closed_even_in_dry_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control, prompt = _layout(tmp_path)
+    _write_config(
+        control,
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    parallel_groups:\n"
+        "      - []\n",
+    )
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 2
+    assert recorder.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    err = capsys.readouterr().err
+    assert "group [0]" in err
+    assert "names no stage" in err
 
 
 # --------------------------------------------------------------------------- #

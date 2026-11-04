@@ -22,12 +22,14 @@ from __future__ import annotations
 import ast
 import builtins
 import inspect
+import itertools
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
 from aidw import stage_registry as registry
+from aidw.config import ERROR
 from aidw.findings import MANIFEST_EXTRA, ParsedFinding
 from aidw.stage_registry import (
     BRIEF_DELTA,
@@ -494,7 +496,17 @@ def test_the_registry_module_imports_no_io_or_workflow_module() -> None:
             imported.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module)
-    assert imported == {"__future__", "collections.abc", "dataclasses", "types", "typing", "aidw.findings"}
+    # E4.4 added ``aidw.config`` (``Issue``/``ERROR`` for ``validate_parallel_groups``);
+    # it is a leaf too — it imports no workflow and no target-config module.
+    assert imported == {
+        "__future__",
+        "collections.abc",
+        "dataclasses",
+        "types",
+        "typing",
+        "aidw.config",
+        "aidw.findings",
+    }
     for module in imported:
         assert not module.startswith(("aidw.workflows", "aidw.git", "aidw.github")), module
         assert module not in {"subprocess", "pathlib", "shutil", "os", "aidw.target_config"}
@@ -537,6 +549,139 @@ def test_a_second_expansion_is_equal_but_independently_owned() -> None:
         assert left.variables == right.variables
         assert left.variables is not right.variables
         assert left.variables is not registry.stage("prompt", "P1").variables
+
+
+# --------------------------------------------------------------------------- #
+# parallel_groups validation (E4.4, EXTRACTION.md §3.5, R11)
+# --------------------------------------------------------------------------- #
+
+def test_validate_parallel_groups_accepts_the_default_and_no_groups() -> None:
+    """The registry's default pair and the empty *list* of groups are both valid."""
+    assert (
+        registry.validate_parallel_groups(
+            "implement", registry.get_workflow("implement").parallel_groups
+        )
+        == []
+    )
+    assert registry.validate_parallel_groups("implement", []) == []
+    # Multi-member groups and a group naming the post-gate ``pr`` stage are valid too:
+    # member existence is the only per-member rule (§3.5).
+    assert registry.validate_parallel_groups(
+        "implement", [("test",), ("record-implementation-results", "pr")]
+    ) == []
+
+
+def test_validate_parallel_groups_rejects_an_unknown_member() -> None:
+    issues = registry.validate_parallel_groups("implement", [["test", "nonesuch"]])
+    assert len(issues) == 1
+    assert issues[0].level == ERROR
+    # One message naming the workflow (its §3.4 path), the group index and the member.
+    assert issues[0].source == "workflows.implement.parallel_groups"
+    assert "group [0]" in issues[0].message
+    assert "nonesuch" in issues[0].message
+    assert "implement" in str(issues[0])
+
+
+def test_validate_parallel_groups_rejects_the_illustrative_semantic_ids() -> None:
+    """R6/R11: §3.4's ``[test, architecture]`` example is an id, not the stage name."""
+    issues = registry.validate_parallel_groups("implement", [["test", "architecture"]])
+    assert len(issues) == 1
+    assert issues[0].level == ERROR
+    assert "architecture" in issues[0].message
+    assert "update-architecture" in issues[0].message
+
+
+def test_validate_parallel_groups_rejects_an_empty_inner_group() -> None:
+    issues = registry.validate_parallel_groups("implement", [[]])
+    assert len(issues) == 1
+    assert issues[0].level == ERROR
+    assert "group [0]" in issues[0].message
+    assert "workflows.implement.parallel_groups" == issues[0].source
+    # The index is the empty group's own, not the first group's.
+    issues = registry.validate_parallel_groups("implement", [["test"], []])
+    assert len(issues) == 1
+    assert "group [1]" in issues[0].message
+
+
+def test_validate_parallel_groups_rejects_a_member_ordered_against_itself() -> None:
+    issues = registry.validate_parallel_groups("implement", [["test", "test"]])
+    assert len(issues) == 1
+    assert issues[0].level == ERROR
+    assert "`test`" in issues[0].message
+    assert "more than once" in issues[0].message
+
+
+def test_validate_parallel_groups_rejects_a_member_in_two_groups() -> None:
+    issues = registry.validate_parallel_groups(
+        "implement",
+        [["test", "update-architecture"], ["test", "record-implementation-results"]],
+    )
+    assert len(issues) == 1
+    assert issues[0].level == ERROR
+    assert "`test`" in issues[0].message
+    assert "already appears in group [0]" in issues[0].message
+
+
+def test_validate_parallel_groups_requires_a_known_workflow() -> None:
+    with pytest.raises(UnknownWorkflowError):
+        registry.validate_parallel_groups("nonesuch", [])
+
+
+def test_validate_parallel_groups_is_pure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No I/O and no mutation of the input, even when every case is a failure."""
+    monkeypatch.setattr(builtins, "open", _explode)
+    monkeypatch.setattr(Path, "read_text", _explode)
+    monkeypatch.setattr(Path, "write_text", _explode)
+    groups = (("test", "update-architecture"), ("nonesuch",), ())
+    before = tuple(tuple(group) for group in groups)
+
+    issues = registry.validate_parallel_groups("implement", groups)
+
+    assert groups == before
+    assert len(issues) == 2  # the unknown member + the empty group
+    assert all(issue.level == ERROR for issue in issues)
+
+
+#: The sweep's member alphabet: two real stage names (one of them in the default pair)
+#: and one unknown name.
+_SWEEP_MEMBERS = ("test", "update-architecture", "aggregate-nonesuch")
+
+
+def _all_group_lists() -> list[list[list[str]]]:
+    """Every ``[[...], [...]]`` shape the sweep enumerates (pinned, not sampled).
+
+    Each group is either empty or one to three members drawn from
+    :data:`_SWEEP_MEMBERS`, and there are zero to two groups: ``(1 + 3 + 9 + 27) ** 2``
+    = 1600 cases. That is the property test's whole seed and run count — hypothesis is
+    not a dependency (AGENTS.md §15), so the enumeration is the generator.
+    """
+    per_group: list[list[str]] = [[]]
+    for size in (1, 2, 3):
+        for members in itertools.product(_SWEEP_MEMBERS, repeat=size):
+            per_group.append(list(members))
+    return [[list(left), list(right)] for left in per_group for right in per_group]
+
+
+def test_validate_parallel_groups_accepts_exactly_the_schedulable_lists() -> None:
+    """Property: no issues ⇔ groups non-empty, members known, no member repeated.
+
+    A repeated member is exactly "ordered against another member" (or itself): the two
+    rejections §3.5 needs and the scheduler can honour. Everything else is accepted.
+    """
+    known = {stage.name for stage in registry.get_workflow("implement").stages}
+    cases = _all_group_lists()
+    assert len(cases) == 1600  # 2 groups × (1 empty + 3 + 9 + 27 members)
+
+    for groups in cases:
+        flattened = [member for group in groups for member in group]
+        schedulable = (
+            all(group for group in groups)
+            and all(member in known for member in flattened)
+            and len(flattened) == len(set(flattened))
+        )
+        issues = registry.validate_parallel_groups("implement", groups)
+        assert (issues == []) is schedulable, groups
+        assert all(issue.level == ERROR for issue in issues), groups
 
 
 # --------------------------------------------------------------------------- #
