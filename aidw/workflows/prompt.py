@@ -113,7 +113,7 @@ from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
 from aidw.roadmap import DONE_RE, TASK_RE, RoadmapTask, find_task, load_tasks
-from aidw.runner import StageSpec, plan_stages, run_stage
+from aidw.runner import StageSpec, declared_stage_issues, plan_stages, run_stage
 # ``DEFAULT_MAX_REVISIONS`` lives in ``aidw.target_config``, its single home (design
 # §12/H8). The direction must not be reversed: ``target_config`` is the low-level config
 # module, and importing this workflow module from it would be an import cycle.
@@ -1444,6 +1444,27 @@ def run(
     if errors or (strict and warnings):
         print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
         return 2
+
+    # --- declared stage settings (E4.5b, EXTRACTION.md §3.5/§3.6) --------------- #
+    # After `load_all`, because the agents dict is what a repo-added stage's `agent` is
+    # checked against — the validator above runs before it. `validate_stage_list` stays
+    # the first stage-list refusal; this one covers the two settings the plan needs and
+    # turns them into config ERRORs (stderr + exit 2) before branch setup, any run record
+    # or worktree, so a missing declared prompt or an unknown repo-added agent never
+    # escapes `run()` as a traceback. This workflow runs no repo-added stage (its consumer
+    # is name-keyed, E4.5b's non-goal), but the declaration is still checked here and
+    # warned about by `plan_stages` — accepted, never a silent drop.
+    if stages_entry is not None and stages_entry.source == SOURCE_CONFIG:
+        declaration_issues = declared_stage_issues(
+            "prompt",
+            stages_entry.value or [],
+            toolkit_root=aidt.root,
+            target_root=repo.root,
+            agents=agents,
+        )
+        if declaration_issues:
+            print(format_issues(declaration_issues), file=sys.stderr)
+            return 2
 
     default_rel = f"docs/task-prompts/{phase}-{task}-prompt.md"
 

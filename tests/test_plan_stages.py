@@ -12,16 +12,27 @@ specification:
 * the D14 overlay: ``explicit_prompt`` set, the declared path resolved, precedence over the
   target shadow, and the whole-list override treated as an overlay (never as a mirror of the
   registry's order/size);
-* the deferred-field warnings of E4.3 (``agent`` → E4.6; ``enabled: false`` and repo-added
-  ids → E4.5): one stderr line per entry, naming the workflow, the id and every reason;
+* the E4.5b plan shapes: a declared list becomes the plan's static half **in declared
+  order** (repo-added stages included, with their full ``StageSpec`` field set), a
+  repo-optional ``enabled: false`` is honoured by omission, and the registry's loop portion
+  follows unchanged — split from the static half by stage id (E4.5a's formula);
+* refusal (E4.5b req 3): a declared list the validator rejects — a disabled core stage, a
+  reordered core list, ``stages: []``, a declared loop id — raises ``StageListError``
+  carrying the validator's ``format_issues`` text, never a shortened/reordered plan;
+* the remaining deferred-field warnings (``agent`` → E4.6; a repo-added stage in the
+  name-keyed ``prompt``/``fix``): one stderr line per entry, naming the workflow, the id and
+  every reason;
 * fail-closed and purity: a declared-but-missing prompt raises, no shadow/toolkit fallback,
   and neither the config nor the registry defaults are mutated.
 
 The invariant sweep at the end is the metamorphic half: for all five workflows, the builder's
-output is exactly the registry's expansion (E4.3 req 1) and a declared overlay never changes
-a plan's shape — only which prompt file a stage resolves to. ``hypothesis`` is not a
-dependency, so the sweep enumerates the small input space deterministically; the "seed" is
-the enumeration itself (the same convention as ``tests/test_stage_registry.py``, AGENTS.md's
+output is exactly the registry's expansion (E4.3 req 1), a declared overlay never changes a
+plan's shape — only which prompt file a stage resolves to — and inserting a repo-added stage
+at any declared position changes nothing but its own insertion point (E4.5b req 1). It also
+pins the purity half: the builder mutates neither the config nor the registry defaults, so
+running the sweep over them again yields the same plan. ``hypothesis`` is not a dependency,
+so the sweep enumerates the small input space deterministically; the "seed" is the
+enumeration itself (the same convention as ``tests/test_stage_registry.py``, AGENTS.md's
 no-new-deps rule).
 """
 
@@ -108,6 +119,45 @@ def _shape(specs: list[StageSpec]) -> list[tuple[str, str, str, list[str], str]]
 
 def _toolkit_prompt(name: str) -> Path:
     return (TOOLKIT.prompts_dir / name).resolve()
+
+
+def _static_ids(workflow: str) -> list[str]:
+    """The static stage ids ``workflow`` plans, in registry order (E4.5a's core order)."""
+    return [item.id for item in stage_registry.get_workflow(workflow).stages]
+
+
+def _stage_entries(
+    workflow: str,
+    *,
+    overrides: dict[str, dict[str, object]] | None = None,
+    added: list[tuple[int, dict[str, object]]] | None = None,
+) -> list[dict[str, object]]:
+    """A full declared stage list, plus per-id overrides and repo-added entries.
+
+    A declared list **replaces** the toolkit's static half wholesale (§3.4), so E4.5a
+    refuses one that omits or reorders a core id: every static id (repo-optional ones
+    included, so the declared plan stays shape-identical) is named in registry order.
+    ``overrides`` adds keys to a declared static id's entry; ``added`` inserts repo-added
+    entries at declared positions (``0`` = before the first core stage).
+    """
+    entries: list[dict[str, object]] = [
+        {"id": stage_id, **(overrides or {}).get(stage_id, {})}
+        for stage_id in _static_ids(workflow)
+    ]
+    for position, entry in sorted(added or [], key=lambda item: item[0]):
+        entries.insert(position, dict(entry))
+    return entries
+
+
+def _config(workflow: str, entries: list[dict[str, object]]) -> str:
+    """The ``aidw/config.yaml`` text declaring ``workflows.<workflow>.stages = entries``."""
+    lines = ["schema_version: 1", "workflows:", f"  {workflow}:", "    stages:"]
+    for entry in entries:
+        for index, (key, value) in enumerate(entry.items()):
+            prefix = "      - " if index == 0 else "        "
+            rendered = ("true" if value else "false") if isinstance(value, bool) else str(value)
+            lines.append(f"{prefix}{key}: {rendered}")
+    return "\n".join(lines) + "\n"
 
 
 # --------------------------------------------------------------------------- #
@@ -299,20 +349,18 @@ def test_prompt_plan_with_a_batch_carries_the_fix_stage_and_reconcile(
 # The D14 explicit-path overlay (§3.4 precedence level 1)
 # --------------------------------------------------------------------------- #
 
-#: §3.4's own example: a repo-declared stage naming an explicit prompt path.
-OVERLAY_CONFIG = """\
-schema_version: 1
-workflows:
-  implement:
-    stages:
-      - id: I3
-        prompt: aidw/prompts/update-traceability.md
-"""
+#: §3.4's own example: a repo-declared stage naming an explicit prompt path. The list is
+#: a whole-list *declaration* (E4.5a), so it names every static stage in registry order and
+#: only I3 carries the overlay.
+OVERLAY_REL = "aidw/prompts/update-traceability.md"
+OVERLAY_CONFIG = _config(
+    "implement", _stage_entries("implement", overrides={"I3": {"prompt": OVERLAY_REL}})
+)
 
 
 def test_declared_prompt_sets_explicit_prompt_and_resolves_it(tmp_path: Path) -> None:
     root = _target(tmp_path, OVERLAY_CONFIG)
-    declared = _write_prompt(root, "aidw/prompts/update-traceability.md")
+    declared = _write_prompt(root, OVERLAY_REL)
 
     specs = _plan(
         "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
@@ -320,7 +368,7 @@ def test_declared_prompt_sets_explicit_prompt_and_resolves_it(tmp_path: Path) ->
     )
 
     by_id = {spec.id: spec for spec in specs}
-    assert by_id["I3"].explicit_prompt == "aidw/prompts/update-traceability.md"
+    assert by_id["I3"].explicit_prompt == OVERLAY_REL
     assert by_id["I3"].prompt == declared
     # Every other stage keeps the toolkit default and no explicit path.
     for stage_id in ("I1", "I2", "I4", "I5", "I6"):
@@ -331,7 +379,7 @@ def test_declared_prompt_sets_explicit_prompt_and_resolves_it(tmp_path: Path) ->
 def test_declared_prompt_beats_a_same_named_target_shadow(tmp_path: Path) -> None:
     """D14: the explicit path wins over filename shadowing, which still applies otherwise."""
     root = _target(tmp_path, OVERLAY_CONFIG)
-    declared = _write_prompt(root, "aidw/prompts/update-traceability.md", "explicit\n")
+    declared = _write_prompt(root, OVERLAY_REL, "explicit\n")
     shadowed = _write_prompt(root, "aidw/prompts/test.md", "shadow\n")
 
     specs = _plan(
@@ -351,7 +399,7 @@ def test_declared_prompt_override_is_rendered_by_a_dry_run_stage(
 ) -> None:
     """D14: the resolved override reaches the user-visible rendered dry-run prompt."""
     root = _target(tmp_path, OVERLAY_CONFIG)
-    declared = _write_prompt(root, "aidw/prompts/update-traceability.md", "# explicit prompt\n")
+    declared = _write_prompt(root, OVERLAY_REL, "# explicit prompt\n")
     (root / "docs" / "task-prompts" / "03-E4.1-prompt.md").write_text(
         "# task\n", encoding="utf-8"
     )
@@ -388,49 +436,45 @@ def test_declared_prompt_override_is_rendered_by_a_dry_run_stage(
     assert rendered == "# explicit prompt\n"
 
 
-def test_overlay_applies_to_every_instance_of_a_repeated_stage_id(
+def test_a_declared_loop_id_is_refused_rather_than_double_planned(
     tmp_path: Path,
 ) -> None:
-    """A loop stage's id repeats per round; the declared prompt describes the stage kind."""
+    """A loop id is generated by ``expand``; declaring one is a D12/D13 refusal (E4.5a).
+
+    Before E4.5b this overlaid every instance of the repeated id; the plan path now runs
+    the validator the preflight runs, so the direct caller is refused too instead of being
+    handed a plan with the loop stage twice.
+    """
     root = _target(
         tmp_path,
-        """\
-schema_version: 1
-workflows:
-  prompt:
-    stages:
-      - id: P2
-        prompt: aidw/prompts/task-review.md
-""",
+        _config(
+            "prompt",
+            _stage_entries(
+                "prompt",
+                added=[(1, {"id": "P2", "prompt": "aidw/prompts/task-review.md"})],
+            ),
+        ),
     )
-    declared = _write_prompt(root, "aidw/prompts/task-review.md")
-    finding = ParsedFinding(
-        priority="could-fix",
-        confidence=3,
-        what_found="w",
-        why_it_matters="y",
-        trigger_and_effect="t",
-        where="f.py",
-        suggested_fix="s",
-    )
+    _write_prompt(root, "aidw/prompts/task-review.md")
 
-    specs = plan_stages(
-        "prompt",
-        config=_resolved(root),
-        toolkit_root=TOOLKIT.root,
-        target_root=root,
-        phase="03",
-        epic="E4",
-        task="E4.1",
-        rel=PROMPT_REL,
-        max_revisions=3,
-        rounds=(FixBatch(review_text="r", could_fix=(finding,)),),
-    )
+    with pytest.raises(stage_registry.StageListError) as raised:
+        plan_stages(
+            "prompt",
+            config=_resolved(root),
+            toolkit_root=TOOLKIT.root,
+            target_root=root,
+            phase="03",
+            epic="E4",
+            task="E4.1",
+            rel=PROMPT_REL,
+            max_revisions=3,
+            rounds=(),
+        )
 
-    reviews = [spec for spec in specs if spec.id == "P2"]
-    assert [spec.name for spec in reviews] == ["task-review-1", "task-review-2"]
-    assert all(spec.explicit_prompt == "aidw/prompts/task-review.md" for spec in reviews)
-    assert all(spec.prompt == declared for spec in reviews)
+    message = str(raised.value)
+    assert "workflows.prompt.stages" in message
+    assert "`P2`" in message
+    assert "loop stages are generated by `expand`" in message
 
 
 def test_a_repo_without_a_workflows_section_plans_pure_defaults(
@@ -452,35 +496,275 @@ def test_a_repo_without_a_workflows_section_plans_pure_defaults(
     assert capsys.readouterr().err == ""
 
 
-def test_the_repo_declared_list_is_an_overlay_not_a_mirror(tmp_path: Path) -> None:
-    """A whole-list override may be shorter/reordered; the registry still plans the chain."""
+def test_a_reordered_declared_list_raises_the_named_error(tmp_path: Path) -> None:
+    """D12: a core stage may not be reordered, so the builder refuses, never re-sorts.
+
+    The preflight is expected to have refused first (exit 2); this is the "not trusting
+    because the validator already ran" half — the plan is not silently built in registry
+    order behind the repo's back.
+    """
+    entries = _stage_entries("implement")
+    entries[0], entries[1] = entries[1], entries[0]  # I2 before I1
+    root = _target(tmp_path, _config("implement", entries))
+
+    with pytest.raises(stage_registry.StageListError) as raised:
+        _plan(
+            "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
+            branch=BRANCH, task_id=TASK_ID,
+        )
+
+    message = str(raised.value)
+    assert message.startswith("error: workflows.implement.stages: ")
+    assert "core stage cannot be reordered" in message
+    # The declared core subsequence and the registry's core order, both named.
+    assert "declared [I2, I1, I5, I6]" in message
+    assert "registry order is [I1, I2, I5, I6]" in message
+
+
+def test_an_empty_declared_list_raises_the_named_error(tmp_path: Path) -> None:
+    """``stages: []`` removes every core stage; the builder reports all of them."""
+    root = _target(tmp_path, "schema_version: 1\nworkflows:\n  implement:\n    stages: []\n")
+
+    with pytest.raises(stage_registry.StageListError) as raised:
+        _plan(
+            "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
+            branch=BRANCH, task_id=TASK_ID,
+        )
+
+    message = str(raised.value)
+    for stage_id in ("I1", "I2", "I5", "I6"):
+        assert f"stage `{stage_id}`: core stage cannot be removed" in message
+
+
+def test_a_disabled_core_stage_raises_the_named_error(tmp_path: Path) -> None:
+    """D12/D13: only a repo-optional stage may be disabled, so a core disable refuses."""
     root = _target(
         tmp_path,
-        """\
-schema_version: 1
-workflows:
-  implement:
-    stages:
-      - id: I5
-      - id: I1
-        prompt: aidw/prompts/impliment-task.md
-""",
+        _config(
+            "implement", _stage_entries("implement", overrides={"I5": {"enabled": False}})
+        ),
     )
-    _write_prompt(root, "aidw/prompts/impliment-task.md")
+
+    with pytest.raises(stage_registry.StageListError) as raised:
+        _plan(
+            "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
+            branch=BRANCH, task_id=TASK_ID,
+        )
+
+    message = str(raised.value)
+    assert "stage `I5`: core stage cannot be disabled" in message
+
+
+# --------------------------------------------------------------------------- #
+# Repo-added stages (E4.5b req 1/req 4, EXTRACTION.md §3.5/§3.6)
+# --------------------------------------------------------------------------- #
+
+REPO_ADDED_PROMPT = "aidw/prompts/repo-added.md"
+
+
+def test_a_repo_added_stage_is_planned_in_declared_order_with_every_field(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Req 4: the declared id, its agent and its prompt become a full ``StageSpec``.
+
+    ``id``/``name`` are the declared id, ``agent_id`` is the declared ``agent`` (the one
+    per-stage setting this version honours), ``variables`` is a fresh empty list (never
+    ``()``), ``extra`` is empty, and the declared ``prompt:`` is the D14 level-1 path.
+    """
+    root = _target(
+        tmp_path,
+        _config(
+            "implement",
+            _stage_entries(
+                "implement",
+                added=[
+                    (1, {"id": "X9", "agent": "implementer", "prompt": REPO_ADDED_PROMPT})
+                ],
+            ),
+        ),
+    )
+    declared = _write_prompt(root, REPO_ADDED_PROMPT)
 
     specs = _plan(
         "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
         branch=BRANCH, task_id=TASK_ID,
     )
 
-    # All six stages, in the registry's order — the declared list reorders/omits nothing.
+    # Declared order: the repo-added stage sits between I1 and I2, not appended.
+    assert [spec.id for spec in specs] == ["I1", "X9", "I2", "I3", "I4", "I5", "I6"]
+    added = specs[1]
+    assert (added.id, added.name, added.agent_id) == ("X9", "X9", "implementer")
+    assert added.prompt == declared
+    assert added.explicit_prompt == REPO_ADDED_PROMPT
+    assert added.variables == []
+    assert added.extra == ""
+    assert added.workflow == "implement"
+    # Its `agent` is honoured, so nothing about it is deferred any more.
+    assert capsys.readouterr().err == ""
+
+
+def test_a_repo_added_stage_shadows_by_its_declared_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """§3.6 level 2: with no ``prompt:``, the shadow is ``<target>/aidw/prompts/<id>.md``."""
+    root = _target(
+        tmp_path,
+        _config(
+            "implement",
+            _stage_entries(
+                "implement", added=[(6, {"id": "review-agent", "agent": "code-reviewer"})]
+            ),
+        ),
+    )
+    shadowed = _write_prompt(root, "aidw/prompts/review-agent.md", "# repo stage\n")
+
+    specs = _plan(
+        "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
+        branch=BRANCH, task_id=TASK_ID,
+    )
+
+    assert [spec.id for spec in specs][-1] == "review-agent"
+    added = specs[-1]
+    assert added.prompt == shadowed
+    assert added.explicit_prompt is None
+    assert added.agent_id == "code-reviewer"
+    assert added.name == "review-agent"
+    assert capsys.readouterr().err == ""
+
+
+def test_a_disabled_repo_added_stage_is_omitted(tmp_path: Path) -> None:
+    """E4.5a accepts any ``enabled`` on a repo-added stage; disabling means omitting it."""
+    root = _target(
+        tmp_path,
+        _config(
+            "implement",
+            _stage_entries(
+                "implement",
+                added=[
+                    (
+                        1,
+                        {
+                            "id": "X9",
+                            "agent": "implementer",
+                            "prompt": REPO_ADDED_PROMPT,
+                            "enabled": False,
+                        },
+                    )
+                ],
+            ),
+        ),
+    )
+    _write_prompt(root, REPO_ADDED_PROMPT)
+
+    specs = _plan(
+        "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
+        branch=BRANCH, task_id=TASK_ID,
+    )
+
     assert [spec.id for spec in specs] == ["I1", "I2", "I3", "I4", "I5", "I6"]
-    assert specs[0].explicit_prompt == "aidw/prompts/impliment-task.md"
-    assert specs[4].explicit_prompt is None
+
+
+def test_a_prompt_repo_added_static_stage_precedes_the_loop_portion(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Req 1/req 2: the declared static half, then ``expand``'s P2 loop portion.
+
+    ``prompt``'s consumer is name-keyed and never runs a repo-added stage, so the entry is
+    planned (the declaration is honoured on the plan path) *and* warned about — never a
+    silent drop.
+    """
+    root = _target(
+        tmp_path,
+        _config(
+            "prompt",
+            _stage_entries(
+                "prompt",
+                added=[(1, {"id": "X9", "agent": "task-reviewer", "prompt": REPO_ADDED_PROMPT})],
+            ),
+        ),
+    )
+    _write_prompt(root, REPO_ADDED_PROMPT)
+    finding = ParsedFinding(
+        priority="must-fix",
+        confidence=4,
+        what_found="what",
+        why_it_matters="why",
+        trigger_and_effect="trigger",
+        where="f.py",
+        suggested_fix="fix",
+    )
+
+    specs = plan_stages(
+        "prompt",
+        config=_resolved(root),
+        toolkit_root=TOOLKIT.root,
+        target_root=root,
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        rel=PROMPT_REL,
+        max_revisions=3,
+        rounds=(FixBatch(review_text="r", blocking=(finding,)),),
+    )
+
+    # The declared static half (P1, X9) is followed by the whole loop portion, unchanged.
+    assert [spec.name for spec in specs] == [
+        "task-prompt",
+        "X9",
+        "task-review-1",
+        "task-review-fixes-1-1",
+        "task-review-reconcile-1",
+        "task-review-2",
+    ]
+    lines = _warning_lines(capsys.readouterr().err)
+    assert len(lines) == 1, lines
+    assert "`prompt`" in lines[0]
+    assert "`X9`" in lines[0]
+    assert "repo-added" in lines[0]
+
+
+def test_a_fix_repo_added_static_stage_precedes_the_iteration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``fix`` is name-keyed too: planned, warned about, and its loop portion follows."""
+    root = _target(
+        tmp_path,
+        _config(
+            "fix",
+            _stage_entries(
+                "fix",
+                added=[(1, {"id": "X9", "agent": "fixer", "prompt": REPO_ADDED_PROMPT})],
+            ),
+        ),
+    )
+    _write_prompt(root, REPO_ADDED_PROMPT)
+
+    specs = _plan(
+        "fix",
+        config=_resolved(root),
+        root=root,
+        pr=PR,
+        round_index=1,
+        iteration=1,
+        manifest_rel="artifacts/iter1-review-manifest.json",
+    )
+
+    assert [spec.name for spec in specs] == [
+        "round1-approve-review-followups",
+        "X9",
+        "iter1-fix-next-review-followup",
+        "iter1-test",
+        "iter1-code-review",
+        "iter1-review-findings-to-github",
+    ]
+    lines = _warning_lines(capsys.readouterr().err)
+    assert len(lines) == 1, lines
+    assert "`X9`" in lines[0]
+    assert "repo-added" in lines[0]
 
 
 # --------------------------------------------------------------------------- #
-# Deferred settings warn — one line per entry (E4.3 req 3)
+# Deferred settings warn — one line per entry (E4.3 req 3, E4.5b req 2)
 # --------------------------------------------------------------------------- #
 
 
@@ -488,65 +772,40 @@ def _warning_lines(err: str) -> list[str]:
     return [line for line in err.splitlines() if line.startswith("warning:")]
 
 
-def test_one_entry_with_agent_and_disabled_draws_one_line_naming_both(
+def test_a_repo_optional_disabled_stage_is_omitted_and_the_agent_still_warns(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """E4.5b: ``enabled: false`` is honoured (omission); the E4.6 ``agent`` still warns.
+
+    Only the *known* id survives as a deferred reason: disabling is no longer ignored, so
+    a repo that disables I3 gets a plan without it plus exactly one line naming the agent
+    override this version still cannot apply.
+    """
     root = _target(
         tmp_path,
-        """\
-schema_version: 1
-workflows:
-  implement:
-    stages:
-      - id: I3
-        agent: implementer
-        enabled: false
-""",
+        _config(
+            "implement",
+            _stage_entries(
+                "implement", overrides={"I3": {"agent": "implementer", "enabled": False}}
+            ),
+        ),
     )
-
-    _plan(
-        "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
-        branch=BRANCH, task_id=TASK_ID,
-    )
-
-    lines = _warning_lines(capsys.readouterr().err)
-    assert len(lines) == 1, lines
-    (line,) = lines
-    # The workflow, the stage id, and *every* deferred reason, on the one line.
-    assert "`implement`" in line
-    assert "`I3`" in line
-    assert "`agent` override (E4.6)" in line
-    assert "`enabled: false` (E4.5)" in line
-
-
-def test_an_unknown_stage_id_draws_one_line_naming_it(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    root = _target(
-        tmp_path,
-        """\
-schema_version: 1
-workflows:
-  implement:
-    stages:
-      - id: X9
-        prompt: aidw/prompts/repo-added.md
-""",
-    )
-    _write_prompt(root, "aidw/prompts/repo-added.md")
 
     specs = _plan(
         "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
         branch=BRANCH, task_id=TASK_ID,
     )
 
+    assert [spec.id for spec in specs] == ["I1", "I2", "I4", "I5", "I6"]
     lines = _warning_lines(capsys.readouterr().err)
     assert len(lines) == 1, lines
-    assert "`X9`" in lines[0]
-    assert "repo-added" in lines[0]
-    # A repo-added stage is deferred (E4.5): it is not planned, and its prompt is not used.
-    assert [spec.id for spec in specs] == ["I1", "I2", "I3", "I4", "I5", "I6"]
-    assert all("repo-added" not in str(spec.prompt) for spec in specs)
+    (line,) = lines
+    # The workflow, the stage id, and *every* remaining deferred reason, on the one line.
+    assert "`implement`" in line
+    assert "`I3`" in line
+    assert "`agent` override (E4.6)" in line
+    # `enabled: false` is honoured now, so it is never reported as deferred.
+    assert "enabled" not in line
 
 
 def test_a_two_entries_are_counted_per_entry_not_per_field(
@@ -554,15 +813,16 @@ def test_a_two_entries_are_counted_per_entry_not_per_field(
 ) -> None:
     root = _target(
         tmp_path,
-        """\
-schema_version: 1
-workflows:
-  implement:
-    stages:
-      - id: I3
-        agent: implementer
-      - id: X9
-""",
+        _config(
+            "implement",
+            _stage_entries(
+                "implement",
+                overrides={
+                    "I3": {"agent": "implementer"},
+                    "I4": {"agent": "implementer"},
+                },
+            ),
+        ),
     )
 
     _plan(
@@ -573,7 +833,7 @@ workflows:
     lines = _warning_lines(capsys.readouterr().err)
     assert len(lines) == 2, lines
     assert any("`I3`" in line for line in lines)
-    assert any("`X9`" in line for line in lines)
+    assert any("`I4`" in line for line in lines)
 
 
 def test_a_prompt_only_entry_draws_no_warning(
@@ -581,7 +841,7 @@ def test_a_prompt_only_entry_draws_no_warning(
 ) -> None:
     """``prompt:`` is not deferred: it is the one field E4.3 honours."""
     root = _target(tmp_path, OVERLAY_CONFIG)
-    _write_prompt(root, "aidw/prompts/update-traceability.md")
+    _write_prompt(root, OVERLAY_REL)
 
     _plan(
         "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
@@ -600,14 +860,12 @@ def test_a_declared_but_missing_prompt_raises_and_falls_back_nowhere(tmp_path: P
     """§3.4 level 1: a declared path is the only location searched, so it fails closed."""
     root = _target(
         tmp_path,
-        """\
-schema_version: 1
-workflows:
-  implement:
-    stages:
-      - id: I3
-        prompt: aidw/prompts/does-not-exist.md
-""",
+        _config(
+            "implement",
+            _stage_entries(
+                "implement", overrides={"I3": {"prompt": "aidw/prompts/does-not-exist.md"}}
+            ),
+        ),
     )
 
     with pytest.raises(FileNotFoundError) as raised:
@@ -625,7 +883,7 @@ def test_plan_stages_mutates_neither_the_config_nor_the_registry(
     tmp_path: Path,
 ) -> None:
     root = _target(tmp_path, OVERLAY_CONFIG)
-    _write_prompt(root, "aidw/prompts/update-traceability.md")
+    _write_prompt(root, OVERLAY_REL)
     config = _resolved(root)
     before_config = config.to_dict()
     before_defaults = repr(DEFAULTS)
@@ -659,7 +917,7 @@ def test_plan_stages_does_no_io_beyond_prompt_existence(
 
 def test_each_call_returns_fresh_objects(tmp_path: Path) -> None:
     root = _target(tmp_path, OVERLAY_CONFIG)
-    _write_prompt(root, "aidw/prompts/update-traceability.md")
+    _write_prompt(root, OVERLAY_REL)
     config = _resolved(root)
     fields = {"prompt_rel": PROMPT_REL, "branch": BRANCH, "task_id": TASK_ID}
 
@@ -733,23 +991,22 @@ def test_a_declared_overlay_never_changes_a_plans_shape(
 ) -> None:
     """Metamorphic: the overlay moves one stage's prompt, nothing else.
 
-    The declared entry also carries the deferred fields, so this covers the "warn but plan
-    the defaults" path for every workflow: same stages, same order, same ``extra``.
+    The declared entry also carries the deferred ``agent``, so this covers the "warn but
+    plan the registry's agent" path for every workflow: same stages, same order, same
+    ``extra`` — the declared list is not a second source of truth for the shape.
     """
     stage_id = _OVERLAY_ID[workflow]
     rel = f"aidw/prompts/{workflow}-override.md"
+    # Every static stage in registry order (a whole-list declaration, E4.5a) with the
+    # ``prompt:`` and the still-deferred ``agent:`` on one of them.
     root = _target(
         tmp_path,
-        f"""\
-schema_version: 1
-workflows:
-  {workflow}:
-    stages:
-      - id: {stage_id}
-        prompt: {rel}
-        agent: implementer
-        enabled: false
-""",
+        _config(
+            workflow,
+            _stage_entries(
+                workflow, overrides={stage_id: {"prompt": rel, "agent": "implementer"}}
+            ),
+        ),
     )
     declared = _write_prompt(root, rel)
     fields = _FIELDS[workflow]
@@ -766,3 +1023,49 @@ workflows:
     assert [
         spec.prompt for spec in overlaid if spec.id != stage_id
     ] == [spec.prompt for spec in plain if spec.id != stage_id]
+
+
+#: Every declared position a repo-added stage can occupy: before the first static stage,
+#: between any two, and after the last. This is the sweep's "seed": the enumeration is the
+#: generator (``hypothesis`` is not a dependency, AGENTS.md's no-new-deps rule).
+@pytest.mark.parametrize("workflow", sorted(_FIELDS))
+def test_inserting_a_repo_added_stage_only_inserts(
+    workflow: str, tmp_path: Path
+) -> None:
+    """Metamorphic (E4.5b req 1): the core plan and the loop portion never move.
+
+    Inserting a repo-added entry at *any* declared position leaves every other spec — its
+    id, name, agent, variables and ``extra``, and therefore the registry's loop portion too
+    — byte-identical; the only change is the inserted spec at the inserted position.
+    """
+    rel = f"aidw/prompts/{workflow}-repo-added.md"
+    fields = _FIELDS[workflow]
+    plain_root = _target(tmp_path / "plain")
+    plain = _plan(workflow, root=plain_root, **fields)
+
+    for position in range(len(_static_ids(workflow)) + 1):
+        root = _target(
+            tmp_path / f"added-{position}",
+            _config(
+                workflow,
+                _stage_entries(
+                    workflow,
+                    added=[(position, {
+                        "id": "X9",
+                        "agent": "implementer",
+                        "prompt": rel,
+                    })],
+                ),
+            ),
+        )
+        _write_prompt(root, rel)
+
+        plan = _plan(workflow, config=_resolved(root), root=root, **fields)
+
+        assert plan[position].id == "X9", position
+        rest = [spec for spec in plan if spec.id != "X9"]
+        assert _shape(rest) == _shape(plain), position
+        # The loop portion is the *tail* of both plans, so the insertion cannot reorder it.
+        assert [spec.id for spec in plan[position + 1 :]] == [
+            spec.id for spec in plain[position:]
+        ]

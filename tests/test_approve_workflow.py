@@ -97,8 +97,12 @@ class _FakeStages:
         return record
 
 
-def _patch(monkeypatch, *, view: dict | None = None) -> None:
-    monkeypatch.setattr(approve_workflow, "load_all", lambda aidt, repo: ({}, []))
+def _patch(
+    monkeypatch, *, view: dict | None = None, agents: dict | None = None
+) -> None:
+    monkeypatch.setattr(
+        approve_workflow, "load_all", lambda aidt, repo: (agents or {}, [])
+    )
     monkeypatch.setattr(git, "current_branch", lambda repo: "03-E4.1")
     monkeypatch.setattr(github, "gh_available", lambda: True)
     monkeypatch.setattr(
@@ -461,3 +465,151 @@ def test_a_disabled_core_approver_is_refused_before_any_side_effect(
     assert stages.names == []
     runs_root = _runs_root(tmp_path)
     assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- #
+# repo-added stages (E4.5b req 1/req 7, EXTRACTION.md §3.5)
+# --------------------------------------------------------------------------- #
+
+#: The declared `prompt:` of a repo-added approve stage, relative to the target root.
+REPO_ADDED_PROMPT = "aidw/prompts/repo-added.md"
+
+#: Stand-in agent configs: `load_all` is faked, so only the ids matter — a repo-added
+#: stage's declared `agent` is *existence*-checked against this dict (E4.5b req 4).
+_AGENTS = {"review-approver": object(), "implementer": object()}
+
+
+def _write_stages_config(root: Path, entries: list[dict[str, object]]) -> None:
+    """``aidw/config.yaml`` declaring ``workflows.approve.stages = entries``."""
+    lines = ["schema_version: 1", "workflows:", "  approve:", "    stages:"]
+    for entry in entries:
+        for index, (key, value) in enumerate(entry.items()):
+            prefix = "      - " if index == 0 else "        "
+            rendered = (
+                ("true" if value else "false") if isinstance(value, bool) else str(value)
+            )
+            lines.append(f"{prefix}{key}: {rendered}")
+    config = root / "aidw" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_repo_added_prompt(root: Path) -> None:
+    path = root / REPO_ADDED_PROMPT
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# repo-added stage\n", encoding="utf-8")
+
+
+def _repo_added(stage_id: str) -> dict[str, object]:
+    return {"id": stage_id, "agent": "implementer", "prompt": REPO_ADDED_PROMPT}
+
+
+def _approved(monkeypatch) -> None:
+    monkeypatch.setattr(
+        approve_workflow,
+        "decide",
+        lambda *a, **k: GateOutcome(approve_workflow.GATE, True, "--yes"),
+    )
+
+
+def test_a_repo_added_stage_plans_and_runs_in_declared_order(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 7: the dry run iterates the full plan — no single-spec unpack."""
+    _init_repo(tmp_path)
+    _write_stages_config(tmp_path, [_repo_added("approve-preflight-notes"), {"id": "A1"}])
+    _write_repo_added_prompt(tmp_path)
+    _patch(monkeypatch, agents=_AGENTS)
+    stages = _FakeStages()
+    monkeypatch.setattr(approve_workflow, "run_stage", stages)
+
+    code = approve_workflow.run(pr=7, **_roots(tmp_path), dry_run=True)
+
+    assert code == 0
+    assert stages.names == ["approve-preflight-notes", "approve-review-followups"]
+    out = capsys.readouterr().out
+    assert "approve-preflight-notes [succeeded] (planned)" in out
+    assert "approve-review-followups [succeeded] (planned) agent=review-approver" in out
+    assert "gate (planned): approve-followups" in out
+
+
+def test_a1_runs_in_its_declared_position_with_the_only_verify(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 7: A1 keeps the approval postcondition; repo-added stages run without it."""
+    _init_repo(tmp_path)
+    _write_stages_config(
+        tmp_path,
+        [
+            _repo_added("approve-notes"),
+            _repo_added("approve-recheck"),
+            {"id": "A1"},
+            _repo_added("approve-digest"),
+        ],
+    )
+    _write_repo_added_prompt(tmp_path)
+    _patch(monkeypatch, agents=_AGENTS)
+    _approved(monkeypatch)
+    stages = _FakeStages()
+    monkeypatch.setattr(approve_workflow, "run_stage", stages)
+
+    code = approve_workflow.run(pr=7, **_roots(tmp_path), approve_all=True)
+
+    assert code == 0
+    assert stages.names == [
+        "approve-notes",
+        "approve-recheck",
+        "approve-review-followups",
+        "approve-digest",
+    ]
+    assert [spec.id for spec in stages.specs] == [
+        "approve-notes",
+        "approve-recheck",
+        "A1",
+        "approve-digest",
+    ]
+    # Located by id, never by position: only A1 carries the postcondition.
+    assert [callable(spec.verify) for spec in stages.specs] == [False, False, True, False]
+    assert stages.specs[2].variables == ["7"]
+    assert stages.specs[0].variables == []
+
+
+def test_a_repo_added_stage_with_a_missing_prompt_is_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 5: the preflight refuses exit 2 with ``format_issues`` text, no traceback."""
+    _init_repo(tmp_path)
+    _write_stages_config(tmp_path, [_repo_added("approve-notes"), {"id": "A1"}])
+    _patch(monkeypatch, agents=_AGENTS)
+    stages = _FakeStages()
+    monkeypatch.setattr(approve_workflow, "run_stage", stages)
+
+    code = approve_workflow.run(pr=7, **_roots(tmp_path), dry_run=True)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "workflows.approve.stages" in err
+    assert "`approve-notes`" in err
+    assert "prompt does not resolve" in err
+    assert stages.names == []
+
+
+def test_a_repo_added_stage_with_an_unknown_agent_is_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 4/req 5: an unknown declared ``agent`` refuses here, not in ``run_stage``."""
+    _init_repo(tmp_path)
+    entry = _repo_added("approve-notes")
+    entry["agent"] = "no-such-agent"
+    _write_stages_config(tmp_path, [entry, {"id": "A1"}])
+    _write_repo_added_prompt(tmp_path)
+    _patch(monkeypatch, agents=_AGENTS)
+    stages = _FakeStages()
+    monkeypatch.setattr(approve_workflow, "run_stage", stages)
+
+    code = approve_workflow.run(pr=7, **_roots(tmp_path), dry_run=True)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "unknown agent `no-such-agent`" in err
+    assert stages.names == []

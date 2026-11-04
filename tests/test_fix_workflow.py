@@ -655,3 +655,140 @@ def test_a_disabled_core_approver_is_refused_before_any_side_effect(
     assert stages.names == []
     runs_root = _runs_root(control)
     assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- #
+# repo-added stages in a name-keyed workflow (E4.5b req 2/req 5)
+# --------------------------------------------------------------------------- #
+
+#: The declared `prompt:` of a repo-added fix stage, relative to the target root.
+REPO_ADDED_PROMPT = "aidw/prompts/repo-added.md"
+
+#: A1 (the only static stage) plus a repo-added one, which `fix`'s name-keyed consumer
+#: never runs: E4.5b's non-goal, warned about rather than silently dropped.
+_CONFIG_WITH_REPO_ADDED = (
+    "schema_version: 1\n"
+    "workflows:\n"
+    "  fix:\n"
+    "    stages:\n"
+    "      - id: A1\n"
+    "      - id: repo-added-review\n"
+    "        agent: code-reviewer\n"
+    "        prompt: aidw/prompts/repo-added.md\n"
+)
+
+#: Stand-in agent configs: `load_all` is faked, so only the ids matter — a repo-added
+#: stage's declared `agent` is *existence*-checked against this dict (E4.5b req 4).
+_AGENTS = {"review-approver": object(), "code-reviewer": object()}
+
+
+def _write_repo_added_prompt(*roots: Path) -> None:
+    """Write the repo-added stage's prompt into each root.
+
+    The preflight resolves it against the **control** root (the tree under check) and the
+    plan against the located PR-head **worktree**, so a real-run test needs it in both —
+    exactly as a committed repo prompt file is.
+    """
+    for root in roots:
+        path = root / REPO_ADDED_PROMPT
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# repo-added stage\n", encoding="utf-8")
+
+
+def _write_stages_config(control: Path, text: str) -> None:
+    config = control / "aidw" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(text, encoding="utf-8")
+
+
+def test_a_repo_added_stage_is_accepted_and_warned_about(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 2/req 5: accepted, warned about by id, never a silent drop."""
+    control, worktree = _fix_layout(tmp_path)
+    _write_stages_config(control, _CONFIG_WITH_REPO_ADDED)
+    _write_repo_added_prompt(control, worktree)
+    _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
+    monkeypatch.setattr(
+        fix_workflow, "load_all", lambda aidt, repo: (_AGENTS, [])
+    )
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), dry_run=True)
+
+    assert code == 0
+    assert "stage `repo-added-review`" in capsys.readouterr().err
+    # The dry run shows the declared plan (a repo-added entry is planned, E4.5b req 1) ...
+    assert "repo-added-review" in stages.names
+    assert "round1-approve-review-followups" in stages.names
+
+
+def test_a_repo_added_stage_never_runs_in_a_real_fix_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 2: the name-keyed real path runs A1 and the iteration only — never X9."""
+    control, worktree = _fix_layout(tmp_path)
+    _write_stages_config(control, _CONFIG_WITH_REPO_ADDED)
+    _write_repo_added_prompt(control, worktree)
+    _patch(monkeypatch, select_impl=_select_seq([_select_none()]))
+    monkeypatch.setattr(
+        fix_workflow, "load_all", lambda aidt, repo: (_AGENTS, [])
+    )
+    stages = _FakeStages(APPROVE_REVIEW)
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 0
+    assert stages.names == ["round1-approve-review-followups"]
+
+
+def test_a_repo_added_stage_with_a_missing_prompt_is_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 5: exit 2 via ``format_issues``, before any run record or worktree."""
+    control, _worktree = _fix_layout(tmp_path)
+    _write_stages_config(control, _CONFIG_WITH_REPO_ADDED)
+    _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
+    monkeypatch.setattr(
+        fix_workflow, "load_all", lambda aidt, repo: (_AGENTS, [])
+    )
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), dry_run=True)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "error: workflows.fix.stages: " in err
+    assert "`repo-added-review`" in err
+    assert "prompt does not resolve" in err
+    assert stages.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def test_a_repo_added_stage_with_an_unknown_agent_is_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 4/req 5: an unknown declared ``agent`` refuses here, not in ``run_stage``."""
+    control, worktree = _fix_layout(tmp_path)
+    _write_stages_config(
+        control, _CONFIG_WITH_REPO_ADDED.replace("agent: code-reviewer", "agent: nobody")
+    )
+    _write_repo_added_prompt(control, worktree)
+    _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
+    monkeypatch.setattr(
+        fix_workflow, "load_all", lambda aidt, repo: (_AGENTS, [])
+    )
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), dry_run=True)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "`repo-added-review`" in err
+    assert "unknown agent `nobody`" in err
+    assert stages.names == []

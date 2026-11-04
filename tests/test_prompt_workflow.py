@@ -5214,3 +5214,96 @@ def test_a_disabled_core_stage_is_refused_before_any_side_effect(
     # Before any run record or worktree, `--dry-run` included.
     assert state.list_runs(_runs_root(tmp_path)) == []
     assert not _task_worktree(tmp_path).exists()
+
+
+# --------------------------------------------------------------------------- #
+# repo-added stages in a name-keyed workflow (E4.5b req 2/req 5)
+# --------------------------------------------------------------------------- #
+
+#: The declared `prompt:` of a repo-added prompt stage, relative to the target root.
+REPO_ADDED_PROMPT = "aidw/prompts/repo-added.md"
+
+#: P1 (the only static stage) plus a repo-added one, which `prompt`'s name-keyed consumer
+#: never runs: E4.5b's non-goal, warned about rather than silently dropped.
+_CONFIG_WITH_REPO_ADDED = (
+    "schema_version: 1\n"
+    "workflows:\n"
+    "  prompt:\n"
+    "    stages:\n"
+    "      - id: P1\n"
+    "      - id: repo-added-review\n"
+    "        agent: task-reviewer\n"
+    "        prompt: aidw/prompts/repo-added.md\n"
+)
+
+
+def _write_repo_added_prompt(root: Path, text: str = "# repo-added stage\n") -> None:
+    path = root / REPO_ADDED_PROMPT
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _run_prompt_dry(tmp_path: Path) -> int:
+    return prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        dry_run=True,
+    )
+
+
+def test_a_repo_added_stage_is_accepted_warned_about_and_never_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 2/req 5: accepted, warned about by id, and never executed (non-goal)."""
+    _patch_prompt_repo(tmp_path, monkeypatch, config_text=_CONFIG_WITH_REPO_ADDED)
+    _write_repo_added_prompt(tmp_path)
+
+    code = _run_prompt_dry(tmp_path)
+
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "workflow `prompt` stage `repo-added-review`" in captured.err
+    assert "repo-added" in captured.err
+    # The name-keyed consumer plans the registry's stages only: the entry never executes.
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert [stage.name for stage in latest.stages] == ["task-prompt", "task-review-1"]
+
+
+def test_a_repo_added_stage_with_a_missing_prompt_is_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 5: exit 2 via ``format_issues``, before any run record or worktree."""
+    _patch_prompt_repo(tmp_path, monkeypatch, config_text=_CONFIG_WITH_REPO_ADDED)
+
+    code = _run_prompt_dry(tmp_path)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "error: workflows.prompt.stages: " in err
+    assert "`repo-added-review`" in err
+    assert "prompt does not resolve" in err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert not _task_worktree(tmp_path).exists()
+
+
+def test_a_repo_added_stage_with_an_unknown_agent_is_refused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 4/req 5: an unknown declared ``agent`` refuses here, not in ``run_stage``."""
+    _patch_prompt_repo(
+        tmp_path,
+        monkeypatch,
+        config_text=_CONFIG_WITH_REPO_ADDED.replace("agent: task-reviewer", "agent: nobody"),
+    )
+    _write_repo_added_prompt(tmp_path)
+
+    code = _run_prompt_dry(tmp_path)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "`repo-added-review`" in err
+    assert "unknown agent `nobody`" in err
+    assert state.list_runs(_runs_root(tmp_path)) == []

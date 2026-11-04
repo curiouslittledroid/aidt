@@ -2,9 +2,12 @@
 
 ```
 preflight (PR exists, targets main, the PR head's worktree is located)
+  → … stages declared before R1  (repo-added; design §8.3 order, E4.5b)
   → R1 code-review                 agent code-reviewer  (fresh, read-only)
   if findings:
+    → … stages declared between R1 and R2 (repo-added)
     → R2 review-findings-to-github agent review-publisher (fresh, ungated)
+    → … stages declared after R2     (repo-added)
   else: report Approved and stop
 ```
 
@@ -35,7 +38,12 @@ from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.runner import plan_stages, run_stage
+from aidw.runner import (
+    StageSpec,
+    declared_stage_issues,
+    plan_stages,
+    run_stage,
+)
 from aidw.state import (
     BLOCKED,
     FAILED,
@@ -65,6 +73,15 @@ MANIFEST_REL = "artifacts/review-manifest.json"
 #: review-follow-up parent issue; the failed and blocked exits never write it, because a
 #: non-zero exit already stops the chain.
 PR_FOLLOWUPS = "followups_published"
+
+
+def _index_of(plan: list[StageSpec], stage_id: str) -> int:
+    """The plan position of ``stage_id`` (E4.5b: by id, never by unpacking position).
+
+    Both core stages are mandatory (D13), so a missing id is a programming error, not a
+    config one; ``StopIteration`` is the loud failure.
+    """
+    return next(index for index, spec in enumerate(plan) if spec.id == stage_id)
 
 
 def _read_out(record) -> str | None:
@@ -146,6 +163,26 @@ def run(
     if errors or (strict and warnings):
         print(format_issues(errors + (warnings if strict else [])), file=sys.stderr)
         return 2
+
+    # --- declared stage settings (E4.5b, EXTRACTION.md §3.5/§3.6) --------------- #
+    # After `load_all`, because the agents dict is what a repo-added stage's `agent` is
+    # checked against — the validator above runs before it. `validate_stage_list` stays
+    # the first stage-list refusal; this one covers the two settings the plan needs and
+    # turns them into config ERRORs (stderr + exit 2) before any run record or worktree, so
+    # a missing declared prompt or an unknown repo-added agent never escapes `run()` as a
+    # traceback. Control-root only: the worktree re-resolve below keeps its own `load_all`
+    # refusal and, like `validate_stage_list`, is not re-run.
+    if stages_entry is not None and stages_entry.source == SOURCE_CONFIG:
+        declaration_issues = declared_stage_issues(
+            "review",
+            stages_entry.value or [],
+            toolkit_root=aidt.root,
+            target_root=repo.root,
+            agents=agents,
+        )
+        if declaration_issues:
+            print(format_issues(declaration_issues), file=sys.stderr)
+            return 2
 
     # --- preflight: gh, PR exists, targets main (design §8.3) ---------------- #
     # The PR head is authoritative, not this process's current branch (K1). Since E2.6
@@ -261,11 +298,14 @@ def run(
         print(f"run:    {state.run_id}")
         print(f"pr:     #{pr}" + (f" {pr_info['url']}" if pr_info.get("url") else ""))
 
-        # The R1/R2 pair comes from the registry (E4.3): `findings=True` plans both (the
-        # pair is "R2 only if R1 reports findings", and the dry run plans R2 as well); the
-        # manifest path is the expansion field that renders R2's extra, so the dry-run
-        # prompt already points at the manifest the real run writes.
-        r1, r2 = plan_stages(
+        # The plan comes from the registry (E4.3): `findings=True` plans both core stages
+        # (the pair is "R2 only if R1 reports findings", and the dry run plans R2 as
+        # well); the manifest path is the expansion field that renders R2's extra, so the
+        # dry-run prompt already points at the manifest the real run writes. Since E4.5b a
+        # declared list may also carry repo-added stages, so the two core stages are
+        # located **by id** (never by unpacking position) and everything else runs in
+        # declared order around them (§8.3's gating and stops are unchanged).
+        plan = plan_stages(
             "review",
             config=resolved_config,
             toolkit_root=aidt.root,
@@ -274,9 +314,39 @@ def run(
             manifest_rel=MANIFEST_REL,
             findings=True,
         )
+        r1_index = _index_of(plan, "R1")
+        r2_index = _index_of(plan, "R2")
+        r1, r2 = plan[r1_index], plan[r2_index]
+        before_r1 = plan[:r1_index]
+        between = plan[r1_index + 1 : r2_index]
+        after_r2 = plan[r2_index + 1 :]
+
+        def run_spec(spec: StageSpec) -> bool:
+            """Run one planned stage; on failure mark the run failed and return ``False``.
+
+            The repo-added stages share this, so their failure contract is the core
+            stages': the stage's error on stderr, ``state.status = FAILED``, the same exit
+            1. ``R1``/``R2`` keep their own handling below because their records are read.
+            """
+            record = run_stage(
+                spec,
+                repo_root=repo.root,
+                toolkit_root=aidt.root,
+                runs_root=runs_root,
+                state=state,
+                logger=logger,
+                agents=agents,
+            )
+            print_stage(record, repo_root=repo.root)
+            if record.status != SUCCEEDED:
+                print(f"stage {spec.name} failed: {record.error}", file=sys.stderr)
+                state.status = FAILED
+                save(directory, state)
+                return False
+            return True
 
         if dry_run:
-            for spec in (r1, r2):
+            for spec in plan:
                 record = run_stage(
                     spec,
                     repo_root=repo.root,
@@ -307,6 +377,11 @@ def run(
             save(directory, state)
             print("dry-run complete; Pi not invoked, no GitHub state written")
             return 0
+
+        # Stages declared before R1 run first, before any verdict exists.
+        for spec in before_r1:
+            if not run_spec(spec):
+                return 1
 
         rec1 = run_stage(
             r1,
@@ -391,6 +466,11 @@ def run(
         )
         print(f"findings: {len(parsed)} (manifest: {MANIFEST_REL})")
 
+        # Stages declared between R1 and R2 run after the verdict/artifacts and before R2.
+        for spec in between:
+            if not run_spec(spec):
+                return 1
+
         # R2's `extra` is the registry-rendered manifest pointer (E4.3): never rebuilt here.
         rec2 = run_stage(
             r2,
@@ -434,6 +514,11 @@ def run(
             + "\n",
             encoding="utf-8",
         )
+
+        # Stages declared after R2 run only on the findings path, after R2 published.
+        for spec in after_r2:
+            if not run_spec(spec):
+                return 1
 
         parent = published["parent_issue"]
         print("review complete; follow-up issues published")
