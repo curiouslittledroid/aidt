@@ -441,7 +441,7 @@
 
 ## Epic E7: Split the prompt library
 
-- [ ] **E7.1. Classify and relocate**
+- [x] **E7.1. Classify and relocate**
   Apply §4.2: keep bucket (i), neutralise (ii), and move bucket (iii) to Mythical Forge's
   `aidw/prompts/` at cutover (§7). Until cutover, leave (iii) in the toolkit but mark each file's
   intended destination in a short header note.

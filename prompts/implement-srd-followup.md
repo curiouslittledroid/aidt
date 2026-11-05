@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 name: implement-srd-followup
 description: Implement one approved SRD mapping follow-up task on a dedicated branch, with regression tests, catalog updates, and verification.
 argument-hint: "<mapping-task-path> <claim-id> [approved]"

@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Refresh the rules-engine SRD subsystem architecture diagram from current source evidence
 argument-hint: "[change-ref]"
 ---

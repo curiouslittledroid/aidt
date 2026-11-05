@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Summarise the integration tests added on the current branch into docs/implementation-results/<branch>/integration-tests.md
 argument-hint: "[branch]"
 ---

@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Refresh the Lambda data-flow diagram (every Lambda, its stage, and the datastores it touches)
 argument-hint: "[change-ref]"
 ---

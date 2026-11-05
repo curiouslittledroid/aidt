@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Refresh the combat child diagram (turn resolution subsystems) from current source evidence
 argument-hint: "[change-ref]"
 ---

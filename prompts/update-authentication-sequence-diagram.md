@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Refresh the Cognito authentication and API authorization sequence diagram from current handler evidence
 argument-hint: "[change-ref]"
 ---

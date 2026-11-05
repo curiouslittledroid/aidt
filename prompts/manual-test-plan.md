@@ -1,3 +1,6 @@
+---
+destination: mythical-forge/aidw/prompts/
+---
 # Generate a manual test plan + executable test scripts
 
 Based on the work just completed in this session, generate a step-by-step manual test plan and a companion set of executable bash scripts, all saved to a directory under `manual-test-plans/`.

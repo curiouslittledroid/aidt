@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Refresh the movement and spatial child diagram (grid subsystems) from current source evidence
 argument-hint: "[change-ref]"
 ---

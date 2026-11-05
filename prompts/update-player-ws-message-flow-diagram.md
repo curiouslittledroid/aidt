@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Refresh the WebSocket player-message sequence diagram (PLAYER_INPUT → identity → moderation → intent → rules → frames) from current handler evidence
 argument-hint: "[change-ref]"
 ---

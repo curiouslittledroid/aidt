@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Summarise the player-facing actions added on the current branch into docs/implementation-results/<branch>/player-actions.md
 argument-hint: "[branch]"
 ---
