@@ -420,7 +420,7 @@
   - Deliverable: config plumbing into the bundled scripts (via CLI args or a generated env/JSON handoff — choose whichever keeps the scripts standalone and stdlib-only).
   - Done when: the bundled scripts still run standalone with no config present.
 
-- [ ] **E6.2. Preserve matching semantics exactly**
+- [x] **E6.2. Preserve matching semantics exactly**
   No change to strict equality, no whitespace normalisation, no case folding, no regex
   reinterpretation of markers. The label "ensure existing" path still never overwrites an existing
   label.
