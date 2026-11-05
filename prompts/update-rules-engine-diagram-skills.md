@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Refresh the skills and stunts child diagram (check resolution subsystems) from current source evidence
 argument-hint: "[change-ref]"
 ---

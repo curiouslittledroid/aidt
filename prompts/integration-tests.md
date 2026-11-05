@@ -1,3 +1,6 @@
+---
+destination: mythical-forge/aidw/prompts/
+---
 # Build Integration Tests
 
 Given a completed and deployed implementation task, write automated integration tests using the framework in `tests/integration/`. The tests verify real AWS endpoints — not mocks, not unit tests, not local stubs.

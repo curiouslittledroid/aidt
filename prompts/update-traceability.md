@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Update SRD traceability (catalog, vector matrix, report, roadmap checkbox) for the current branch
 argument-hint: "[branch]"
 ---

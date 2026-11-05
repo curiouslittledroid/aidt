@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Refresh the progression child diagram (shared kernel) from current source evidence
 argument-hint: "[change-ref]"
 ---

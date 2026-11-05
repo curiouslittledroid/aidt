@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Refresh the spells child diagram (cast resolution subsystems) from current source evidence
 argument-hint: "[change-ref]"
 ---

@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Update architecture documentation and Archify diagrams after an implementation change
 ---
 

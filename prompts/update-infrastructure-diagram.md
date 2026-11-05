@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Refresh the AWS CDK infrastructure architecture diagram from the synthesized CloudFormation templates
 argument-hint: "[change-ref]"
 ---

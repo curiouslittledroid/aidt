@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Refresh the vision and world child diagram (two independent models) from current source evidence
 argument-hint: "[change-ref]"
 ---

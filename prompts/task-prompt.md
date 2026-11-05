@@ -1,3 +1,6 @@
+---
+destination: mythical-forge/aidw/prompts/
+---
 # Create a task prompt
 
 The task files in the ./docs/tasks folder (`01 - Foundation.md` through `09 - Frontend.md`) are **planning indexes**, not agent prompts. Each entry is deliberately terse — one line of context, one spec citation, one done-condition — so the roadmap itself stays scannable and doesn't drift out of sync with 100+ fully-written prompts.

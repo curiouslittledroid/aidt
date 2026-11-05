@@ -1,4 +1,5 @@
 ---
+destination: mythical-forge/aidw/prompts/
 description: Regenerate the canonical Lambda reference document from CDK infrastructure and Lambda source code
 ---
 
