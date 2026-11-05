@@ -112,7 +112,7 @@ def _select_none() -> github.ScriptResult:
 def _select_seq(items: list[github.ScriptResult]):
     queue = list(items)
 
-    def _next(aidt, repo, pr, timeout=github.DEFAULT_TIMEOUT):
+    def _next(aidt, repo, pr, timeout=github.DEFAULT_TIMEOUT, **_kwargs):
         return queue.pop(0) if queue else _select_none()
 
     return _next

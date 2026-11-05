@@ -19,21 +19,24 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# The frozen pieces stay on ``constants``: the comment-body decision literal, the role
+# label names, the priority labels and the publisher's five-name obligation (E6.1 req 4 —
+# it is *not* derived from config keys, so a repo-added label is a definition, not a
+# publisher obligation). The marker accessors and the label definitions come from ``gh``,
+# which owns the ``AIDW_REVIEW_FOLLOWUP_CONFIG`` handoff.
 from constants import (
     DECISION_APPROVE_FIX,
     LABEL_DECISION_PENDING,
-    LABEL_DEFINITIONS,
     LABEL_REVIEW_FOLLOW_UP,
     PRIORITY_LABELS,
     PUBLISHER_LABELS,
-    child_marker,
-    parent_marker,
-    summary_marker,
 )
 from gh import (
+    LABEL_DEFINITIONS,
     GhIssue,
     PrInfo,
     assert_gh_authenticated,
+    child_marker,
     create_issue,
     create_label,
     create_pr_comment,
@@ -43,8 +46,10 @@ from gh import (
     labels_of,
     list_comments,
     list_issues,
+    parent_marker,
     resolve_pr,
     resolve_repo,
+    summary_marker,
     update_issue_comment,
 )
 from logic import Finding, Manifest, parse_manifest, parse_publish_args

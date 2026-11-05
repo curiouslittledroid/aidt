@@ -36,13 +36,16 @@ from constants import (
     EXIT_OK,
     EXIT_VERIFY_FAILED,
     LABEL_APPROVE_FIX,
-    LABEL_DEFINITIONS,
     LABEL_REVIEW_FOLLOW_UP,
     STATUS_FIXED,
     STATUS_IN_PROGRESS,
-    parent_marker,
 )
+# The marker and label *definitions* come from ``gh`` — the module that owns the
+# ``AIDW_REVIEW_FOLLOWUP_CONFIG`` handoff (E6.1) — not from the frozen ``constants``
+# fallbacks. The frozen role names and the comment bodies stay on ``constants``: they are
+# not config-driven (§3.4 has no field for them, D5 freezes the names).
 from gh import (
+    LABEL_DEFINITIONS,
     ParentIssue,
     PrInfo,
     add_comment,
@@ -54,6 +57,7 @@ from gh import (
     get_issue,
     label_list,
     list_native_children,
+    parent_marker,
     resolve_pr,
     resolve_repo,
 )

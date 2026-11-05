@@ -9,6 +9,14 @@ and consume review follow-ups:
 
 Change them here and in those prompts together, or not at all.
 
+The marker literals and label definitions below have a **second home** by design
+(EXTRACTION.md §3.4/§3.9, D5, task E6.1): ``aidw/target_config.py`` seeds the same values as
+``TOOLKIT_DEFAULTS.github``, because the wheel ships only the ``aidw`` package and so cannot
+import this directory. This file stays the standalone fallback (no config, no environment);
+``gh.py`` overlays the resolved values from ``AIDW_REVIEW_FOLLOWUP_CONFIG`` when aidw sets it.
+``tests/test_target_config.py`` pins the two homes equal, so editing one without the other
+fails the suite.
+
 The scripts deliberately have no runtime dependencies beyond the Python
 standard library and no project-specific paths, so this directory can be copied
 into another repository with the prompts. They run on any Python 3.9+:
@@ -41,23 +49,44 @@ STATUS_FIXED = "Status: fixed"
 DECISION_APPROVE_FIX = "Decision: approve-fix"
 
 
+#: The three marker **templates** as frozen literals (EXTRACTION.md §3.4/§3.9, D5).
+#:
+#: Exposed as module constants since E6.1 because they are the script-side fallback the
+#: toolkit's ``github.markers`` defaults are pinned equal to: ``aidw/target_config.py``
+#: cannot import them (the wheel ships only the ``aidw`` package, so the literals live in
+#: both homes and a test keeps them equal), and an env-var overlay in :mod:`gh` must be
+#: able to read the default template without probing the rendered functions.
+#:
+#: These remain the *frozen* fallback: nothing here reads configuration or the
+#: environment. ``gh`` owns the ``AIDW_REVIEW_FOLLOWUP_CONFIG`` handoff.
+PARENT_MARKER_TEMPLATE = "<!-- mythical-forge-review-followups: pr={pr_url} -->"
+CHILD_MARKER_TEMPLATE = (
+    "<!-- mythical-forge-review-follow-up: pr={pr_url} finding={finding_id} -->"
+)
+SUMMARY_MARKER_TEMPLATE = "<!-- mythical-forge-review-followups-summary: pr={pr_url} -->"
+
+
 def parent_marker(pr_url: str) -> str:
     """Exact parent-issue body marker.
 
     ``pr_url`` must be the canonical browser URL returned by
     ``gh pr view <ref> --json url``, not the ``api.github.com`` URL.
+
+    Keyed ``str.format`` on :data:`PARENT_MARKER_TEMPLATE`, not an f-string: the template
+    is the same literal a repo's ``github.markers.parent`` supplies, so both paths render
+    one way.
     """
-    return f"<!-- mythical-forge-review-followups: pr={pr_url} -->"
+    return PARENT_MARKER_TEMPLATE.format(pr_url=pr_url)
 
 
 def child_marker(pr_url: str, finding_id: str) -> str:
     """Exact child-issue body marker, one per review finding."""
-    return f"<!-- mythical-forge-review-follow-up: pr={pr_url} finding={finding_id} -->"
+    return CHILD_MARKER_TEMPLATE.format(pr_url=pr_url, finding_id=finding_id)
 
 
 def summary_marker(pr_url: str) -> str:
     """Exact marker on the single PR summary comment."""
-    return f"<!-- mythical-forge-review-followups-summary: pr={pr_url} -->"
+    return SUMMARY_MARKER_TEMPLATE.format(pr_url=pr_url)
 
 
 #: Canonical label definitions.

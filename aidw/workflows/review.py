@@ -351,6 +351,7 @@ def run(
                 state=state,
                 logger=logger,
                 agents=agents,
+                config=resolved_config,
             )
             print_stage(record, repo_root=repo.root)
             if record.status != SUCCEEDED:
@@ -371,6 +372,7 @@ def run(
                     logger=logger,
                     agents=agents,
                     dry_run=True,
+                    config=resolved_config,
                 )
                 suffix = (
                     " (runs only when R1 reports findings)" if spec.name == R2 else ""
@@ -406,6 +408,7 @@ def run(
             state=state,
             logger=logger,
             agents=agents,
+            config=resolved_config,
         )
         print_stage(rec1, repo_root=repo.root)
         if rec1.status != SUCCEEDED:
@@ -495,6 +498,7 @@ def run(
             state=state,
             logger=logger,
             agents=agents,
+            config=resolved_config,
         )
         print_stage(rec2, repo_root=repo.root)
         if rec2.status != SUCCEEDED:

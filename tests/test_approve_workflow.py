@@ -117,7 +117,7 @@ def _patch(
             "headRefName": "03-E4.1",
         },
     )
-    monkeypatch.setattr(github, "select_followups", lambda aidt, repo, pr, timeout=github.DEFAULT_TIMEOUT: _select_ok())
+    monkeypatch.setattr(github, "select_followups", lambda aidt, repo, pr, timeout=github.DEFAULT_TIMEOUT, **_kwargs: _select_ok())
 
 
 def test_dry_run_plans_stage_and_gate(tmp_path: Path, monkeypatch, capsys) -> None:

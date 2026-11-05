@@ -21,9 +21,11 @@ config:
 - It does not inject defaults; a field that is absent stays ``None``/empty. Only
   :func:`resolve_config` merges, so a near-empty config is never re-serialised inflated,
   and a loader caller still sees what was actually declared (E3.1's round-trip). The
-  seeded default *values* are E3.4's (the eight ``repo:``/``paths:`` leaves, D17) plus
-  design §12's ``max_revisions``; ``github``/``workflows`` stay empty until E6/E4.1 seed
-  them, and those tasks likewise add values without touching the merge.
+  seeded default *values* are E3.4's (the eight ``repo:``/``paths:`` leaves, D17), design
+  §12's ``max_revisions`` and — since E6.1 — the frozen D5 ``github.markers``/
+  ``github.labels`` values (a second home for ``prompts/scripts/review-followup/
+  constants.py``, which this package cannot import). ``workflows`` stays empty until E4.1
+  seeds it; each of those tasks adds a value without touching the merge.
 - The *loader* does not compare ``schema_version``/``requires_toolkit``: the fields are
   loaded and type-checked there. Interpreting them is :func:`check_compatibility`
   (E3.3, D10/§3.11), a separate pure pass a workflow preflight runs after the loader.
@@ -995,10 +997,11 @@ class ResolvedValue:
     """One resolved §3.4 leaf: its value plus where that value came from.
 
     ``source is None`` is the *unset* state (value ``None`` too): the config did not
-    declare the field and no default exists for it. After E3.4 the ``paths:``/``repo:``
-    leaves always resolve ``default``; the still-unset leaves are ``requires_toolkit`` and
-    ``github.markers.*`` until E6 seeds them. ``aidw config show`` renders that state as
-    ``unset`` and omits the ``source`` key in its JSON.
+    declare the field and no default exists for it. After E6.1 the ``paths:``/``repo:``
+    leaves and every ``github.markers.*``/``github.labels.*`` leaf always resolve
+    ``default``; the still-unset leaves are ``schema_version``, ``requires_toolkit`` and
+    ``paths.agent_configs_dir``. ``aidw config show`` renders that state as ``unset`` and
+    omits the ``source`` key in its JSON.
     """
 
     value: Any = None
@@ -1080,13 +1083,22 @@ class ConfigDefaults:
     and a seeded repo-relative path would make every repo without that folder fail
     :func:`validate_paths`. Seeding nothing is what keeps a config-less repo valid.
 
-    ``github``/``workflows`` are present but empty: an empty slot resolves *unset* rather
-    than inventing a value, because those defaults are E6's and E4.1's to own. A later
-    task adds values by populating a slot; :func:`resolve_config` already walks the
-    slots, so the merge does not change. ``schema_version`` and ``requires_toolkit`` are
-    left empty on purpose: the former is required *in* a config file and interpreting it
-    is E3.3's, so a repo with no config file has no resolved version; the latter is an
-    optional pin, never a default.
+    ``github`` carries the frozen D5 markers and label definitions (E6.1, §3.4/§3.9).
+    ``workflows`` is present but empty: an empty slot resolves *unset* rather than
+    inventing a value, because that default is E4.1's to own. A later task adds values by
+    populating a slot; :func:`resolve_config` already walks the slots, so the merge does
+    not change. ``schema_version`` and ``requires_toolkit`` are left empty on purpose: the
+    former is required *in* a config file and interpreting it is E3.3's, so a repo with no
+    config file has no resolved version; the latter is an optional pin, never a default.
+
+    The ``github`` values are a **second home** for
+    ``prompts/scripts/review-followup/constants.py``'s literals, by design: the wheel ships
+    only the ``aidw`` package, so this module must not import the bundled scripts (and the
+    scripts are copied into other repositories without ``aidw``).
+    ``tests/test_target_config.py`` pins the two homes byte-identical; the authoritative
+    ``baseline-verbatim`` golden is E6.3's. Only ``markers`` and ``labels`` are seeded — the
+    comment bodies and the role label names stay in ``constants.py``, because §3.4 has no
+    field for them and D5 freezes the names.
     """
 
     schema_version: int | None = None
@@ -1113,9 +1125,48 @@ class ConfigDefaults:
             architecture_dir="docs/architecture",
         )
     )
-    # ``markers`` is materialised (not ``None``) so the merge can read its slots; every
-    # field is still ``None``, so markers stay unset until E6 seeds the frozen D5 values.
-    github: GitHubConfig = field(default_factory=lambda: GitHubConfig(markers=MarkersConfig()))
+    # EXTRACTION.md §3.4/§3.9's ``github:`` block, character-for-character (D5: no
+    # currently-persisted GitHub string changes). The three markers are **templates**
+    # rendered with keyed ``str.format`` by the review-followup scripts' accessors; the six
+    # labels are exactly ``constants.py:LABEL_DEFINITIONS``. A repo declaring either wins
+    # per leaf — :func:`resolve_config` already merges them.
+    github: GitHubConfig = field(
+        default_factory=lambda: GitHubConfig(
+            markers=MarkersConfig(
+                parent="<!-- mythical-forge-review-followups: pr={pr_url} -->",
+                child=(
+                    "<!-- mythical-forge-review-follow-up: pr={pr_url} "
+                    "finding={finding_id} -->"
+                ),
+                summary="<!-- mythical-forge-review-followups-summary: pr={pr_url} -->",
+            ),
+            labels={
+                "review-follow-up": LabelConfig(
+                    color="5319E7",
+                    description="Review-generated task or parent issue",
+                ),
+                "must-fix": LabelConfig(
+                    color="B60205", description="Blocking review finding"
+                ),
+                "should-fix": LabelConfig(
+                    color="D93F0B",
+                    description="Non-blocking but recommended finding",
+                ),
+                "could-fix": LabelConfig(
+                    color="FBCA04",
+                    description="Limited review improvement or simplification",
+                ),
+                "decision-pending": LabelConfig(
+                    color="EDEDED",
+                    description="Human decision required before implementation",
+                ),
+                "approve-fix": LabelConfig(
+                    color="B8D64A",
+                    description="Human-approved review follow-up fix",
+                ),
+            },
+        )
+    )
     workflows: Mapping[str, WorkflowConfig] = field(default_factory=dict)
 
 
@@ -1250,7 +1301,7 @@ def resolve_config(
         )
 
     # Open maps contribute an entry only for a key that exists on either side: the config
-    # file's declared labels, plus (once E6 seeds them) the toolkit's default labels.
+    # file's declared labels, plus the toolkit's seeded default labels (E6.1).
     declared_labels = declared.github.labels if declared.github is not None else {}
     for name in sorted(set(declared_labels) | set(defaults.github.labels)):
         declared_label = declared_labels.get(name)

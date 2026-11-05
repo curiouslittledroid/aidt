@@ -8,8 +8,10 @@ import pytest
 import yaml
 
 from aidw.config import load_all
+from aidw.github import serialize_github_config
 from aidw.log import RunLogger
 from aidw.paths import (
+    REVIEW_FOLLOWUP_CONFIG_ENV_VAR,
     RUN_ID_ENV_VAR,
     SCRIPTS_DIR_ENV_VAR,
     STAGE_ENV_VAR,
@@ -735,3 +737,109 @@ def test_global_override_then_per_stage_model_precedence(tmp_path: Path) -> None
     log = (tmp_path / run.run_id / "run.log").read_text()
     assert "--model vendor/global-override" in log
     assert "--model vendor/stage-winner" in log
+
+
+# ---------------------------------------------------------------------------
+# E6.1: the resolved github.markers/github.labels reach the stage environment
+# ---------------------------------------------------------------------------
+
+
+def _declared_github_config():
+    """A resolved config whose declared marker/label prove the wiring is not just defaults."""
+    from aidw.target_config import (
+        GitHubConfig,
+        LabelConfig,
+        MarkersConfig,
+        TargetConfig,
+        resolve_config,
+    )
+
+    return resolve_config(
+        TargetConfig(
+            schema_version=1,
+            github=GitHubConfig(
+                markers=MarkersConfig(parent="<!-- declared: pr={pr_url} -->"),
+                labels={"must-fix": LabelConfig(color="111111", description="Declared")},
+            ),
+        )
+    )
+
+
+def _capture_stage_env(
+    tmp_path: Path, monkeypatch, *, clear_handoff: bool = True, **stage_kwargs
+) -> dict:
+    agents, _ = load_all(toolkit_root(), repo_root())
+    captured: dict = {}
+
+    def _capture(argv, prompt, **kwargs):
+        captured.update(kwargs)
+        return _result(0.0)
+
+    if clear_handoff:
+        monkeypatch.delenv(REVIEW_FOLLOWUP_CONFIG_ENV_VAR, raising=False)
+    monkeypatch.setattr(runner_mod, "execute", _capture)
+    run = create_run(tmp_path, repo_root(), "stage", label="github-config")
+    logger = RunLogger(tmp_path / run.run_id)
+
+    run_stage(
+        StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
+        repo_root=repo_root(),
+        toolkit_root=toolkit_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        runs_root=tmp_path,
+        **stage_kwargs,
+    )
+    return captured
+
+
+def test_stage_env_carries_the_resolved_github_config(tmp_path: Path, monkeypatch) -> None:
+    """Req 6(a): the agent-invoked scripts inherit the resolved markers/labels.
+
+    The variable is set alongside ``AIDW_SCRIPTS_DIR`` and comes from the one serializer, so
+    the publisher an agent runs and the ``select`` aidw runs cannot disagree about a marker
+    (a disagreement reads as "No review-follow-up parent issue found").
+    """
+    import json
+
+    config = _declared_github_config()
+
+    captured = _capture_stage_env(tmp_path, monkeypatch, config=config)
+
+    env = captured["env"]
+    assert env[SCRIPTS_DIR_ENV_VAR].endswith("prompts/scripts")
+    assert env[REVIEW_FOLLOWUP_CONFIG_ENV_VAR] == serialize_github_config(config)
+    payload = json.loads(env[REVIEW_FOLLOWUP_CONFIG_ENV_VAR])
+    # A declared override rides through, so the assertion cannot pass on defaults alone.
+    assert payload["markers"]["parent"] == "<!-- declared: pr={pr_url} -->"
+    assert payload["labels"]["must-fix"] == {"color": "111111", "description": "Declared"}
+    assert set(payload["labels"]) == {
+        "review-follow-up",
+        "must-fix",
+        "should-fix",
+        "could-fix",
+        "decision-pending",
+        "approve-fix",
+    }
+
+
+def test_stage_env_leaves_the_variable_unset_without_a_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``config=None`` keeps the scripts' frozen fallback: the variable is *absent*."""
+    captured = _capture_stage_env(tmp_path, monkeypatch)
+
+    assert REVIEW_FOLLOWUP_CONFIG_ENV_VAR not in captured["env"]
+    assert SCRIPTS_DIR_ENV_VAR in captured["env"]
+
+
+def test_stage_env_removes_a_stale_inherited_handoff_without_a_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A stage without config must not inherit a handoff from its parent process."""
+    monkeypatch.setenv(REVIEW_FOLLOWUP_CONFIG_ENV_VAR, '{"stale": true}')
+    captured = _capture_stage_env(tmp_path, monkeypatch, clear_handoff=False)
+
+    assert REVIEW_FOLLOWUP_CONFIG_ENV_VAR not in captured["env"]
+    assert SCRIPTS_DIR_ENV_VAR in captured["env"]

@@ -1607,6 +1607,7 @@ def run(
             logger=logger,
             agents=agents,
             dry_run=dry_run,
+            config=resolved_config,
         )
         print_stage(rec1, repo_root=target.root)
 
@@ -1620,6 +1621,7 @@ def run(
                 logger=logger,
                 agents=agents,
                 dry_run=True,
+                config=resolved_config,
             )
             print(f"stage:  {rec2.name} [{rec2.status}] (planned) model={rec2.model}")
             state.status = SUCCEEDED
@@ -1743,6 +1745,7 @@ def run(
                 state=state,
                 logger=logger,
                 agents=agents,
+                config=resolved_config,
             )
             print_stage(rec, repo_root=target.root)
             if rec.status != SUCCEEDED:
@@ -1944,6 +1947,7 @@ def run(
                         state=state,
                         logger=logger,
                         agents=agents,
+                        config=resolved_config,
                     )
                     print_stage(rec_fix, repo_root=target.root)
                     if rec_fix.status != SUCCEEDED:
@@ -1995,6 +1999,7 @@ def run(
                         state=state,
                         logger=logger,
                         agents=agents,
+                        config=resolved_config,
                     )
                     print_stage(rec_fix, repo_root=target.root)
                     if rec_fix.status != SUCCEEDED:
@@ -2042,6 +2047,7 @@ def run(
                 state=state,
                 logger=logger,
                 agents=agents,
+                config=resolved_config,
             )
             print_stage(rec_reconcile, repo_root=target.root)
             if rec_reconcile.status != SUCCEEDED:
