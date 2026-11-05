@@ -13,6 +13,7 @@ edit that contradicts the code therefore fails here instead of at the next roadm
 
 from __future__ import annotations
 
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
@@ -138,6 +139,35 @@ def test_doc_states_one_format_and_the_directory_plus_glob_surface() -> None:
     assert "[0-9]* - *.md" in text
     # No configurable parser/dialect is described, only the two path keys.
     assert "per-repo dialect" in text
+
+
+def test_doc_states_the_default_globs_spacing_is_convention_not_strictness() -> None:
+    """The §1 glob trap: `*` matches spaces, so the spacing is convention, not strictness.
+
+    `roadmap_glob` is an `fnmatch` glob, and `*` absorbs spaces: the spaceless
+    `[0-9]*-*.md` matches `00 - Extraction.md` too, so §1 must state the spaced default as
+    the canonical convention (and a real non-matching shape), never as a strictness
+    guarantee — the false blanket claim that the spaceless glob "would match nothing"
+    invites a wrong strictness assumption in E5.2's file selection (issue #96).
+    """
+    text = DOC.read_text(encoding="utf-8")
+
+    # The trigger, reproduced: `*` matches spaces, so both spellings select the same names.
+    assert fnmatch("00 - Extraction.md", "[0-9]* - *.md")
+    assert fnmatch("00 - Extraction.md", "[0-9]*-*.md")
+    assert fnmatch("07 - Example Roadmap.md", "[0-9]* - *.md")
+    assert fnmatch("07 - Example Roadmap.md", "[0-9]*-*.md")
+
+    # The real strictness boundary is the pattern's scope, not its spacing.
+    assert not fnmatch("example-roadmap.md", "[0-9]* - *.md")  # no two-digit prefix
+    assert not fnmatch("00 - Extraction.txt", "[0-9]* - *.md")  # not `.md`
+
+    # §1 states the convention and the scope, not the false glob-theory claim.
+    assert "[0-9]*-*.md` would match" not in text  # the spaceless glob *does* match
+    assert "not a strictness guarantee" in text
+    assert "canonical convention" in text
+    assert "no two-digit prefix" in text
+    assert "not `.md`" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -389,6 +419,48 @@ def test_field_bullet_indent_is_exactly_two_spaces() -> None:
         "  Tests: x",  # unbulleted
     ):
         assert not prompt_workflow._FIELD_BULLET_RE.match(line), line
+
+
+def test_a_second_done_when_line_is_never_merged(tmp_path: Path) -> None:
+    """The doc's §6 rule: a bulleted second line truncates the block, a bare one continues it.
+
+    `parse_file` keeps the first Done-when in both forms; `_done_when_block` differs — the
+    bulleted `  - Done when:` is a field bullet (§7) and bounds the block, so the second
+    bulleted line is silently dropped from the stage evidence bundle.
+    """
+    header = "## Epic A: Alpha\n\n- [ ] **A1. One task**\n"
+
+    # Canonical (bulleted) second Done-when: a field-bullet boundary — the block truncates.
+    bulleted = tmp_path / "07 - Bulleted.md"
+    bulleted.write_text(
+        header + "  - Done when: first.\n  - Done when: second.\n", encoding="utf-8"
+    )
+    tasks = parse_file(bulleted, EXAMPLE_PHASE)
+    assert tasks[0].done_when == "first."  # `parse_file` keeps the first, in both forms
+    block = prompt_workflow._done_when_block(
+        (header + "  - Done when: first.\n  - Done when: second.\n").splitlines(),
+        tasks[0].line - 1,
+    )
+    assert block == "  - Done when: first."
+    assert "second." not in block  # truncated at the field bullet, not merged
+
+    # Bare (unbulleted) second Done-when: not a field bullet — carried as continuation.
+    bare = tmp_path / "07 - Bare.md"
+    bare.write_text(
+        header + "  - Done when: first.\n  Done when: second.\n", encoding="utf-8"
+    )
+    tasks = parse_file(bare, EXAMPLE_PHASE)
+    assert tasks[0].done_when == "first."
+    block = prompt_workflow._done_when_block(
+        (header + "  - Done when: first.\n  Done when: second.\n").splitlines(),
+        tasks[0].line - 1,
+    )
+    assert "second." in block
+
+    # And the doc's §6 bullet states the distinction rather than the false blanket claim.
+    text = DOC.read_text(encoding="utf-8")
+    assert "**truncates the" in text  # the bulleted-second truncation rule is stated
+    assert "_done_when_block` includes the second" not in text  # the old false claim is gone
 
 
 def test_a_misindented_field_is_swallowed_into_the_done_when_block(tmp_path: Path) -> None:

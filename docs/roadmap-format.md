@@ -30,9 +30,13 @@ pattern (**D15**). Concretely, the whole per-repo surface is:
 | `paths.roadmap_glob` | `[0-9]* - *.md` | the filename pattern selecting phase files |
 
 Both come from `<target>/aidw/config.yaml` and resolve through the normal config layering
-(EXTRACTION.md §3.4/D17). `roadmap_glob` is literal: `[0-9]* - *.md` has a space on **each**
-side of the dash, which is what matches `00 - Extraction.md`; a `[0-9]*-*.md` would match
-nothing.
+(EXTRACTION.md §3.4/D17). `roadmap_glob` is a glob, and `*` matches spaces too — so the
+default's spacing is the naming convention, not a strictness guarantee: a spaceless
+`[0-9]*-*.md` matches `00 - Extraction.md` as well. The default `[0-9]* - *.md` (a space on
+**each** side of the dash) is the canonical convention the phase files are named by
+(`00 - Extraction.md`; the worked example in §3 is `07 - Example Roadmap.md`). What it does
+not select is a name outside its scope: `example-roadmap.md` (no two-digit prefix) or
+`00 - Extraction.txt` (not `.md`).
 
 There is **no per-repo dialect** — no configurable regexes, no alternate heading syntax, no
 repo-specific parser. A second dialect defeats the point of the toolkit owning the concept
@@ -251,8 +255,12 @@ Consequences for writers:
 - Continuation indentation is free-form — there is no pattern for it — but a continuation line
   must not be blank, must not start with `#`, must not look like a task entry, and must not be
   shaped like a field bullet (two spaces, `- `, a letter, a label, a colon; §7).
-- Write one `Done when` per entry. A second one in the same block is not merged: `parse_file`
-  keeps the first, and `_done_when_block` includes the second as an ordinary continuation line.
+- Write one `Done when` per entry. A second one is never merged: `parse_file` keeps the
+  first in every form. What `_done_when_block` does with the second line depends on its
+  shape — a bulleted `  - Done when: …` is itself a field bullet (§7) and so **truncates the
+  block** before it, dropping the second line from the stage evidence bundle; a bare
+  `Done when: …` (no bullet) is not a field bullet and is carried into the block as an
+  ordinary continuation line.
 
 ---
 
