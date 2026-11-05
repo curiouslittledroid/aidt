@@ -62,7 +62,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 import yaml
@@ -240,6 +240,52 @@ def _read_bool(
         )
         return default
     return value
+
+
+def _check_roadmap_glob(
+    paths_raw: Mapping[str, Any], source: str, issues: list[Issue]
+) -> None:
+    """Reject a degenerate declared ``paths.roadmap_glob`` (review follow-up PR #97, F1).
+
+    ``roadmap_glob`` is the one ``paths`` value that is a pattern, not a path, so it is
+    deliberately outside :data:`READ_PATHS`/:data:`WRITE_TARGETS` — nothing stat's it,
+    and pre-fix a degenerate value reached ``Path.glob`` unguarded (E5.2): an empty
+    pattern or an absolute one (``/etc/*.md``) raises there (``ValueError`` /
+    ``NotImplementedError`` on Python 3.13+) and traceback'd both consumers (``aidw
+    tasks``, the prompt workflow) instead of their documented stderr refusals. The
+    loader is where every other bad ``paths`` value fails closed — §3.4's wrong-type
+    contract — so the two shapes ``Path.glob`` refuses become an ``ERROR`` naming
+    ``paths.roadmap_glob`` here, and both callers refuse through their existing config
+    refusal sites (``aidw tasks``'s error check, ``resolve_workflow_config``), before
+    resolution and before ``load_tasks``.
+
+    Only a *declared* value is checked: the toolkit default (D17, ``[0-9]* - *.md``)
+    stays the only in-code pattern, and a non-string value is already a wrong-type
+    ``ERROR`` from ``_read_str`` — reporting it here too would duplicate the issue for
+    one bad value. Host-flavour ``PurePath`` mirrors what ``Path.glob`` will see, so
+    the rule is the loader's own and not a Python version's exception behaviour.
+    """
+    if "roadmap_glob" not in paths_raw:
+        return
+    value = paths_raw["roadmap_glob"]
+    if not isinstance(value, str):
+        return
+    if not value:
+        issues.append(
+            Issue(
+                ERROR,
+                source,
+                "`paths.roadmap_glob` must be a non-empty glob pattern, got ''",
+            )
+        )
+    elif PurePath(value).is_absolute():
+        issues.append(
+            Issue(
+                ERROR,
+                source,
+                f"`paths.roadmap_glob` must be a relative glob pattern, got {value!r}",
+            )
+        )
 
 
 def _read_int(
@@ -707,6 +753,7 @@ def _parse_target_config(
     )
     if paths_raw is not None:
         _flag_unknown(paths_raw, PATH_FIELDS, "paths", source, issues)
+        _check_roadmap_glob(paths_raw, source, issues)
     paths = (
         PathsConfig(
             **{

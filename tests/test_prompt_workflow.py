@@ -4090,6 +4090,73 @@ def test_e33_incompatible_config_refuses_before_any_state(
     assert not _task_worktree(tmp_path).exists()
 
 
+@pytest.mark.parametrize(
+    ("glob", "expected"),
+    [
+        pytest.param("", "must be a non-empty glob pattern", id="empty"),
+        pytest.param("/etc/*.md", "must be a relative glob pattern", id="absolute"),
+    ],
+)
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_degenerate_roadmap_glob_refuses_before_load_tasks(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    glob: str,
+    expected: str,
+    dry_run: bool,
+) -> None:
+    """A degenerate ``paths.roadmap_glob`` refuses (stderr + exit 2) before ``load_tasks``.
+
+    Review follow-up for PR #97, finding F1: pre-fix the value reached
+    ``tasks_dir.glob`` unguarded, so the run escaped the single-refusal-site design
+    (E3.3's config refusal) with a traceback instead of the documented stderr + 2.
+    """
+    _patch_prompt_repo(
+        tmp_path,
+        monkeypatch,
+        config_text=(
+            "schema_version: 1\npaths:\n"
+            f"  roadmap_glob: \"{glob}\"\n"
+        ),
+    )
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    def _must_not_run(*_args, **_kwargs):
+        raise AssertionError(
+            "a degenerate roadmap_glob must refuse before load_tasks/derive_branch_name"
+        )
+
+    monkeypatch.setattr(prompt_workflow, "load_tasks", _must_not_run)
+    monkeypatch.setattr(prompt_workflow, "derive_branch_name", _must_not_run)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        max_revisions=1,
+        dry_run=dry_run,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    err = captured.err
+    assert "error: config.yaml:" in err
+    assert "paths.roadmap_glob" in err
+    assert expected in err
+    # Nothing was created: no stage ran, no run record, no branch and no worktree.
+    assert seen == []
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert not _runs_root(tmp_path).exists()
+    assert git.worktree_for_branch(tmp_path, "03-E4.1") is None
+    assert not _task_worktree(tmp_path).exists()
+
+
 def test_e33_both_refusals_are_reported(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:

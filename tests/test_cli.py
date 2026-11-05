@@ -6,6 +6,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from typer.testing import CliRunner
 
 from aidw import __version__, github
@@ -1315,6 +1317,44 @@ def test_tasks_malformed_config_fails_closed(tmp_path: Path, monkeypatch) -> Non
     assert result.exit_code == EXIT_STAGE_FAILURE
     assert result.stdout == ""
     assert "cannot read/parse config" in result.stderr
+    assert "Implement Total Defense" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("glob", "expected"),
+    [
+        pytest.param("", "must be a non-empty glob pattern", id="empty"),
+        pytest.param("/etc/*.md", "must be a relative glob pattern", id="absolute"),
+    ],
+)
+def test_tasks_degenerate_roadmap_glob_fails_closed(
+    tmp_path: Path, monkeypatch, glob: str, expected: str
+) -> None:
+    """A degenerate ``paths.roadmap_glob`` refuses like any broken config (PR #97 F1).
+
+    Pre-fix the value reached ``tasks_dir.glob`` unguarded, so the command
+    traceback'd (``ValueError``/``NotImplementedError`` on Python 3.13+) instead of
+    the documented stderr + ``EXIT_STAGE_FAILURE`` refusal (E3.2/E3.3).
+    """
+    _target_cwd(tmp_path, monkeypatch)
+    _init_repo(tmp_path)
+    _write_roadmap(tmp_path / "docs" / "tasks", {"03 - Test Phase.md": ROADMAP_FIXTURE})
+    _write_target_config(
+        tmp_path,
+        "schema_version: 1\npaths:\n  roadmap_dir: docs/tasks\n"
+        f"  roadmap_glob: {json.dumps(glob)}\n",
+    )
+
+    result = runner.invoke(app, ["tasks"])
+
+    assert result.exit_code == EXIT_STAGE_FAILURE
+    # A clean refusal, never the pre-fix crash out of `load_tasks`.
+    assert not isinstance(result.exception, (ValueError, NotImplementedError)), (
+        result.exception
+    )
+    assert result.stdout == ""
+    assert "paths.roadmap_glob" in result.stderr
+    assert expected in result.stderr
     assert "Implement Total Defense" not in result.stderr
 
 
