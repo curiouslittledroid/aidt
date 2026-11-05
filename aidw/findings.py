@@ -265,6 +265,13 @@ def render_could_fix_block(findings: list[ParsedFinding]) -> str:
 
 
 #: Appended to the publisher stage so a fresh session uses the manifest AIDW extracted.
+#:
+#: The pointer is an **absolute** path. The stage runs with the target repo as its cwd and
+#: the run directory is outside it, so a repo-relative value made the publisher look for
+#: `<repo>/artifacts/review-manifest.json`, find nothing, and stop without publishing —
+#: correctly (inventing findings is worse), but the review still recorded
+#: ``followups_published`` (see :func:`aidw.github.verify_published`). Absolute is the one
+#: value that cannot be resolved against the wrong root.
 MANIFEST_EXTRA = """\
 
 ## AIDW-supplied manifest
@@ -272,7 +279,11 @@ MANIFEST_EXTRA = """\
 The preceding review's findings have already been extracted to this manifest. Use it as
 `--input` and do **not** re-derive or invent findings:
 
-- manifest: `{manifest_rel}` (relative to the repository root)
+- manifest: `{manifest_path}`
+
+That path is absolute and lies in AIDW's run directory, outside your working directory.
+Copy it verbatim: do not resolve it against the repository, and do not expect to find it
+under `artifacts/` here.
 
 Run the publisher `--dry-run` first, then the real command, exactly as the prompt above
 instructs.

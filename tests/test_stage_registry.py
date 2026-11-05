@@ -353,7 +353,7 @@ def test_reconcile_brief_is_instruction_review_and_combined_diff() -> None:
 
 def test_review_chain_reproduces_r1_and_r2() -> None:
     stages = expand(
-        "review", pr=PR, manifest_rel="artifacts/review-manifest.json", findings=True
+        "review", pr=PR, manifest_path="artifacts/review-manifest.json", findings=True
     )
     assert [(stage.id, stage.name, stage.agent, stage.prompt_file) for stage in stages] == [
         ("R1", review_workflow.R1, "code-reviewer", "code-review.md"),
@@ -368,13 +368,13 @@ def test_review_chain_reproduces_r1_and_r2() -> None:
     assert stages[1].variables == (str(PR),)
     assert stages[1].when == registry.WHEN_FINDINGS
     assert stages[1].extra == MANIFEST_EXTRA.format(
-        manifest_rel="artifacts/review-manifest.json"
+        manifest_path="artifacts/review-manifest.json"
     )
 
 
 def test_review_without_findings_omits_r2() -> None:
     stages = expand(
-        "review", pr=PR, manifest_rel="artifacts/review-manifest.json", findings=False
+        "review", pr=PR, manifest_path="artifacts/review-manifest.json", findings=False
     )
     assert [stage.name for stage in stages] == [review_workflow.R1]
 
@@ -400,7 +400,7 @@ def test_fix_expansion_reproduces_the_dry_run_plan() -> None:
         pr=PR,
         round_index=1,
         iteration=1,
-        manifest_rel="artifacts/iter1-review-manifest.json",
+        manifest_path="artifacts/iter1-review-manifest.json",
     )
     assert [
         (stage.name, stage.agent, stage.prompt_file, list(stage.variables), stage.extra)
@@ -415,7 +415,7 @@ def test_fix_expansion_reproduces_the_dry_run_plan() -> None:
         ("iter1-code-review", "code-reviewer", "code-review.md", [], ""),
         ("iter1-review-findings-to-github", "review-publisher",
          "review-findings-to-github.md", [str(PR)],
-         MANIFEST_EXTRA.format(manifest_rel="artifacts/iter1-review-manifest.json")),
+         MANIFEST_EXTRA.format(manifest_path="artifacts/iter1-review-manifest.json")),
     ]
     # F4 is conditional on F3's verdict (§8.4); the condition travels with the stage.
     assert [stage.id for stage in stages] == ["A1", "F1", "F2", "F3", "F4"]
@@ -430,7 +430,7 @@ def test_fix_iteration_is_part_of_the_stage_names() -> None:
         pr=PR,
         round_index=2,
         iteration=3,
-        manifest_rel="artifacts/iter3-review-manifest.json",
+        manifest_path="artifacts/iter3-review-manifest.json",
     )
     assert [stage.name for stage in stages] == [
         "round2-approve-review-followups",

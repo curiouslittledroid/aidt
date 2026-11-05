@@ -310,8 +310,8 @@ def plan_stages(
     ``expand_fields`` is exactly :func:`aidw.stage_registry.expand`'s documented
     per-workflow field set: ``implement`` (``prompt_rel``/``branch``/``task_id``/
     ``base_branch``), ``prompt`` (``phase``/``epic``/``task``/``rel``/``max_revisions``/
-    ``rounds``), ``review`` (``pr``/``manifest_rel``/``findings``), ``fix`` (``pr``/
-    ``round_index``/``iteration``/``manifest_rel``) and ``approve`` (``pr``). Each expanded
+    ``rounds``), ``review`` (``pr``/``manifest_path``/``findings``), ``fix`` (``pr``/
+    ``round_index``/``iteration``/``manifest_path``) and ``approve`` (``pr``). Each expanded
     :class:`~aidw.stage_registry.PlannedStage` becomes one :class:`StageSpec`: its prompt is
     resolved through :func:`resolve_prompt` (D4/D14), ``variables`` is a fresh ``list``
     (the registry's tuples are frozen) and ``extra`` is carried byte for byte.

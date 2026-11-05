@@ -78,14 +78,16 @@ def _planned_iteration(
     config: ResolvedConfig,
     aidt: Path,
     repo: Path,
+    directory: Path,
 ) -> dict[str, StageSpec]:
     """One fix iteration's stage specs from the registry, keyed by stage name (E4.3).
 
     The iteration count and the round index are external GitHub state, so the loop expands
     the iteration it is about to run rather than a pre-built list (EXTRACTION.md §3.5,
-    design §8.4). ``manifest_rel`` is that iteration's real-run manifest path — the value
-    the registry renders into F4's pointer — so the dry run and a real run plan the same
-    ``extra``.
+    design §8.4). ``manifest_path`` is that iteration's real-run manifest path in the run
+    directory ``directory`` — the value the registry renders into F4's pointer — so the dry
+    run and a real run plan the same ``extra``. It is absolute for the same reason
+    ``review.py`` passes an absolute path: F4 runs with the target repo as its cwd.
     """
     planned = plan_stages(
         "fix",
@@ -95,7 +97,7 @@ def _planned_iteration(
         pr=pr,
         round_index=round_index,
         iteration=iteration,
-        manifest_rel=f"artifacts/iter{iteration}-review-manifest.json",
+        manifest_path=str(directory / f"artifacts/iter{iteration}-review-manifest.json"),
     )
     return {spec.name: spec for spec in planned}
 
@@ -196,6 +198,7 @@ def _approval_round(
         config=config,
         aidt=aidt,
         repo=repo,
+        directory=directory,
     )
     spec = planned[f"round{round_index}-approve-review-followups"]
     name = spec.name
@@ -526,6 +529,7 @@ def run(
                 config=resolved_config,
                 aidt=aidt.root,
                 repo=repo.root,
+                directory=directory,
             )
             for spec in planned.values():
                 record = run_stage(
@@ -624,6 +628,7 @@ def run(
                 config=resolved_config,
                 aidt=aidt.root,
                 repo=repo.root,
+                directory=directory,
             )
 
             # F1 — fix exactly one approved child.
@@ -724,9 +729,8 @@ def run(
 
             if parsed:
                 # F4 — publish the new findings (ungated), then a human decides on GitHub.
-                manifest_rel = f"artifacts/{prefix}-review-manifest.json"
                 _write_json(
-                    directory / manifest_rel,
+                    directory / f"artifacts/{prefix}-review-manifest.json",
                     findings_mod.to_manifest(parsed),
                 )
                 record = run_stage(

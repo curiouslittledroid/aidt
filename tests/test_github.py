@@ -154,6 +154,83 @@ def test_verify_approvals_rejects_unparseable_output(monkeypatch) -> None:
     assert error == "approve --dry-run returned unparseable output"
 
 
+def test_verify_published_holds_when_the_parent_issue_exists(monkeypatch) -> None:
+    monkeypatch.setattr(
+        github,
+        "run_script",
+        lambda argv, repo, timeout, **_kwargs: _script_result(
+            "[dry-run] parent: reuse #100\n"
+        ),
+    )
+
+    assert github.verify_published(Path("/aidt"), Path("/repo"), 7, Path("/run/m.json")) is None
+
+
+def test_verify_published_reports_a_parent_that_was_never_created(monkeypatch) -> None:
+    """A publisher that exits 0 having published nothing must fail the stage.
+
+    This is the E7.3 PR 110 failure: the agent could not find the manifest, stopped and
+    reported the blocker in its final message, exited 0, and the review recorded
+    ``followups_published`` with no parent issue.
+    """
+    monkeypatch.setattr(
+        github,
+        "run_script",
+        lambda argv, repo, timeout, **_kwargs: _script_result("[dry-run] parent: create\n"),
+    )
+
+    error = github.verify_published(Path("/aidt"), Path("/repo"), 7, Path("/run/m.json"))
+
+    assert error is not None
+    assert "no review-follow-up parent issue" in error
+
+
+def test_verify_published_reports_a_read_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        github,
+        "run_script",
+        lambda argv, repo, timeout, **_kwargs: _script_result(
+            "", exit_code=2, stderr="error: no such file: /run/m.json"
+        ),
+    )
+
+    error = github.verify_published(Path("/aidt"), Path("/repo"), 7, Path("/run/m.json"))
+
+    assert error is not None
+    assert "exit 2" in error
+    assert "no such file" in error
+
+
+def test_verify_published_rejects_output_without_a_parent_verdict(monkeypatch) -> None:
+    monkeypatch.setattr(
+        github,
+        "run_script",
+        lambda argv, repo, timeout, **_kwargs: _script_result("Stopping.\n"),
+    )
+
+    assert (
+        github.verify_published(Path("/aidt"), Path("/repo"), 7, Path("/run/m.json"))
+        == "publish --dry-run did not report a parent issue"
+    )
+
+
+def test_verify_published_runs_a_read_only_command(monkeypatch) -> None:
+    seen: dict = {}
+
+    def _capture(argv, repo, timeout, **_kwargs):
+        seen["argv"] = argv
+        return _script_result("[dry-run] parent: reuse #100\n")
+
+    monkeypatch.setattr(github, "run_script", _capture)
+
+    manifest = Path("/run/artifacts/review-manifest.json")
+    github.verify_published(Path("/aidt"), Path("/repo"), 7, manifest)
+
+    assert "--dry-run" in seen["argv"]
+    # The postcondition reads the same manifest the stage was told to publish.
+    assert str(manifest) in seen["argv"]
+
+
 def test_verify_approvals_runs_a_read_only_command(monkeypatch) -> None:
     seen: dict = {}
 

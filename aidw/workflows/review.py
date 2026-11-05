@@ -320,18 +320,37 @@ def run(
         # declared list may also carry repo-added stages, so the two core stages are
         # located **by id** (never by unpacking position) and everything else runs in
         # declared order around them (§8.3's gating and stops are unchanged).
+        #
+        # The field is the manifest's **absolute** path: the publisher stage runs with the
+        # target repo as its cwd, so a run-dir-relative value sent it looking for
+        # `<repo>/artifacts/review-manifest.json`, finding nothing (E7.3's PR 110).
+        manifest_path = directory / MANIFEST_REL
         plan = plan_stages(
             "review",
             config=resolved_config,
             toolkit_root=aidt.root,
             target_root=repo.root,
             pr=pr,
-            manifest_rel=MANIFEST_REL,
+            manifest_path=str(manifest_path),
             findings=True,
         )
         r1_index = _index_of(plan, "R1")
         r2_index = _index_of(plan, "R2")
         r1, r2 = plan[r1_index], plan[r2_index]
+        # R2's postcondition is workflow-side, not stage data (E4.3 req 5), exactly as the
+        # approve stage's is: the registry knows the stage, only this workflow knows which
+        # manifest to re-read. A publisher that publishes nothing must fail the stage here,
+        # not be recorded as `followups_published` and break `aidw fix` one workflow later.
+        r2 = replace(
+            r2,
+            verify=lambda: github.verify_published(
+                aidt.root,
+                repo.root,
+                pr,
+                manifest_path,
+                config=resolved_config,
+            ),
+        )
         before_r1 = plan[:r1_index]
         between = plan[r1_index + 1 : r2_index]
         after_r2 = plan[r2_index + 1 :]
@@ -381,14 +400,9 @@ def run(
                     f"{record.name} [{record.status}] (planned) "
                     f"agent={record.agent} model={record.model}{suffix}"
                 )
-            manifest_path = directory / MANIFEST_REL
             publisher = github.script_path(aidt.root, github.PUBLISH_SCRIPT)
             argv = github.build_publish_argv(publisher, pr, manifest_path, dry_run=True)
-            try:
-                manifest_display = manifest_path.relative_to(repo.root)
-            except ValueError:
-                manifest_display = manifest_path
-            print(f"manifest: {manifest_display}")
+            print(f"manifest: {manifest_path}")
             print("publisher argv: " + " ".join(argv))
             state.status = SUCCEEDED
             save(directory, state)
@@ -478,11 +492,10 @@ def run(
                 print(f"  {problem}", file=sys.stderr)
             return 3
 
-        manifest_path = directory / MANIFEST_REL
         manifest_path.write_text(
             json.dumps(findings_mod.to_manifest(parsed), indent=2) + "\n", encoding="utf-8"
         )
-        print(f"findings: {len(parsed)} (manifest: {MANIFEST_REL})")
+        print(f"findings: {len(parsed)} (manifest: {manifest_path})")
 
         # Stages declared between R1 and R2 run after the verdict/artifacts and before R2.
         for spec in between:

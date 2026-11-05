@@ -67,6 +67,11 @@ _CHILD_LINE = re.compile(
     re.MULTILINE,
 )
 _SUMMARY_LINE = re.compile(r"^Summary comment:\s*(\S+)", re.MULTILINE)
+#: The publisher's ``--dry-run`` parent verdict: ``create`` when no parent issue exists yet,
+#: ``reuse #N`` when the markers find the one a real run would have created. Deliberately
+#: matched on the dry-run line rather than on an issue number, because "create" is the only
+#: value that proves nothing was published.
+_DRY_RUN_PARENT = re.compile(r"^\[dry-run\] parent:\s*(.+)$", re.MULTILINE)
 _URL_NUMBER = re.compile(r"/(\d+)/?$")
 
 
@@ -327,6 +332,46 @@ def verify_approvals(
     if pending:
         numbers = ", ".join(f"#{child.get('number')}" for child in pending)
         return f"open children still awaiting approval: {numbers}"
+    return None
+
+
+def verify_published(
+    aidt: Path,
+    repo: Path,
+    pr: int,
+    manifest: Path,
+    timeout: int = DEFAULT_TIMEOUT,
+    *,
+    config: ResolvedConfig | None = None,
+) -> str | None:
+    """Read-only postcondition for the publisher stage: the parent issue now exists.
+
+    A zero exit from the publisher agent is not evidence that the GitHub writes happened
+    — it can stop, report a blocker in its final message and still exit 0 (design §10),
+    which is exactly how a review that created nothing was recorded as
+    ``followups_published`` and then failed ``aidw fix``'s approval stage one workflow
+    later. This re-runs the publisher with ``--dry-run`` (no writes) and requires it to
+    *find* the parent instead of creating one.
+
+    Returns ``None`` when the postcondition holds, otherwise a human-readable error.
+    """
+    script = script_path(aidt, PUBLISH_SCRIPT)
+    argv = build_publish_argv(script, pr, manifest, dry_run=True)
+    result = run_script(argv, repo, timeout, config=config)
+    if result.exit_code != 0:
+        detail = (result.stderr or result.stdout).strip()[:300]
+        return (
+            f"could not read publication state (publish --dry-run exit "
+            f"{result.exit_code}): {detail}"
+        )
+    match = _DRY_RUN_PARENT.search(result.stdout)
+    if match is None:
+        return "publish --dry-run did not report a parent issue"
+    if match.group(1).strip() == "create":
+        return (
+            "no review-follow-up parent issue exists for this PR: the publisher stage "
+            "reported success without publishing the findings"
+        )
     return None
 
 
