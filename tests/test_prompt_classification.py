@@ -172,16 +172,54 @@ def _raw(name: str) -> str:
 
 
 @lru_cache(maxsize=1)
-def _parent_prompt_text() -> dict[str, str]:
-    """Load the parent revision's prompt bytes as the E7.1 no-body-edit oracle.
+def _baseline_revision() -> str:
+    """The pre-E7.1 revision: the first parent of the commit that introduced the marker.
 
-    The implementation adds metadata to files that are already tracked, so checking only
-    that the marker is absent from the current body would miss an accidental body edit. A
-    single archive keeps this regression check independent of the implementation's own
-    classification constants and avoids one Git process per prompt.
+    ``git log -S`` (pickaxe) lists every commit that changed how often ``MARKER_LINE``
+    occurs under ``prompts/``; ``--reverse`` puts the introduction first, so that commit's
+    first parent is the tree the marker commit was applied to — the actual baseline the
+    no-body-edit contract is stated against.
+
+    Resolving the baseline *from the marker* — rather than ``HEAD`` or ``merge-base`` —
+    keeps the oracle armed after this branch merges: ``merge-base HEAD origin/main``
+    collapses to ``HEAD`` on ``main``, the same compare-the-tree-to-itself tautology this
+    fix closes (review follow-up #108). Pickaxe needs only history, which CI already
+    fetches in full for the D5 freeze golden (``fetch-depth: 0``, .github/workflows/ci.yml).
     """
     completed = subprocess.run(
-        ["git", "archive", "--format=tar", "HEAD", "--", "prompts"],
+        ["git", "log", "--reverse", "--format=%H", f"-S{MARKER_LINE}", "--", "prompts"],
+        cwd=toolkit_root(),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    shas = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if not shas:
+        # An error, never a skip (the BaselineTagError rule, tests/test_baseline_verbatim_
+        # golden.py): a guard that quietly disarms is exactly the defect this oracle exists
+        # to prevent.
+        raise RuntimeError(
+            f"no commit in {toolkit_root()} history introduced '{MARKER_LINE}' under "
+            "prompts/ — the E7.1 no-body-edit oracle has no baseline; a shallow clone "
+            "needs `fetch-depth: 0` (.github/workflows/ci.yml) rather than a disarmed guard."
+        )
+    return f"{shas[0]}^"
+
+
+@lru_cache(maxsize=1)
+def _parent_prompt_text() -> dict[str, str]:
+    """Load the pre-E7.1 prompt bytes as the no-body-edit oracle (review follow-up #108).
+
+    The marker commit adds metadata to files that are already tracked, so checking only
+    that the marker is absent from the current body would miss an accidental body edit. A
+    single archive of the baseline revision keeps this regression check independent of the
+    implementation's own classification constants and avoids one Git process per prompt.
+    The archive must never be ``HEAD``: on this branch HEAD already carries the E7.1
+    markers, which made both "parent revision" tests compare the tree to itself — a body
+    edit committed together with the marker change passed on a clean tree.
+    """
+    completed = subprocess.run(
+        ["git", "archive", "--format=tar", _baseline_revision(), "--", "prompts"],
         cwd=toolkit_root(),
         check=True,
         capture_output=True,
@@ -372,12 +410,34 @@ def test_the_marker_never_reaches_the_rendered_prompt(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", BUCKET_PRODUCT)
+def test_the_parent_revision_oracle_predates_the_marker(name: str) -> None:
+    """The no-body-edit oracle is the pre-E7.1 baseline, never the current revision (#108).
+
+    The oracle once archived ``HEAD`` while HEAD already carried the E7.1 markers, so both
+    "parent revision" tests compared the tree to itself: a body edit committed together
+    with the marker change passed on a clean tree. Pin the baseline — the parent text must
+    predate the marker, so the oracle cannot silently collapse back onto the working tree
+    (or onto any post-marker revision) without this going red.
+    """
+    parent = _parent_prompt_text()[name]
+
+    # The baseline predates the marker; the current file carries it.
+    assert MARKER_LINE not in parent
+    assert MARKER_LINE in _raw(name)
+    # The three files that gained a minimal block had no frontmatter at the baseline.
+    if name in NO_FRONTMATTER:
+        assert _frontmatter_block(parent) == ""
+
+
+@pytest.mark.parametrize("name", BUCKET_PRODUCT)
 def test_product_prompt_rendering_matches_the_parent_revision(name: str) -> None:
     """Adding the destination field does not change the prompt sent to Pi.
 
-    Compare the rendered current file with the parent revision, rather than merely checking
-    that the current marker is in a frontmatter block. This catches an accidental body edit
-    in the same change, including edits to the three files that had no frontmatter before E7.1.
+    Compare the rendered current file with the parent revision (the pre-marker baseline,
+    see ``test_the_parent_revision_oracle_predates_the_marker``), rather than merely
+    checking that the current marker is in a frontmatter block. This catches an accidental
+    body edit in the same change, including edits to the three files that had no
+    frontmatter before E7.1.
     """
     assert load_prompt_file(toolkit_root() / "prompts" / name) == strip_frontmatter(
         _parent_prompt_text()[name]
