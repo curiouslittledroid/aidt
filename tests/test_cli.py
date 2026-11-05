@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -1376,3 +1377,175 @@ def test_tasks_does_not_validate_the_other_read_paths(
     assert "E4.1" in result.stdout
     assert not (tmp_path / "docs" / "task-prompts").exists()
     assert not (tmp_path / "docs" / "implementation-results").exists()
+
+
+# --------------------------------------------------------------------------- #
+# E5.3: `aidw tasks --validate` reports malformed entries (roadmap-format.md §10)
+# --------------------------------------------------------------------------- #
+#
+# One malformed entry per rule, with hand-counted lines: `E4.1` (line 3) is before the
+# first `## Epic`, `E4.2` is defined twice (lines 8 and 11, so the later one is the issue),
+# and `E4.3` (line 14) has no `Done when`. `E4.4` is the clean control under the epic.
+MALFORMED_ROADMAP = """# Phase 3: Test Phase
+
+- [ ] **E4.1. Entry outside an epic** text.
+  - Done when: outside an epic is reported.
+
+## Epic E4: Defensive Combat
+
+- [ ] **E4.2. Duplicate definition** text.
+  - Done when: the duplicate is reported.
+
+- [ ] **E4.2. Duplicate again** text.
+  - Done when: the duplicate is reported.
+
+- [ ] **E4.3. No Done when** text.
+- [ ] **E4.4. Clean control** text.
+  - Done when: the clean entry is quiet.
+"""
+
+
+#: Same task id (`E4.1`) in another phase file — legal, so `--validate` must stay silent.
+OTHER_PHASE_ISSUE = """# Phase 7: Zero Phase
+
+## Epic E7: Zero
+
+- [ ] **E7.1. Missing acceptance** text.
+  - Notes: no Done when here.
+"""
+
+
+def _init_repo_with_roadmap(path: Path, body: str) -> Path:
+    """A temp git repo carrying ``body`` as its only roadmap file (``03 - Test Phase.md``)."""
+    _init_repo_with_task(path)
+    (path / "docs" / "tasks" / "03 - Test Phase.md").write_text(body, encoding="utf-8")
+    return path
+
+
+def _init_repo_without_roadmap(path: Path) -> Path:
+    """A temp git repo with the read-paths but no roadmap directory at all."""
+    _init_repo_with_task(path)
+    shutil.rmtree(path / "docs" / "tasks")
+    return path
+
+
+def test_tasks_validate_reports_every_issue_on_stdout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Every malformation is printed as ``{file}:{line}: {rule} — {message}``, exit 2.
+
+    The report goes to stdout (the `agents validate`/`prompts check` convention) and
+    stderr stays empty; an early return after the first issue would fail this vector.
+    ``AIDW_STATE_DIR`` is moved out of the tree so the §3.10 layout warning (which every
+    in-tree state root gets) does not stand in for validation output on stderr.
+    """
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_repo_with_roadmap(tmp_path / "target", MALFORMED_ROADMAP)
+
+    result = runner.invoke(app, ["--repo", str(repo), "tasks", "--validate"])
+
+    assert result.exit_code == EXIT_USAGE, result.output
+    assert result.stderr == ""
+    lines = result.stdout.splitlines()
+    assert len(lines) == 3, result.stdout
+    assert lines[0].startswith("03 - Test Phase.md:3: entry outside an epic — "), lines[0]
+    assert lines[1].startswith("03 - Test Phase.md:11: duplicate id — "), lines[1]
+    # The duplicate names the earlier definition so the reader can go and fix it.
+    assert "03 - Test Phase.md:8" in lines[1]
+    assert lines[2].startswith("03 - Test Phase.md:14: missing Done when — "), lines[2]
+    # The clean control entry (line 15) is not reported.
+    assert ":15:" not in result.stdout
+
+
+def test_tasks_validate_is_silent_and_zero_on_a_clean_roadmap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_repo_with_roadmap(tmp_path / "target", ROADMAP_FIXTURE)
+
+    result = runner.invoke(app, ["--repo", str(repo), "tasks", "--validate"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_tasks_validate_keeps_the_zero_entry_guard(tmp_path: Path) -> None:
+    """No roadmap directory is not a clean pass: the existing stderr guard still refuses."""
+    repo = _init_repo_without_roadmap(tmp_path / "target")
+
+    result = runner.invoke(app, ["--repo", str(repo), "tasks", "--validate"])
+
+    assert result.exit_code == EXIT_USAGE
+    assert result.stdout == ""
+    assert "no roadmap tasks found" in result.stderr
+
+
+def test_tasks_validate_glob_selecting_nothing_keeps_the_zero_entry_guard(
+    tmp_path: Path,
+) -> None:
+    """A glob with no matches is also zero entries — refused, never a silent clean pass."""
+    repo = _init_repo_with_roadmap(tmp_path / "target", MALFORMED_ROADMAP)
+    _write_target_config(
+        repo, "schema_version: 1\npaths:\n  roadmap_glob: \"no-such-*.md\"\n"
+    )
+
+    result = runner.invoke(app, ["--repo", str(repo), "tasks", "--validate"])
+
+    assert result.exit_code == EXIT_USAGE
+    assert result.stdout == ""
+    assert "no roadmap tasks found" in result.stderr
+
+
+def test_tasks_validate_ignores_filters(tmp_path: Path, monkeypatch) -> None:
+    """``--phase`` cannot narrow the report: an issue in another phase is still reported.
+
+    The malformed entry is in the ``00`` file while the filter selects ``03``; a filtered
+    validation would print nothing and exit 0, silently missing the issue.
+    """
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_repo_with_task(tmp_path / "target")
+    _write_roadmap(
+        repo / "docs" / "tasks",
+        {
+            "00 - Zero Phase.md": OTHER_PHASE_ISSUE,
+            "03 - Test Phase.md": ROADMAP_FIXTURE,
+        },
+    )
+
+    result = runner.invoke(
+        app, ["--repo", str(repo), "tasks", "--validate", "--phase", "03"]
+    )
+
+    assert result.exit_code == EXIT_USAGE, result.output
+    assert result.stderr == ""
+    assert result.stdout.startswith("00 - Zero Phase.md:5: missing Done when — ")
+    assert "03 - Test Phase.md" not in result.stdout
+
+
+def test_tasks_without_validate_still_lists_a_malformed_roadmap(tmp_path: Path) -> None:
+    """``--validate`` is additive: the existing listing path is unchanged (and exit 0)."""
+    repo = _init_repo_with_roadmap(tmp_path / "target", MALFORMED_ROADMAP)
+
+    result = runner.invoke(app, ["--repo", str(repo), "tasks"])
+
+    assert result.exit_code == 0, result.output
+    assert "E4.1" in result.stdout
+    assert "E4.4" in result.stdout
+    assert "missing Done when" not in result.stdout
+
+
+def test_tasks_validate_fails_closed_on_a_broken_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Validation uses the tasks command's config refusal, not silent defaults."""
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_repo_with_roadmap(tmp_path / "target", ROADMAP_FIXTURE)
+    _write_target_config(repo, "{{ not yaml: [")
+
+    result = runner.invoke(app, ["--repo", str(repo), "tasks", "--validate"])
+
+    assert result.exit_code == EXIT_STAGE_FAILURE
+    assert result.stdout == ""
+    assert "cannot read/parse config" in result.stderr
+    assert "no roadmap tasks found" not in result.stderr

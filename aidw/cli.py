@@ -40,7 +40,13 @@ from aidw.paths import (
     ToolkitPaths,
     WorkspacePaths,
 )
-from aidw.roadmap import filter_tasks, find_task, load_tasks, next_todo
+from aidw.roadmap import (
+    filter_tasks,
+    find_task,
+    load_tasks,
+    next_todo,
+    validate_tasks,
+)
 from aidw.report import (
     rel_to,
     stage_lines,
@@ -574,8 +580,13 @@ def tasks(
         None, "--show", help='Show one task: "<phase> <epic> <task>".'
     ),
     next_: bool = typer.Option(False, "--next", help="Show the next unchecked task."),
+    validate: bool = typer.Option(
+        False,
+        "--validate",
+        help="Report malformed entries as `{file}:{line}: {rule} — {message}`.",
+    ),
 ) -> None:
-    """List or inspect roadmap tasks parsed from the configured roadmap directory."""
+    """List, inspect or validate roadmap tasks parsed from the configured roadmap."""
     repo, _aidt, _workspace = _roots()
     # D15/D17: where the roadmap lives is target-repo configuration, not an AIDT constant
     # — ``paths.roadmap_dir`` plus ``paths.roadmap_glob``. Loaded and resolved here exactly
@@ -596,6 +607,19 @@ def tasks(
     if not entries:
         typer.echo("no roadmap tasks found", err=True)
         raise typer.Exit(EXIT_USAGE)
+
+    # E5.3: format validation is a full-list report, so it runs before (and instead of)
+    # every filter/show branch — the filters must never narrow what is validated, or an
+    # issue outside the filter would go unreported. Issues go to stdout (the report
+    # convention `agents validate`/`prompts check` follow); stderr stays the refusal
+    # channel used above. Exit is nonzero because a malformed roadmap is a bad request.
+    if validate:
+        issues = validate_tasks(entries)
+        for issue in issues:
+            typer.echo(f"{issue.file}:{issue.line}: {issue.rule} — {issue.message}")
+        if issues:
+            raise typer.Exit(EXIT_USAGE)
+        return
 
     if show:
         parts = show.split()

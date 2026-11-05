@@ -400,7 +400,7 @@
   - Deliverable: parser change plus tests.
   - Done when: the fixture repo's roadmap parses without any code change.
 
-- [ ] **E5.3. Format validation with actionable errors**
+- [x] **E5.3. Format validation with actionable errors**
   Report the file, line and rule when an entry is malformed (a task with no `Done when`, a duplicate
   id, an entry outside an epic).
   - Deliverable: validation plus tests.

@@ -15,6 +15,13 @@ Which directory is read and which filenames are candidates are the caller's inpu
 from its caller, so this module carries neither a product-specific directory nor a
 product-specific pattern. There is no per-repo dialect (D15) — the patterns below are the
 one format.
+
+It also *validates* that parsed list (design §11, roadmap-format.md §10): ``validate_tasks``
+reports the three malformations the format defines — a missing ``Done when``, a duplicate
+``(phase, task)`` id, and an entry before any ``## Epic`` heading — with the entry's file,
+1-based line and rule. Validation is a separate, pure pass: the parser itself still never
+reports (roadmap-format.md §10), so ``parse_file``/``load_tasks`` and their callers are
+unchanged.
 """
 
 from __future__ import annotations
@@ -121,6 +128,91 @@ def parse_file(path: Path, phase: str) -> list[RoadmapTask]:
         )
 
     return tasks
+
+
+#: The three rule tokens (roadmap-format.md §10). They mirror the roadmap entry's wording.
+RULE_MISSING_DONE_WHEN = "missing Done when"
+RULE_DUPLICATE_ID = "duplicate id"
+RULE_OUTSIDE_EPIC = "entry outside an epic"
+
+
+@dataclass(frozen=True)
+class RoadmapIssue:
+    """One format problem, addressed by the entry's own file and 1-based line."""
+
+    file: str
+    line: int
+    rule: str
+    message: str
+
+
+def validate_tasks(tasks: list[RoadmapTask]) -> list[RoadmapIssue]:
+    """Report every format malformation in a parsed roadmap (roadmap-format.md §10).
+
+    ``tasks`` is ``load_tasks``' output, so ``file`` is already a basename and ``line`` is
+    already 1-based: both are used as-is. Pure by construction — the list is read, never
+    mutated, no file is re-read, and the result is deterministic (one entry's issues in a
+    fixed order, entries in input order), so repeat calls compare equal.
+
+    The three rules are exactly the ones the format enumerates:
+
+    - ``missing Done when`` — ``done_when == ""`` (§6/§11).
+    - ``duplicate id`` — a repeated ``(phase, task)``; the later entry is the issue and its
+      message names the earlier ``file:line``. Keying on ``(phase, task)`` matters: the
+      branch is ``{phase}-{task}`` and ``find_task`` matches phase+task, so the same task id
+      in another phase file is a different task, not a duplicate.
+    - ``entry outside an epic`` — ``epic_title is None`` (§4). Deliberately not ``epic``: it
+      is derived from the id by ``derive_epic`` and is never ``None``.
+
+    Validation is *not* wired into ``parse_file``/``load_tasks``; §10 keeps the parser
+    silent. The collapsed-id trap is likewise not a rule here (E0.7 owns that guard).
+    """
+    issues: list[RoadmapIssue] = []
+    seen: dict[tuple[str, str], RoadmapTask] = {}
+    for entry in tasks:
+        if entry.done_when == "":
+            issues.append(
+                RoadmapIssue(
+                    file=entry.file,
+                    line=entry.line,
+                    rule=RULE_MISSING_DONE_WHEN,
+                    message=(
+                        f"task {entry.phase}-{entry.task} has no 'Done when' line "
+                        "(roadmap-format.md §6)"
+                    ),
+                )
+            )
+
+        key = (entry.phase, entry.task)
+        earlier = seen.get(key)
+        if earlier is not None:
+            issues.append(
+                RoadmapIssue(
+                    file=entry.file,
+                    line=entry.line,
+                    rule=RULE_DUPLICATE_ID,
+                    message=(
+                        f"task {entry.phase}-{entry.task} is already defined at "
+                        f"{earlier.file}:{earlier.line}"
+                    ),
+                )
+            )
+        else:
+            seen[key] = entry
+
+        if entry.epic_title is None:
+            issues.append(
+                RoadmapIssue(
+                    file=entry.file,
+                    line=entry.line,
+                    rule=RULE_OUTSIDE_EPIC,
+                    message=(
+                        f"task {entry.phase}-{entry.task} appears before any '## Epic' "
+                        "heading (roadmap-format.md §4)"
+                    ),
+                )
+            )
+    return issues
 
 
 def load_tasks(tasks_dir: Path, glob: str) -> list[RoadmapTask]:
