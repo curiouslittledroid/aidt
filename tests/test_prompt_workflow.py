@@ -2870,6 +2870,25 @@ CI runs the frozen commands.
 This heading ends the gate section and must not be copied.
 """
 
+#: E7.3/D16: the *second* gate channel. ``AGENTS.md`` keeps its own ``## Gates`` section
+#: (the AGENTS.md-only fixture above, unchanged); this file carries the commands R14 sends
+#: to ``aidw/conventions.md``, plus a trailing ``## Tests`` heading that must also bound
+#: the extracted section.
+CONVENTIONS_EVIDENCE_FIXTURE = """# Repo conventions
+
+Intro prose.
+
+## Gates
+
+```bash
+conventions-repo-only gate --strict
+```
+
+## Tests
+
+This heading ends the conventions gate section and must not be copied.
+"""
+
 EXTRACTION_EVIDENCE_FIXTURE = """# Extraction
 
 ## 3.8 Task-prompt format and repo conventions (D16)
@@ -2879,13 +2898,21 @@ The conventions channel.
 
 
 def _evidence_repo(
-    tmp_path: Path, monkeypatch, *, agents_md: str | None = AGENTS_EVIDENCE_FIXTURE
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    agents_md: str | None = AGENTS_EVIDENCE_FIXTURE,
+    conventions_md: str | None = None,
 ) -> Path:
     """A committed bare+control repo (no ``origin``) with the evidence fixtures.
 
     Committed so the local base branch resolves to a real sha while ``origin/main``
     stays absent — the no-origin fixture the base-branch assertion needs — and so branch
     setup can create a real task worktree from it.
+
+    ``conventions_md`` defaults to ``None`` so the AGENTS.md-only fixture every existing
+    assertion uses stays byte-for-byte what it was; only the E7.3 gate-source tests add
+    the second channel (D16).
     """
     files = {
         "docs/tasks/03 - Test Phase.md": ROADMAP_EVIDENCE,
@@ -2893,6 +2920,8 @@ def _evidence_repo(
     }
     if agents_md is not None:
         files["AGENTS.md"] = agents_md
+    if conventions_md is not None:
+        files["aidw/conventions.md"] = conventions_md
     _make_control_repo(tmp_path, files=files)
     return tmp_path
 
@@ -3215,6 +3244,117 @@ def test_l24_missing_gate_source_notes_the_section_unavailable(
     # The rest of the bundle is still present and usable.
     assert "docs/task-prompts/03-E4.1-prompt.md" in bundle
     assert "design.md §8.1" in bundle
+
+
+# ---------------------------------------------------------------------------
+# E7.3/D16 — the gate list's second channel: ``aidw/conventions.md``
+# ---------------------------------------------------------------------------
+
+
+def test_e73_gate_list_includes_conventions_md_commands_after_agents_md(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """R14: gate commands travel in ``conventions.md``, so the bundle must carry them.
+
+    Both sources are present: the section must contain both gate lists, AGENTS.md's
+    first (D16 order), each bounded by its own next ``## `` heading. The AGENTS.md-only
+    six-element assertions elsewhere stay unchanged — this fixture only adds the second
+    file.
+    """
+    _evidence_repo(
+        tmp_path, monkeypatch, conventions_md=CONVENTIONS_EVIDENCE_FIXTURE
+    )
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        allow_incomplete_prereqs=True,
+    )
+
+    assert code == 0
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    bundle = _evidence_path(tmp_path, run_id, "task-review-1").read_text(
+        encoding="utf-8"
+    )
+    gate_section = bundle.split("## Gate commands", 1)[1].split("## Base-branch", 1)[0]
+    # The AGENTS.md channel is still read exactly as before...
+    assert "target-repo-only gate --check" in gate_section
+    assert "uv run --frozen pytest" in gate_section
+    # ...and the conventions.md channel now contributes too.
+    assert "conventions-repo-only gate --strict" in gate_section
+    # D16 order: AGENTS.md, then aidw/conventions.md.
+    assert gate_section.index("target-repo-only") < gate_section.index(
+        "conventions-repo-only"
+    )
+    # Each source's section is bounded by its own next `## ` heading.
+    assert "This heading ends the gate section" not in gate_section
+    assert "This heading ends the conventions gate section" not in gate_section
+
+
+def test_e73_conventions_md_alone_supplies_the_gate_list(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A repo that publishes its gates only in ``conventions.md`` still gets a usable list.
+
+    No AGENTS.md at all, so a ``_gate_block`` that read only ``AGENTS.md`` would degrade to
+    ``unavailable`` here. Asserted on the section renderer directly: the workflow-level
+    proof above already covers the bundle wiring, and this needs no git fixture.
+    """
+    _evidence_repo(
+        tmp_path,
+        monkeypatch,
+        agents_md=None,
+        conventions_md=CONVENTIONS_EVIDENCE_FIXTURE,
+    )
+    repo = TargetRepo.resolve(tmp_path)
+
+    block = prompt_workflow._gate_block(repo)
+
+    assert block.startswith("## Gates")
+    assert "conventions-repo-only gate --strict" in block
+    assert "unavailable" not in block
+    assert "This heading ends the conventions gate section" not in block
+
+
+def test_e73_non_utf8_conventions_source_is_ignored_by_the_gate_block(
+    tmp_path: Path,
+) -> None:
+    """A malformed optional source must not crash the evidence-bundle reader.
+
+    The valid AGENTS.md gate list remains usable while the shared reader skips the
+    undecodable ``aidw/conventions.md`` source, matching the injection channel's
+    fail-closed behavior.
+    """
+    target = tmp_path / "target"
+    (target / "aidw").mkdir(parents=True)
+    (target / "AGENTS.md").write_text(AGENTS_EVIDENCE_FIXTURE, encoding="utf-8")
+    (target / "aidw" / "conventions.md").write_bytes(b"\xff invalid utf8")
+    repo = TargetRepo(root=target, git_dir=target / ".git", common_dir=target / ".git")
+
+    block = prompt_workflow._gate_block(repo)
+
+    assert "target-repo-only gate --check" in block
+    assert "unavailable" not in block
+    assert "conventions-repo-only" not in block
+
+
+def test_e73_no_source_still_degrades_the_gate_block(tmp_path: Path) -> None:
+    """Neither file: the unavailable note survives the second channel (L2.4 requirement 4).
+
+    Built as a bare :class:`TargetRepo` over a plain directory — ``_gate_block`` reads only
+    ``repo.root``, and a real git repo would buy process spawns for nothing.
+    """
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    repo = TargetRepo(root=plain, git_dir=plain / ".git", common_dir=plain / ".git")
+
+    assert prompt_workflow._gate_block(repo) == prompt_workflow._EVIDENCE_UNAVAILABLE
 
 
 # ---------------------------------------------------------------------------

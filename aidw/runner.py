@@ -37,7 +37,7 @@ from aidw.paths import (
     STAGE_ENV_VAR,
 )
 from aidw.progress import ProgressIndicator, resolve_enabled
-from aidw.prompts import render_prompt_file
+from aidw.prompts import inject_repo_conventions, render_prompt_file
 from aidw.report import cost_note
 from aidw.target_config import SOURCE_CONFIG, ResolvedConfig
 from aidw.state import (
@@ -654,6 +654,16 @@ def run_stage(
     rendered = render_prompt_file(spec.prompt, spec.variables)
     if spec.extra:
         rendered = f"{rendered}\n\n{spec.extra}"
+    # E7.3/D16: the *target* repo's conventions (root ``AGENTS.md`` then optional
+    # ``aidw/conventions.md``) reach exactly the four EXTRACTION.md §3.8 prompts, keyed by
+    # the resolved prompt basename rather than the stage id (``test.md`` runs as both
+    # ``test`` and ``iter{n}-test``). Applied last — after ``spec.extra`` — so the agent
+    # reads prompt body → stage extra → repo conventions, and both the written
+    # ``.rendered.md`` below and the stdin payload to Pi carry the same text. A repo with
+    # no conventions and a prompt outside the four both return the text unchanged, so this
+    # never adds noise or fails a stage. ``repo_root`` is the target root: reading
+    # ``toolkit_root()`` would pass every self-hosted test and break only after extraction.
+    rendered = inject_repo_conventions(rendered, spec.prompt, repo_root)
     directory = run_dir(runs_root, state.run_id)
     prompts_dir = directory / "prompts"
     prompts_dir.mkdir(parents=True, exist_ok=True)

@@ -468,11 +468,24 @@
     re-supply the five prompts' exact product text as `aidw/prompts/` overrides (§5.4, D14
     precedence 2).
 
-- [ ] **E7.3. Conventions injection (D16)**
+- [x] **E7.3. Conventions injection (D16)**
   Define how `AGENTS.md` and optional `<target>/aidw/conventions.md` reach the four prompts that need
   them, and implement it.
   - Deliverable: injection mechanism plus tests.
   - Done when: a fixture repo's `conventions.md` appears in the rendered prompt for the relevant stages, and its absence is not an error.
+  - Notes: delivered as the conventions channel in `aidw/prompts.py` (`CONVENTIONS_PROMPTS`,
+    `CONVENTIONS_SOURCES`, `read_conventions_sources`, `render_repo_conventions`,
+    `receives_repo_conventions`, `inject_repo_conventions`), its `run_stage` call site in
+    `aidw/runner.py` (after `spec.extra`, keyed on the *resolved* prompt basename, reading the
+    target `repo_root`), and the `aidw/workflows/prompt.py` gate source (`_gates_section` plus
+    the extended `_gate_block`, both D16 files through the same reader). Tests:
+    `tests/test_conventions_injection.py` and the E7.3 cases in `tests/test_prompt_workflow.py`.
+    No vector-matrix or coverage-catalog change: this repo has neither artifact
+    (`docs/rules-coverage/`, `tests/integration/`, the `srd:*` scripts) and E7.3 adds no Rules
+    Engine action and no implemented product claim, so nothing is eligible for matrix coverage.
+    Flags: an empty `aidw/conventions.md` is treated as absent (no dangling header), and the
+    evidence bundle's gate heading now names both D16 sources even when a repo has only
+    `AGENTS.md`.
 
 - [ ] **E7.4. Neutralise the agent guidance**
   Per §4.3: `agents/implementer/AGENTS.md`, `agents/recorder/AGENTS.md`,
