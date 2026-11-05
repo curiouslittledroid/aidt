@@ -17,7 +17,7 @@ import pytest
 
 from aidw import git, github, lock
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
-from aidw.state import SUCCEEDED, StageRecord, run_dir
+from aidw.state import FAILED, SUCCEEDED, StageRecord, run_dir
 from aidw.workflows import review as review_workflow
 
 #: ``worktree_repo`` checks the task branch out in ``<workspace>/task`` (§3.2).
@@ -57,13 +57,24 @@ def _runs_root(repo: Path) -> Path:
 
 
 class _FakeStages:
-    def __init__(self, review_text: str) -> None:
+    """Fake ``run_stage`` that writes stage outputs instead of invoking Pi.
+
+    ``honour_verify`` mirrors :func:`aidw.runner.run_stage`'s postcondition contract
+    (design §10): a stage can exit 0, have its declared ``verify`` re-read external state,
+    and still fail. Tests that assert on the postcondition need that, since the default
+    fake replaces ``run_stage`` wholesale and the check would never run.
+    """
+
+    def __init__(self, review_text: str, *, honour_verify: bool = False) -> None:
         self.names: list[str] = []
         self.repo_roots: list[Path] = []
+        self.specs: list = []
         self.review_text = review_text
+        self.honour_verify = honour_verify
 
     def __call__(self, spec, **kwargs):
         self.names.append(spec.name)
+        self.specs.append(spec)
         self.repo_roots.append(kwargs["repo_root"])
         directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
@@ -78,11 +89,18 @@ class _FakeStages:
                 "Summary comment: https://github.com/o/r/pull/7#issuecomment-1\n",
                 encoding="utf-8",
             )
+        status, error = SUCCEEDED, None
+        if self.honour_verify and spec.verify is not None:
+            verification = spec.verify()
+            if verification:
+                status = FAILED
+                error = f"postcondition not met: {verification}"
         record = StageRecord(
             name=spec.name,
             agent=spec.agent_id,
             model="test/model",
-            status=SUCCEEDED,
+            status=status,
+            error=error,
             artifacts={"out": str(out)},
         )
         kwargs["state"].record_stage(record)
@@ -319,6 +337,58 @@ def test_request_changes_publishes_and_records(worktree_repo, monkeypatch) -> No
     assert manifest["findings"][0]["id"] == "F1"
     recorded = json.loads((directory / "state.json").read_text(encoding="utf-8"))
     assert recorded["pr"][review_workflow.PR_FOLLOWUPS] is True
+
+
+def test_the_publisher_is_told_an_absolute_manifest_path(
+    worktree_repo, monkeypatch
+) -> None:
+    """E7.3's PR 110: a run-dir-relative pointer sent the publisher into the target repo.
+
+    The stage runs with the target repo as its cwd, so only an absolute path points at the
+    manifest the workflow actually wrote.
+    """
+    _patch(monkeypatch)
+    stages = _FakeStages(FINDINGS_REVIEW)
+    monkeypatch.setattr(review_workflow, "run_stage", stages)
+
+    assert review_workflow.run(pr=7, **_roots(worktree_repo.control)) == 0
+
+    extra = stages.specs[-1].extra
+    assert "relative to the repository root" not in extra
+    directory = next(_runs_root(worktree_repo.control).iterdir())
+    manifest = directory / "artifacts" / "review-manifest.json"
+    assert str(manifest) in extra
+    assert manifest.exists()
+
+
+def test_a_publisher_that_publishes_nothing_fails_the_review(
+    worktree_repo, monkeypatch
+) -> None:
+    """A silent non-publication must never be recorded as ``followups_published``.
+
+    PR 110's publisher could not find the manifest, stopped, reported the blocker and exited
+    0. The review was recorded as having published, so ``aidw fix`` failed one workflow
+    later with a confusing "no parent issue" error instead of this stage failing now.
+    """
+    _patch(monkeypatch)
+    monkeypatch.setattr(
+        github,
+        "verify_published",
+        lambda *args, **kwargs: (
+            "no review-follow-up parent issue exists for this PR: the publisher stage "
+            "reported success without publishing the findings"
+        ),
+    )
+    stages = _FakeStages(FINDINGS_REVIEW, honour_verify=True)
+    monkeypatch.setattr(review_workflow, "run_stage", stages)
+
+    code = review_workflow.run(pr=7, **_roots(worktree_repo.control))
+
+    assert code == 1
+    directory = next(_runs_root(worktree_repo.control).iterdir())
+    recorded = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    assert recorded["status"] == FAILED
+    assert review_workflow.PR_FOLLOWUPS not in recorded["pr"]
 
 
 def test_preflight_rejects_non_main_base(worktree_repo, monkeypatch) -> None:

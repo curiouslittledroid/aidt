@@ -1073,10 +1073,15 @@ def expand(workflow: str, /, **fields: Any) -> tuple[PlannedStage, ...]:
       (default ``"main"``, matching ``build_plan``).
     * ``prompt`` — ``phase``, ``epic``, ``task``, ``rel``, ``max_revisions``, and ``rounds``
       (one :class:`FixBatch` per fixing round, in order).
-    * ``review`` — ``pr``, ``manifest_rel``, ``findings`` (``True``/``False``; ``False``
+    * ``review`` — ``pr``, ``manifest_path``, ``findings`` (``True``/``False``; ``False``
       omits R2).
-    * ``fix`` — ``pr``, ``round_index``, ``iteration``, ``manifest_rel``.
+    * ``fix`` — ``pr``, ``round_index``, ``iteration``, ``manifest_path``.
     * ``approve`` — ``pr``.
+
+    ``manifest_path`` is the findings manifest's **absolute** path in the run directory.
+    It is rendered into the publisher stage's ``extra``, whose agent runs with the target
+    repo as its cwd — a relative value made the publisher look for the manifest in the
+    target tree and refuse to publish (E7.3's PR 110).
 
     Raises :class:`UnknownWorkflowError`, :class:`StageFieldError` or
     :class:`RevisionBudgetError` — never returns a silently shortened plan.

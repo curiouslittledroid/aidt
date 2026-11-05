@@ -207,7 +207,7 @@ def test_implement_plan_is_the_six_registry_stages(tmp_path: Path) -> None:
 def test_review_plan_is_r1_plus_the_r2_manifest_pointer(tmp_path: Path) -> None:
     root = _target(tmp_path)
     specs = _plan(
-        "review", root=root, pr=PR, manifest_rel=MANIFEST, findings=True
+        "review", root=root, pr=PR, manifest_path=MANIFEST, findings=True
     )
 
     assert [
@@ -221,7 +221,7 @@ def test_review_plan_is_r1_plus_the_r2_manifest_pointer(tmp_path: Path) -> None:
             "review-publisher",
             _toolkit_prompt("review-findings-to-github.md"),
             [str(PR)],
-            MANIFEST_EXTRA.format(manifest_rel=MANIFEST),
+            MANIFEST_EXTRA.format(manifest_path=MANIFEST),
         ),
     ]
 
@@ -234,7 +234,7 @@ def test_fix_plan_is_the_approval_plus_one_iteration(tmp_path: Path) -> None:
         pr=PR,
         round_index=1,
         iteration=1,
-        manifest_rel="artifacts/iter1-review-manifest.json",
+        manifest_path="artifacts/iter1-review-manifest.json",
     )
 
     assert [spec.id for spec in specs] == ["A1", "F1", "F2", "F3", "F4"]
@@ -250,7 +250,7 @@ def test_fix_plan_is_the_approval_plus_one_iteration(tmp_path: Path) -> None:
     )
     # F4's pointer names *this* iteration's manifest, the value a real run writes.
     assert specs[4].extra == MANIFEST_EXTRA.format(
-        manifest_rel="artifacts/iter1-review-manifest.json"
+        manifest_path="artifacts/iter1-review-manifest.json"
     )
     assert [spec.variables for spec in specs] == [[str(PR)], [str(PR)], [], [], [str(PR)]]
     # The approval postcondition is workflow-side: the plan never carries one.
@@ -790,7 +790,7 @@ def test_a_fix_repo_added_static_stage_precedes_the_iteration(
         pr=PR,
         round_index=1,
         iteration=1,
-        manifest_rel="artifacts/iter1-review-manifest.json",
+        manifest_path="artifacts/iter1-review-manifest.json",
     )
 
     assert [spec.name for spec in specs] == [
@@ -999,7 +999,7 @@ _FIELDS: dict[str, dict[str, object]] = {
         "pr": PR,
         "round_index": 1,
         "iteration": 1,
-        "manifest_rel": "artifacts/iter1-review-manifest.json",
+        "manifest_path": "artifacts/iter1-review-manifest.json",
     },
     "implement": {
         "prompt_rel": PROMPT_REL,
@@ -1014,7 +1014,7 @@ _FIELDS: dict[str, dict[str, object]] = {
         "max_revisions": 3,
         "rounds": (),
     },
-    "review": {"pr": PR, "manifest_rel": MANIFEST, "findings": True},
+    "review": {"pr": PR, "manifest_path": MANIFEST, "findings": True},
 }
 
 #: A stage id that exists in each workflow, so the overlay can name a real stage.
