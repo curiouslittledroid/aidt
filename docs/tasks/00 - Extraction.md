@@ -427,7 +427,7 @@
   - Deliverable: unchanged matching code paths, with tests pinning the semantics.
   - Done when: the review-followup test suite passes unmodified except for the new config plumbing.
 
-- [ ] **E6.3. Freeze test (the D5 guard)**
+- [x] **E6.3. Freeze test (the D5 guard)**
   A golden test asserting that the Mythical-Forge-shaped config yields byte-identical marker strings,
   label names, colours, descriptions and comment bodies to the `baseline-verbatim` tag.
   - Deliverable: the test.
