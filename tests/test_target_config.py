@@ -43,6 +43,7 @@ import ast
 import copy
 import dataclasses
 import fnmatch
+import importlib.util
 import inspect
 import json
 import pathlib
@@ -66,6 +67,7 @@ from aidw.target_config import (
     SOURCES,
     ConfigDefaults,
     ConfigOverrides,
+    LABEL_KEYS,
     GitHubConfig,
     LabelConfig,
     MarkersConfig,
@@ -1057,17 +1059,16 @@ def test_every_seeded_default_is_the_section_3_4_mythical_forge_value() -> None:
     assert TOOLKIT_DEFAULTS.paths.architecture_dir == "docs/architecture"
 
 
-def test_seeded_defaults_are_the_budget_and_the_mythical_forge_layout_only() -> None:
-    """Requirement 1/2: nothing else is seeded — no ``schema_version``, no ``github``."""
+def test_seeded_defaults_are_the_budget_the_layout_and_the_frozen_github_contracts() -> None:
+    """Requirement 1/2: nothing else is seeded — no ``schema_version``, no stages."""
     assert DEFAULT_MAX_REVISIONS == 3
     assert TOOLKIT_DEFAULTS.max_revisions == DEFAULT_MAX_REVISIONS
     # E3.1/E3.3 own the version fields: a missing config file has no resolved version,
     # and ``requires_toolkit`` is an optional pin, never a default.
     assert TOOLKIT_DEFAULTS.schema_version is None
     assert TOOLKIT_DEFAULTS.requires_toolkit is None
-    # E6 owns the frozen D5 markers/labels: present as empty slots, so they stay unset.
-    assert TOOLKIT_DEFAULTS.github == GitHubConfig(markers=MarkersConfig())
-    assert dict(TOOLKIT_DEFAULTS.github.labels) == {}
+    # E6.1 seeds the frozen D5 github values; they are pinned by name below.
+    assert set(TOOLKIT_DEFAULTS.github.labels) == FROZEN_LABEL_NAMES
     # E4.1 owns the stage-list defaults.
     assert dict(TOOLKIT_DEFAULTS.workflows) == {}
     assert {f.name for f in dataclasses.fields(ConfigDefaults)} >= {
@@ -1075,6 +1076,97 @@ def test_seeded_defaults_are_the_budget_and_the_mythical_forge_layout_only() -> 
         "paths",
         "github",
         "workflows",
+    }
+
+
+#: The six ``github.labels`` names, spelled out rather than derived from the module, so a
+#: dropped or renamed label fails here. Sorted, which is also the order ``resolve_config``
+#: walks them (open maps are visited in sorted name order).
+FROZEN_LABEL_NAMES = {
+    "approve-fix",
+    "could-fix",
+    "decision-pending",
+    "must-fix",
+    "review-follow-up",
+    "should-fix",
+}
+
+
+def test_seeded_markers_are_the_three_frozen_d5_templates() -> None:
+    """E6.1 req 1: the markers are templates, byte-identical to today's literals (D5).
+
+    Each asserted by name — never through a shared dict — because these three strings are
+    already persisted in live GitHub issues: renaming one orphans every existing
+    parent/child and makes the next publish create duplicates (§3.9).
+    """
+    markers = TOOLKIT_DEFAULTS.github.markers
+
+    assert markers is not None
+    assert markers.parent == "<!-- mythical-forge-review-followups: pr={pr_url} -->"
+    assert markers.child == (
+        "<!-- mythical-forge-review-follow-up: pr={pr_url} finding={finding_id} -->"
+    )
+    assert markers.summary == (
+        "<!-- mythical-forge-review-followups-summary: pr={pr_url} -->"
+    )
+
+
+def test_seeded_labels_are_the_six_frozen_d5_definitions() -> None:
+    """E6.1 req 1: names, colours and descriptions are ``constants.LABEL_DEFINITIONS``.
+
+    One assertion per label, so a changed colour or description names the label it broke.
+    """
+    labels = TOOLKIT_DEFAULTS.github.labels
+
+    assert labels["review-follow-up"] == LabelConfig(
+        color="5319E7", description="Review-generated task or parent issue"
+    )
+    assert labels["must-fix"] == LabelConfig(
+        color="B60205", description="Blocking review finding"
+    )
+    assert labels["should-fix"] == LabelConfig(
+        color="D93F0B", description="Non-blocking but recommended finding"
+    )
+    assert labels["could-fix"] == LabelConfig(
+        color="FBCA04", description="Limited review improvement or simplification"
+    )
+    assert labels["decision-pending"] == LabelConfig(
+        color="EDEDED", description="Human decision required before implementation"
+    )
+    assert labels["approve-fix"] == LabelConfig(
+        color="B8D64A", description="Human-approved review follow-up fix"
+    )
+
+
+def test_schema_version_only_config_resolves_every_github_leaf_from_the_defaults() -> None:
+    """E6.1 Done-when: a ``schema_version: 1``-only config resolves the frozen values.
+
+    Built in code, so the vector proves resolution itself supplies ``default`` provenance
+    for all three markers and all twelve label leaves — and that no leaf is left unset.
+    """
+    resolved = resolve_config(TargetConfig(schema_version=1))
+
+    for name, template in (
+        ("parent", TOOLKIT_DEFAULTS.github.markers.parent),
+        ("child", TOOLKIT_DEFAULTS.github.markers.child),
+        ("summary", TOOLKIT_DEFAULTS.github.markers.summary),
+    ):
+        assert resolved[f"github.markers.{name}"] == ResolvedValue(
+            template, SOURCE_DEFAULT
+        ), name
+
+    for name in sorted(FROZEN_LABEL_NAMES):
+        definition = TOOLKIT_DEFAULTS.github.labels[name]
+        assert resolved[f"github.labels.{name}.color"] == ResolvedValue(
+            definition.color, SOURCE_DEFAULT
+        ), name
+        assert resolved[f"github.labels.{name}.description"] == ResolvedValue(
+            definition.description, SOURCE_DEFAULT
+        ), name
+
+    assert {path for path, entry in resolved.items() if entry == ResolvedValue()} == {
+        "requires_toolkit",
+        "paths.agent_configs_dir",
     }
 
 
@@ -1130,6 +1222,86 @@ def test_the_two_repo_defaults_match_the_target_repo_dataclass() -> None:
     )
     assert TargetRepo.base_branch == TOOLKIT_DEFAULTS.repo.base_branch
     assert TargetRepo.branch_pattern == TOOLKIT_DEFAULTS.repo.branch_pattern
+
+
+#: The scripts are **not** importable as a package: they are copied into other repositories
+#: and loaded by path (their own ``tests/conftest.py`` puts the directory on ``sys.path``).
+#: Loading ``constants.py`` by path here is what lets the two homes be compared without
+#: ``target_config`` importing anything from ``prompts/``.
+REVIEW_FOLLOWUP_CONSTANTS = (
+    toolkit_root() / "prompts" / "scripts" / "review-followup" / "constants.py"
+)
+
+
+def _frozen_script_constants():
+    spec = importlib.util.spec_from_file_location(
+        "review_followup_constants_for_two_home_test", REVIEW_FOLLOWUP_CONSTANTS
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_script_frozen_literals_match_the_seeded_config_defaults() -> None:
+    """E6.1 req 2: the two homes of the D5 literals cannot drift.
+
+    The wheel ships only the ``aidw`` package, so ``aidw/target_config.py`` must not import
+    ``prompts/scripts/review-followup/constants.py`` — and the scripts are copied into other
+    repositories without ``aidw``, so neither import direction is available. The literals
+    therefore live in both places, and *this* test is what keeps them equal: editing one
+    without the other fails here rather than publishing a marker nobody searches for.
+
+    Deliberately a drift guard, not the authoritative freeze: E6.3's
+    ``baseline-verbatim`` golden is the byte-identity proof for a Mythical-Forge-shaped
+    config.
+    """
+    constants = _frozen_script_constants()
+
+    assert constants.PARENT_MARKER_TEMPLATE == TOOLKIT_DEFAULTS.github.markers.parent
+    assert constants.CHILD_MARKER_TEMPLATE == TOOLKIT_DEFAULTS.github.markers.child
+    assert constants.SUMMARY_MARKER_TEMPLATE == TOOLKIT_DEFAULTS.github.markers.summary
+
+    assert set(constants.LABEL_DEFINITIONS) == set(TOOLKIT_DEFAULTS.github.labels)
+    for name, definition in constants.LABEL_DEFINITIONS.items():
+        seeded = TOOLKIT_DEFAULTS.github.labels[name]
+        assert definition["color"] == seeded.color, name
+        assert definition["description"] == seeded.description, name
+
+    # The accessors render the frozen templates (keyed ``.format``), so the literal above is
+    # what the scripts actually emit when no config is present.
+    assert constants.parent_marker("U") == constants.PARENT_MARKER_TEMPLATE.format(
+        pr_url="U"
+    )
+    assert constants.child_marker("U", "F1") == constants.CHILD_MARKER_TEMPLATE.format(
+        pr_url="U", finding_id="F1"
+    )
+    assert constants.summary_marker("U") == constants.SUMMARY_MARKER_TEMPLATE.format(
+        pr_url="U"
+    )
+
+
+def test_neither_home_imports_the_other_or_reads_configuration() -> None:
+    """Req 2/4: the layering holds, and the frozen fallback stays a fallback."""
+    from aidw import target_config
+
+    imported_by_target_config = _imported_modules(inspect.getsource(target_config))
+    assert not any(
+        "prompts" in module or "review" in module or "constants" in module
+        for module in imported_by_target_config
+    )
+    # ``constants.py`` imports nothing but ``__future__`` — no env parsing, no config, no
+    # aidw: it stays the frozen standalone fallback.
+    assert _imported_modules(
+        REVIEW_FOLLOWUP_CONSTANTS.read_text(encoding="utf-8")
+    ) == {"__future__"}
+    # And it does not *read* the handoff variable: that parsing is ``gh.py``'s (req 3).
+    # The name may appear in a comment explaining the arrangement; ``os.environ``/
+    # ``getenv`` may not appear at all.
+    constants_source = REVIEW_FOLLOWUP_CONSTANTS.read_text(encoding="utf-8")
+    assert "os.environ" not in constants_source
+    assert "getenv" not in constants_source
+    assert "json" not in _imported_modules(constants_source)
 
 
 def test_undeclared_max_revisions_resolves_to_the_default(tmp_path: Path) -> None:
@@ -1190,8 +1362,8 @@ def test_partial_config_resolves_defaults_and_leaves_only_unseeded_leaves_unset(
     assert resolved["repo.branch_pattern"] == ResolvedValue(
         "{phase}-{task}", SOURCE_DEFAULT
     )
-    # After E3.4/E4.6 the only unseeded leaves are ``requires_toolkit``, E4.6's override
-    # directory (no default on purpose) and the E6 markers.
+    # After E3.4/E4.6/E6.1 the only unseeded leaves are ``requires_toolkit`` and E4.6's
+    # override directory (no default on purpose); the markers resolve the frozen defaults.
     assert {
         path
         for path, entry in resolved.items()
@@ -1199,10 +1371,10 @@ def test_partial_config_resolves_defaults_and_leaves_only_unseeded_leaves_unset(
     } == {
         "requires_toolkit",
         "paths.agent_configs_dir",
-        "github.markers.parent",
-        "github.markers.child",
-        "github.markers.summary",
     }
+    assert resolved["github.markers.parent"] == ResolvedValue(
+        TOOLKIT_DEFAULTS.github.markers.parent, SOURCE_DEFAULT
+    )
 
 
 #: The eight §3.4 ``repo:``/``paths:`` leaves and D17's Mythical Forge values, spelled
@@ -1231,8 +1403,8 @@ def test_schema_version_only_config_resolves_the_mythical_forge_layout() -> None
         assert resolved[path] == ResolvedValue(value, SOURCE_DEFAULT), path
         assert resolved[path].is_set is True
 
-    # Every other leaf is either the E3.2 budget, E4.6's unset override dir, or still
-    # unseeded; no E6/E4.1 value.
+    # Every other leaf is the E3.2 budget, E4.6's unset override dir, E6.1's frozen D5
+    # github values, or still unseeded (E4.1's stage lists).
     assert set(resolved) == {
         "schema_version",
         "requires_toolkit",
@@ -1242,9 +1414,15 @@ def test_schema_version_only_config_resolves_the_mythical_forge_layout() -> None
         "github.markers.parent",
         "github.markers.child",
         "github.markers.summary",
+        *(f"github.labels.{name}.{key}" for name in FROZEN_LABEL_NAMES for key in LABEL_KEYS),
     }
-    assert not any(path.startswith(("github.labels.", "workflows.")) for path in resolved)
+    assert not any(path.startswith("workflows.") for path in resolved)
     assert resolved["max_revisions"] == ResolvedValue(3, SOURCE_DEFAULT)
+    # The seeded github leaves all resolve ``default`` — none is left unset.
+    for path in resolved:
+        if path.startswith("github."):
+            assert resolved[path].source == SOURCE_DEFAULT, path
+            assert resolved[path].is_set is True, path
 
 
 def test_schema_version_only_config_file_through_the_loader_resolves_the_layout(
@@ -1320,16 +1498,30 @@ def test_declared_markers_and_labels_carry_config_provenance(tmp_path: Path) -> 
     )
 
     assert resolved["github.markers.parent"] == ResolvedValue("<!-- p -->", SOURCE_CONFIG)
-    assert resolved["github.markers.child"] == ResolvedValue()
-    assert resolved["github.markers.summary"] == ResolvedValue()
+    # The declared marker beats its two defaults; the undeclared siblings keep theirs.
+    assert resolved["github.markers.child"] == ResolvedValue(
+        TOOLKIT_DEFAULTS.github.markers.child, SOURCE_DEFAULT
+    )
+    assert resolved["github.markers.summary"] == ResolvedValue(
+        TOOLKIT_DEFAULTS.github.markers.summary, SOURCE_DEFAULT
+    )
     assert resolved["github.labels.must-fix.color"] == ResolvedValue(
         "B60205", SOURCE_CONFIG
     )
     assert resolved["github.labels.must-fix.description"] == ResolvedValue(
         "Blocking", SOURCE_CONFIG
     )
-    # Open maps contribute only the keys the config declared (E6 seeds defaults later).
-    assert not any(path.startswith("github.labels.could-fix") for path in resolved)
+    # Precedence is per leaf: the declared label's siblings resolve the seeded defaults, and
+    # a label the config never mentioned resolves both of its fields from the toolkit.
+    assert resolved["github.labels.could-fix.color"] == ResolvedValue(
+        TOOLKIT_DEFAULTS.github.labels["could-fix"].color, SOURCE_DEFAULT
+    )
+    assert resolved["github.labels.could-fix.description"] == ResolvedValue(
+        TOOLKIT_DEFAULTS.github.labels["could-fix"].description, SOURCE_DEFAULT
+    )
+    assert resolved["github.labels.review-follow-up.color"] == ResolvedValue(
+        "5319E7", SOURCE_DEFAULT
+    )
 
 
 def test_workflow_stages_are_one_whole_list_entry(tmp_path: Path) -> None:

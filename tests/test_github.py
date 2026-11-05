@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
 from aidw import github
+from aidw.paths import REVIEW_FOLLOWUP_CONFIG_ENV_VAR
 
 
 def test_build_publish_argv_with_pr() -> None:
@@ -104,7 +106,7 @@ def test_verify_approvals_holds_when_no_open_child_needs_changes(monkeypatch) ->
     monkeypatch.setattr(
         github,
         "run_script",
-        lambda argv, repo, timeout: _script_result(
+        lambda argv, repo, timeout, **_kwargs: _script_result(
             _approve_children("already-approved", "preserved-closed")
         ),
     )
@@ -116,7 +118,7 @@ def test_verify_approvals_reports_children_still_pending(monkeypatch) -> None:
     monkeypatch.setattr(
         github,
         "run_script",
-        lambda argv, repo, timeout: _script_result(
+        lambda argv, repo, timeout, **_kwargs: _script_result(
             _approve_children("already-approved", "would-approve")
         ),
     )
@@ -130,7 +132,7 @@ def test_verify_approvals_reports_a_read_failure(monkeypatch) -> None:
     monkeypatch.setattr(
         github,
         "run_script",
-        lambda argv, repo, timeout: _script_result("", exit_code=2, stderr="gh: not authenticated"),
+        lambda argv, repo, timeout, **_kwargs: _script_result("", exit_code=2, stderr="gh: not authenticated"),
     )
 
     error = github.verify_approvals(Path("/aidt"), Path("/repo"), 7)
@@ -144,7 +146,7 @@ def test_verify_approvals_rejects_unparseable_output(monkeypatch) -> None:
     monkeypatch.setattr(
         github,
         "run_script",
-        lambda argv, repo, timeout: _script_result("not json"),
+        lambda argv, repo, timeout, **_kwargs: _script_result("not json"),
     )
 
     error = github.verify_approvals(Path("/aidt"), Path("/repo"), 7)
@@ -155,7 +157,7 @@ def test_verify_approvals_rejects_unparseable_output(monkeypatch) -> None:
 def test_verify_approvals_runs_a_read_only_command(monkeypatch) -> None:
     seen: dict = {}
 
-    def _capture(argv, repo, timeout):
+    def _capture(argv, repo, timeout, **_kwargs):
         seen["argv"] = argv
         return _script_result(_approve_children("already-approved"))
 
@@ -166,3 +168,173 @@ def test_verify_approvals_runs_a_read_only_command(monkeypatch) -> None:
     assert "approve" in seen["argv"]
     assert "--dry-run" in seen["argv"]
     assert "--pr" in seen["argv"]
+
+
+# ---------------------------------------------------------------------------
+# E6.1: the resolved github.markers/github.labels handoff
+# ---------------------------------------------------------------------------
+#
+# One vector per behaviour: the payload shape and its values, the env reaching the
+# subprocess through both callers that run a bundled script, the same callers leaving the
+# variable *absent* when no config is threaded, and the read-only helpers never carrying it
+# (they are ``gh`` calls, not bundled scripts).
+
+
+def _resolved_defaults():
+    from aidw.target_config import TargetConfig, resolve_config
+
+    return resolve_config(TargetConfig(schema_version=1))
+
+
+def _resolved_with_override():
+    """Defaults merged under a declared marker + label, as a real repo config resolves."""
+    from aidw.target_config import (
+        GitHubConfig,
+        LabelConfig,
+        MarkersConfig,
+        TargetConfig,
+        resolve_config,
+    )
+
+    return resolve_config(
+        TargetConfig(
+            schema_version=1,
+            github=GitHubConfig(
+                markers=MarkersConfig(parent="<!-- declared: pr={pr_url} -->"),
+                labels={
+                    "must-fix": LabelConfig(
+                        color="111111", description="Declared blocking"
+                    )
+                },
+            ),
+        )
+    )
+
+
+def test_serialize_github_config_emits_the_handoff_shape() -> None:
+    payload = json.loads(github.serialize_github_config(_resolved_defaults()))
+
+    assert set(payload) == {"markers", "labels"}
+    assert payload["markers"] == {
+        "parent": "<!-- mythical-forge-review-followups: pr={pr_url} -->",
+        "child": (
+            "<!-- mythical-forge-review-follow-up: pr={pr_url} "
+            "finding={finding_id} -->"
+        ),
+        "summary": "<!-- mythical-forge-review-followups-summary: pr={pr_url} -->",
+    }
+    # Labels are enumerated from the resolved entries: the six seeded definitions, each
+    # exactly a colour and a description.
+    assert set(payload["labels"]) == {
+        "review-follow-up",
+        "must-fix",
+        "should-fix",
+        "could-fix",
+        "decision-pending",
+        "approve-fix",
+    }
+    assert payload["labels"]["must-fix"] == {
+        "color": "B60205",
+        "description": "Blocking review finding",
+    }
+    assert all(set(entry) == {"color", "description"} for entry in payload["labels"].values())
+
+
+def test_serialize_github_config_carries_declared_overrides_with_the_defaults() -> None:
+    payload = json.loads(github.serialize_github_config(_resolved_with_override()))
+
+    assert payload["markers"]["parent"] == "<!-- declared: pr={pr_url} -->"
+    # Undeclared siblings still come from the toolkit defaults.
+    assert payload["markers"]["child"].startswith("<!-- mythical-forge-review-follow-up:")
+    assert payload["labels"]["must-fix"] == {
+        "color": "111111",
+        "description": "Declared blocking",
+    }
+    assert payload["labels"]["approve-fix"]["color"] == "B8D64A"
+
+
+def _capture_subprocess(monkeypatch) -> dict:
+    seen: dict = {}
+    stdout = _approve_children("already-approved")
+
+    def _fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(github.subprocess, "run", _fake_run)
+    return seen
+
+
+def test_select_followups_carries_the_handoff_to_the_script(monkeypatch) -> None:
+    seen = _capture_subprocess(monkeypatch)
+    config = _resolved_with_override()
+
+    github.select_followups(Path("/aidt"), Path("/repo"), 7, config=config)
+
+    assert seen["env"] is not None
+    assert seen["env"][REVIEW_FOLLOWUP_CONFIG_ENV_VAR] == github.serialize_github_config(
+        config
+    )
+
+
+def test_verify_approvals_carries_the_handoff_to_the_script(monkeypatch) -> None:
+    seen = _capture_subprocess(monkeypatch)
+    config = _resolved_defaults()
+
+    assert github.verify_approvals(Path("/aidt"), Path("/repo"), 7, config=config) is None
+    assert seen["env"][REVIEW_FOLLOWUP_CONFIG_ENV_VAR] == github.serialize_github_config(
+        config
+    )
+
+
+def test_script_callers_leave_the_variable_absent_without_a_config(monkeypatch) -> None:
+    """``config=None`` is "unset", never an empty payload: the script must fall back."""
+    seen = _capture_subprocess(monkeypatch)
+
+    github.select_followups(Path("/aidt"), Path("/repo"), 7)
+
+    # The child gets a copied environment with any inherited handoff removed, so the
+    # scripts take their frozen constants fallback rather than a stale or partial handoff.
+    assert seen["env"] is not None
+    assert REVIEW_FOLLOWUP_CONFIG_ENV_VAR not in seen["env"]
+
+
+def test_script_callers_remove_a_stale_inherited_handoff_without_a_config(monkeypatch) -> None:
+    """``config=None`` must not accidentally reuse a caller's stale repo configuration."""
+    monkeypatch.setenv(REVIEW_FOLLOWUP_CONFIG_ENV_VAR, '{"stale": true}')
+    seen = _capture_subprocess(monkeypatch)
+
+    github.select_followups(Path("/aidt"), Path("/repo"), 7)
+
+    # ``None`` means the default/frozen path, not "inherit whatever handoff the parent
+    # process happened to have". The subprocess environment must explicitly omit it.
+    assert seen["env"] is not None
+    assert REVIEW_FOLLOWUP_CONFIG_ENV_VAR not in seen["env"]
+
+
+def test_read_only_gh_helpers_never_carry_the_handoff(monkeypatch) -> None:
+    """``repo_slug``/``pr_view`` are ``gh`` reads, not bundled scripts: no env channel."""
+    calls: list[tuple] = []
+
+    def _capture(argv, repo, timeout=github.DEFAULT_TIMEOUT, **kwargs):
+        calls.append((argv, kwargs))
+        return 1, "", ""
+
+    monkeypatch.setattr(github, "_run", _capture)
+
+    github.repo_slug(Path("/repo"))
+    github.pr_view(Path("/repo"), 7)
+
+    assert len(calls) == 2
+    assert all(kwargs == {} for _argv, kwargs in calls)
+
+
+def test_argv_builders_carry_no_env_channel() -> None:
+    """Req 6(b): the argv builders are argv-only; the env travels through the runner."""
+    publish = github.build_publish_argv(Path("/s.py"), 7, Path("/m.json"))
+    followup = github.build_followup_argv(Path("/s.py"), "select", 7)
+
+    assert all(isinstance(part, str) for part in publish + followup)
+    assert "--input" in publish
+    assert followup[2] == "select"

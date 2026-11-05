@@ -116,15 +116,32 @@ EXPECTED_DEFAULTS: dict[str, str] = {
     "model": "unset",
     "thinking": "unset",
     "timeout_seconds": "unset",
-    # github: markers / labels (E6's defaults, unseeded today)
+    # github: markers / labels. The two containers stay "unset" (a mapping key has no value
+    # of its own; its leaves resolve individually), the three marker leaves carry the frozen
+    # D5 templates (E6.1), and a label entry's two fields are required.
     "markers": "unset",
     "labels": "unset",
-    "parent": "unset",
-    "child": "unset",
-    "summary": "unset",
+    "parent": f"`{TOOLKIT_DEFAULTS.github.markers.parent}`",
+    "child": f"`{TOOLKIT_DEFAULTS.github.markers.child}`",
+    "summary": f"`{TOOLKIT_DEFAULTS.github.markers.summary}`",
     "color": "required",
     "description": "required",
 }
+
+#: The twelve ``github.labels`` leaves a ``schema_version``-only config resolves from the
+#: seeded defaults (E6.1): six names, two fields each.
+MINIMAL_LABEL_PATHS = frozenset(
+    f"github.labels.{name}.{key}"
+    for name in (
+        "approve-fix",
+        "could-fix",
+        "decision-pending",
+        "must-fix",
+        "review-follow-up",
+        "should-fix",
+    )
+    for key in ("color", "description")
+)
 
 MINIMAL_PATHS = frozenset(
     {
@@ -143,6 +160,7 @@ MINIMAL_PATHS = frozenset(
         "github.markers.parent",
         "github.markers.child",
         "github.markers.summary",
+        *MINIMAL_LABEL_PATHS,
     }
 )
 
@@ -458,19 +476,46 @@ def test_minimal_resolves_to_the_mythical_forge_layout(tmp_path: Path):
         "paths.build_results_template": "docs/implementation-results/TEMPLATE.md",
         "paths.architecture_dir": "docs/architecture",
         "paths.agent_configs_dir": None,
-        "github.markers.parent": None,
-        "github.markers.child": None,
-        "github.markers.summary": None,
+        "github.markers.parent": (
+            "<!-- mythical-forge-review-followups: pr={pr_url} -->"
+        ),
+        "github.markers.child": (
+            "<!-- mythical-forge-review-follow-up: pr={pr_url} finding={finding_id} -->"
+        ),
+        "github.markers.summary": (
+            "<!-- mythical-forge-review-followups-summary: pr={pr_url} -->"
+        ),
+        "github.labels.review-follow-up.color": "5319E7",
+        "github.labels.review-follow-up.description": (
+            "Review-generated task or parent issue"
+        ),
+        "github.labels.must-fix.color": "B60205",
+        "github.labels.must-fix.description": "Blocking review finding",
+        "github.labels.should-fix.color": "D93F0B",
+        "github.labels.should-fix.description": (
+            "Non-blocking but recommended finding"
+        ),
+        "github.labels.could-fix.color": "FBCA04",
+        "github.labels.could-fix.description": (
+            "Limited review improvement or simplification"
+        ),
+        "github.labels.decision-pending.color": "EDEDED",
+        "github.labels.decision-pending.description": (
+            "Human decision required before implementation"
+        ),
+        "github.labels.approve-fix.color": "B8D64A",
+        "github.labels.approve-fix.description": (
+            "Human-approved review follow-up fix"
+        ),
     }
-    # Provenance: the eight seeded repo/paths leaves and the budget come from the defaults,
-    # the declared schema version from the file, and the unseeded fields are unset —
-    # including E4.6's `paths.agent_configs_dir`, which has no toolkit default on purpose.
+    # Provenance: the seeded repo/paths leaves, the budget and the frozen D5 github values
+    # come from the defaults; the declared schema version from the file; and only
+    # `requires_toolkit` and E4.6's `paths.agent_configs_dir` (no toolkit default on
+    # purpose) are unset.
     for path, entry in resolved.items():
         if path == "schema_version":
             assert entry.source == SOURCE_CONFIG
-        elif path in {"requires_toolkit", "paths.agent_configs_dir"} or path.startswith(
-            "github.markers."
-        ):
+        elif path in {"requires_toolkit", "paths.agent_configs_dir"}:
             assert entry.source is None, f"{path} must resolve unset"
         else:
             assert entry.source == SOURCE_DEFAULT, f"{path} must resolve from the defaults"

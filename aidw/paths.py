@@ -215,6 +215,18 @@ class TargetRepo:
 #: working directory would point inside the *target* repository, not the toolkit.
 SCRIPTS_DIR_ENV_VAR = "AIDW_SCRIPTS_DIR"
 
+#: Environment variable carrying the target repo's **resolved** ``github.markers`` and
+#: ``github.labels`` to the bundled review-followup scripts (EXTRACTION.md §3.4/§3.9, D5;
+#: task E6.1). One JSON object, so the standalone scripts stay stdlib-only and never read
+#: ``aidw/config.yaml``: ``{"markers": {parent, child, summary}, "labels": {name: {color,
+#: description}}}`` with defaults merged and provenance dropped. Set at both invocation
+#: seams — the agent's stage environment (:func:`aidw.runner.run_stage`) and aidw's own
+#: script runs (:func:`aidw.github._run`) — because a mismatch between the marker the
+#: publisher writes and the one ``select`` searches for silently finds no parent issue.
+#: ``prompts/scripts/review-followup/gh.py`` owns the parsing; that copy of the literal is
+#: deliberate, because the scripts are copied into other repositories without ``aidw``.
+REVIEW_FOLLOWUP_CONFIG_ENV_VAR = "AIDW_REVIEW_FOLLOWUP_CONFIG"
+
 #: Environment variables the stage runner sets so a gate the *agent* runs lands in the
 #: right run state (EXTRACTION.md E4.8). ``aidw gate run`` reads them to record an
 #: outcome against the run and stage that produced it, which is what lets a later stage

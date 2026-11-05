@@ -129,18 +129,22 @@ merged element-wise, so a stage you omit is not inherited from the default.
 These are the strings **already written into live GitHub issues** (D5, §3.9). Freeze means the
 values become per-repo config whose defaults are today's literals; parent lookup is an exact
 string match, so renaming one orphans every existing parent/child and causes duplicate issue
-creation on the next publish. The frozen D5 defaults are **E6's** to seed: until then every field
-in this block resolves `unset`, and the §3.4 literals in the Full example below are declarations,
-not toolkit defaults.
+creation on the next publish. The defaults below *are* those literals (E6.1), so a config that
+does not mention this block resolves the Mythical Forge values and changes nothing in GitHub.
 
 #### `github.markers`
 
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `markers` | mapping | unset | The fixed three-marker object; any other marker key is a typo and an error. |
-| `parent` | string | unset | The parent-issue marker template, with `{pr_url}` substituted; it is also what parent lookup matches (the review-followup scripts' `find_parent_issues`). |
-| `child` | string | unset | The child-issue marker template, with `{pr_url}` and `{finding_id}` substituted. |
-| `summary` | string | unset | The summary-comment marker template, with `{pr_url}` substituted. |
+| `parent` | string | `<!-- mythical-forge-review-followups: pr={pr_url} -->` | The parent-issue marker template, with `{pr_url}` substituted; it is also what parent lookup matches (the review-followup scripts' `find_parent_issues`). |
+| `child` | string | `<!-- mythical-forge-review-follow-up: pr={pr_url} finding={finding_id} -->` | The child-issue marker template, with `{pr_url}` and `{finding_id}` substituted. |
+| `summary` | string | `<!-- mythical-forge-review-followups-summary: pr={pr_url} -->` | The summary-comment marker template, with `{pr_url}` substituted. |
+
+The values are **templates**, rendered with keyed `str.format` (`pr_url`, and `finding_id` for
+`child`). A template with a stray `{` or an unknown placeholder cannot render, so it is refused
+with a clear error before any marker is written — never a half-rendered marker or a silent
+fallback to the default.
 
 #### `github.labels`
 
@@ -153,10 +157,30 @@ description, and both are required.
 | `color` | string | required | The label colour, six hex digits as GitHub stores it (`B60205`, no leading `#`). |
 | `description` | string | required | The label description. |
 
+The six definitions that ship as defaults — the same names, colours and descriptions already on
+live issues — are:
+
+| Label name | `color` | `description` |
+|---|---|---|
+| `review-follow-up` | `5319E7` | Review-generated task or parent issue |
+| `must-fix` | `B60205` | Blocking review finding |
+| `should-fix` | `D93F0B` | Non-blocking but recommended finding |
+| `could-fix` | `FBCA04` | Limited review improvement or simplification |
+| `decision-pending` | `EDEDED` | Human decision required before implementation |
+| `approve-fix` | `B8D64A` | Human-approved review follow-up fix |
+
+A repo may declare more labels; they are definitions, and the publisher's own obligation stays
+the fixed five (the six above minus `approve-fix`, which the approval step creates on demand).
+
+The comment bodies (`Status: in progress`, `Status: fixed`, `Decision: approve-fix`) and the role
+label names are **not** config: §3.4 has no field for them and D5 freezes them, so they stay in
+the scripts' `constants.py`.
+
 ## Toolkit defaults
 
 A value the config file does not declare resolves from `TOOLKIT_DEFAULTS` (§3.4, D17). The seeded
-set is exactly design §12's revision budget plus the eight `repo:`/`paths:` leaves — nothing else:
+set is design §12's revision budget, the eight `repo:`/`paths:` leaves and the frozen D5 GitHub
+strings — nothing else:
 
 - `max_revisions` = `3` (`aidw.target_config.DEFAULT_MAX_REVISIONS`).
 - `repo.base_branch` = `main`.
@@ -167,6 +191,8 @@ set is exactly design §12's revision budget plus the eight `repo:`/`paths:` lea
 - `paths.implementation_results_dir` = `docs/implementation-results`.
 - `paths.build_results_template` = `docs/implementation-results/TEMPLATE.md`.
 - `paths.architecture_dir` = `docs/architecture`.
+- `github.markers.parent`, `.child`, `.summary` = the three marker templates above.
+- `github.labels.<name>.color`/`.description` = the six label definitions above.
 
 `paths.agent_configs_dir` is deliberately **not** seeded: its consumer falls back to
 `<toolkit>/agent-configs/`, and seeding a repo-relative directory would make every repo
@@ -177,7 +203,7 @@ Mythical-Forge-shaped config file is near-empty and doubles as the Typical examp
 that differs must override the fields it differs on; the defaults are not guesses about what a
 generic repo might want.
 
-**Unset, not defaulted.** Five things have **no toolkit default**, and a document that presented
+**Unset, not defaulted.** Three things have **no toolkit default**, and a document that presented
 them as already-defaulting would be wrong about `resolve_config`'s output today:
 
 - `schema_version` — required *in* a config file, and unset when there is no file at all. It is
@@ -186,10 +212,9 @@ them as already-defaulting would be wrong about `resolve_config`'s output today:
 - `requires_toolkit` — an optional pin, never a default.
 - `paths.agent_configs_dir` — optional, and unset means "use the toolkit's own
   `agent-configs/`" rather than a repo-relative default (E4.6).
-- `github.markers.*` and `github.labels.*` — the frozen D5 values become defaults in **E6**.
-  Until then a config that does not declare them resolves them unset.
-- `workflows.*` — the default stage registry is **E4.1's**. Until then a workflow the config does
-  not declare has no resolved entries at all.
+
+A workflow name the config does not declare has no `workflows.*` entries at all: the default
+stage registry is **E4.1's** and contributes no resolved values.
 
 ## Override precedence
 
@@ -275,10 +300,10 @@ defaults.
 schema_version: 1
 ```
 
-Resolves to the full Mythical Forge layout — `repo.*` and the six defaulted `paths.*` leaves from
-`TOOLKIT_DEFAULTS` with source `default`, `max_revisions` `3` (`default`) and `schema_version` `1`
-(`config`). `requires_toolkit`, `paths.agent_configs_dir`, `github.markers.*` and every
-`workflows.*` entry resolve `unset`.
+Resolves to the full Mythical Forge layout — `repo.*`, the six defaulted `paths.*` leaves,
+`max_revisions` `3` and the three markers plus twelve label leaves from `TOOLKIT_DEFAULTS`, all
+with source `default`, and `schema_version` `1` (`config`). Only `requires_toolkit` and
+`paths.agent_configs_dir` resolve `unset`, and there is no `workflows.*` entry at all.
 
 ### Typical — the defaults echoed explicitly
 
@@ -303,7 +328,8 @@ Resolves to exactly the same **values** as Minimal. Only the provenance differs:
 
 §3.4's own example, with `max_revisions` added — a loader-accepted top-level key that §3.4's
 snippet omits. `github.markers` and `github.labels` carry Mythical Forge's frozen D5 literals:
-declaring them is what pins them, since the toolkit seeds no defaults for them until E6.
+declaring them pins them in the file, so `aidw config show` reports them `config` instead of
+`default`. The values are identical either way — that is the point of the freeze.
 
 ```yaml
 schema_version: 1

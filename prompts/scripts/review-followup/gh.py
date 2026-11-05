@@ -8,19 +8,103 @@ here.
 Every command runs through :mod:`proc`, which uses an argument array and no
 shell. Comment bodies are passed on stdin via ``--body-file -``, so markdown,
 backticks, apostrophes, and ``$`` are never re-interpreted.
+
+This module also owns the **config handoff** (EXTRACTION.md §3.4/§3.9, D5; task E6.1).
+AIDT resolves the target repo's ``github.markers``/``github.labels`` and passes them to
+these standalone scripts in one environment variable, :data:`CONFIG_ENV_VAR`, as a JSON
+object ``{"markers": {name: template}, "labels": {name: {color, description}}}`` carrying
+fully-resolved values (toolkit defaults merged, provenance dropped). The scripts never
+read ``aidw/config.yaml`` themselves — they have no YAML dependency and no idea where the
+target root is.
+
+The contract is *absent → fallback, present-but-broken → fail closed*:
+
+- unset variable → the frozen :mod:`constants` values, byte-identical to the standalone
+  behaviour before E6.1;
+- present but unparseable, missing a marker/label field a script needs, or carrying a
+  template that cannot render under the keyed ``str.format`` its accessor performs → the
+  module refuses at import, with a clear message and exit code 2, **before** anything is
+  published. Silently falling back would publish a wrong marker, and a marker rename
+  orphans every existing parent/child (D5), so a wrong publish is worse than a stop.
+
+Marker templates are validated at that same resolution step by rendering them with probe
+values through the accessors' own keyed argument table (:data:`_MARKER_ARGS`), so a
+template can never pass validation and then raise mid-publish: there is no half-published
+issue and no mid-run crash.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 from dataclasses import dataclass, field
 
-from constants import parent_marker
+from constants import (
+    CHILD_MARKER_TEMPLATE,
+    EXIT_ERROR,
+    LABEL_DEFINITIONS as FROZEN_LABEL_DEFINITIONS,
+    PARENT_MARKER_TEMPLATE,
+    SUMMARY_MARKER_TEMPLATE,
+)
 from logic import ChildIssue
 from proc import CommandError, probe, run
 
 GH = "gh"
+
+#: The environment variable aidw sets on every bundled-script invocation that carries the
+#: resolved ``github.markers``/``github.labels`` (EXTRACTION.md §3.4/§3.9, D5; E6.1).
+#: ``aidw.paths.REVIEW_FOLLOWUP_CONFIG_ENV_VAR`` is the same literal on the toolkit side;
+#: the scripts are standalone and deliberately duplicate it rather than import aidw.
+CONFIG_ENV_VAR = "AIDW_REVIEW_FOLLOWUP_CONFIG"
+
+#: The keyword arguments each accessor passes to ``str.format`` (E6.1 req 5). One table for
+#: both validation and rendering, so the two cannot drift: a template that renders at the
+#: resolution step necessarily renders when its accessor is called.
+_MARKER_ARGS: dict[str, tuple[str, ...]] = {
+    "parent": ("pr_url",),
+    "child": ("pr_url", "finding_id"),
+    "summary": ("pr_url",),
+}
+
+#: Probe values for the resolution-step render check. Concrete (not ``{"pr_url": ""}``) so
+#: a template that only fails for a non-empty URL still fails here, not at publish time.
+_MARKER_PROBES: dict[str, str] = {
+    "pr_url": "https://github.com/o/r/pull/1",
+    "finding_id": "F1",
+}
+
+#: The label names a script actually reads: the six frozen role labels of
+#: :data:`constants.LABEL_DEFINITIONS` (``PUBLISHER_LABELS`` plus ``approve-fix``). Derived
+#: from that mapping — never a re-typed list — so a role rename cannot leave this behind.
+#: A handoff that omits one is refused rather than silently publishing an undefined label;
+#: *extra* labels are allowed, because a repo may add its own (the map is open, D5/§3.9).
+_REQUIRED_LABELS: tuple[str, ...] = tuple(FROZEN_LABEL_DEFINITIONS)
+
+
+def _render_marker(templates: dict[str, str], name: str, **values: str) -> str:
+    """Render one marker template with exactly the arguments its accessor passes."""
+    return templates[name].format(
+        **{arg: values[arg] for arg in _MARKER_ARGS[name]}
+    )
+
+
+def parent_marker(pr_url: str) -> str:
+    """Exact parent-issue body marker, from the resolved (or frozen) template."""
+    return _render_marker(_MARKER_TEMPLATES, "parent", pr_url=pr_url)
+
+
+def child_marker(pr_url: str, finding_id: str) -> str:
+    """Exact child-issue body marker, one per review finding."""
+    return _render_marker(
+        _MARKER_TEMPLATES, "child", pr_url=pr_url, finding_id=finding_id
+    )
+
+
+def summary_marker(pr_url: str) -> str:
+    """Exact marker on the single PR summary comment."""
+    return _render_marker(_MARKER_TEMPLATES, "summary", pr_url=pr_url)
 
 
 @dataclass
@@ -145,7 +229,9 @@ def list_comments(repo: str, issue_number: int) -> list[dict]:
 def find_parent_issues(repo: str, pr_url: str) -> list[ParentIssue]:
     """Find parent issues whose body carries the exact ``pr=<canonical PR URL>`` marker.
 
-    Returns every match; the caller decides whether the ambiguity is fatal.
+    The marker is the *effective* one (:func:`parent_marker`), so a configured template and
+    the publish path agree. Returns every match; the caller decides whether the ambiguity
+    is fatal.
     """
     marker = parent_marker(pr_url)
     parents: list[ParentIssue] = []
@@ -380,3 +466,145 @@ def issue_url(repo: str, number: int) -> str:
 
 def labels_of(issue: GhIssue) -> set[str]:
     return set(issue.labels)
+
+
+# ── Config handoff (E6.1) ─────────────────────────────────────────────────
+
+
+class ConfigError(Exception):
+    """A malformed ``AIDW_REVIEW_FOLLOWUP_CONFIG`` handoff.
+
+    Never swallowed: :func:`_load_config` turns it into a clear message and exit code 2 at
+    import time, because silently falling back to the frozen literals would publish a
+    different marker than the one aidw resolved (D5).
+    """
+
+
+def _config_error(detail: str) -> ConfigError:
+    return ConfigError(
+        f"{CONFIG_ENV_VAR} is set but unusable: {detail}. Unset it to use the bundled "
+        f"frozen markers/labels, or pass a JSON object "
+        f'{{"markers": {{parent, child, summary}}, "labels": {{name: '
+        f'{{color, description}}}}}}.'
+    )
+
+
+def _marker_templates(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        raise _config_error("`markers` must be a JSON object")
+    templates: dict[str, str] = {}
+    for name in _MARKER_ARGS:
+        if name not in raw:
+            raise _config_error(f"`markers.{name}` is missing")
+        value = raw[name]
+        if not isinstance(value, str):
+            raise _config_error(f"`markers.{name}` must be a string")
+        templates[name] = value
+    return templates
+
+
+def _label_definitions(raw: object) -> dict[str, dict[str, str]]:
+    if not isinstance(raw, dict):
+        raise _config_error("`labels` must be a JSON object")
+    labels: dict[str, dict[str, str]] = {}
+    for name, entry in raw.items():
+        if not isinstance(name, str) or not name:
+            raise _config_error("`labels` keys must be non-empty strings")
+        if not isinstance(entry, dict):
+            raise _config_error(f"`labels.{name}` must be a JSON object")
+        values: dict[str, str] = {}
+        for key in ("color", "description"):
+            value = entry.get(key)
+            if not isinstance(value, str):
+                raise _config_error(f"`labels.{name}.{key}` must be a string")
+            values[key] = value
+        labels[name] = values
+    missing = [name for name in _REQUIRED_LABELS if name not in labels]
+    if missing:
+        raise _config_error(f"`labels` is missing {', '.join(missing)}")
+    return labels
+
+
+def _validate_templates(templates: dict[str, str]) -> None:
+    """Prove every template renders under the keyed ``.format`` its accessor performs.
+
+    A stray ``{`` raises ``ValueError``, an unknown placeholder ``KeyError``, and a
+    positional placeholder ``IndexError``. All three are caught here, at the one
+    resolution step, so the failure is a clear stop **before** any marker renders rather
+    than a traceback after some issues have already been written (E6.1 req 3/req 5).
+    """
+    for name, args in _MARKER_ARGS.items():
+        try:
+            templates[name].format(**{arg: _MARKER_PROBES[arg] for arg in args})
+        except (AttributeError, KeyError, ValueError, IndexError) as error:
+            raise _config_error(
+                f"`markers.{name}` template {templates[name]!r} does not render with "
+                f"{', '.join('{' + arg + '}' for arg in args)} ({error})"
+            ) from error
+
+
+def parse_config_json(text: str) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    """Parse one handoff payload into the effective marker templates and label definitions.
+
+    Pure (no environment, no I/O) so the contract is unit-testable. Raises
+    :class:`ConfigError` for anything malformed — including a syntactically valid payload
+    whose marker template cannot render. Both returned containers are fresh, so a caller
+    can keep them for the process lifetime without aliasing the frozen ``constants``.
+    """
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise _config_error(f"not valid JSON ({error})") from error
+    if not isinstance(payload, dict):
+        raise _config_error("the payload must be a JSON object")
+    # Unknown top-level keys are *tolerated*, not refused: only ``markers`` and ``labels``
+    # are read, the fields the scripts need are validated below, and a copied copy of these
+    # standalone scripts outliving one aidw release must not refuse a newer payload over a
+    # key it does not use. A typo'd key still fails closed — as a *missing* required field.
+    # Markers first, then their render check, then labels: the first defect reported is the
+    # one that would otherwise break a publish (a template that cannot render), and a
+    # template problem is never masked by a label problem in the same payload.
+    templates = _marker_templates(payload.get("markers"))
+    _validate_templates(templates)
+    labels = _label_definitions(payload.get("labels"))
+    return templates, labels
+
+
+def _frozen_config() -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    """The standalone defaults: the frozen ``constants`` literals, freshly copied."""
+    return (
+        {
+            "parent": PARENT_MARKER_TEMPLATE,
+            "child": CHILD_MARKER_TEMPLATE,
+            "summary": SUMMARY_MARKER_TEMPLATE,
+        },
+        {
+            name: dict(definition)
+            for name, definition in FROZEN_LABEL_DEFINITIONS.items()
+        },
+    )
+
+
+def _load_config() -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    """Resolve the effective markers/labels once, at import.
+
+    Absent variable → the frozen fallback (the standalone case). Present → the handoff,
+    validated; anything wrong exits 2 with one ``error:`` line and writes nothing.
+
+    An *empty* value counts as present-but-broken rather than absent: aidw's serializer
+    never emits one, so an empty value means a shell or wrapper mangled the handoff, and a
+    silent fallback there is exactly the wrong-marker publish D5 forbids.
+    """
+    raw = os.environ.get(CONFIG_ENV_VAR)
+    if raw is None:
+        return _frozen_config()
+    try:
+        return parse_config_json(raw)
+    except ConfigError as error:
+        sys.stderr.write(f"error: {error}\n")
+        raise SystemExit(EXIT_ERROR) from error
+
+
+#: The three marker templates in force for this process, keyed ``parent``/``child``/
+#: ``summary``; :func:`parent_marker` and friends render these.
+_MARKER_TEMPLATES, LABEL_DEFINITIONS = _load_config()

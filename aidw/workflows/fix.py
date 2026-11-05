@@ -199,7 +199,7 @@ def _approval_round(
     )
     spec = planned[f"round{round_index}-approve-review-followups"]
     name = spec.name
-    selection = github.select_followups(aidt, repo, pr)
+    selection = github.select_followups(aidt, repo, pr, config=config)
     outcome = decide(
         GATE_FOLLOWUPS,
         _followup_summary(selection, round_index),
@@ -229,13 +229,17 @@ def _approval_round(
     record = run_stage(
         # The approval postcondition is workflow-side, not stage data (E4.3 req 5): the
         # registry knows the stage, only this workflow knows how to verify the approvals.
-        replace(spec, verify=lambda: github.verify_approvals(aidt, repo, pr)),
+        replace(
+            spec,
+            verify=lambda: github.verify_approvals(aidt, repo, pr, config=config),
+        ),
         repo_root=repo,
         toolkit_root=aidt,
         runs_root=runs_root,
         state=state,
         logger=logger,
         agents=agents,
+        config=config,
     )
     print_stage(record, repo_root=repo)
     if record.status != SUCCEEDED:
@@ -486,7 +490,9 @@ def run(
         if dry_run:
             script = github.script_path(aidt.root, github.FOLLOWUP_SCRIPT)
             if github.gh_available():
-                selection = github.select_followups(aidt.root, repo.root, pr)
+                selection = github.select_followups(
+                    aidt.root, repo.root, pr, config=resolved_config
+                )
                 payload = github.parse_json_output(selection.stdout) or {}
                 if selection.exit_code == github.EXIT_NONE_AVAILABLE:
                     print("child:  none available")
@@ -531,6 +537,7 @@ def run(
                     logger=logger,
                     agents=agents,
                     dry_run=True,
+                    config=resolved_config,
                 )
                 note = (
                     " (only when F3 reports findings)"
@@ -582,7 +589,9 @@ def run(
                 save(directory, state)
                 return 3
 
-            selection = github.select_followups(aidt.root, repo.root, pr)
+            selection = github.select_followups(
+                aidt.root, repo.root, pr, config=resolved_config
+            )
             payload = github.parse_json_output(selection.stdout) or {}
             if selection.exit_code == github.EXIT_NONE_AVAILABLE:
                 break
@@ -626,6 +635,7 @@ def run(
                 state=state,
                 logger=logger,
                 agents=agents,
+                config=resolved_config,
             )
             print_stage(record, repo_root=repo.root)
             if record.status != SUCCEEDED:
@@ -643,6 +653,7 @@ def run(
                 state=state,
                 logger=logger,
                 agents=agents,
+                config=resolved_config,
             )
             print_stage(record, repo_root=repo.root)
             if record.status != SUCCEEDED:
@@ -660,6 +671,7 @@ def run(
                 state=state,
                 logger=logger,
                 agents=agents,
+                config=resolved_config,
             )
             print_stage(record, repo_root=repo.root)
             if record.status != SUCCEEDED:
@@ -725,6 +737,7 @@ def run(
                     state=state,
                     logger=logger,
                     agents=agents,
+                    config=resolved_config,
                 )
                 print_stage(record, repo_root=repo.root)
                 if record.status != SUCCEEDED:

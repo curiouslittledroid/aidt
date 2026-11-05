@@ -64,6 +64,10 @@ def _planned_stage(*, pr: int, config, aidt: Path, repo: Path) -> list[StageSpec
     approvals were actually applied, so it is attached to the planned spec rather than
     being stage data the registry would have to carry. The gate itself is decided in
     :func:`run` before any stage, so a repo-added stage never gates the approval.
+
+    ``config`` is the one already-resolved config for this run: it plans the stages and it
+    is the handoff the approval postcondition passes on (E6.1), so ``verify_approvals``
+    re-reads the same markers aidw resolved rather than the frozen fallbacks.
     """
     plan = plan_stages(
         "approve",
@@ -73,7 +77,10 @@ def _planned_stage(*, pr: int, config, aidt: Path, repo: Path) -> list[StageSpec
         pr=pr,
     )
     return [
-        replace(spec, verify=lambda: github.verify_approvals(aidt, repo, pr))
+        replace(
+            spec,
+            verify=lambda: github.verify_approvals(aidt, repo, pr, config=config),
+        )
         if spec.id == "A1"
         else spec
         for spec in plan
@@ -234,7 +241,9 @@ def run(
 
         if dry_run:
             if github.gh_available():
-                selection = github.select_followups(aidt.root, repo.root, pr)
+                selection = github.select_followups(
+                    aidt.root, repo.root, pr, config=resolved_config
+                )
                 payload = github.parse_json_output(selection.stdout) or {}
                 if selection.exit_code == github.EXIT_NONE_AVAILABLE:
                     print("child:  none available")
@@ -271,6 +280,7 @@ def run(
                     logger=logger,
                     agents=agents,
                     dry_run=True,
+                    config=resolved_config,
                 )
                 print(
                     f"{record.name} [{record.status}] (planned) "
@@ -282,7 +292,9 @@ def run(
             print("dry-run complete; Pi not invoked, no GitHub state written")
             return 0
 
-        selection = github.select_followups(aidt.root, repo.root, pr)
+        selection = github.select_followups(
+            aidt.root, repo.root, pr, config=resolved_config
+        )
         outcome = decide(
             GATE,
             _selection_summary(selection),
@@ -326,6 +338,7 @@ def run(
                 state=state,
                 logger=logger,
                 agents=agents,
+                config=resolved_config,
             )
             print_stage(record, repo_root=repo.root)
             if record.status != SUCCEEDED:

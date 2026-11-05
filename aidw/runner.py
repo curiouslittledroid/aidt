@@ -27,7 +27,15 @@ from aidw.agents import build_argv, build_env, prompt_template_dirs
 from aidw.config import ERROR, AgentConfig, Issue, format_issues, load_all
 from aidw.log import RunLogger
 from aidw.pi import PiResult, execute, write_meta
-from aidw.paths import RUN_ID_ENV_VAR, SCRIPTS_DIR_ENV_VAR, STAGE_ENV_VAR
+# ``runner -> github`` adds no cycle: ``aidw.github`` imports stdlib plus ``aidw.paths``
+# only, and ``ResolvedConfig`` is already imported below (E6.1).
+from aidw.github import serialize_github_config
+from aidw.paths import (
+    REVIEW_FOLLOWUP_CONFIG_ENV_VAR,
+    RUN_ID_ENV_VAR,
+    SCRIPTS_DIR_ENV_VAR,
+    STAGE_ENV_VAR,
+)
 from aidw.progress import ProgressIndicator, resolve_enabled
 from aidw.prompts import render_prompt_file
 from aidw.report import cost_note
@@ -600,6 +608,7 @@ def run_stage(
     retry_transient: bool | None = None,
     show_progress: bool | None = None,
     runs_root: Path,
+    config: ResolvedConfig | None = None,
 ) -> StageRecord:
     """Execute (or plan) one stage and persist its record in ``state``.
 
@@ -607,6 +616,14 @@ def run_stage(
     agent config once (:func:`_effective_agent`), so the rendered argv, Pi's timeout, run
     state, stage metadata and the cost note all describe the same invocation. The loaded
     config and every other stage's are left untouched.
+
+    E6.1: ``config`` is the workflow's already-resolved target config. When set, the stage
+    environment carries the resolved ``github.markers``/``github.labels`` as
+    :data:`aidw.paths.REVIEW_FOLLOWUP_CONFIG_ENV_VAR`, so a script the *agent* invokes (the
+    review publisher under R2, or a fix-round ``review_followup.py``) publishes and searches
+    for the same markers and labels aidw resolved. ``None`` leaves the variable unset — the
+    scripts' frozen fallbacks, byte-identical to the toolkit defaults — which is what keeps
+    callers that pass nothing working. The config is never re-loaded or re-resolved here.
     """
     if retry_transient is None:
         retry_transient = DEFAULT_RETRY_TRANSIENT
@@ -669,6 +686,15 @@ def run_stage(
     # in the environment it inherits, not in its prompt.
     env[RUN_ID_ENV_VAR] = state.run_id
     env[STAGE_ENV_VAR] = spec.name
+    # The resolved GitHub contracts travel to the scripts the stage invokes (E6.1). Set
+    # after the agent's `env:` overrides for the same reason as `AIDW_SCRIPTS_DIR`: the one
+    # resolved value cannot be shadowed per agent. `None` means "not configured" — the
+    # variable is then *absent*, never partially populated, so the scripts take their
+    # frozen fallback instead of failing closed on an empty handoff.
+    if config is None:
+        env.pop(REVIEW_FOLLOWUP_CONFIG_ENV_VAR, None)
+    else:
+        env[REVIEW_FOLLOWUP_CONFIG_ENV_VAR] = serialize_github_config(config)
 
     record = StageRecord(
         name=spec.name,

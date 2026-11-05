@@ -4,19 +4,47 @@ Safety rule: AIDT **reads** GitHub only through ``gh`` (read-only, structured JS
 **writes** only through AIDT's bundled Python scripts under
 ``aidt/prompts/scripts/review-followup/``. Python never calls ``gh issue create``,
 ``gh pr comment``, or a mutating ``gh api`` method directly.
+
+This module is also the toolkit side of the **config handoff** to those scripts (E6.1,
+EXTRACTION.md §3.4/§3.9, D5): :func:`serialize_github_config` turns a resolved
+:class:`~aidw.target_config.ResolvedConfig`'s ``github.markers.*``/``github.labels.*``
+leaves into the JSON one environment variable carries
+(:data:`aidw.paths.REVIEW_FOLLOWUP_CONFIG_ENV_VAR`). Both invocation seams use this one
+serializer — the stage environment (:func:`aidw.runner.run_stage`, so agent-invoked
+scripts inherit it) and aidw's own script runs (:func:`_run`) — because a repository whose
+publisher writes one marker while ``select`` searches for another silently finds no parent
+issue.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from aidw.paths import REVIEW_FOLLOWUP_CONFIG_ENV_VAR
+
+if TYPE_CHECKING:  # stdlib-only at runtime: the annotation below is never evaluated.
+    from aidw.target_config import ResolvedConfig
 
 GH = "gh"
+
+#: The three marker names, in ``constants.py``/``§3.4`` order. A typo here would ask the
+#: scripts for a template they do not validate, so the serializer refuses a missing leaf
+#: instead of emitting a partial payload.
+MARKER_NAMES = ("parent", "child", "summary")
+
+#: The two fields every ``github.labels.<name>`` entry carries (§3.4, D5).
+LABEL_FIELDS = ("color", "description")
+
+_MARKERS_PREFIX = "github.markers."
+_LABELS_PREFIX = "github.labels."
 
 SCRIPT_DIR = ("prompts", "scripts", "review-followup")
 PUBLISH_SCRIPT = "publish_review_followups.py"
@@ -58,7 +86,99 @@ def gh_available() -> bool:
     return shutil.which(GH) is not None
 
 
-def _run(argv: list[str], repo: Path, timeout: int = DEFAULT_TIMEOUT) -> tuple[int, str, str]:
+# --------------------------------------------------------------------------- #
+# Config handoff (E6.1)
+# --------------------------------------------------------------------------- #
+
+
+def serialize_github_config(config: ResolvedConfig) -> str:
+    """Serialize a resolved config's GitHub leaves as the scripts' handoff JSON (E6.1).
+
+    The payload is exactly what ``prompts/scripts/review-followup/gh.py`` parses:
+
+    .. code-block:: json
+
+        {"markers": {"parent": "…", "child": "…", "summary": "…"},
+         "labels": {"<name>": {"color": "…", "description": "…"}}}
+
+    Label names are **enumerated from the resolved entries**, never a hardcoded list: a
+    repo-added label resolves a leaf like any other, and ``resolve_config`` merges the
+    seeded definitions underneath the declared ones, so the payload always carries the
+    fully-resolved set (a repo that overrides one colour still sends the other five).
+
+    The parameter is a ``ResolvedConfig``, read through its ``Mapping`` interface (a
+    dotted path -> ``ResolvedValue``); the import is ``TYPE_CHECKING``-only so this module
+    stays a stdlib-only leaf at runtime.
+
+    A missing/unset marker leaf is a ``ValueError``, not an omission: aidw always resolves
+    the three from :data:`~aidw.target_config.TOOLKIT_DEFAULTS`, so a hole means the caller
+    passed a hand-built config, and emitting it would make the script fail closed later
+    with a much less specific message. Pure: no I/O, no mutation.
+    """
+    entries = config
+    markers: dict[str, str] = {}
+    for name in MARKER_NAMES:
+        entry = entries.get(_MARKERS_PREFIX + name)
+        value = getattr(entry, "value", None)
+        if entry is None or value is None:
+            raise ValueError(
+                f"cannot serialize the review-followup config: `github.markers.{name}` "
+                "did not resolve"
+            )
+        markers[name] = str(value)
+
+    labels: dict[str, dict[str, str]] = {}
+    for path in entries:
+        if not path.startswith(_LABELS_PREFIX):
+            continue
+        name, _, key = path[len(_LABELS_PREFIX) :].rpartition(".")
+        if not name or key not in LABEL_FIELDS:
+            continue
+        entry = entries[path]
+        value = getattr(entry, "value", None)
+        if value is None:
+            continue
+        labels.setdefault(name, {})[key] = str(value)
+
+    # A label with only one of its two fields would be rejected by the script anyway; do
+    # it here, where the message can name the unresolved leaf.
+    for name, definition in labels.items():
+        missing = [key for key in LABEL_FIELDS if key not in definition]
+        if missing:
+            raise ValueError(
+                f"cannot serialize the review-followup config: "
+                f"`github.labels.{name}.{missing[0]}` did not resolve"
+            )
+
+    return json.dumps({"markers": markers, "labels": labels})
+
+
+# --------------------------------------------------------------------------- #
+# Process execution
+# --------------------------------------------------------------------------- #
+
+
+def _run(
+    argv: list[str],
+    repo: Path,
+    timeout: int = DEFAULT_TIMEOUT,
+    *,
+    config: ResolvedConfig | None = None,
+) -> tuple[int, str, str]:
+    """Run ``argv`` in ``repo``; with ``config``, carry the resolved GitHub handoff.
+
+    ``config=None`` leaves :data:`REVIEW_FOLLOWUP_CONFIG_ENV_VAR` out of the child
+    environment entirely — the scripts then use their frozen fallbacks, which is
+    byte-identical to the toolkit defaults (E6.1). The read-only ``gh`` helpers
+    (:func:`repo_slug`/:func:`pr_view`) never pass it; only the bundled-script callers do.
+    """
+    env = {
+        **os.environ,
+    }
+    if config is None:
+        env.pop(REVIEW_FOLLOWUP_CONFIG_ENV_VAR, None)
+    else:
+        env[REVIEW_FOLLOWUP_CONFIG_ENV_VAR] = serialize_github_config(config)
     try:
         result = subprocess.run(
             argv,
@@ -67,6 +187,7 @@ def _run(argv: list[str], repo: Path, timeout: int = DEFAULT_TIMEOUT) -> tuple[i
             text=True,
             check=False,
             timeout=timeout,
+            env=env,
         )
     except FileNotFoundError as exc:
         return 127, "", str(exc)
@@ -138,26 +259,44 @@ def build_followup_argv(
     return argv
 
 
-def run_script(argv: list[str], repo: Path, timeout: int = 600) -> ScriptResult:
-    code, out, err = _run(argv, repo, timeout)
+def run_script(
+    argv: list[str],
+    repo: Path,
+    timeout: int = 600,
+    *,
+    config: ResolvedConfig | None = None,
+) -> ScriptResult:
+    code, out, err = _run(argv, repo, timeout, config=config)
     return ScriptResult(argv=argv, exit_code=code, stdout=out, stderr=err)
 
 
 def select_followups(
-    aidt: Path, repo: Path, pr: int, timeout: int = DEFAULT_TIMEOUT
+    aidt: Path,
+    repo: Path,
+    pr: int,
+    timeout: int = DEFAULT_TIMEOUT,
+    *,
+    config: ResolvedConfig | None = None,
 ) -> ScriptResult:
     """Read-only ``review_followup.py select`` for the PR's next approved child.
 
     Exit code ``3`` means there is no available child; the stdout still carries JSON
-    (``selected: null`` plus the skipped reasons).
+    (``selected: null`` plus the skipped reasons). ``config`` carries the resolved
+    ``github.markers``/``github.labels`` so the search uses the same parent marker the
+    publisher writes (E6.1); ``None`` means "do not set the handoff" (toolkit defaults).
     """
     script = script_path(aidt, FOLLOWUP_SCRIPT)
     argv = build_followup_argv(script, "select", pr)
-    return run_script(argv, repo, timeout)
+    return run_script(argv, repo, timeout, config=config)
 
 
 def verify_approvals(
-    aidt: Path, repo: Path, pr: int, timeout: int = DEFAULT_TIMEOUT
+    aidt: Path,
+    repo: Path,
+    pr: int,
+    timeout: int = DEFAULT_TIMEOUT,
+    *,
+    config: ResolvedConfig | None = None,
 ) -> str | None:
     """Read-only postcondition for the approve stage: every open child is approved.
 
@@ -170,7 +309,7 @@ def verify_approvals(
     """
     script = script_path(aidt, FOLLOWUP_SCRIPT)
     argv = build_followup_argv(script, "approve", pr, dry_run=True)
-    result = run_script(argv, repo, timeout)
+    result = run_script(argv, repo, timeout, config=config)
     if result.exit_code != 0:
         detail = (result.stderr or result.stdout).strip()[:300]
         return (

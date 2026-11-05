@@ -567,10 +567,22 @@ CONFIG_KEYS = {
 #: The six E1.6 root entries, kept intact by E3.2.
 CONFIG_ROOT_KEYS = CONFIG_KEYS - {"config"}
 
+#: The six ``github.labels`` names in the resolver's walk order: ``resolve_config`` visits
+#: an open map in sorted name order, and ``config show`` prints the leaves in resolution
+#: order, so the leaf tuple below is the real output order (asserted line-by-line).
+CONFIG_LABEL_NAMES = (
+    "approve-fix",
+    "could-fix",
+    "decision-pending",
+    "must-fix",
+    "review-follow-up",
+    "should-fix",
+)
+
 #: Every §3.4 leaf resolved by ``resolve_config`` for a repo with no config file:
-#: ``max_revisions`` (E3.2), the eight ``repo:``/``paths:`` values (E3.4), and the
-#: ``github.markers`` leaves E6 still owns. Only the declared-only leaves are *unset*
-#: after E3.4.
+#: ``max_revisions`` (E3.2), the eight ``repo:``/``paths:`` values (E3.4), E4.6's unset
+#: override directory, and E6.1's frozen ``github.markers``/``github.labels`` values. Only
+#: the declared-only leaves are *unset* now.
 CONFIG_LEAF_PATHS = (
     "schema_version",
     "requires_toolkit",
@@ -587,9 +599,16 @@ CONFIG_LEAF_PATHS = (
     "github.markers.parent",
     "github.markers.child",
     "github.markers.summary",
+    *(
+        f"github.labels.{name}.{key}"
+        for name in CONFIG_LABEL_NAMES
+        for key in ("color", "description")
+    ),
 )
 
-#: E3.4's eight §3.4 defaults (D17/R7), as ``config show`` must report them.
+#: E3.4's eight §3.4 defaults (D17/R7) and E6.1's frozen D5 GitHub literals, spelled out
+#: literally (never read from the module) so a changed default fails here, at the operator's
+#: debug surface, and not only in the resolver's own tests.
 CONFIG_DEFAULT_LEAVES = {
     "repo.base_branch": "main",
     "repo.branch_pattern": "{phase}-{task}",
@@ -599,19 +618,43 @@ CONFIG_DEFAULT_LEAVES = {
     "paths.implementation_results_dir": "docs/implementation-results",
     "paths.build_results_template": "docs/implementation-results/TEMPLATE.md",
     "paths.architecture_dir": "docs/architecture",
+    "github.markers.parent": "<!-- mythical-forge-review-followups: pr={pr_url} -->",
+    "github.markers.child": (
+        "<!-- mythical-forge-review-follow-up: pr={pr_url} finding={finding_id} -->"
+    ),
+    "github.markers.summary": (
+        "<!-- mythical-forge-review-followups-summary: pr={pr_url} -->"
+    ),
+    "github.labels.approve-fix.color": "B8D64A",
+    "github.labels.approve-fix.description": "Human-approved review follow-up fix",
+    "github.labels.could-fix.color": "FBCA04",
+    "github.labels.could-fix.description": (
+        "Limited review improvement or simplification"
+    ),
+    "github.labels.decision-pending.color": "EDEDED",
+    "github.labels.decision-pending.description": (
+        "Human decision required before implementation"
+    ),
+    "github.labels.must-fix.color": "B60205",
+    "github.labels.must-fix.description": "Blocking review finding",
+    "github.labels.review-follow-up.color": "5319E7",
+    "github.labels.review-follow-up.description": (
+        "Review-generated task or parent issue"
+    ),
+    "github.labels.should-fix.color": "D93F0B",
+    "github.labels.should-fix.description": (
+        "Non-blocking but recommended finding"
+    ),
 }
 
 #: The leaves with **no** toolkit default: ``schema_version``/``requires_toolkit`` are
-#: declared-only (E3.1/E3.3) and the ``github.markers`` values are E6's. In a no-config
-#: repo they are the only leaves ``config show`` prints as ``unset``.
+#: declared-only (E3.1/E3.3) and E4.6's override directory has none on purpose. In a
+#: no-config repo they are the only leaves ``config show`` prints as ``unset``.
 CONFIG_UNSET_LEAVES = (
     "schema_version",
     "requires_toolkit",
     # E4.6: the global agent-config override dir is unset, not defaulted.
     "paths.agent_configs_dir",
-    "github.markers.parent",
-    "github.markers.child",
-    "github.markers.summary",
 )
 
 
@@ -833,15 +876,29 @@ def test_config_show_dumps_a_declared_config_by_dotted_path(
         "source": "config",
     }
     # E3.4: an undeclared sibling resolves its own §3.4 default, independently.
+    assert config["paths.roadmap_dir"] == {"value": "docs/tasks", "source": "default"}
     assert config["repo.branch_pattern"] == {
         "value": "{phase}-{task}",
         "source": "default",
     }
-    assert config["paths.roadmap_dir"] == {"value": "docs/tasks", "source": "default"}
-    # ...and the E3.2 budget still resolves as ``default``, while E6's markers stay unset.
+    # ...and the E3.2 budget still resolves as ``default``, E6.1's markers resolve their
+    # frozen defaults, while the declared-only pin stays unset.
     assert config["max_revisions"] == {"value": 3, "source": "default"}
     assert config["requires_toolkit"] == {"value": None}
-    assert config["github.markers.parent"] == {"value": None}
+    assert config["github.markers.parent"] == {
+        "value": "<!-- mythical-forge-review-followups: pr={pr_url} -->",
+        "source": "default",
+    }
+    # The declared label's fields are ``config``; every other label (and the three markers)
+    # resolve the seeded defaults, per leaf.
+    assert config["github.labels.must-fix.description"] == {
+        "value": "Blocking",
+        "source": "config",
+    }
+    assert config["github.labels.should-fix.color"] == {
+        "value": "D93F0B",
+        "source": "default",
+    }
 
 
 def test_config_show_human_renders_declared_and_unset_leaves(
@@ -879,9 +936,19 @@ def test_config_show_human_renders_declared_and_unset_leaves(
         "paths.build_results_template: "
         "docs/implementation-results/TEMPLATE.md (default)" in lines
     )
-    # The still-unseeded leaves (E3.3's optional pin, E6's markers) print ``unset``.
+    # The still-unseeded leaves (E3.3's optional pin, E4.6's override dir) print ``unset``.
     assert "requires_toolkit: unset" in lines
-    assert "github.markers.parent: unset" in lines
+    assert "paths.agent_configs_dir: unset" in lines
+    # E6.1: the frozen D5 markers/labels now resolve ``default`` and render inline.
+    assert (
+        "github.markers.parent: <!-- mythical-forge-review-followups: pr={pr_url} --> "
+        "(default)" in lines
+    )
+    assert "github.labels.must-fix.color: B60205 (default)" in lines
+    assert (
+        "github.labels.approve-fix.description: Human-approved review follow-up fix "
+        "(default)" in lines
+    )
     assert f"config file: {config_path.resolve()} (target repo)" in lines
 
 

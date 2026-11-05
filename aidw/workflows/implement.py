@@ -668,6 +668,7 @@ def run(
                     logger=logger,
                     agents=agents,
                     dry_run=True,
+                    config=resolved_config,
                 )
                 print(f"{entry.id} {record.name} [{record.status}] (planned) "
                       f"agent={record.agent} model={record.model}")
@@ -717,6 +718,7 @@ def run(
                 state=state,
                 logger=logger,
                 agents=agents,
+                config=resolved_config,
             )
             print_stage(record, repo_root=target.root, prefix=entry.id)
             if record.status != SUCCEEDED:
@@ -865,6 +867,7 @@ def run(
                 state=state,
                 logger=logger,
                 agents=agents,
+                config=resolved_config,
             )
             print_stage(record, repo_root=target.root, prefix=pr_plan.id)
             if record.status != SUCCEEDED:
@@ -891,6 +894,7 @@ def run(
                 state=state,
                 logger=logger,
                 agents=agents,
+                config=resolved_config,
             )
             print_stage(record, repo_root=target.root, prefix=spec.id)
             if record.status != SUCCEEDED:
