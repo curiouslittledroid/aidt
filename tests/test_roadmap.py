@@ -1,13 +1,25 @@
-"""Tests for roadmap parsing."""
+"""Tests for roadmap parsing (``aidw/roadmap.py``, design §11, roadmap-format.md).
+
+The complete roadmap body these tests parse is **not** inline. Since E5.4 the canonical
+example is the fenced block in ``docs/roadmap-format.md`` §9 and it is read from the doc's
+current bytes on every run through ``tests/conftest.py``'s ``roadmap_example`` fixture, so
+the doc and the parser cannot drift (EXTRACTION.md §3.7). The inline bodies that remain —
+``OTHER_FIXTURE``, ``PROPERTY_BODY`` and the synthetic filenames — are *selection
+mechanics* inputs (ordering, glob/regex pre-selection), not format examples.
+"""
 
 from __future__ import annotations
 
 import random
+import re
+from collections.abc import Callable
 from fnmatch import fnmatch
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from aidw.roadmap import (
     _FILENAME_RE,
+    RoadmapTask,
     derive_epic,
     filter_tasks,
     find_task,
@@ -16,29 +28,11 @@ from aidw.roadmap import (
     parse_file,
 )
 
-FIXTURE = """# Phase 7: Test Phase
-
-Some intro.
-
-## Epic A: Alpha
-
-- [x] **A1. First task** per Design 07 §1.
-  - Done when: first is done.
-
-- [ ] **A2. Second task** per Design 08.1.
-  Done when: second is done.
-
-## Epic B: Beta
-
-- [ ] **B1. Third task** text.
-  - Done when: third is done.
-"""
-
-
-def _write_fixture(tmp_path: Path) -> Path:
-    path = tmp_path / "07 - Test Phase.md"
-    path.write_text(FIXTURE, encoding="utf-8")
-    return path
+if TYPE_CHECKING:  # pragma: no cover - type-only
+    # A runtime ``from conftest import …`` binds whichever of the two collected
+    # ``conftest`` modules was imported last and breaks the full-suite run; the fixture's
+    # name is all these annotations need (``from __future__ import annotations``).
+    from conftest import RoadmapExample
 
 
 def test_derive_epic() -> None:
@@ -50,41 +44,162 @@ def test_derive_epic() -> None:
     assert derive_epic("T1") == "T"
 
 
-def test_parse_file_extracts_tasks(tmp_path: Path) -> None:
-    tasks = parse_file(_write_fixture(tmp_path), "07")
-    assert [t.task for t in tasks] == ["A1", "A2", "B1"]
-    assert tasks[0].done is True
-    assert tasks[1].done is False
-    assert tasks[0].epic == "A"
-    assert tasks[1].epic == "A"
-    assert tasks[2].epic == "B"
+# --------------------------------------------------------------------------- #
+# The canonical example (docs/roadmap-format.md §9), through parse_file
+# --------------------------------------------------------------------------- #
 
 
-def test_parse_file_done_when_forms(tmp_path: Path) -> None:
-    tasks = parse_file(_write_fixture(tmp_path), "07")
-    assert tasks[0].done_when == "first is done."
-    assert tasks[1].done_when == "second is done."
-    assert tasks[2].done_when == "third is done."
+def test_parse_file_extracts_tasks(tmp_path: Path, roadmap_example: RoadmapExample) -> None:
+    """Hand-checkable vector from §9: three entries, in file order, none collapsed."""
+    tasks = parse_file(roadmap_example.write(tmp_path), roadmap_example.phase)
+
+    assert [task.task for task in tasks] == ["E5.1", "E5.2", "E6.1"]
+    # E0.7 rule 1 / §5: a missing period collapses an id, so every id must still carry one.
+    assert all("." in task.task for task in tasks)
+    assert [task.done for task in tasks] == [True, False, False]
+    assert [task.key for task in tasks] == ["07-E5.1", "07-E5.2", "07-E6.1"]
+    assert next_todo(tasks).task == "E5.2"
+
+    # `epic` is derived from the id, never read from the `## Epic` heading (§5).
+    assert [task.epic for task in tasks] == ["E5", "E5", "E6"]
+    assert [task.epic for task in tasks] == [derive_epic(task.task) for task in tasks]
 
 
-def test_parse_file_citations_and_meta(tmp_path: Path) -> None:
-    tasks = parse_file(_write_fixture(tmp_path), "07")
-    assert "Design 07" in tasks[0].citations
-    assert "Design 08.1" in tasks[1].citations
-    assert tasks[0].phase_title == "Test Phase"
-    assert tasks[0].epic_title == "Alpha"
-    assert tasks[0].branch == "07-A1"
+def test_parse_file_done_when_forms(tmp_path: Path, roadmap_example: RoadmapExample) -> None:
+    """`done_when` is the first physical line only (§6); §9's table gives the text."""
+    tasks = parse_file(roadmap_example.write(tmp_path), roadmap_example.phase)
+
+    assert [task.done_when for task in tasks] == [
+        "the format doc states the five-regex contract and the worked example in it",
+        "the fixture repo's roadmap parses without any code change.",
+        "the bundled scripts still run standalone with no config present.",
+    ]
 
 
-def test_find_filter_next(tmp_path: Path) -> None:
-    tasks = parse_file(_write_fixture(tmp_path), "07")
-    assert find_task(tasks, "07", "A", "A2") is not None
-    assert find_task(tasks, "99", "A", "A2") is None
-    assert [t.task for t in filter_tasks(tasks, todo=True)] == ["A2", "B1"]
-    assert [t.task for t in filter_tasks(tasks, epic="A")] == ["A1", "A2"]
-    assert next_todo(tasks).task == "A2"
+def test_parse_file_citations_and_meta(tmp_path: Path, roadmap_example: RoadmapExample) -> None:
+    """§8.1's `Design N` channel, plus the cosmetic headings and the derived branch."""
+    tasks = parse_file(roadmap_example.write(tmp_path), roadmap_example.phase)
+
+    # `EXTRACTION.md` is the doc-ref channel, which never reaches `.citations` (§8.2).
+    assert [task.citations for task in tasks] == [["Design 11"], ["Design 11.1"], []]
+    # `phase`/`phase_title` come from the filename prefix and the matching `# Phase 07:`.
+    assert [task.phase for task in tasks] == [roadmap_example.phase] * 3
+    assert [task.phase_title for task in tasks] == ["Example phase"] * 3
+    assert [task.epic_title for task in tasks] == [
+        "Roadmap contracts",
+        "Roadmap contracts",
+        "Frozen GitHub contracts",
+    ]
+    assert [task.file for task in tasks] == [roadmap_example.name] * 3
+    assert [task.branch for task in tasks] == ["07-E5.1", "07-E5.2", "07-E6.1"]
+    assert tasks[0].branch == "07-E5.1"
+
+
+def test_find_filter_next(tmp_path: Path, roadmap_example: RoadmapExample) -> None:
+    tasks = parse_file(roadmap_example.write(tmp_path), roadmap_example.phase)
+
+    assert find_task(tasks, roadmap_example.phase, "E5", "E5.2") is tasks[1]
+    assert find_task(tasks, "99", "E5", "E5.2") is None
+    assert [task.task for task in filter_tasks(tasks, todo=True)] == ["E5.2", "E6.1"]
+    assert [task.task for task in filter_tasks(tasks, epic="E5")] == ["E5.1", "E5.2"]
+    assert [task.task for task in filter_tasks(tasks, phase=roadmap_example.phase)] == [
+        "E5.1",
+        "E5.2",
+        "E6.1",
+    ]
+    assert next_todo(tasks).task == "E5.2"
     assert next_todo(tasks, phase="99") is None
 
+
+# --------------------------------------------------------------------------- #
+# The drift proof: the fields above come from the doc's bytes, not a cached copy
+# --------------------------------------------------------------------------- #
+
+
+#: The first task entry's id line: `- [x] **E5.1. Title**`. Mutating the *entry shape*
+#: rather than a fixed sentence keeps these edits valid when §9's prose changes.
+_ENTRY_ID_RE = re.compile(r"^(\s*-\s*\[[ xX]\]\s*\*\*[A-Za-z0-9.]+)\.", re.MULTILINE)
+
+
+def _drop_the_first_entrys_separator(example: str) -> str:
+    """`**E5.1. Title**` → `**E5.1 Title**` — the §5 collapsed-id trap."""
+    return _ENTRY_ID_RE.sub(r"\1", example, count=1)
+
+
+def _rename_the_last_done_when(example: str) -> str:
+    """`Done when:` → `Checked when:` on the last entry, so `DONE_RE` stops matching (§6)."""
+    head, separator, tail = example.rpartition("Done when")
+    assert separator, "the example carries no `Done when` label to rename"
+    return head + "Checked when" + tail
+
+
+def _drop_the_first_design_citation(example: str) -> str:
+    """Remove the first `Design N` token, leaving only the doc-ref channel (§8.1/§8.2)."""
+    return re.sub(r"Design\s+\d+(?:\.\d+)?,?\s*", "", example, count=1)
+
+
+def _parse_doctored_example(
+    tmp_path: Path, roadmap_example: RoadmapExample, edit: Callable[[str], str]
+) -> list[RoadmapTask]:
+    """Parse the doc's §9 example after applying ``edit`` to the doc's *current* bytes.
+
+    The example is located in the doc and replaced in place, so an edit cannot go stale
+    when the surrounding prose changes; the real doc is never written to (it lives outside
+    ``tmp_path``). The edited copy is what the shared helper extracts from, which is how
+    each test below proves the parsed fields are a function of the doc's bytes rather than
+    a module-level string.
+    """
+    doc_text = roadmap_example.doc.read_text(encoding="utf-8")
+    example = roadmap_example.text()  # also exercises the "exactly one example" guard
+    assert example in doc_text, "§9's example is no longer a contiguous block of the doc"
+
+    doctored_text = doc_text.replace(example, edit(example), 1)
+    assert doctored_text != doc_text, "the drift edit changed nothing"
+    doctored = tmp_path / "doctored-roadmap-format.md"
+    doctored.write_text(doctored_text, encoding="utf-8")
+    return parse_file(roadmap_example.write(tmp_path, doc=doctored), roadmap_example.phase)
+
+
+def test_a_collapsed_id_in_the_doc_example_changes_the_parsed_id(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
+    """Drop the period after the first id (§5's trap) and the asserted id no longer holds."""
+    tasks = _parse_doctored_example(
+        tmp_path, roadmap_example, _drop_the_first_entrys_separator
+    )
+
+    assert [task.task for task in tasks] != ["E5.1", "E5.2", "E6.1"]
+    assert tasks[0].task == "E5"  # collapsed to the epic-level id...
+    assert tasks[0].title.startswith("1 ")  # ...with a stray leading digit
+    assert "." not in tasks[0].task
+
+
+def test_a_broken_done_when_line_in_the_doc_example_changes_done_when(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
+    """Rename the last `Done when:` and `DONE_RE` stops matching (§6): the field empties."""
+    tasks = _parse_doctored_example(tmp_path, roadmap_example, _rename_the_last_done_when)
+
+    assert [task.task for task in tasks] == ["E5.1", "E5.2", "E6.1"]  # ids unaffected
+    assert tasks[2].done_when == ""  # only the renamed entry lost its check
+    assert all(task.done_when for task in tasks[:2])
+
+
+def test_a_dropped_citation_in_the_doc_example_changes_citations(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
+    """Remove the first `Design N` token and §8.1's channel finds nothing for E5.1."""
+    tasks = _parse_doctored_example(
+        tmp_path, roadmap_example, _drop_the_first_design_citation
+    )
+
+    assert tasks[0].citations == []
+    assert tasks[0].citations != ["Design 11"]
+
+
+# --------------------------------------------------------------------------- #
+# Directory selection mechanics (glob first, then _FILENAME_RE) — inline bodies
+# --------------------------------------------------------------------------- #
 
 #: The toolkit's default ``paths.roadmap_glob`` (``TOOLKIT_DEFAULTS.paths``, D17). Every
 #: call passes a glob explicitly: ``load_tasks`` carries no pattern of its own (E5.2), so
@@ -106,15 +221,16 @@ def _write(tmp_path: Path, name: str, body: str = OTHER_FIXTURE) -> None:
     (tmp_path / name).write_text(body, encoding="utf-8")
 
 
-def test_load_tasks_reads_a_directory(tmp_path: Path) -> None:
-    _write(tmp_path, "07 - Test Phase.md", FIXTURE)
+def test_load_tasks_reads_a_directory(tmp_path: Path, roadmap_example: RoadmapExample) -> None:
+    roadmap_example.write(tmp_path)
     _write(tmp_path, "99 - Other Phase.md")
     tasks = load_tasks(tmp_path, DEFAULT_GLOB)
-    assert [t.task for t in tasks] == ["A1", "A2", "B1", "Z1"]
+    assert [task.task for task in tasks] == ["E5.1", "E5.2", "E6.1", "Z1"]
 
 
 def test_load_tasks_glob_pre_selects_but_the_filename_regex_is_the_phase_authority(
     tmp_path: Path,
+    roadmap_example: RoadmapExample,
 ) -> None:
     """One vector per selection rule: glob first, then ``_FILENAME_RE``, phase from prefix.
 
@@ -122,14 +238,14 @@ def test_load_tasks_glob_pre_selects_but_the_filename_regex_is_the_phase_authori
     rejected by ``_FILENAME_RE`` (exactly two digits), so neither may be parsed — and a
     glob alone must never be treated as the phase authority.
     """
-    _write(tmp_path, "07 - Test Phase.md", FIXTURE)
+    roadmap_example.write(tmp_path)
     _write(tmp_path, "0 - One digit.md")
     _write(tmp_path, "0123 - Four digits.md")
     _write(tmp_path, "notes.md", "# Notes\n")
 
     # Hand-calculated: the glob admits three of the four, the filename pattern two of those.
     assert [fnmatch(name, DEFAULT_GLOB) for name in (
-        "07 - Test Phase.md",
+        roadmap_example.name,
         "0 - One digit.md",
         "0123 - Four digits.md",
         "notes.md",
@@ -139,9 +255,9 @@ def test_load_tasks_glob_pre_selects_but_the_filename_regex_is_the_phase_authori
 
     tasks = load_tasks(tmp_path, DEFAULT_GLOB)
 
-    assert [t.file for t in tasks] == ["07 - Test Phase.md"] * 3
-    assert {t.phase for t in tasks} == {"07"}
-    assert [t.task for t in tasks] == ["A1", "A2", "B1"]
+    assert [task.file for task in tasks] == [roadmap_example.name] * 3
+    assert {task.phase for task in tasks} == {roadmap_example.phase}
+    assert [task.task for task in tasks] == ["E5.1", "E5.2", "E6.1"]
 
 
 def test_load_tasks_glob_drives_selection(tmp_path: Path) -> None:
@@ -155,8 +271,8 @@ def test_load_tasks_glob_drives_selection(tmp_path: Path) -> None:
     _write(tmp_path, "04 - Roadmap.md")
     _write(tmp_path, "05 - Other.md")
 
-    assert [t.phase for t in load_tasks(tmp_path, "*- Roadmap.md")] == ["04"]
-    assert [t.phase for t in load_tasks(tmp_path, DEFAULT_GLOB)] == ["04", "05"]
+    assert [task.phase for task in load_tasks(tmp_path, "*- Roadmap.md")] == ["04"]
+    assert [task.phase for task in load_tasks(tmp_path, DEFAULT_GLOB)] == ["04", "05"]
 
 
 def test_load_tasks_missing_directory_is_empty_not_an_error(tmp_path: Path) -> None:
@@ -164,9 +280,11 @@ def test_load_tasks_missing_directory_is_empty_not_an_error(tmp_path: Path) -> N
     assert load_tasks(tmp_path / "absent", DEFAULT_GLOB) == []
 
 
-def test_load_tasks_is_pure_and_repeatable(tmp_path: Path) -> None:
+def test_load_tasks_is_pure_and_repeatable(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
     """No file is created, changed or removed, and two calls agree entry for entry."""
-    _write(tmp_path, "07 - Test Phase.md", FIXTURE)
+    roadmap_example.write(tmp_path)
     _write(tmp_path, "07 - Ignored.md")  # same phase, its own tasks
     before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
 
@@ -176,7 +294,7 @@ def test_load_tasks_is_pure_and_repeatable(tmp_path: Path) -> None:
     assert first == second
     assert first is not second
     assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
-    assert sorted(before) == ["07 - Ignored.md", "07 - Test Phase.md"]
+    assert sorted(before) == sorted([roadmap_example.name, "07 - Ignored.md"])
 
 
 #: Pinned seed and run count for the seeded property test below (AGENTS.md: pytest only, no

@@ -406,7 +406,7 @@
   - Deliverable: validation plus tests.
   - Done when: each malformed case names the file, line and rule.
 
-- [ ] **E5.4. Promote the canonical example**
+- [x] **E5.4. Promote the canonical example**
   Move the `tests/test_roadmap.py` inline fixture into `docs/roadmap-format.md` and keep the test
   reading it, so doc and parser cannot drift.
   - Deliverable: single-source example.
