@@ -3,7 +3,7 @@ description: Push the current branch and open a pull request to main following r
 argument-hint: "[task-id]"
 ---
 
-Open a pull request for the work on the current branch. Task id (if known, e.g. `02-D2`): $1.
+Open a pull request for the work on the current branch. Task id (if known, e.g. `<phase>-<task>`): $1.
 
 ## Pre-flight
 
@@ -20,36 +20,28 @@ the PR.
   ```
 - Review the complete change set relative to `main` — the working tree, not only commits.
 - Run the verification gates and capture the **real** results (never invent them). The commands are
-  the **repo's own** — take them from the target repo, not from this prompt: its
-  `aidw/conventions.md`, its `AGENTS.md`, the task prompt for this task, or its stack. The rows
-  below are keyed off files the repo actually has, so run the row that matches and nothing for a
-  stack it does not have:
-
-  | the repo has | its gates |
-  |---|---|
-  | `pnpm-workspace.yaml` | `pnpm install`, `pnpm -r lint`, `pnpm -r build`, `pnpm -r test` |
-  | `pyproject.toml` / `uv.lock` | `uv sync --frozen`, `uv build`, `uv run --frozen pytest` |
-
-  Another stack uses its own package manager's install/lint/build/test scripts, or whatever the repo
-  documents. A command from another repo's stack is not a gate here, and running one costs a turn
+  the **repo's own** — take them by name from its `aidw/conventions.md`, its root `AGENTS.md`, or the
+  task prompt for this task, and never from this prompt. Run the gates it names, written the way it
+  writes them; a command from another repo's stack is not a gate here, and running one costs a turn
   and produces no evidence.
 - Run each gate through `aidw gate run <key> -- <command>` so its outcome is recorded against the
   exact tree it gated, and a later stage of this run cites it instead of paying for the same run
   twice:
 
   ```bash
-  # what this gate's command cannot read: the documents the *other* stages write
-  SCOPE="--ignore docs/implementation-results --ignore docs/architecture --ignore docs/tasks --ignore docs/task-prompts"
+  # what this gate's command cannot read: the documents the *other* stages write — read
+  # each resolved value from `aidw config show` and pass it as one --ignore prefix
+  SCOPE="--ignore <implementation_results_dir> --ignore <architecture_dir> --ignore <roadmap_dir> --ignore <task_prompts_dir>"
   aidw gate run lint  $SCOPE -- <the repo's lint command, as the repo writes it>
   aidw gate run suite $SCOPE -- <the repo's full test command>
   ```
 
-  `--ignore` declares paths the gate's command cannot read. The four above are the write-targets of
-  the other stages (`implementation_results_dir`, `architecture_dir`, `roadmap_dir`,
-  `task_prompts_dir`; `docs/implementation-results`, `docs/architecture`, `docs/tasks`,
-  `docs/task-prompts` by default): a document those stages wrote cannot change a lint, build or test
-  result. If a stage of this workflow writes anywhere else — a traceability report directory, for
-  example — add that too: the list is every path a stage *writes* and no path a gate *reads*.
+  `--ignore` declares paths the gate's command cannot read. The four above are the other stages'
+  configured write-targets — `implementation_results_dir`, `architecture_dir`, `roadmap_dir`,
+  `task_prompts_dir` — resolved for this repo by `aidw config show` and never retyped from another
+  repo's defaults: a document those stages wrote cannot change a lint, build or test result. If a
+  stage of this workflow writes anywhere else — a traceability report directory, for example — add
+  that too: the list is every path a stage *writes* and no path a gate *reads*.
   Declaring them is what makes reuse work at all — `/record` writes its results document *after* it
   gates, so without a scope every tree this stage delivers differs from the tree that was verified,
   and the suite is bought again here. **Never ignore anything else**: source, tests, config and
@@ -92,8 +84,8 @@ Use `gh pr create --base main --head <branch>` (base is **always** `main`).
 
 - **Title:** conventional-commit style — `<type>(<scope>): <summary>` where:
   - `<type>` ∈ `feat` / `fix` / `docs` / `refactor` / `chore`
-  - `<scope>` is the package/service/area touched (e.g. `rules-engine`, `player-api`, `shared-types`, `infra`)
-  - append the task id in parentheses when known, e.g. `feat(rules-engine): cover & flanking bonus calculation (D2)`
+  - `<scope>` is the package, service, or area touched (e.g. `<the package, service, or area>`)
+  - append the task id in parentheses when known, e.g. `feat(<scope>): <summary> (<task-id>)`
 - **Body** with these exact sections:
   - `## Summary` — 1–2 sentences: what changed and which spec section / roadmap task it implements.
   - `## Changes` — bullet list of files added/modified with their paths.

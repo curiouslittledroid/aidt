@@ -32,7 +32,7 @@ python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" verify --pr "$pr"
 Rules for using it:
 
 - Use the `python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py"` form above. It runs on any Python 3.9+ with no install step and no third-party dependencies, so it works in any repository these prompts are copied into.
-- Do **not** route the output through a package-manager script alias when you need to read the JSON output — the package manager prefixes its own banner to stdout, and `pnpm -s` collapses every non-zero exit code to 1.
+- Do **not** route the output through a wrapper or script alias when you need to read the JSON output — a wrapper can prefix its own banner to stdout and collapse every non-zero exit code to 1. Run the `python3` command above directly.
 - Read the exit code: `0` ok, `1` verification failed, `2` usage/GitHub error, `3` no available child, `4` workflow conflict. A non-zero code means stop and report — do not work around it.
 - The script never decides whether the *code* work is done. `fixed` is an explicit call you make only after section 5 passes. Never chain it to anything.
 - Its `select` output is the authoritative parent/child resolution; use it for your final report rather than re-deriving values.
@@ -85,11 +85,7 @@ Do not discard, reset, or overwrite unrelated existing work. If the working tree
 
 ## 2. Locate the review-follow-up parent issue
 
-The parent issue is identified by this exact body marker:
-
-```text
-<!-- mythical-forge-review-followups: pr=<canonical PR URL> -->
-```
+The parent issue is identified by the repo's configured parent marker (`github.markers.parent`), rendered with the canonical PR URL. The marker template is frozen and lives in the repo's config, so never retype it: `select` reads it from the resolved config and matches issue bodies exactly.
 
 `select` performs this search across all repository issues, including closed ones. Rules it enforces for you:
 
@@ -161,9 +157,9 @@ The requirement “fail before the fix and pass after it” needs a before-state
 ```bash
 cp <path> /tmp/review-followup-fixed.bak
 git show HEAD:<path> > <path>
-pnpm --filter <affected-package> test -- <focused pattern>   # must FAIL
+<the repo's focused test command>   # must FAIL
 cp /tmp/review-followup-fixed.bak <path>
-pnpm --filter <affected-package> test -- <focused pattern>   # must PASS
+<the repo's focused test command>   # must PASS
 ```
 
 Always restore the file and confirm `git diff` still shows your fix before continuing. A path-scoped `git stash push -- <paths you modified in this run>` followed immediately by `git stash pop` is also acceptable. Never stash, reset, or check out paths you did not modify in this run.
@@ -172,21 +168,22 @@ These two invocations stay **bare commands** — deliberately *not* `aidw gate r
 
 ## 6. Verify the fix
 
-Run the narrowest meaningful checks first, then broader checks required by the affected package or issue. Use the repository’s package manager and report the real commands and outcomes.
+Run the narrowest meaningful checks first, then broader checks required by the affected package or issue. Use the repo's own gate commands, taken by name from its `aidw/conventions.md`, its root `AGENTS.md`, or the issue — never inlined here — and report the real commands and outcomes.
 
 Run each command through `aidw gate run <key> $SCOPE -- <command>`, so its outcome is recorded against the exact tree it verified and a later stage of this run cites it instead of buying the same run twice. At minimum, where applicable:
 
 ```bash
-# what these gates' commands cannot read: the documents the *other* stages write
-SCOPE="--ignore docs/implementation-results --ignore docs/architecture --ignore docs/tasks --ignore docs/task-prompts"
-aidw gate run build $SCOPE -- pnpm --filter <affected-package> build
-aidw gate run lint  $SCOPE -- pnpm --filter <affected-package> lint
-aidw gate run smoke $SCOPE -- pnpm --filter <affected-package> test
+# what these gates' commands cannot read: the documents the *other* stages write — read
+# each resolved value from `aidw config show` and pass it as one --ignore prefix
+SCOPE="--ignore <implementation_results_dir> --ignore <architecture_dir> --ignore <roadmap_dir> --ignore <task_prompts_dir>"
+aidw gate run build $SCOPE -- <the repo's package-scoped build command>
+aidw gate run lint  $SCOPE -- <the repo's package-scoped lint command>
+aidw gate run smoke $SCOPE -- <the repo's package-scoped test command>
 ```
 
 Keys name gates the way `pr.md` names them: `suite` for the full test gate, `lint`, `build`, and `smoke` for a package-scoped check (as `test.md` uses). The same command from every stage must carry the same key.
 
-`--ignore` declares paths the gate’s command cannot read. The four above are the write-targets of the other stages (`implementation_results_dir`, `architecture_dir`, `roadmap_dir`, `task_prompts_dir`; `docs/implementation-results`, `docs/architecture`, `docs/tasks`, `docs/task-prompts` by default): a document those stages wrote cannot change a build, lint or test result. If a stage of this workflow writes anywhere else, add that too — the list is every path a stage *writes* and no path a gate *reads*. **Never ignore anything else**: source, tests, config and lockfiles must always re-run the gate.
+`--ignore` declares paths the gate’s command cannot read. The four above are the other stages' configured write-targets — `implementation_results_dir`, `architecture_dir`, `roadmap_dir`, `task_prompts_dir` — resolved for this repo by `aidw config show` and never retyped from another repo's defaults: a document those stages wrote cannot change a build, lint or test result. If a stage of this workflow writes anywhere else, add that too — the list is every path a stage *writes* and no path a gate *reads*. **Never ignore anything else**: source, tests, config and lockfiles must always re-run the gate.
 
 Every stage of a run that asks for a gate must pass the same key, command and `--ignore` scope, or the outcomes cannot line up and the gate re-runs instead of being cited.
 
@@ -198,7 +195,7 @@ Asking again for the same key, command and scope against content that differs on
 
 and exits 0 **without re-running** — cite that line, with its origin (key, tree, stage, timestamp), as evidence rather than re-running the gate, and never transcribe a number you did not observe. `--force` re-runs when you doubt the outcome; a `failed:` line is never evidence — fix the failure and ask again.
 
-Also run focused tests for the selected issue: bare when the point is the red-before/green-after proof (section 5), or through `aidw gate run smoke $SCOPE -- <focused command>` when the result is evidence to record. Do not claim tests passed unless they actually passed. If a check cannot run because it requires unavailable AWS credentials, deployed infrastructure, or another external dependency, report it clearly and do not close the issue unless the user explicitly accepts that limitation.
+Also run focused tests for the selected issue: bare when the point is the red-before/green-after proof (section 5), or through `aidw gate run smoke $SCOPE -- <focused command>` when the result is evidence to record. Do not claim tests passed unless they actually passed. If a check cannot run because it requires unavailable credentials or external dependencies, report it clearly and do not close the issue unless the user explicitly accepts that limitation.
 
 Inspect the final diff and check for accidental changes:
 
@@ -300,7 +297,9 @@ Find the parent by exact marker (external `jq`, because `gh api --slurp` cannot 
 ```bash
 repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
 pr_url="$(gh pr view <pr-number-or-url> --json url --jq .url)"
-marker="<!-- mythical-forge-review-followups: pr=$pr_url -->"
+# The repo's configured parent marker (github.markers.parent), rendered with the PR URL:
+# take the template from the resolved config and substitute $pr_url — never retype it.
+marker="<the configured parent marker, rendered with $pr_url>"
 gh api --paginate --slurp "repos/$repo/issues?state=all&per_page=100" |
   jq -r --arg marker "$marker" '
     add[]
