@@ -111,6 +111,7 @@ from aidw.findings import (
 from aidw.gates import GateOutcome, decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
+from aidw.prompts import read_conventions_sources
 from aidw.report import print_stage
 from aidw.roadmap import DONE_RE, TASK_RE, RoadmapTask, find_task, load_tasks
 from aidw.runner import StageSpec, declared_stage_issues, plan_stages, run_stage
@@ -290,9 +291,10 @@ def _brief_diff(
 #: being marked failed (L2.4, requirement 4).
 _EVIDENCE_UNAVAILABLE = "unavailable — could not be read"
 
-#: Heading that opens the target repo's gate list in ``AGENTS.md`` (L2.4). Per D16 the
-#: eventual source is root ``AGENTS.md`` plus optional ``aidw/conventions.md``; E7.3 owns
-#: that second channel, so this reads ``AGENTS.md`` directly and adds no second source.
+#: Heading that opens a gate list in each conventions source (L2.4, D16/E7.3). Since E7.3
+#: the sources are the D16 pair — root ``AGENTS.md`` **and** the optional
+#: ``aidw/conventions.md`` — both read through ``aidw.prompts.read_conventions_sources``
+#: (R14: new gate commands travel in ``conventions.md`` by name).
 _GATES_HEADING = "## Gates"
 
 #: A field bullet inside a roadmap task entry (``  - Tests:``). The full ``Done when:``
@@ -474,30 +476,55 @@ def _render_prerequisites(entries: list[RoadmapTask], entry: RoadmapTask) -> str
     )
 
 
-def _gate_block(repo: TargetRepo) -> str:
-    """The target repo root's ``## Gates`` section, copied verbatim (L2.4, D16).
+def _gates_section(text: str) -> str | None:
+    """One conventions source's ``## Gates`` section verbatim, or ``None`` without one.
 
-    Reads ``repo.root / "AGENTS.md"`` — the *target* root, never the toolkit root or a
-    cwd-relative path. In a self-hosted run the two roots coincide, so a wrong-root read
-    would pass every test here and break only after extraction (AGENTS.md "Two roots").
+    The section runs from the ``## Gates`` heading to the next ``## `` heading, so a later
+    section (``## Tests``) is never copied into the gate list. Pure.
     """
-    try:
-        text = (repo.root / "AGENTS.md").read_text(encoding="utf-8")
-    except OSError:
-        return _EVIDENCE_UNAVAILABLE
     lines = text.splitlines()
     start = next(
         (index for index, line in enumerate(lines) if line.startswith(_GATES_HEADING)),
         None,
     )
     if start is None:
-        return _EVIDENCE_UNAVAILABLE
+        return None
     block = [lines[start]]
     for line in lines[start + 1 :]:
         if line.startswith("## "):
             break
         block.append(line)
     return "\n".join(block).rstrip()
+
+
+def _gate_block(repo: TargetRepo) -> str:
+    """The target repo's gate commands, from every conventions source (L2.4, D16/E7.3).
+
+    Sources are read through :func:`aidw.prompts.read_conventions_sources` — the same
+    single conventions channel the four-prompt injection uses — in D16 order: the root
+    ``AGENTS.md``, then the optional ``aidw/conventions.md``. Each source contributes its
+    ``## Gates`` section verbatim (:func:`_gates_section`), joined in that order, so a repo
+    that publishes its gates in either file is honoured rather than silently ignoring the
+    one R14 names for new commands.
+
+    When no source exists, or none carries a ``## Gates`` heading, the section degrades to
+    ``_EVIDENCE_UNAVAILABLE`` — a normal state, never an error (L2.4 requirement 4).
+
+    ``repo.root`` is the *target* root, never the toolkit root or a cwd-relative path. In
+    a self-hosted run the two roots coincide, so a wrong-root read would pass every test
+    here and break only after extraction (AGENTS.md "Two roots").
+    """
+    blocks = [
+        block
+        for block in (
+            _gates_section(text)
+            for _, text in read_conventions_sources(repo.root)
+        )
+        if block is not None
+    ]
+    if not blocks:
+        return _EVIDENCE_UNAVAILABLE
+    return "\n\n".join(blocks)
 
 
 def _render_base_branch(repo: TargetRepo) -> str:
@@ -573,7 +600,7 @@ def _render_evidence_bundle(
             "",
             _render_prerequisites(entries, entry),
             "",
-            "## Gate commands (target repo `AGENTS.md`)",
+            "## Gate commands (target repo `AGENTS.md` + `aidw/conventions.md`)",
             "",
             _gate_block(repo),
             "",
