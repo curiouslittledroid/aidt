@@ -433,7 +433,7 @@
   - Deliverable: the test.
   - Done when: changing any frozen value in Mythical Forge's config fails this test.
 
-- [ ] **E6.4. Document the freeze**
+- [x] **E6.4. Document the freeze**
   Explain in `docs/target-repo-config.md` why these values are config-with-frozen-defaults, and what a
   rename would break (orphaned parents, duplicate issue creation).
   - Deliverable: documentation.
