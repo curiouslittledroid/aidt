@@ -117,6 +117,11 @@ BRACE_GROUP = (
 #: Bucket (i)/(ii) files keep their destination in the table only — no marker in the file.
 UNMARKED = (*BUCKET_GENERIC, *BUCKET_MIXED)
 
+#: Bucket (i) alone is byte-frozen against the pre-E7.1 baseline. Bucket (ii) is **edited**
+#: by E7.2, which is exactly why §5.4 excludes it from byte-frozen coverage — the E7.1
+#: oracle could only hold until the neutralisation landed.
+BYTE_FROZEN = BUCKET_GENERIC
+
 #: ``| `file.md` | bucket | action | destination |`` — the table's only row shape.
 _TABLE_ROW = re.compile(r"^\|\s*`([^`]+\.md)`\s*\|(.+)\|\s*$")
 _FRONTMATTER_BLOCK = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.DOTALL)
@@ -444,9 +449,14 @@ def test_product_prompt_rendering_matches_the_parent_revision(name: str) -> None
     )
 
 
-@pytest.mark.parametrize("name", UNMARKED)
+@pytest.mark.parametrize("name", BYTE_FROZEN)
 def test_unmarked_prompt_content_matches_the_parent_revision(name: str) -> None:
-    """Bucket (i)/(ii) prompts are byte-for-byte unchanged in this metadata-only task."""
+    """Bucket (i) prompts are byte-for-byte unchanged in this metadata-only task.
+
+    Scoped to bucket (i): §5.4 excludes the five bucket (ii) prompts from byte-frozen
+    coverage precisely because E7.2 neutralises them, and their contract is
+    ``tests/test_prompt_neutrality.py``.
+    """
     assert _raw(name) == _parent_prompt_text()[name]
 
 
@@ -483,11 +493,10 @@ def test_existing_frontmatter_was_extended_not_replaced(name: str) -> None:
 
 @pytest.mark.parametrize("name", UNMARKED)
 def test_generic_and_mixed_prompts_carry_no_marker(name: str) -> None:
-    """Bucket (i)/(ii) destinations live in the table only — no field, no body edit.
+    """Bucket (i)/(ii) destinations live in the table only — no marker field in the file.
 
-    Bucket (ii)'s neutralisation is E7.2's: those five files must still read exactly as they
-    do today, and ``pr.md`` in particular is already "partly edited ahead of E7.2" (§4.2) and
-    must be left as found.
+    Bucket (ii)'s body is E7.2's to edit, but the *marker* rule still holds for it: its
+    destination stays in the table, so no ``destination:`` field may appear in the file.
     """
     raw = _raw(name)
 

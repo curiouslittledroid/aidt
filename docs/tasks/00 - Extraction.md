@@ -448,7 +448,7 @@
   - Deliverable: a classification table checked into the repo plus the bucket (iii) marker notes.
   - Done when: every prompt file carries an explicit destination, and no file is unclassified.
 
-- [ ] **E7.2. Neutralise bucket (ii)**
+- [x] **E7.2. Neutralise bucket (ii)**
   Replace repo-specific commands and paths with references to the target repo's conventions and the
   config paths, per the §4.2 table. Keep the workflow semantics identical. Gate commands move to
   `aidw/conventions.md` by name (§3.4); the build-results template becomes the configured path; and
@@ -459,6 +459,14 @@
   derived from that single invocation.
   - Deliverable: five edited prompts.
   - Done when: the *rendered* prompt for each of the five names no package manager, no product path and no product doc — asserted against both a Mythical-Forge-shaped config and a neutral one, not by grepping the templates — and no prompt instructs a command the non-interactive runner blocks.
+  - Notes: delivered as the five prompt edits plus `tests/test_prompt_neutrality.py`. No
+    vector-matrix or coverage-catalog change: this repo has neither artifact (`docs/rules-coverage/`,
+    `tests/integration/`, the `srd:*` scripts) and E7.2 adds no Rules Engine action and no
+    implemented product claim, so nothing is eligible for matrix coverage. Two review flags: the
+    E7.1 bucket-(ii) byte-equality oracle in `tests/test_prompt_classification.py` is now scoped to
+    bucket (i), because §5.4 excludes bucket (ii) from byte-frozen coverage; and MF.2 must still
+    re-supply the five prompts' exact product text as `aidw/prompts/` overrides (§5.4, D14
+    precedence 2).
 
 - [ ] **E7.3. Conventions injection (D16)**
   Define how `AGENTS.md` and optional `<target>/aidw/conventions.md` reach the four prompts that need
