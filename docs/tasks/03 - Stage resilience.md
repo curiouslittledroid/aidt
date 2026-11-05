@@ -5,9 +5,11 @@ outgrows the model's context, or a provider hiccup discards the whole run — in
 stage that already succeeded — because `aidw prompt` cannot resume and the only recovery is a
 manual re-run from the author.
 
-This phase changes the Pi attempt loop, the delta brief's size contract, and the prompt
-workflow's resumability. It does **not** change the loop's convergence rules (Phase 02), model
-routing, or the stage shapes of `implement`/`review`/`fix`/`approve`.
+This phase changes the Pi attempt loop, the delta brief's size contract, the prompt workflow's
+resumability, and — in epic H3 — which stage owns the roadmap tick. It does **not** change the
+loop's convergence rules (Phase 02), model routing, or the shape of `prompt`/`review`/`approve`;
+`implement`'s chain becomes seven stages and `fix` gains one after its loop, both for the tick
+alone.
 
 ## Evidence: the runs this phase is derived from
 
@@ -84,7 +86,10 @@ was about.
 | `E2.4`/`E2.5` (AIDT owns branch creation; `aidw prompt` runs in the control worktree) | H1.2 reuses the existing task worktree instead of creating one, so it edits the same branch-setup code and must preserve the one-run-per-worktree lock (design §3.2). |
 | `E4.3` (config-driven plans) | H2.1 edits `stage_registry.render_delta_brief`, which E4.3 moved out of `prompt.py`, and must keep `--dry-run` for `prompt` byte-identical (E4.3's Done when). |
 | Phase 02 `L2.3` (delta brief) and `L3.4` (reconcile) | H2.1 changes what a later round is told. L2.3's purpose — a per-finding `resolved`/`not resolved`/`newly contradicted` verdict before any new finding — must survive the substitution. |
-| `E9.1` (rewrite `design.md`) | H1.1 and H1.2 amend design §9.3 and §10 and record the decisions in §17; E9.1 carries them forward. |
+| `E4.8` (whole-repo gates, recorded once and cited) | H3.2's condition is a read of the outcomes `aidw gate run` recorded (design §14); it cannot cite evidence the run does not keep. |
+| `E5.1`/`E5.2` (`aidw.roadmap` and the configured `paths.roadmap_dir`) | H3.1 resolves the tick's entry through `find_task` against the resolved config, so the stage names no `docs/tasks` literal (D15/D17's two readers). |
+| `E6.1` (the incident this epic exists for) | `20261105T030527Z-00-E6.1-implement` is H3.2's acceptance replay: the stage flipped E6.1's box and reverted it against a red `suite`. |
+| `E9.1` (rewrite `design.md`) | H1.1, H1.2 and H3.1 amend design §9.3, §10 and §8.2 and record the decisions in §17; E9.1 carries them forward. |
 
 ## How this phase is driven
 
@@ -99,7 +104,7 @@ Parser guard (run after any edit to this file — a missing period after the tas
 collapses every id and breaks `aidw prompt`):
 
 ```bash
-uv run python -c 'import pathlib; from aidw.roadmap import load_tasks; t=load_tasks(pathlib.Path("docs/tasks")); assert t, "no tasks parsed"; bad=[x.task for x in t if "." not in x.task]; assert not bad, f"MISPARSE: {bad}"; print(f"{len(t)} tasks, none collapsed")'
+uv run python -c 'import pathlib; from aidw.roadmap import load_tasks; t=load_tasks(pathlib.Path("docs/tasks"), "[0-9]* - *.md"); assert t, "no tasks parsed"; bad=[x.task for x in t if "." not in x.task]; assert not bad, f"MISPARSE: {bad}"; print(f"{len(t)} tasks, none collapsed")'
 ```
 
 Every behaviour change here is proven by a fake Pi argv or a fake stage (AGENTS.md §Tests, design
@@ -211,6 +216,126 @@ Every behaviour change here is proven by a fake Pi argv or a fake stage (AGENTS.
     checking whether a change landed, not reading the surrounding prose. A hard cap stays as the
     backstop and must name what it dropped: a reviewer that cannot see a fix cannot verify it.
 
+## Epic H3: One roadmap tick, one owner
+
+- [ ] **H3.1. Give the roadmap tick its own stage** (Design 8.2, EXTRACTION.md §3.5)
+  I3 carries two jobs with different owners. Four of its owned artifacts —
+  `docs/rules-coverage/catalog.json`, the generated `report.md`,
+  `tests/integration/src/vector-matrix/vectors.ts` and `tests/integration/src/02.5-B/**` — exist
+  only in a repo that has an SRD traceability system, which is exactly why D13 makes I3
+  repo-optional. The fifth is the roadmap checkbox, which every repo has and which no repo should
+  be able to switch off: today `enabled: false` on I3 drops the tick with it, and a repo with no
+  catalog runs a stage whose only honest move is to stop and report that it owns nothing. The tick
+  is also the one edit in that prompt needing no repo knowledge at all — one checkbox in one file
+  whose location is `paths.roadmap_dir` (D15/D17).
+  - Deliverable: split the stage. I3 keeps the four repo-specific artifacts and stays
+    repo-optional; `prompts/update-traceability.md` loses its roadmap row and its checkbox
+    instruction. A new **core** stage (`update-roadmap`, prompt `prompts/update-roadmap.md`) does
+    the tick and nothing else, on the `recorder` agent — `read`/`bash`/`write`, `session: fresh`,
+    `thinking: low`, the same cheap/mechanical shape as I5 — with a second section added to
+    `agents/recorder/AGENTS.md` rather than a new agent id, and `inventory.REQUIRED_PROMPTS`
+    gaining the prompt. Its id joins `STAGE_IDS` (`REPO_OPTIONAL_IDS` unchanged) and the
+    vocabulary decision is recorded in EXTRACTION.md §3.5 and design §17. It is placed after I5
+    `record-implementation-results` — where the gates have been recorded — and before the
+    `approve-implementation-pr` gate and I6 `pr`, because I6 is the single owner of the commit
+    (§8.2), so the tick lands in the task's own PR. `implement.py` resolves the entry itself
+    through `aidw.roadmap.find_task` against the resolved `paths.roadmap_dir`/`paths.roadmap_glob`
+    and renders `{roadmap_file}` and `{task_id}` into the stage, so the prompt names no directory
+    (`prompt.py`'s D15 "two readers" rule); zero or two matching entries refuse with exit 2 before
+    the stage runs. After the stage the workflow re-parses the file and asserts that exactly the
+    target line flipped and every other byte is unchanged.
+  - Done when: a repo with no `docs/rules-coverage/` gets its box ticked and no error; `enabled:
+    false` on I3 no longer drops the tick, while a declared implement stage list that omits the new
+    core id errors naming it (`validate_stage_list`'s removal rule) instead of silently planning
+    defaults; an already-`[x]` entry is a successful no-op recorded as such; an edit touching any
+    other line, and an entry that is missing or appears twice, fail the stage instead of passing;
+    `--dry-run` plans the new stage in the position the run would use; and `uv run aidw prompts
+    check`, `uv run aidw agents validate --strict` and `uv run aidw doctor` stay green.
+  - Tests: `tests/test_implement_workflow.py`'s `DEFAULT_ORDER`/stage-list pins plus
+    `tests/test_plan_stages.py` and `tests/test_stage_registry.py` re-baselined for the seventh
+    stage, `tests/test_override_integration.py`'s I3 prompt-override case re-pointed, and a new
+    `tests/test_roadmap_tick.py` driving the one-line verification with a fake stage (design §15:
+    no task invokes a real model).
+  - Notes: rejected — keep the tick in I3 and document "don't disable I3 if you want your roadmap
+    ticked"; that turns one config switch into a trap and keeps a repo-independent edit hostage to
+    artifacts the repo may not have. Rejected — a new agent id for a two-line mechanical edit. The
+    split does not by itself make the tick honest; that is H3.2.
+
+- [ ] **H3.2. Tick only behind evidence, never against a red gate** (Design 8.2, Design 10, Design 14)
+  The run this epic exists for: `20261105T030527Z-00-E6.1-implement`. Its traceability stage
+  flipped E6.1's box, then reverted it —
+  > I flipped the E6.1 checkbox as instructed, then reverted it when the gate run came back red:
+  > `docs/roadmap-format.md` defines `[x]` = "done" and `aidw prompt --next` takes "the first
+  > unchecked entry in file order", so a checked E6.1 would advance the roadmap to E6.2 while
+  > E6.1's own change set fails `uv run --frozen pytest`.
+  Both halves of that decision were the agent's, and both were made early: `[x]` is a completion
+  claim, and I3 runs *before* I5 records the gates, so the stage had no evidence either way. The
+  suite was green by the time `pr` ran (1382 passed) and the review approved with no follow-ups,
+  so E6.1's branch ships `- [ ]` and nothing ever re-runs I3 after a gate turns green.
+  - Deliverable: a `when=` condition the workflow evaluates instead of the agent — a new
+    `WHEN_EVIDENCE_GREEN` token answering each workflow from its own evidence. In `implement` it
+    means: every gate outcome recorded for the tree the tick edits is a pass. Any recorded failure
+    skips the stage; so does a tree with no recorded outcome, because "no evidence" is not
+    "green" and E4.8's contract is cite-or-run, never assume. A skip records a skipped stage
+    naming the failing gate(s) or the absence, leaves the checkbox byte-identical — nothing flips,
+    so nothing needs reverting — and changes no exit status, since the red gate already decided
+    the run. The condition is only real if the evidence survives the run: every `state.json` in
+    the state root today shows `gate_outcomes: []` (94 of 94, E6.1's red `suite` among them)
+    because a workflow's `save()` rewrites the file from its in-memory copy and drops what the
+    agent's `aidw gate run` subprocess appended, so reload-and-merge (or reading the file at the
+    moment of the decision) is part of this task, not an assumption behind it.
+  - Done when: replaying the E6.1 shape (green `build`/`doctor`/`agents`/`prompts`, red `suite`)
+    leaves the box unticked, records the stage `skipped` naming `suite`, and writes no roadmap
+    change at all; the same run with `suite` green ticks it exactly once; a second green run on an
+    already-ticked box is a successful no-op; a run whose gates recorded nothing skips with its own
+    reason; and no stage in the chain can tick a box the run has no evidence for.
+  - Tests: `tests/test_implement_workflow.py` with fake gate outcomes and a fake stage — the skip
+    reason, the untouched file, the single tick, the missing-evidence skip — plus a state-persistence
+    test that a gate outcome written through the CLI path is still there after the workflow's next
+    save.
+  - Notes: rejected — instruct the agent to "run the tests and tick if they pass": that is the
+    judgement that produced the flip and the revert, it pays for a suite run the run has already
+    recorded, and it re-opens the same red-gate hole. I3 and I4 stay ungated: they are the repo's
+    own documents, and E4.8's gate scope belongs to I5.
+
+- [ ] **H3.3. Give `fix` the same tick, once its loop converges** (Design 8.4, Design 8.6, H3.1)
+  `fix` is where a task the review found wanting actually finishes — every `prompt-to-fix` chain
+  ends in it — and no stage of it has ever touched the roadmap. A `fix` run that closes a task's
+  last approved follow-up leaves that task's box unticked, so `aidw tasks --next` keeps offering
+  work on a roadmap that still calls the previous task open. The other half is the double claim:
+  with the tick in `implement` and nothing in `fix`, the box can be asserted twice, or by a run
+  whose own tests are red.
+  - Deliverable: one stage definition shared by both workflows — the `A1` precedent (one id, one
+    prompt, one agent, two workflows, so the two ticks cannot drift) — emitted by `expand()` from a
+    new post-loop section on `WorkflowDefinition` rather than bolted on in
+    `aidw/workflows/fix.py`, so `--dry-run` plans it and `validate_stage_list` classifies it as
+    core. In `fix` the task id comes from the newest `implement` run's recorded `state.task` for
+    the PR-head branch — `run.py`'s re-read-the-run-state trade-off, not a new `gh` query and never
+    the PR title; a branch with no such run falls back to reversing `repo.branch_pattern`, and when
+    neither yields a roadmap entry the stage is **skipped with a reason** and the run still
+    succeeds, because `fix` must keep working on PRs that are not AIDT tasks. The condition is
+    `WHEN_EVIDENCE_GREEN`, read from this run: `select` returned `EXIT_NONE_AVAILABLE` (not
+    `--max-iterations`, not a denied gate, not an ambiguous verdict), every `iter{N}-test` stage
+    succeeded, and the last recorded re-review verdict is `Approve`. The edit is left uncommitted
+    like every other `fix` stage (no stage of `fix` commits), and the outcome is recorded as
+    `state.pr.roadmap_ticked` plus the skip reason.
+  - Done when: a `fix` run closing its last approved follow-up ticks the box once and records
+    `roadmap_ticked: true`; a run stopped by `--max-iterations`, by a denied gate, or by a failed
+    `iter{N}-test` ticks nothing and records why; a PR whose branch maps to no roadmap entry skips
+    and still exits 0; the stage appears once per run — never once per iteration — in `state.json`,
+    `run.log` and the `--dry-run` plan; and a whole `prompt-to-fix` chain leaves one task ticked
+    exactly once, whether the tick came from `implement` or from `fix`.
+  - Tests: `tests/test_fix_workflow.py` with fake `select` payloads and fake stages (once-per-run,
+    the three skip reasons, the task-id resolution), `tests/test_stage_registry.py` for the
+    post-loop expansion and its carried condition, and `tests/test_run_workflow.py` for the
+    chain-level exactly-once assertion.
+  - Notes: rejected — put the tick in the fix loop's `tail`: it would run per iteration, so
+    iteration 1's green tests would claim the task done while an approved follow-up was still
+    open, and nothing in the chain can untick. Rejected — run the repo's `suite` gate inside `fix`
+    to reuse E4.8 evidence: F2 already ran this iteration's tests, a second suite run doubles every
+    iteration's cost, and the stage records its decision either way. Depends on H3.1 (the stage)
+    and H3.2 (the condition).
+
 ## Explicit non-goals
 
 - Phase 02's convergence rules (finding sampling, fixer verification, the terminal review) are
@@ -222,3 +347,5 @@ Every behaviour change here is proven by a fake Pi argv or a fake stage (AGENTS.
 - Gate failures are never retried automatically (design §10) — a `Request changes`, a `Blocked`
   verdict and the revision budget's terminal review all keep failing closed. H1.3's continuation
   is an explicit operator action on one recorded run, not a retry.
+- Moving the tick to the merge. AIDT still never merges (design §13), so H3 makes the tick
+  evidence-based inside the run that produced the evidence; it does not make a merge the proof.
