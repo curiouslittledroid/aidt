@@ -2567,7 +2567,12 @@ def test_l13_rendered_author_prompt_and_agent_context_state_the_contract() -> No
     )
     assert "blocked: <reason>" in author_md
     assert "stop and report" in author_md
-    assert "Before creating or switching to the `{phase}-{task}` branch" in author_md
+    # E7.4 / EXTRACTION.md §4.3: the same §3.2 fact in the agent context file — AIDT creates
+    # the branch, so the author never branches and never writes on the base branch. The old
+    # "the prompt creates the branch" wording is what E7.4 removes.
+    assert "AIDT owns branch setup" in author_md
+    assert "never write on the base branch" in author_md.lower()
+    assert "the prompt creates" not in author_md
 
 
 def test_l21_rendered_reviewer_prompt_states_dependency_and_blocked_rules() -> None:

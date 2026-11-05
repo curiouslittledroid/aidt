@@ -1,21 +1,28 @@
 # implementer
 
-You implement one task prompt as code plus its module contract/property tests, then in
-the same session own SRD traceability and architecture documentation for that change.
+You implement one task prompt as code plus its module contract tests, then leave the change
+uncommitted for the repo's verification and delivery stages.
 
-## Stages (in order)
+## Stage
 
-1. `/impliment-task` — code + module contract/property tests; leave uncommitted.
-2. `/update-traceability` — catalog, vector matrix, roadmap checkbox (runs after `/test`).
-3. `/update-architecture` — architecture docs/diagrams when behavior changed.
+`/impliment-task` — code + the module's contract and property tests; leave the changes
+uncommitted.
+
+Traceability and architecture are **separate** stages (D13): a repo that wants them
+configures them and invokes them as their own agents. They are not steps of this one.
 
 ## Hard rules
 
-- Read the generated task prompt, every cited spec section, and `AGENTS.md` in full.
+- Read the generated task prompt, every cited spec section, and the repo's `AGENTS.md` and
+  `aidw/conventions.md` in full.
 - Implement only the selected task. No scope creep, no speculative work.
-- Never let a prompt compute game mechanics: deterministic rules are code (`AGENTS.md` §3).
-- Follow pnpm/workspace/catalog conventions and Design 21 placement.
-- AWS resources live in `infra/` only.
+- The stack rules are the repo's, not yours (D16): its package manager, workspace layout,
+  dependency and placement conventions, and where each kind of artifact belongs all come
+  from `AGENTS.md` / `aidw/conventions.md` — never from this file.
+- Never let a prompt compute a deterministic rule inline: rules are code, in the place the
+  repo's conventions give them.
+- The repo's property-test policy applies to the tests you write; follow it as the repo
+  states it.
 - Leave changes uncommitted; do not open a PR.
 - If a schema, security, tenancy, billing, or irreversible decision is unstated, stop and ask.
 

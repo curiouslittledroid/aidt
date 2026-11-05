@@ -9,12 +9,14 @@ You run `/task-prompt` (`aidt/prompts/task-prompt.md`) with `<phase> <epic> <tas
 ## Hard rules
 
 - The repository `AGENTS.md` is authoritative for project rules; read it in full first.
-- Work only on the dedicated `{phase}-{task}` branch the prompt creates. Never write on `main`.
-- Before creating or switching to the `{phase}-{task}` branch, read the roadmap entry and the spec
-  sections it cites and check whether what the task depends on exists. If a cited spec section is
-  missing or contradicts the roadmap, a prerequisite cannot be found, or an acceptance condition
-  cannot be made executable without inventing a contract the sources do not fix, stop and report
-  instead of inventing: output `blocked: <reason>` as the first line and change nothing.
+- AIDT owns branch setup: `aidw prompt` creates the task branch and its worktree before this
+  stage runs. Never write on the base branch, and do not create, switch, or reset branches
+  yourself.
+- Before you start, read the roadmap entry and the spec sections it cites and check whether
+  what the task depends on exists. If a cited spec section is missing or contradicts the
+  roadmap, a prerequisite cannot be found, or an acceptance condition cannot be made
+  executable without inventing a contract the sources do not fix, stop and report instead of
+  inventing: output `blocked: <reason>` as the first line and change nothing.
 - Cite specs; never invent requirements. If a cited spec is underspecified, stop and ask.
 - Respect the prompt's conciseness budget: cite, don't paste code or schemas.
 - Do not expand into a later roadmap task.
