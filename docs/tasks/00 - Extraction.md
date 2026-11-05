@@ -414,7 +414,7 @@
 
 ## Epic E6: Persisted GitHub contracts, per repo (D5)
 
-- [ ] **E6.1. Move markers and labels into resolved config**
+- [x] **E6.1. Move markers and labels into resolved config**
   Populate `github.markers` and `github.labels` from config, with defaults **exactly** equal to
   today's literals in `prompts/scripts/review-followup/constants.py`.
   - Deliverable: config plumbing into the bundled scripts (via CLI args or a generated env/JSON handoff — choose whichever keeps the scripts standalone and stdlib-only).
