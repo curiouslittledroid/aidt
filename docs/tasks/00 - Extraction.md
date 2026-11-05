@@ -394,7 +394,7 @@
   - Deliverable: the doc, with the worked example taken from the prefixed baseline.
   - Done when: the example in the doc parses with the shipped parser.
 
-- [ ] **E5.2. Generalise the parser**
+- [x] **E5.2. Generalise the parser**
   Drive `roadmap.py` from `paths.roadmap_dir` + `paths.roadmap_glob`. Remove product assumptions from
   its docstrings. No configurable dialect (D15).
   - Deliverable: parser change plus tests.

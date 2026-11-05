@@ -671,6 +671,57 @@ def test_wrong_type_is_an_error_naming_the_offending_path(
 
 
 # ---------------------------------------------------------------------------
+# Fail-closed: degenerate roadmap_glob (review follow-up for PR #97, finding F1)
+# ---------------------------------------------------------------------------
+
+#: The two shapes ``Path.glob`` refuses (Python 3.13+): an empty pattern raises
+#: ``ValueError: Unacceptable pattern: ''`` and an absolute one ``NotImplementedError:
+#: Non-relative patterns are unsupported`` — both reached it unguarded pre-fix.
+DEGENERATE_GLOB_CASES = [
+    pytest.param("", "must be a non-empty glob pattern", id="empty"),
+    pytest.param("/etc/*.md", "must be a relative glob pattern", id="absolute"),
+]
+
+
+@pytest.mark.parametrize(("glob", "expected"), DEGENERATE_GLOB_CASES)
+def test_degenerate_roadmap_glob_is_an_error_naming_the_field(
+    tmp_path: Path, glob: str, expected: str
+) -> None:
+    """A declared empty or absolute ``roadmap_glob`` fails closed at load time.
+
+    Both otherwise reach ``tasks_dir.glob`` unguarded and traceback ``aidw tasks`` and
+    the prompt workflow; the loader's wrong-type contract (§3.4) is the shape kept.
+    """
+    config = _load(
+        tmp_path, {"schema_version": 1, "paths": {"roadmap_glob": glob}}
+    )
+
+    messages = _errors(config)
+    assert any(
+        "`paths.roadmap_glob`" in message and expected in message
+        for message in messages
+    ), format_issues(config.issues)
+    # Exactly one issue for the one bad value: the loader does not double-report.
+    assert len(messages) == 1, format_issues(config.issues)
+
+
+def test_valid_declared_roadmap_glob_loads_without_error(tmp_path: Path) -> None:
+    """A declared, relative, non-empty glob is exactly what the loader must accept.
+
+    The control for the degenerate cases: ``_read_str`` accepts any string, so the
+    refusal above must be the value's shape, not the key's presence.
+    """
+    config = _load(
+        tmp_path,
+        {"schema_version": 1, "paths": {"roadmap_glob": "0[0-9] - *.md"}},
+    )
+
+    assert _errors(config) == [], format_issues(config.issues)
+    assert config.paths is not None
+    assert config.paths.roadmap_glob == "0[0-9] - *.md"
+
+
+# ---------------------------------------------------------------------------
 # Fail-closed: missing required keys
 # ---------------------------------------------------------------------------
 

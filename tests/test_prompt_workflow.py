@@ -3023,6 +3023,65 @@ def test_l24_bundle_contains_the_six_elements(tmp_path: Path, monkeypatch) -> No
     assert "origin/main: absent/unverifiable" in bundle
 
 
+def test_l24_evidence_bundle_re_reads_the_configured_roadmap_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """E5.2/D15: the bundle's re-read follows `paths.roadmap_dir` + `paths.roadmap_glob`.
+
+    The roadmap directory has two readers (roadmap-format.md §6), and this test exists for
+    the second one: rewiring only the `load_tasks` call would leave the Done-when/spec
+    re-read on a fixed path, so here it would degrade to `unavailable` while the listing
+    still worked. The repo has no `docs/tasks` at all, and the configured glob is not the
+    default, so neither a hardcoded directory nor an ignored glob can pass.
+    """
+    _make_control_repo(
+        tmp_path,
+        files={
+            "plans/03 - Test Phase.md": ROADMAP_EVIDENCE,
+            "aidw/config.yaml": (
+                "schema_version: 1\n"
+                "paths:\n"
+                "  roadmap_dir: plans\n"
+                '  roadmap_glob: "0[0-9] - *.md"\n'
+            ),
+            "docs/migration/EXTRACTION.md": EXTRACTION_EVIDENCE_FIXTURE,
+            "AGENTS.md": AGENTS_EVIDENCE_FIXTURE,
+        },
+    )
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        allow_incomplete_prereqs=True,
+    )
+
+    assert code == 0
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    bundle = _evidence_path(tmp_path, run_id, "task-review-1").read_text(
+        encoding="utf-8"
+    )
+    # The entry was parsed from the configured directory and glob...
+    assert "03 - Test Phase.md:13" in bundle
+    # ...and the same configured directory is what the re-read used: the full multi-line
+    # Done when survives, which only the real file can supply.
+    roadmap_section = bundle.split("## Roadmap entry", 1)[1].split(
+        "## Cited spec sections", 1
+    )[0]
+    assert "unavailable" not in roadmap_section
+    assert (
+        "including a later continuation line that a first-line-only parser would drop."
+        in roadmap_section
+    )
+    # A second consumer left on the default directory would read nothing at all.
+    assert not (tmp_path / "docs" / "tasks").exists()
+
+
 def test_l24_dry_run_writes_no_evidence_bundle(tmp_path: Path, monkeypatch) -> None:
     """The dry-run path returns before the loop: no evidence file, no pointer."""
     _evidence_repo(tmp_path, monkeypatch)
@@ -3070,7 +3129,7 @@ def test_l24_unreadable_prompt_is_explicitly_unavailable(
     """A prompt path the writer cannot read must not look like usable evidence."""
     _evidence_repo(tmp_path, monkeypatch)
     repo = TargetRepo.resolve(tmp_path)
-    entries = prompt_workflow.load_tasks(tmp_path / "docs" / "tasks")
+    entries = prompt_workflow.load_tasks(tmp_path / "docs" / "tasks", "[0-9]* - *.md")
     entry = next(candidate for candidate in entries if candidate.task == "E4.1")
     directory = tmp_path / "state" / "run"
 
@@ -3081,6 +3140,7 @@ def test_l24_unreadable_prompt_is_explicitly_unavailable(
         entry=entry,
         entries=entries,
         rel="docs/task-prompts/missing-prompt.md",
+        roadmap_dir="docs/tasks",
     )
 
     assert path is not None
@@ -3101,7 +3161,7 @@ def test_l24_writer_failure_returns_none_and_warns(
     directory.mkdir(parents=True)
     # A file where the `stages/` directory must be makes the mkdir fail.
     (directory / "stages").write_text("blocked", encoding="utf-8")
-    entries = prompt_workflow.load_tasks(tmp_path / "docs" / "tasks")
+    entries = prompt_workflow.load_tasks(tmp_path / "docs" / "tasks", "[0-9]* - *.md")
     entry = next(candidate for candidate in entries if candidate.task == "E4.1")
 
     path = prompt_workflow._write_evidence_bundle(
@@ -3111,6 +3171,7 @@ def test_l24_writer_failure_returns_none_and_warns(
         entry=entry,
         entries=entries,
         rel="docs/task-prompts/03-E4.1-prompt.md",
+        roadmap_dir="docs/tasks",
     )
 
     assert path is None
@@ -4021,6 +4082,73 @@ def test_e33_incompatible_config_refuses_before_any_state(
     assert "error: config.yaml:" in err
     for token in expected_tokens:
         assert token in err
+    # Nothing was created: no stage ran, no run record, no branch and no worktree.
+    assert seen == []
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert not _runs_root(tmp_path).exists()
+    assert git.worktree_for_branch(tmp_path, "03-E4.1") is None
+    assert not _task_worktree(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    ("glob", "expected"),
+    [
+        pytest.param("", "must be a non-empty glob pattern", id="empty"),
+        pytest.param("/etc/*.md", "must be a relative glob pattern", id="absolute"),
+    ],
+)
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_degenerate_roadmap_glob_refuses_before_load_tasks(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    glob: str,
+    expected: str,
+    dry_run: bool,
+) -> None:
+    """A degenerate ``paths.roadmap_glob`` refuses (stderr + exit 2) before ``load_tasks``.
+
+    Review follow-up for PR #97, finding F1: pre-fix the value reached
+    ``tasks_dir.glob`` unguarded, so the run escaped the single-refusal-site design
+    (E3.3's config refusal) with a traceback instead of the documented stderr + 2.
+    """
+    _patch_prompt_repo(
+        tmp_path,
+        monkeypatch,
+        config_text=(
+            "schema_version: 1\npaths:\n"
+            f"  roadmap_glob: \"{glob}\"\n"
+        ),
+    )
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    def _must_not_run(*_args, **_kwargs):
+        raise AssertionError(
+            "a degenerate roadmap_glob must refuse before load_tasks/derive_branch_name"
+        )
+
+    monkeypatch.setattr(prompt_workflow, "load_tasks", _must_not_run)
+    monkeypatch.setattr(prompt_workflow, "derive_branch_name", _must_not_run)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        max_revisions=1,
+        dry_run=dry_run,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    err = captured.err
+    assert "error: config.yaml:" in err
+    assert "paths.roadmap_glob" in err
+    assert expected in err
     # Nothing was created: no stage ran, no run record, no branch and no worktree.
     assert seen == []
     assert state.list_runs(_runs_root(tmp_path)) == []

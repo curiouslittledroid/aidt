@@ -43,6 +43,10 @@ DOC = toolkit_root() / "docs" / "roadmap-format.md"
 EXAMPLE_NAME = "07 - Example Roadmap.md"
 EXAMPLE_PHASE = "07"
 
+#: The toolkit's default ``paths.roadmap_glob`` (``TOOLKIT_DEFAULTS.paths``, D17). Passed
+#: explicitly because :func:`aidw.roadmap.load_tasks` carries no pattern of its own.
+DEFAULT_GLOB = "[0-9]* - *.md"
+
 
 def _fenced_blocks(text: str) -> list[str]:
     """Every fenced code block body in a markdown document (fence lines dropped)."""
@@ -229,7 +233,7 @@ def test_example_parses_through_load_tasks(tmp_path: Path) -> None:
     # A non-matching filename in the same directory must be ignored (§3).
     (tmp_path / "notes.md").write_text("# Notes\n\n## Epic A: Alpha\n", encoding="utf-8")
 
-    tasks = load_tasks(tmp_path)
+    tasks = load_tasks(tmp_path, DEFAULT_GLOB)
 
     assert [task.task for task in tasks] == ["E5.1", "E5.2", "E6.1"]
     assert all("." in task.task for task in tasks)

@@ -1,14 +1,20 @@
 """Roadmap parsing (design §11).
 
-Parses the checkbox task index under ``docs/tasks/*.md``:
+Parses the checkbox task index in the configured roadmap directory:
 
-- ``# Phase NN: Title`` — phase title (the zero-padded phase id comes from the filename)
+- ``# Phase NN: Title`` — phase title (the phase id comes from the filename)
 - ``## Epic X: Title`` — epic title
 - ``- [x] **A1. Title** <details>`` — a task, with an indented ``Done when:`` line
 
-The phase id is taken from the filename prefix (``03``, ``02.5``), because the
-``/task-prompt`` workflow expects the zero-padded form that matches the task-prompt file
-name and the branch name.
+The phase id is taken from the filename prefix (a two-digit phase id, optionally ``.``
+plus digits), because the ``/task-prompt`` workflow expects the zero-padded form that
+matches the task-prompt file name and the branch name.
+
+Which directory is read and which filenames are candidates are the caller's inputs
+(``paths.roadmap_dir``/``paths.roadmap_glob``, D15/D17): ``load_tasks`` takes the glob
+from its caller, so this module carries neither a product-specific directory nor a
+product-specific pattern. There is no per-repo dialect (D15) — the patterns below are the
+one format.
 """
 
 from __future__ import annotations
@@ -117,12 +123,19 @@ def parse_file(path: Path, phase: str) -> list[RoadmapTask]:
     return tasks
 
 
-def load_tasks(tasks_dir: Path) -> list[RoadmapTask]:
-    """Parse every numbered roadmap file under ``tasks_dir``."""
+def load_tasks(tasks_dir: Path, glob: str) -> list[RoadmapTask]:
+    """Parse every roadmap file under ``tasks_dir`` that ``glob`` selects.
+
+    ``glob`` is the caller's configured filename pattern (``paths.roadmap_glob``); it only
+    pre-selects candidates. ``_FILENAME_RE`` stays the phase authority: a name the glob
+    admits but the pattern rejects (``0 - x.md``, ``0123 - x.md``) is still dropped, and
+    the phase always comes from the filename prefix, never from the ``# Phase`` heading.
+    A missing ``tasks_dir`` is empty, not an error (the read-path check is the caller's).
+    """
     if not tasks_dir.is_dir():
         return []
     tasks: list[RoadmapTask] = []
-    for path in sorted(tasks_dir.glob("*.md")):
+    for path in sorted(tasks_dir.glob(glob)):
         match = _FILENAME_RE.match(path.name)
         if not match:
             continue

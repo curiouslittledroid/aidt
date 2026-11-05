@@ -94,7 +94,7 @@ aidt/
 │   ├── git.py                    # git safety checks, branch/PR helpers
 │   ├── github.py                 # thin wrappers around bundled Python scripts + gh reads
 │   ├── gates.py                  # human-in-the-loop prompts, skip recording
-│   ├── roadmap.py                # docs/tasks/*.md checkbox parsing
+│   ├── roadmap.py                # roadmap checkbox parsing (configured dir + glob)
 │   ├── verdict.py                # deterministic Approve/Request changes/Blocked parsing
 │   ├── inventory.py              # prompt/script inventory check
 │   ├── log.py                    # run logging (JSONL + human transcript)
@@ -447,7 +447,7 @@ preflight (clean tree, on main; fetch and refuse when the base branch is behind 
 ```
 
 - The preflight fetches `origin` and refuses (exit 4) when the local base branch is behind or diverged from `origin/<base>`; `--no-fetch` skips the fetch and the comparison.
-- Before that fetch, the preflight refuses (exit 4) when an earlier task in the target's own `docs/tasks/*.md` phase file is still unticked, naming every incomplete predecessor in roadmap order. `--allow-incomplete-prereqs` proceeds with a warning instead. `--dry-run` reports the incomplete predecessors and never refuses.
+- Before that fetch, the preflight refuses (exit 4) when an earlier task in the target's own roadmap phase file (the configured `paths.roadmap_dir`) is still unticked, naming every incomplete predecessor in roadmap order. `--allow-incomplete-prereqs` proceeds with a warning instead. `--dry-run` reports the incomplete predecessors and never refuses.
 - `P1` receives `$1=phase`, `$2=epic`, `$3=task`. The prompt itself creates the `{phase}-{task}`
   branch and commits the prompt. Before branching, the author checks feasibility — the roadmap
   entry and the spec sections it cites, and whether what the task depends on exists. When
@@ -801,24 +801,38 @@ stage fails, so `--resume` continues from that stage.
 
 ## 11. Roadmap task selection
 
-`roadmap.py` parses `docs/tasks/<NN> - <Name>.md`:
+Where the roadmap lives is target-repo configuration (**D15/D17**): the whole per-repo surface is
+`paths.roadmap_dir` plus `paths.roadmap_glob`, documented in `docs/target-repo-config.md`. The
+toolkit defaults are `docs/tasks` and `[0-9]* - *.md` (`TOOLKIT_DEFAULTS.paths`), and there is
+**no** per-repo dialect — no configurable regex, heading syntax or parser variant.
+
+`roadmap.py` parses the files in `<paths.roadmap_dir>` that `<paths.roadmap_glob>` selects:
 
 - Headings `# Phase NN:`, `## Epic X:`, and checkbox items `- [x]` / `- [ ]` with
   `**<ID>. <Title>**` and an indented `- Done when:` line.
-- Produces `{phase, epic, task, title, done, done_when, spec_citations}`.
+- `_FILENAME_RE` stays the phase authority: the glob only pre-selects candidates, and the phase
+  always comes from the `<NN> - <Name>.md` filename prefix, never from the `# Phase` heading — a
+  name the glob admits but the pattern rejects (`0 - x.md`, `0123 - x.md`) is ignored.
+- Produces `{phase, epic, task, title, done, done_when, citations, file, line, epic_title,
+  phase_title}`.
 
 Commands:
 
-- `aidw tasks` — list all tasks with `phase/epic/id/status`.
+- `aidw tasks` — list all tasks with `phase/epic/id/status`. It resolves `<target>/aidw/config.yaml`
+  for the two `paths.` leaves and **fails closed** on a config the loader rejects (issues on
+  stderr, exit 1), so a typo cannot silently list the wrong roadmap; it deliberately does not run
+  the read-path preflight, so a roadmap-only repo still lists.
 - `aidw tasks --todo` — only unchecked.
 - `aidw tasks --phase 03 [--epic E2]` — filter.
-- `aidw tasks --show 03 E2 E2.9` — detail including `Done when` and cited specs.
-- `aidw tasks --next [--phase 03]` — first unchecked task (dependency-graph awareness is deferred;
-  v1 documents that prerequisite ordering is the operator's responsibility, per `docs/workflow.md`
-  Step 0 item 3).
+- `aidw tasks --show "03 E2 E2.9"` — detail including `Done when` and cited specs. The argument is
+  one quoted string whose three space-separated parts are all required.
+- `aidw tasks --next [--phase 03]` — first unchecked task. Dependency-graph awareness is deferred
+  (§17 F4): neither `--next` nor the listing enforces ordering, and the refusal that does exist is
+  `aidw prompt`'s preflight on an unticked predecessor in the same roadmap phase file (§8.1).
 
-`aidw prompt` accepts either explicit `<phase> <epic> <task>` or `--task <id>` resolved from the
-roadmap.
+`aidw prompt <phase> <epic> <task>` takes those three positionals only (there is no `--task` flag)
+and resolves the entry from the same configured roadmap; the stage evidence bundle re-reads the
+entry's own file from that same directory (`docs/roadmap-format.md` §6, "two readers").
 
 ---
 

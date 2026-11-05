@@ -6,6 +6,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from typer.testing import CliRunner
 
 from aidw import __version__, github
@@ -1185,3 +1187,192 @@ def test_config_show_writes_no_state_dir(tmp_path: Path, monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert not (tmp_path / ".aidw").exists()
+
+
+# --------------------------------------------------------------------------- #
+# E5.2: `aidw tasks` reads the configured roadmap location (D15/D17)
+# --------------------------------------------------------------------------- #
+#
+# The roadmap's directory and filename pattern are target-repo configuration, so `tasks`
+# must list whatever `paths.roadmap_dir` + `paths.roadmap_glob` resolve to — with no
+# parser change and no `docs/tasks` present — and must fail closed on a broken config
+# (E3.2/E3.3: a broken config is never silently resolved to defaults).
+
+
+def _write_roadmap(path: Path, names: dict[str, str]) -> Path:
+    """Write ``{filename: body}`` into ``path`` (created) and return it."""
+    path.mkdir(parents=True, exist_ok=True)
+    for name, body in names.items():
+        (path / name).write_text(body, encoding="utf-8")
+    return path
+
+
+def _write_target_config(repo: Path, text: str) -> Path:
+    config_path = repo / "aidw" / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(text, encoding="utf-8")
+    return config_path
+
+
+def _target_cwd(tmp_path: Path, monkeypatch) -> None:
+    """Make ``tmp_path`` the resolved target with no leftover env override."""
+    monkeypatch.delenv("AIDW_REPO", raising=False)
+    monkeypatch.delenv("AIDW_STATE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+
+def test_tasks_reads_the_configured_roadmap_dir_and_glob(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A non-default ``roadmap_dir`` + ``roadmap_glob`` drive the listing, config only.
+
+    The repo has no ``docs/tasks`` at all, and the configured glob excludes the second
+    phase file, so neither a hardcoded directory nor an ignored glob can pass.
+    """
+    _target_cwd(tmp_path, monkeypatch)
+    _init_repo(tmp_path)
+    _write_roadmap(
+        tmp_path / "plans",
+        {
+            "03 - Test Phase.md": ROADMAP_FIXTURE,
+            "10 - Later Phase.md": (
+                "# Phase 10: Later Phase\n\n## Epic E4: Later\n\n"
+                "- [ ] **E4.9. Later task** text.\n  - Done when: later.\n"
+            ),
+        },
+    )
+    _write_target_config(
+        tmp_path,
+        "schema_version: 1\n"
+        "paths:\n"
+        "  roadmap_dir: plans\n"
+        '  roadmap_glob: "0[0-9] - *.md"\n',
+    )
+
+    result = runner.invoke(app, ["tasks"])
+
+    assert result.exit_code == 0, result.output
+    assert "E4.1" in result.stdout
+    assert "Implement Total Defense" in result.stdout
+    # `0[0-9] - *.md` selects the `03` file only: the glob, not just the directory, is read.
+    assert "10 - Later Phase.md" not in result.stdout
+    assert "E4.9" not in result.stdout
+    assert not (tmp_path / "docs" / "tasks").exists()
+
+
+def test_tasks_absolute_roadmap_dir_wins(tmp_path: Path, monkeypatch) -> None:
+    """``repo.root / value``: an absolute ``roadmap_dir`` wins (pathlib, §3.4's rule)."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _target_cwd(repo, monkeypatch)
+    elsewhere = _write_roadmap(
+        tmp_path / "elsewhere", {"07 - Absolute.md": ROADMAP_FIXTURE}
+    )
+    _write_target_config(
+        repo,
+        "schema_version: 1\n"
+        "paths:\n"
+        f"  roadmap_dir: {json.dumps(str(elsewhere))}\n",
+    )
+
+    result = runner.invoke(app, ["tasks"])
+
+    assert result.exit_code == 0, result.output
+    # The phase comes from the filename in the absolute directory, not from the heading.
+    assert "07" in result.stdout
+    assert "E4.1" in result.stdout
+    # Nothing was read from the repo itself: the absolute dir is the roadmap.
+    assert not (repo / "elsewhere").exists()
+    assert not (repo / "docs" / "tasks").exists()
+
+
+def test_tasks_default_roadmap_dir_still_lists_with_no_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The D17 default (``docs/tasks`` + ``[0-9]* - *.md``) needs no config file."""
+    _target_cwd(tmp_path, monkeypatch)
+    _init_repo(tmp_path)
+    _write_roadmap(tmp_path / "docs" / "tasks", {"03 - Test Phase.md": ROADMAP_FIXTURE})
+
+    result = runner.invoke(app, ["tasks"])
+
+    assert result.exit_code == 0, result.output
+    assert "Implement Total Defense" in result.stdout
+    assert not (tmp_path / "aidw").exists()
+
+
+def test_tasks_malformed_config_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    """A broken config refuses (stderr + EXIT_STAGE_FAILURE) instead of listing anything.
+
+    The roadmap itself is present and parseable, so a command that resolved the config
+    leniently would print a listing here; it must not.
+    """
+    _target_cwd(tmp_path, monkeypatch)
+    _init_repo(tmp_path)
+    _write_roadmap(tmp_path / "docs" / "tasks", {"03 - Test Phase.md": ROADMAP_FIXTURE})
+    _write_target_config(tmp_path, "{{ not yaml: [")
+
+    result = runner.invoke(app, ["tasks"])
+
+    assert result.exit_code == EXIT_STAGE_FAILURE
+    assert result.stdout == ""
+    assert "cannot read/parse config" in result.stderr
+    assert "Implement Total Defense" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("glob", "expected"),
+    [
+        pytest.param("", "must be a non-empty glob pattern", id="empty"),
+        pytest.param("/etc/*.md", "must be a relative glob pattern", id="absolute"),
+    ],
+)
+def test_tasks_degenerate_roadmap_glob_fails_closed(
+    tmp_path: Path, monkeypatch, glob: str, expected: str
+) -> None:
+    """A degenerate ``paths.roadmap_glob`` refuses like any broken config (PR #97 F1).
+
+    Pre-fix the value reached ``tasks_dir.glob`` unguarded, so the command
+    traceback'd (``ValueError``/``NotImplementedError`` on Python 3.13+) instead of
+    the documented stderr + ``EXIT_STAGE_FAILURE`` refusal (E3.2/E3.3).
+    """
+    _target_cwd(tmp_path, monkeypatch)
+    _init_repo(tmp_path)
+    _write_roadmap(tmp_path / "docs" / "tasks", {"03 - Test Phase.md": ROADMAP_FIXTURE})
+    _write_target_config(
+        tmp_path,
+        "schema_version: 1\npaths:\n  roadmap_dir: docs/tasks\n"
+        f"  roadmap_glob: {json.dumps(glob)}\n",
+    )
+
+    result = runner.invoke(app, ["tasks"])
+
+    assert result.exit_code == EXIT_STAGE_FAILURE
+    # A clean refusal, never the pre-fix crash out of `load_tasks`.
+    assert not isinstance(result.exception, (ValueError, NotImplementedError)), (
+        result.exception
+    )
+    assert result.stdout == ""
+    assert "paths.roadmap_glob" in result.stderr
+    assert expected in result.stderr
+    assert "Implement Total Defense" not in result.stderr
+
+
+def test_tasks_does_not_validate_the_other_read_paths(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`tasks` needs only the roadmap: it must not run the E3.7 read-path preflight.
+
+    A roadmap-only repo (no task-prompts/results/template) is exactly what an inspection
+    command must still be able to list; `validate_paths` here would refuse it.
+    """
+    _target_cwd(tmp_path, monkeypatch)
+    _init_repo(tmp_path)
+    _write_roadmap(tmp_path / "docs" / "tasks", {"03 - Test Phase.md": ROADMAP_FIXTURE})
+
+    result = runner.invoke(app, ["tasks"])
+
+    assert result.exit_code == 0, result.output
+    assert "E4.1" in result.stdout
+    assert not (tmp_path / "docs" / "task-prompts").exists()
+    assert not (tmp_path / "docs" / "implementation-results").exists()
