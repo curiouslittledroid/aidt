@@ -7,7 +7,7 @@ It deliberately documents behaviour the shipped parser already has; it introduce
 | Activity | Owner |
 |---|---|
 | This doc | E5.1 (done) |
-| Driving the parser from `paths.roadmap_dir` + `paths.roadmap_glob` | E5.2 (not done — see §3) |
+| Driving the parser from `paths.roadmap_dir` + `paths.roadmap_glob` | E5.2 (done — see §3) |
 | Format *validation* with file/line/rule errors | E5.3 (not done — see §10) |
 | Promoting this doc's example to the single source the parser tests read | E5.4 (not done) |
 
@@ -89,8 +89,8 @@ Two structural consequences follow from the anchors alone and are worth stating 
 ## 3. Directory and filename
 
 A roadmap file is `<phase> - <name>.md` where `<phase>` is **exactly two digits**, optionally
-followed by `.` and more digits for a sub-phase. `roadmap.py`'s own docstring names `03` and
-`02.5` as the two shapes it expects.
+followed by `.` and more digits for a sub-phase. `roadmap.py`'s own docstring states the same
+rule generically (a two-digit phase id, optionally `.` plus digits) and names no repository.
 
 | Filename | Result |
 |---|---|
@@ -100,14 +100,19 @@ followed by `.` and more digits for a sub-phase. `roadmap.py`'s own docstring na
 | `000 - Extraction.md` | **ignored** |
 | `example-roadmap.md` | **ignored** (and the default glob would not select it either) |
 
-`load_tasks(<dir>)` parses the files in that directory; `parse_file(path, phase)` parses one
-file for a phase id the caller supplies. Both take the phase from the **filename prefix**,
-never from the `# Phase` heading, because the `/task-prompt` workflow needs the zero-padded
-form that the task-prompt filename and the branch name are built from. The phase is what
-`aidw prompt 00 E0 E0.1` must be given — `0` does not match `find_task`.
+`load_tasks(<dir>, <glob>)` parses the files in `<dir>` that `<glob>` selects;
+`parse_file(path, phase)` parses one file for a phase id the caller supplies. Both take the
+phase from the **filename prefix**, never from the `# Phase` heading, because the
+`/task-prompt` workflow needs the zero-padded form that the task-prompt filename and the
+branch name are built from. The phase is what `aidw prompt 00 E0 E0.1` must be given — `0`
+does not match `find_task`.
 
-E5.2 wires `paths.roadmap_dir` and `paths.roadmap_glob` through to these two functions. Until
-it lands, the directory is the hardcoded `docs/tasks`; the *format* rules below are unaffected.
+Since E5.2 the two calls are wired to the config: `<dir>` is `paths.roadmap_dir` and `<glob>`
+is `paths.roadmap_glob`, both resolved through the normal layering (§1) and joined against
+the target root (an absolute value wins). The glob only **pre-selects** candidates;
+`_FILENAME_RE` stays the phase authority, so a name the glob admits but the pattern rejects
+(`0 - x.md`, `0123 - x.md`) is still ignored. The parser itself carries neither a directory
+nor a default pattern. The *format* rules below are unaffected by either config key.
 
 ---
 
@@ -182,7 +187,7 @@ in the file collapse to the epic-level id with a stray leading digit in the titl
 The one-line guard from E0.7 exists for exactly this, and reports any id that lost its dot:
 
 ```bash
-uv run python -c 'import pathlib; from aidw.roadmap import load_tasks; t=load_tasks(pathlib.Path("docs/tasks")); assert t, "no tasks parsed"; bad=[x.task for x in t if "." not in x.task]; assert not bad, f"MISPARSE: {bad}"; print(f"{len(t)} tasks, none collapsed")'
+uv run python -c 'import pathlib; from aidw.roadmap import load_tasks; t=load_tasks(pathlib.Path("docs/tasks"), "[0-9]* - *.md"); assert t, "no tasks parsed"; bad=[x.task for x in t if "." not in x.task]; assert not bad, f"MISPARSE: {bad}"; print(f"{len(t)} tasks, none collapsed")'
 ```
 
 ### `derive_epic`

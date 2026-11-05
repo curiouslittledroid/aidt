@@ -42,7 +42,7 @@ Stages:
 
 A real run requires the configured base branch (``repo.base_branch``) checked out in the
 control worktree and a clean working tree. It then refuses (exit 4) when an earlier task in
-the same ``docs/tasks/*.md`` phase file is unticked, unless ``--allow-incomplete-prereqs``
+the same roadmap phase file is unticked, unless ``--allow-incomplete-prereqs``
 is given, then fetches ``origin`` and refuses (exit 4) when the base branch is behind or
 diverged from ``origin/<base>``; ``--no-fetch`` skips both the fetch and the comparison.
 It derives the branch/worktree name from ``repo.branch_pattern`` and creates the task
@@ -310,11 +310,19 @@ _DECISION_RE = re.compile(r"\bD\d+\b")
 _HEADING_NUMBER_RE = re.compile(r"^#+\s+(\d+(?:\.\d+)?)\b")
 
 
-def _roadmap_lines(repo: TargetRepo, entry: RoadmapTask) -> list[str] | None:
-    """Re-read the entry's own roadmap file, or ``None`` when it cannot be read."""
+def _roadmap_lines(
+    repo: TargetRepo, entry: RoadmapTask, *, roadmap_dir: str
+) -> list[str] | None:
+    """Re-read the entry's own roadmap file, or ``None`` when it cannot be read.
+
+    ``roadmap_dir`` is the resolved ``paths.roadmap_dir`` (D15/D17): the second consumer
+    of the roadmap directory (roadmap-format.md §6, "two readers"), so it must follow the
+    same configured location the entry was parsed from rather than a fixed path. It is
+    joined against ``repo`` — the tree the stage runs in — and an absolute value wins.
+    """
     try:
         return (
-            (repo.root / "docs" / "tasks" / entry.file)
+            (repo.root / roadmap_dir / entry.file)
             .read_text(encoding="utf-8")
             .splitlines()
         )
@@ -516,6 +524,7 @@ def _render_evidence_bundle(
     entry: RoadmapTask,
     entries: list[RoadmapTask],
     rel: str,
+    roadmap_dir: str,
 ) -> str:
     """Render the six-element bundle (L2.4) for one stage.
 
@@ -523,7 +532,7 @@ def _render_evidence_bundle(
     renderers, so the bundle is always produced even when ``AGENTS.md`` is missing or the
     roadmap file cannot be read.
     """
-    lines = _roadmap_lines(repo, entry)
+    lines = _roadmap_lines(repo, entry, roadmap_dir=roadmap_dir)
     task_index = entry.line - 1
     done_block = (
         _done_when_block(lines, task_index)
@@ -584,6 +593,7 @@ def _write_evidence_bundle(
     entry: RoadmapTask,
     entries: list[RoadmapTask],
     rel: str,
+    roadmap_dir: str,
 ) -> Path | None:
     """Write ``stages/<stage>.evidence.md`` and return its absolute path, or ``None``.
 
@@ -594,7 +604,12 @@ def _write_evidence_bundle(
     """
     try:
         body = _render_evidence_bundle(
-            stage=stage, repo=repo, entry=entry, entries=entries, rel=rel
+            stage=stage,
+            repo=repo,
+            entry=entry,
+            entries=entries,
+            rel=rel,
+            roadmap_dir=roadmap_dir,
         )
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
@@ -643,6 +658,7 @@ def _stage_evidence_pointer(
     entry: RoadmapTask,
     entries: list[RoadmapTask],
     rel: str,
+    roadmap_dir: str,
 ) -> str:
     """Write this stage's bundle and return the pointer to prepend to its ``extra``."""
     return _evidence_pointer(
@@ -653,6 +669,7 @@ def _stage_evidence_pointer(
             entry=entry,
             entries=entries,
             rel=rel,
+            roadmap_dir=roadmap_dir,
         )
     )
 
@@ -1362,7 +1379,16 @@ def run(
     # and threaded in as ``workspace`` so no workflow re-resolves it.
     runs_root = workspace.state_root / "runs"
 
-    entries = load_tasks(repo.root / "docs" / "tasks")
+    # D15/D17: the roadmap location is target-repo configuration — the whole per-repo
+    # surface is ``paths.roadmap_dir`` plus ``paths.roadmap_glob`` (no parser dialect).
+    # Both resolve from the config already resolved above; the glob only pre-selects files
+    # and ``roadmap.py``'s ``_FILENAME_RE`` stays the phase authority. ``roadmap_dir`` is
+    # threaded on to the evidence bundle, whose re-read is the second consumer of the same
+    # directory (roadmap-format.md §6).
+    roadmap_dir = str(resolved_config["paths.roadmap_dir"].value)
+    entries = load_tasks(
+        repo.root / roadmap_dir, str(resolved_config["paths.roadmap_glob"].value)
+    )
     entry = find_task(entries, phase, epic, task)
     if entry is None:
         print(
@@ -1707,6 +1733,7 @@ def run(
                 entry=entry,
                 entries=entries,
                 rel=rel,
+                roadmap_dir=roadmap_dir,
             )
             rec = run_stage(
                 _with_pointer(spec, pointer, delta),
@@ -1907,6 +1934,7 @@ def run(
                         entry=entry,
                         entries=entries,
                         rel=rel,
+                        roadmap_dir=roadmap_dir,
                     )
                     rec_fix = run_stage(
                         _with_pointer(spec, pointer),
@@ -1957,6 +1985,7 @@ def run(
                         entry=entry,
                         entries=entries,
                         rel=rel,
+                        roadmap_dir=roadmap_dir,
                     )
                     rec_fix = run_stage(
                         _with_pointer(spec, pointer),
@@ -2003,6 +2032,7 @@ def run(
                 entry=entry,
                 entries=entries,
                 rel=rel,
+                roadmap_dir=roadmap_dir,
             )
             rec_reconcile = run_stage(
                 _with_pointer(reconcile_spec, pointer, reconcile_render),

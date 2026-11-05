@@ -575,9 +575,24 @@ def tasks(
     ),
     next_: bool = typer.Option(False, "--next", help="Show the next unchecked task."),
 ) -> None:
-    """List or inspect roadmap tasks parsed from docs/tasks/."""
+    """List or inspect roadmap tasks parsed from the configured roadmap directory."""
     repo, _aidt, _workspace = _roots()
-    entries = load_tasks(repo.root / "docs" / "tasks")
+    # D15/D17: where the roadmap lives is target-repo configuration, not an AIDT constant
+    # — ``paths.roadmap_dir`` plus ``paths.roadmap_glob``. Loaded and resolved here exactly
+    # like ``config show`` so a broken config fails closed (stderr + EXIT_STAGE_FAILURE, no
+    # listing) instead of silently listing the wrong or an empty roadmap (E3.2/E3.3).
+    declared = load_target_config(repo.root / "aidw" / "config.yaml")
+    config_errors = [issue for issue in declared.issues if issue.level == ERROR]
+    if config_errors:
+        typer.echo(format_issues(config_errors), err=True)
+        raise typer.Exit(EXIT_STAGE_FAILURE)
+    resolved = resolve_config(declared)
+    # ``repo.root / value``: pathlib lets an absolute value win, which is the same rule
+    # every other §3.4 read-path resolves by (``target_config._target_path``). Deliberately
+    # no ``validate_paths`` here: this command only needs the roadmap location, so it must
+    # work on a roadmap-only repo (the read-path preflight belongs to the workflows, E3.7).
+    roadmap_dir = repo.root / str(resolved["paths.roadmap_dir"].value)
+    entries = load_tasks(roadmap_dir, str(resolved["paths.roadmap_glob"].value))
     if not entries:
         typer.echo("no roadmap tasks found", err=True)
         raise typer.Exit(EXIT_USAGE)
