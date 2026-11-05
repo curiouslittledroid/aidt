@@ -3322,6 +3322,28 @@ def test_e73_conventions_md_alone_supplies_the_gate_list(
     assert "This heading ends the conventions gate section" not in block
 
 
+def test_e73_non_utf8_conventions_source_is_ignored_by_the_gate_block(
+    tmp_path: Path,
+) -> None:
+    """A malformed optional source must not crash the evidence-bundle reader.
+
+    The valid AGENTS.md gate list remains usable while the shared reader skips the
+    undecodable ``aidw/conventions.md`` source, matching the injection channel's
+    fail-closed behavior.
+    """
+    target = tmp_path / "target"
+    (target / "aidw").mkdir(parents=True)
+    (target / "AGENTS.md").write_text(AGENTS_EVIDENCE_FIXTURE, encoding="utf-8")
+    (target / "aidw" / "conventions.md").write_bytes(b"\xff invalid utf8")
+    repo = TargetRepo(root=target, git_dir=target / ".git", common_dir=target / ".git")
+
+    block = prompt_workflow._gate_block(repo)
+
+    assert "target-repo-only gate --check" in block
+    assert "unavailable" not in block
+    assert "conventions-repo-only" not in block
+
+
 def test_e73_no_source_still_degrades_the_gate_block(tmp_path: Path) -> None:
     """Neither file: the unavailable note survives the second channel (L2.4 requirement 4).
 

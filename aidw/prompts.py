@@ -129,7 +129,12 @@ def read_conventions_sources(repo_root: Path) -> tuple[tuple[str, str], ...]:
     for relative in CONVENTIONS_SOURCES:
         try:
             text = (Path(repo_root) / relative).read_text(encoding="utf-8")
-        except OSError:
+        # UnicodeDecodeError is a ValueError, not an OSError (issue #113): a
+        # conventions file with non-UTF-8 bytes must degrade to "no conventions" like
+        # an unreadable one, not crash every §3.8 stage and the evidence bundle. The
+        # same ``(OSError, UnicodeDecodeError)`` precedent is used by the must-not-fail
+        # read in ``aidw/workflows/prompt.py`` (``_check_conciseness``).
+        except (OSError, UnicodeDecodeError):
             continue
         if text.strip():
             sources.append((relative, text))

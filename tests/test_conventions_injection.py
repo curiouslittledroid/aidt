@@ -512,6 +512,53 @@ def test_an_unreadable_source_degrades_to_nothing_instead_of_raising(
     assert AGENTS_SENTINEL in block
 
 
+def test_a_non_utf8_source_degrades_to_nothing_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """Issue #113: a non-UTF-8 source is skipped, never raised.
+
+    ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError``, so the
+    ``except OSError`` in ``read_conventions_sources`` did not cover it and a
+    Latin-1-encoded ``AGENTS.md`` crashed every §3.8 stage and the evidence bundle
+    instead of degrading to "no conventions".
+    """
+    target = _target(tmp_path)
+    # The issue's repro: invalid UTF-8 at position 0, so ``read_text`` raises
+    # ``UnicodeDecodeError`` before any ``OSError`` subclass could appear.
+    (target / "AGENTS.md").write_bytes(b"\xff\xfe invalid utf8 \x80\x81")
+
+    sources = read_conventions_sources(target)
+    block = render_repo_conventions(target)
+
+    assert [name for name, _ in sources] == ["aidw/conventions.md"]
+    assert AGENTS_SENTINEL not in block
+    assert CONVENTIONS_SENTINEL in block
+
+
+def test_a_non_utf8_conventions_file_does_not_fail_a_dry_run(
+    tmp_path: Path,
+) -> None:
+    """The stage boundary also degrades when the optional second source is malformed.
+
+    The shared reader is used by ``run_stage`` rather than only by its direct renderer;
+    this proves the user-visible dry-run still succeeds and retains the valid AGENTS.md
+    source when ``aidw/conventions.md`` cannot be decoded.
+    """
+    target = _target(tmp_path)
+    (target / "aidw" / "conventions.md").write_bytes(b"\xff invalid utf8")
+
+    rendered, state_json = _dry_run(
+        tmp_path,
+        target,
+        name="test",
+        prompt=toolkit_root() / "prompts" / "test.md",
+    )
+
+    assert AGENTS_SENTINEL in rendered
+    assert CONVENTIONS_SENTINEL not in rendered
+    assert '"status": "succeeded"' in state_json
+
+
 def test_an_empty_source_contributes_no_dangling_header(tmp_path: Path) -> None:
     """An empty ``conventions.md`` adds nothing, so the prompt stays byte-identical."""
     target = _target(tmp_path, agents_md=None, conventions_md="   \n")
