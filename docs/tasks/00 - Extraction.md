@@ -387,7 +387,7 @@
 
 ## Epic E5: Roadmap as an AIDT-owned format (D6, D15)
 
-- [ ] **E5.1. Write the format contract**
+- [x] **E5.1. Write the format contract**
   `docs/roadmap-format.md`: the required heading/entry structure, the ids, `Done when`, optional
   `Tests:`/citations, and a complete worked example. Mythical Forge's `docs/tasks/*.md` is the
   reference implementation.
