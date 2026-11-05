@@ -126,11 +126,68 @@ merged element-wise, so a stage you omit is not inherited from the default.
 
 ### `github:` — persisted GitHub strings
 
-These are the strings **already written into live GitHub issues** (D5, §3.9). Freeze means the
-values become per-repo config whose defaults are today's literals; parent lookup is an exact
-string match, so renaming one orphans every existing parent/child and causes duplicate issue
-creation on the next publish. The defaults below *are* those literals (E6.1), so a config that
-does not mention this block resolves the Mythical Forge values and changes nothing in GitHub.
+These are the strings **already written into live GitHub issues** (D5, §3.9): the three markers
+that identify the parent issue, the child issues and the single PR summary comment AIDT created,
+and the labels the review-followup publisher ensures. **Freeze means** the values become per-repo
+config whose defaults are today's literals, so the toolkit stops hardcoding the `mythical-forge`
+brand while a config that does not mention this block resolves those literals byte-identically
+(D17) and changes nothing in GitHub.
+
+**Why config-with-frozen-defaults.** D5 freezes the literals ("no currently-persisted string in
+GitHub changes"), and §3.9's mechanism is the one shape that satisfies both halves at once:
+`github.markers` and `github.labels` are ordinary config (§3.4) seeded from
+`aidw/target_config.py:TOOLKIT_DEFAULTS.github` (E6.1). That gives two different readers two
+different, both-correct answers:
+
+- **An existing repo changes nothing.** A config that declares neither block — or declares only
+  part of one — resolves the rest from the defaults, which *are* the literals in the tables below
+  (D17). `aidw config show`
+  reports those leaves `default` instead of `config`; the values, and therefore every existing
+  issue body and label, are unchanged.
+- **Any repo may declare its own literals.** That is what removes the brand from the toolkit: a
+  repo whose issues are marked differently supplies its own templates and definitions, and the
+  publisher uses them.
+
+Declaring this block is therefore a provenance/documentation choice, not a behaviour change: the
+Full example below pins exactly the values it would otherwise inherit. Treat a *rename* as a
+migration for the repo that owns the live issues, never as a config tweak.
+
+> **Warning — renaming a frozen value breaks matching against live issues.**
+>
+> - **A renamed marker orphans every existing parent/child pairing.** Parent lookup is an
+>   **exact string match**: `prompts/scripts/review-followup/gh.py:find_parent_issues` skips every
+>   issue whose body does not contain the rendered marker
+>   (`marker not in str(issue.get("body") or "")`). Issues created under the old marker stop
+>   matching the new template, so the next publish finds no parent for the PR and creates a
+>   **duplicate issue** — a second parent, plus a duplicate child per finding.
+> - **A renamed label is created beside the old one, not renamed.**
+>   `publish_review_followups.py:ensure_labels` only creates names it does not find (via
+>   `gh label create`); the "ensure existing" path never updates an existing label, so a new name
+>   yields a duplicate label for the same role while the old name stays on every issue that
+>   already carried it.
+> - **The comment bodies are compared with strict `==`**
+>   (`prompts/scripts/review-followup/logic.py:has_exact_comment`,
+>   `any(body == exact for body in bodies)`), so any edit — case, whitespace, punctuation — stops
+>   availability and idempotency detection from seeing the comment: the script re-adds a status
+>   comment, or fails to recognise an already-fixed or already-approved issue.
+
+**Scope: what is config and what is not.** Only `github.markers` (parent/child/summary) and
+`github.labels` (the six names with their colour and description) are
+config-with-frozen-defaults, seeded at `aidw/target_config.py:TOOLKIT_DEFAULTS.github` (E6.1).
+The three comment bodies (`Status: in progress`, `Status: fixed`, `Decision: approve-fix`) and the
+role-name constants (`LABEL_REVIEW_FOLLOW_UP`, `LABEL_APPROVE_FIX`, `LABEL_DECISION_PENDING`,
+`PRIORITY_LABELS`, `PUBLISHER_LABELS`) are **not** config: §3.4 has no field for them, so D5
+freezes them where they live, in `prompts/scripts/review-followup/constants.py`. There is no
+`github.comment_bodies:` or `github.role_labels:` key to declare — an invented one is refused as
+an unknown key like any other.
+
+**The guard, and the migration that is out of scope.** `tests/test_baseline_verbatim_golden.py`
+(E6.3) pins the Mythical-Forge-shaped defaults — markers, labels, comment bodies and role names —
+byte-identical to the `baseline-verbatim` tag, and `tests/test_target_config.py` pins the two
+homes (`constants.py` and `TOOLKIT_DEFAULTS.github`) equal. Changing any frozen value for an
+existing repo is therefore never a config edit alone: it requires a **one-time marker/label
+migration across that repo's open issues**, which §9 leaves out of scope. AIDT neither plans nor
+automates that migration.
 
 #### `github.markers`
 
@@ -173,8 +230,9 @@ A repo may declare more labels; they are definitions, and the publisher's own ob
 the fixed five (the six above minus `approve-fix`, which the approval step creates on demand).
 
 The comment bodies (`Status: in progress`, `Status: fixed`, `Decision: approve-fix`) and the role
-label names are **not** config: §3.4 has no field for them and D5 freezes them, so they stay in
-the scripts' `constants.py`.
+label names are **not** config either — §3.4 has no field for them — so D5 freezes them where they
+live, in the scripts' `constants.py`; the scope boundary stated at the top of this section is the
+complete list.
 
 ## Toolkit defaults
 
@@ -193,6 +251,10 @@ strings — nothing else:
 - `paths.architecture_dir` = `docs/architecture`.
 - `github.markers.parent`, `.child`, `.summary` = the three marker templates above.
 - `github.labels.<name>.color`/`.description` = the six label definitions above.
+
+The two `github.*` entries are the frozen D5 values: read the `github:` section above before you
+pin or change one — it explains why they are config-with-frozen-defaults and what a rename breaks
+(orphaned parent/child pairings, duplicate issue and label creation).
 
 `paths.agent_configs_dir` is deliberately **not** seeded: its consumer falls back to
 `<toolkit>/agent-configs/`, and seeding a repo-relative directory would make every repo

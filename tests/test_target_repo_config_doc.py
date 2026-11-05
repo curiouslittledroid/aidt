@@ -23,7 +23,17 @@ against the code, so prose drift fails here instead of at a reader's desk:
 - both precedence layers are pinned: the four-step prompt order and the
   ``override > config > default`` value order, so an edit that flattens or swaps them fails;
 - resolving the examples is pure: ``TOOLKIT_DEFAULTS`` is not mutated and no resolved
-  container aliases the declared config or the defaults.
+  container aliases the declared config or the defaults;
+- the E6.4 freeze narrative lives in the ``github:`` section, *before* its default tables, and
+  states the semantics a config editor must know: the exact-match lookup symbol
+  (``find_parent_issues``, in the bundled script rather than ``aidw/github.py``), both rename
+  failure modes (orphaned parent/child pairings, duplicate issue and label creation), the
+  strict-``==`` comment-body comparison, the not-config scope boundary, and the
+  ``test_baseline_verbatim_golden.py`` guard with §9's out-of-scope migration. It is asserted
+  by *semantic presence* (symbols and the roadmap's own words), not by a pinned sentence, so
+  wording edits stay free while silently dropping the warning fails. The narrative must also
+  not re-type the frozen literals: they belong in the drift-checked tables and the Full
+  example, so a hand-copied variant in prose (the D5 violation the freeze prevents) fails.
 
 Deliberately *not* tested here: path existence (E3.7), the enforced stage-id vocabulary
 (E4.1/E4.5), and anything the loader does not accept — the doc states those contracts but
@@ -295,6 +305,117 @@ def test_doc_is_not_the_placeholder():
     assert "This document is written in task E3.6" not in doc
     # The machine-readable counterpart stays referenced.
     assert "docs/schema/aidw-config.schema.json" in doc
+
+
+def _github_section() -> str:
+    """The ``### `github:` `` block: the freeze narrative and the pinned default tables."""
+    return _section(_doc(), "### `github:`", level=3)
+
+
+def _prose(section: str) -> str:
+    """The section's non-table lines, so a literal in a drift-checked table is not prose."""
+    return "\n".join(
+        line for line in section.splitlines() if not line.lstrip().startswith("|")
+    )
+
+
+# ---------------------------------------------------------------------------
+# E6.4: the freeze narrative a config editor reads before declaring `github:`
+# ---------------------------------------------------------------------------
+
+
+def test_freeze_narrative_precedes_the_marker_and_label_tables():
+    """The warning is read first: it sits in the section intro, above the defaults."""
+    section = _github_section()
+
+    assert "find_parent_issues" in section
+    assert section.index("find_parent_issues") < section.index("#### `github.markers`")
+    assert section.index("orphan") < section.index("#### `github.markers`")
+
+
+def test_freeze_narrative_cites_the_exact_match_lookup_by_symbol():
+    """§3.9: parent lookup is an exact match in the *bundled script*, not `aidw/github.py`."""
+    section = _github_section()
+
+    assert "find_parent_issues" in section
+    assert "prompts/scripts/review-followup/gh.py" in section
+    assert "exact string match" in section
+
+
+def test_freeze_narrative_states_both_rename_failure_modes():
+    """E6.4: a renamed marker orphans parents and duplicates issues; a label duplicates too."""
+    section = _github_section()
+
+    assert "orphan" in section
+    assert "duplicate issue" in section
+    assert "parent/child" in section
+    # The label path creates, never updates (E6.2), so a rename duplicates rather than edits.
+    assert "duplicate label" in section
+    assert "never updates an existing label" in section
+    # The comment bodies are frozen by strict equality, not by config.
+    assert "has_exact_comment" in section
+    assert "strict `==`" in section
+
+
+def test_freeze_narrative_states_why_they_are_config_with_frozen_defaults():
+    """D5 + §3.9 + D17: both halves, with the defaults seeded at the loader's literal."""
+    section = _github_section()
+
+    assert "config-with-frozen-defaults" in section
+    assert "D5" in section
+    assert "§3.9" in section
+    assert "D17" in section
+    assert "TOOLKIT_DEFAULTS.github" in section
+    assert "aidw/target_config.py" in section
+
+
+def test_freeze_narrative_states_the_not_config_scope_boundary():
+    """§3.4 has no field for comment bodies or role labels: they are not presented as config."""
+    section = _github_section()
+    flat = " ".join(section.split())
+
+    assert "**not** config" in flat
+    assert "§3.4 has no field" in flat
+    assert "prompts/scripts/review-followup/constants.py" in flat
+    assert "role-name constants" in flat
+    assert "comment bodies" in flat
+    # No invented keys: the narrative says plainly there is nothing to declare.
+    assert "no field for them" in flat
+
+
+def test_freeze_narrative_names_the_guard_and_the_out_of_scope_migration():
+    """E6.3's golden pins the defaults; §9 makes a live-issue migration out of scope."""
+    section = _github_section()
+
+    assert "tests/test_baseline_verbatim_golden.py" in section
+    assert "baseline-verbatim" in section
+    assert "E6.3" in section
+    assert "one-time marker/label" in section
+    assert "out of scope" in section
+    assert "§9" in section
+
+
+def test_freeze_narrative_does_not_retype_the_frozen_literals():
+    """Requirement 4/D5: prose points at the drift-checked tables, it never copies them."""
+    prose = _prose(_github_section())
+    markers = TOOLKIT_DEFAULTS.github.markers
+
+    for template in (markers.parent, markers.child, markers.summary):
+        assert template is not None
+        assert template not in prose, f"re-typed marker template in prose: {template!r}"
+    for name, label in TOOLKIT_DEFAULTS.github.labels.items():
+        assert label.color not in prose, f"re-typed colour for {name!r} in prose"
+        assert label.description not in prose, (
+            f"re-typed description for {name!r} in prose"
+        )
+
+
+def test_toolkit_defaults_cross_references_the_freeze_narrative():
+    """The seeded `github.*` bullets point back at the warning, not at a bare literal."""
+    section = _section(_doc(), "## Toolkit defaults", level=2)
+
+    assert "`github:` section" in section
+    assert "orphaned parent/child" in section
 
 
 def test_doc_states_the_tracked_layout_and_the_no_folder_case():
