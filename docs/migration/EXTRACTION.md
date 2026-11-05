@@ -360,8 +360,9 @@ Mythical Forge's `docs/tasks/*.md` files are the **reference implementation**.
 - Per-repo config supplies only the directory and a filename pattern (D15). **No custom
   regex/parser dialect in v1** — a second dialect defeats the point of the toolkit owning the
   concept.
-- `tests/test_roadmap.py`'s inline fixture becomes the canonical format example and moves into
-  the toolkit docs.
+- The worked example in `docs/roadmap-format.md` §9 is the **single canonical format example**:
+  `tests/test_roadmap.py` and `tests/test_roadmap_format.py` parse it out of the doc's bytes
+  (E5.4), so the doc and the parser cannot drift.
 
 ### 3.8 Task-prompt format and repo conventions (D16)
 
@@ -481,7 +482,7 @@ Measured by grepping every file for product tokens, not by inspection.
 | `aidw/git.py` | Clean — no product coupling | Extend with worktree primitives |
 | `aidw/cli.py:36,115`, `aidw/__init__.py:4-5` | Branding strings in help and docstring | Trivial |
 | `tests/test_paths.py` | Asserts the `<repo>/aidt` layout | **Resolved in E0.4** — now `toolkit_root() == repo_root()`, and asserts no `aidt/` subdirectory exists |
-| `tests/test_roadmap.py` | `test_load_tasks_real_roadmap` reads the **target repo's** `docs/tasks` and asserts Mythical Forge's content: `len(tasks) > 200`, and `03/E2/E2.9` present with `done is True`. The inline fixture itself is fine (its "Design 07 §1" text is cosmetic) | **Resolved in E0.4** — repo-ised to `test_load_tasks_reads_a_directory(tmp_path)`. Keep the inline fixture as the canonical format example (E5.4) |
+| `tests/test_roadmap.py` | `test_load_tasks_real_roadmap` reads the **target repo's** `docs/tasks` and asserts Mythical Forge's content: `len(tasks) > 200`, and `03/E2/E2.9` present with `done is True`. The inline fixture itself is fine (its "Design 07 §1" text is cosmetic) | **Resolved in E0.4** — repo-ised to `test_load_tasks_reads_a_directory(tmp_path)`. E5.4 retires the inline fixture: the canonical format example is the worked example in `docs/roadmap-format.md` §9, which the roadmap tests now parse from the doc's bytes |
 | `tests/test_prompt_workflow.py` | Three tests passed `repo=repo_root()` and expected a **real** Mythical Forge roadmap entry `03/E4/E4.1`: `test_prompt_workflow_dry_run` (asserts `code == 0`), `test_prompt_workflow_requires_main_for_real_run` and `..._requires_clean_tree` (assert `code == 4`). `load_tasks`/`find_task` run *before* the branch and clean-tree checks, so all three returned `2` instead | **Resolved in E0.4** — all three now use the file's own `_patch_prompt_repo(tmp_path)` fixture |
 | Remaining 21 test modules | **Product-free** (zero token hits) | Portable as-is |
 

@@ -1,8 +1,12 @@
 """Contract tests for ``docs/roadmap-format.md`` (E5.1, EXTRACTION.md §3.7, D6/D15).
 
 The document is the format contract and the fenced worked example in it is the executable
-half of that contract: these tests extract the example, write it to the filename the doc
-names, and assert the shipped parser produces exactly what the doc's field tables promise.
+half of that contract — and, since E5.4, the **only** copy of it (``tests/test_roadmap.py"
+parses the same extraction). These tests write the example to the filename the doc names
+and assert the shipped parser produces exactly what the doc's field tables promise. The
+extraction itself, including its "exactly one complete worked example" guard, lives once in
+``tests/conftest.py`` (``roadmap_example``, E5.4) so a second example cannot satisfy one
+copy of the selector while the other still finds "one" (EXTRACTION.md §3.7).
 
 Nothing here re-implements a rule: every assertion compares the doc's claims against
 ``aidw/roadmap.py`` (the four entry patterns, ``_FILENAME_RE``, ``CITATION_RE``,
@@ -15,10 +19,11 @@ from __future__ import annotations
 
 from fnmatch import fnmatch
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
-from aidw.paths import TargetRepo, toolkit_root
+from aidw.paths import TargetRepo
 from aidw.roadmap import (
     CITATION_RE,
     DONE_RE,
@@ -35,60 +40,15 @@ from aidw.roadmap import (
 )
 from aidw.workflows import prompt as prompt_workflow
 
-#: The document under contract.
-DOC = toolkit_root() / "docs" / "roadmap-format.md"
-
-#: The filename the doc names for its worked example. The ``07`` prefix is the phase id the
-#: parser takes from the filename (§3), and the doc's ``# Phase 07:`` heading matches it.
-EXAMPLE_NAME = "07 - Example Roadmap.md"
-EXAMPLE_PHASE = "07"
+if TYPE_CHECKING:  # pragma: no cover - type-only
+    # A runtime ``from conftest import …`` binds whichever of the two collected
+    # ``conftest`` modules was imported last and breaks the full-suite run; the fixture's
+    # name is all these annotations need (``from __future__ import annotations``).
+    from conftest import RoadmapExample
 
 #: The toolkit's default ``paths.roadmap_glob`` (``TOOLKIT_DEFAULTS.paths``, D17). Passed
 #: explicitly because :func:`aidw.roadmap.load_tasks` carries no pattern of its own.
 DEFAULT_GLOB = "[0-9]* - *.md"
-
-
-def _fenced_blocks(text: str) -> list[str]:
-    """Every fenced code block body in a markdown document (fence lines dropped)."""
-    blocks: list[str] = []
-    body: list[str] | None = None
-    for line in text.splitlines():
-        if line.startswith("```"):
-            if body is None:
-                body = []
-            else:
-                blocks.append("\n".join(body))
-                body = None
-            continue
-        if body is not None:
-            body.append(line)
-    return blocks
-
-
-def _example_text() -> str:
-    """The doc's one worked-example block, as a roadmap file's contents.
-
-    Selected by content — a complete roadmap file starts with a phase heading *and* carries
-    at least one task entry — rather than by position, so the doc may grow other fenced
-    blocks without silently handing this suite the wrong one. Exactly one match is required:
-    two competing examples would let the doc and the parser drift in one of them.
-    """
-    candidates = [
-        block
-        for block in _fenced_blocks(DOC.read_text(encoding="utf-8"))
-        if block.startswith("# Phase") and any(TASK_RE.match(line) for line in block.splitlines())
-    ]
-    assert len(candidates) == 1, (
-        f"expected exactly one complete worked example in {DOC}, "
-        f"found {len(candidates)}"
-    )
-    return candidates[0] + "\n"
-
-
-def _write_example(directory: Path) -> Path:
-    path = directory / EXAMPLE_NAME
-    path.write_text(_example_text(), encoding="utf-8")
-    return path
 
 
 def _snapshot(tasks: list) -> list[tuple]:
@@ -116,8 +76,8 @@ def _snapshot(tasks: list) -> list[tuple]:
 # --------------------------------------------------------------------------- #
 
 
-def test_doc_is_no_longer_a_placeholder() -> None:
-    text = DOC.read_text(encoding="utf-8")
+def test_doc_is_no_longer_a_placeholder(roadmap_example: RoadmapExample) -> None:
+    text = roadmap_example.doc.read_text(encoding="utf-8")
     assert "Placeholder" not in text
     assert "# The AIDT roadmap format" in text
     # The contract's load-bearing pieces, named as the task requires.
@@ -125,17 +85,19 @@ def test_doc_is_no_longer_a_placeholder() -> None:
         assert required in text
 
 
-def test_doc_quotes_the_shipped_patterns_verbatim() -> None:
+def test_doc_quotes_the_shipped_patterns_verbatim(roadmap_example: RoadmapExample) -> None:
     """A pattern edited in code but not in the doc (or vice versa) fails here."""
-    text = DOC.read_text(encoding="utf-8")
+    text = roadmap_example.doc.read_text(encoding="utf-8")
     for pattern in (TASK_RE, EPIC_RE, PHASE_RE, DONE_RE, _FILENAME_RE, CITATION_RE):
-        assert pattern.pattern in text, f"{pattern.pattern!r} is missing from {DOC}"
+        assert pattern.pattern in text, f"{pattern.pattern!r} is missing from {roadmap_example.doc}"
     assert prompt_workflow._FIELD_BULLET_RE.pattern in text
 
 
-def test_doc_states_one_format_and_the_directory_plus_glob_surface() -> None:
+def test_doc_states_one_format_and_the_directory_plus_glob_surface(
+    roadmap_example: RoadmapExample,
+) -> None:
     """D6/D15: one AIDT-owned format; the repo supplies only a directory and a pattern."""
-    text = DOC.read_text(encoding="utf-8")
+    text = roadmap_example.doc.read_text(encoding="utf-8")
     assert "D15" in text and "D6" in text
     assert "paths.roadmap_dir" in text
     assert "paths.roadmap_glob" in text
@@ -145,7 +107,9 @@ def test_doc_states_one_format_and_the_directory_plus_glob_surface() -> None:
     assert "per-repo dialect" in text
 
 
-def test_doc_states_the_default_globs_spacing_is_convention_not_strictness() -> None:
+def test_doc_states_the_default_globs_spacing_is_convention_not_strictness(
+    roadmap_example: RoadmapExample,
+) -> None:
     """The §1 glob trap: `*` matches spaces, so the spacing is convention, not strictness.
 
     `roadmap_glob` is an `fnmatch` glob, and `*` absorbs spaces: the spaceless
@@ -154,7 +118,7 @@ def test_doc_states_the_default_globs_spacing_is_convention_not_strictness() -> 
     guarantee — the false blanket claim that the spaceless glob "would match nothing"
     invites a wrong strictness assumption in E5.2's file selection (issue #96).
     """
-    text = DOC.read_text(encoding="utf-8")
+    text = roadmap_example.doc.read_text(encoding="utf-8")
 
     # The trigger, reproduced: `*` matches spaces, so both spellings select the same names.
     assert fnmatch("00 - Extraction.md", "[0-9]* - *.md")
@@ -175,13 +139,58 @@ def test_doc_states_the_default_globs_spacing_is_convention_not_strictness() -> 
 
 
 # --------------------------------------------------------------------------- #
+# The shared selector (tests/conftest.py, E5.4)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_shared_selector_rejects_a_second_complete_example(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
+    """One guard, one home (E5.4): a second complete example fails loudly, not silently.
+
+    This is the property that makes a single source meaningful. With the selector copied
+    into each test file, a second worked example could satisfy one copy (which happens to
+    find its own) while the other kept parsing the first — exactly the doc/parser drift the
+    guard exists to prevent.
+    """
+    example = roadmap_example.text()
+    doc = tmp_path / "two-examples.md"
+    doc.write_text(
+        "# Roadmap format\n\n"
+        f"```markdown\n{example}```\n\n"
+        f"```markdown\n{example}```\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="exactly one complete worked example"):
+        roadmap_example.text(doc=doc)
+
+
+def test_reading_the_example_writes_nothing_outside_tmp_path(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
+    """No cached copy and no stray I/O: the doc is only read; ``tmp_path`` gets one file."""
+    doc_before = roadmap_example.doc.read_bytes()
+
+    first = roadmap_example.text()
+    second = roadmap_example.text()
+    path = roadmap_example.write(tmp_path)
+
+    assert first == second == path.read_text(encoding="utf-8")
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == [roadmap_example.name]
+    assert roadmap_example.doc.read_bytes() == doc_before
+
+
+# --------------------------------------------------------------------------- #
 # The worked example, through the shipped parser
 # --------------------------------------------------------------------------- #
 
 
-def test_example_parses_to_the_documented_fields(tmp_path: Path) -> None:
-    path = _write_example(tmp_path)
-    tasks = parse_file(path, EXAMPLE_PHASE)
+def test_example_parses_to_the_documented_fields(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
+    path = roadmap_example.write(tmp_path)
+    tasks = parse_file(path, roadmap_example.phase)
 
     assert [task.task for task in tasks] == ["E5.1", "E5.2", "E6.1"]
     assert [task.title for task in tasks] == [
@@ -201,7 +210,7 @@ def test_example_parses_to_the_documented_fields(tmp_path: Path) -> None:
     ]
 
     # The phase comes from the filename; the matching `# Phase 07:` heading supplies the title.
-    assert {task.phase for task in tasks} == {EXAMPLE_PHASE}
+    assert {task.phase for task in tasks} == {roadmap_example.phase}
     assert [task.phase_title for task in tasks] == ["Example phase"] * 3
 
     # `done_when` is the first physical line only — the doc says the block is `_done_when_block`'s.
@@ -214,22 +223,26 @@ def test_example_parses_to_the_documented_fields(tmp_path: Path) -> None:
     # CITATION_RE captures `Design N` only; the `EXTRACTION.md` ref is the other channel (§8).
     assert [task.citations for task in tasks] == [["Design 11"], ["Design 11.1"], []]
 
-    assert tasks[0].file == EXAMPLE_NAME
+    assert tasks[0].file == roadmap_example.name
     assert tasks[0].line < tasks[1].line < tasks[2].line
     assert [task.key for task in tasks] == ["07-E5.1", "07-E5.2", "07-E6.1"]
     assert [task.branch for task in tasks] == ["07-E5.1", "07-E5.2", "07-E6.1"]
 
 
-def test_example_has_no_collapsed_id(tmp_path: Path) -> None:
+def test_example_has_no_collapsed_id(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
     """The E0.7 rule-1 guard: every parsed id kept its period (§5)."""
-    tasks = parse_file(_write_example(tmp_path), EXAMPLE_PHASE)
+    tasks = parse_file(roadmap_example.write(tmp_path), roadmap_example.phase)
     assert tasks, "no tasks parsed from the doc's worked example"
     bad = [task.task for task in tasks if "." not in task.task]
     assert not bad, f"MISPARSE: the doc's example has collapsed ids {bad}"
 
 
-def test_example_parses_through_load_tasks(tmp_path: Path) -> None:
-    _write_example(tmp_path)
+def test_example_parses_through_load_tasks(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
+    roadmap_example.write(tmp_path)
     # A non-matching filename in the same directory must be ignored (§3).
     (tmp_path / "notes.md").write_text("# Notes\n\n## Epic A: Alpha\n", encoding="utf-8")
 
@@ -237,7 +250,7 @@ def test_example_parses_through_load_tasks(tmp_path: Path) -> None:
 
     assert [task.task for task in tasks] == ["E5.1", "E5.2", "E6.1"]
     assert all("." in task.task for task in tasks)
-    assert find_task(tasks, EXAMPLE_PHASE, "E5", "E5.2") is not None
+    assert find_task(tasks, roadmap_example.phase, "E5", "E5.2") is not None
     assert find_task(tasks, "7", "E5", "E5.2") is None  # phase must be the filename's `07`
     assert next_todo(tasks).task == "E5.2"
     assert [task.task for task in filter_tasks(tasks, todo=True)] == ["E5.2", "E6.1"]
@@ -246,13 +259,15 @@ def test_example_parses_through_load_tasks(tmp_path: Path) -> None:
     assert next_todo(tasks, phase="99") is None
 
 
-def test_example_parsing_is_deterministic_and_read_only(tmp_path: Path) -> None:
+def test_example_parsing_is_deterministic_and_read_only(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
     """No input mutation and no undeclared I/O: the file is only ever read."""
-    path = _write_example(tmp_path)
+    path = roadmap_example.write(tmp_path)
     before = path.read_bytes()
 
-    first = _snapshot(parse_file(path, EXAMPLE_PHASE))
-    second = _snapshot(parse_file(path, EXAMPLE_PHASE))
+    first = _snapshot(parse_file(path, roadmap_example.phase))
+    second = _snapshot(parse_file(path, roadmap_example.phase))
 
     assert first == second
     assert path.read_bytes() == before
@@ -263,9 +278,11 @@ def test_example_parsing_is_deterministic_and_read_only(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_example_done_when_block_survives_the_prompt_reread(tmp_path: Path) -> None:
-    path = _write_example(tmp_path)
-    tasks = parse_file(path, EXAMPLE_PHASE)
+def test_example_done_when_block_survives_the_prompt_reread(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
+    path = roadmap_example.write(tmp_path)
+    tasks = parse_file(path, roadmap_example.phase)
     lines = path.read_text(encoding="utf-8").splitlines()
 
     multi = tasks[0]
@@ -290,10 +307,12 @@ def test_example_done_when_block_survives_the_prompt_reread(tmp_path: Path) -> N
     assert tasks[2].done_when in notes_bounded
 
 
-def test_citation_channels_are_separate(tmp_path: Path) -> None:
+def test_citation_channels_are_separate(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
     """`Design N` fills `.citations`; `<NAME>.md` is recovered only by the prompt stage."""
-    path = _write_example(tmp_path)
-    tasks = parse_file(path, EXAMPLE_PHASE)
+    path = roadmap_example.write(tmp_path)
+    tasks = parse_file(path, roadmap_example.phase)
     lines = path.read_text(encoding="utf-8").splitlines()
 
     # `_render_cited_specs` locates a doc ref under the *target root*, so give it one.
@@ -345,7 +364,7 @@ _ENTRY_VARIANTS = [
 
 @pytest.mark.parametrize("done_line", _ENTRY_VARIANTS)
 def test_done_when_forms_are_metamorphic(
-    tmp_path: Path, done_line: str
+    tmp_path: Path, roadmap_example: RoadmapExample, done_line: str
 ) -> None:
     """Every tolerated `Done when` spelling parses to identical fields (a metamorphic test).
 
@@ -362,7 +381,7 @@ def test_done_when_forms_are_metamorphic(
         path = tmp_path / "07 - Variants.md"
         path.write_text(text, encoding="utf-8")
 
-        tasks = parse_file(path, EXAMPLE_PHASE)
+        tasks = parse_file(path, roadmap_example.phase)
 
         assert [task.task for task in tasks] == ["A1", "A2"]
         assert tasks[0].done is False
@@ -375,7 +394,9 @@ def test_done_when_forms_are_metamorphic(
         assert "the check passes." in prompt_workflow._done_when_block(lines, 2)
 
 
-def test_blank_line_inside_the_block_truncates_both_readers(tmp_path: Path) -> None:
+def test_blank_line_inside_the_block_truncates_both_readers(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
     text = (
         "## Epic A: Alpha\n\n"
         "- [ ] **A1. One task**\n"
@@ -386,13 +407,15 @@ def test_blank_line_inside_the_block_truncates_both_readers(tmp_path: Path) -> N
     path = tmp_path / "07 - Truncated.md"
     path.write_text(text, encoding="utf-8")
 
-    tasks = parse_file(path, EXAMPLE_PHASE)
+    tasks = parse_file(path, roadmap_example.phase)
     assert tasks[0].done_when == "the first paragraph."
     block = prompt_workflow._done_when_block(text.splitlines(), tasks[0].line - 1)
     assert block == "  - Done when: the first paragraph."
 
 
-def test_blank_lines_before_done_when_are_tolerated(tmp_path: Path) -> None:
+def test_blank_lines_before_done_when_are_tolerated(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
     """E0.7 rule 5 is stale: both shipped readers skip blank lines *before* the label."""
     text = (
         "## Epic A: Alpha\n\n"
@@ -405,7 +428,7 @@ def test_blank_lines_before_done_when_are_tolerated(tmp_path: Path) -> None:
     path = tmp_path / "07 - Gaps.md"
     path.write_text(text, encoding="utf-8")
 
-    tasks = parse_file(path, EXAMPLE_PHASE)
+    tasks = parse_file(path, roadmap_example.phase)
     assert tasks[0].done_when == "still found."
     assert "still found." in prompt_workflow._done_when_block(text.splitlines(), 2)
 
@@ -425,7 +448,9 @@ def test_field_bullet_indent_is_exactly_two_spaces() -> None:
         assert not prompt_workflow._FIELD_BULLET_RE.match(line), line
 
 
-def test_a_second_done_when_line_is_never_merged(tmp_path: Path) -> None:
+def test_a_second_done_when_line_is_never_merged(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
     """The doc's §6 rule: a bulleted second line truncates the block, a bare one continues it.
 
     `parse_file` keeps the first Done-when in both forms; `_done_when_block` differs — the
@@ -439,7 +464,7 @@ def test_a_second_done_when_line_is_never_merged(tmp_path: Path) -> None:
     bulleted.write_text(
         header + "  - Done when: first.\n  - Done when: second.\n", encoding="utf-8"
     )
-    tasks = parse_file(bulleted, EXAMPLE_PHASE)
+    tasks = parse_file(bulleted, roadmap_example.phase)
     assert tasks[0].done_when == "first."  # `parse_file` keeps the first, in both forms
     block = prompt_workflow._done_when_block(
         (header + "  - Done when: first.\n  - Done when: second.\n").splitlines(),
@@ -453,7 +478,7 @@ def test_a_second_done_when_line_is_never_merged(tmp_path: Path) -> None:
     bare.write_text(
         header + "  - Done when: first.\n  Done when: second.\n", encoding="utf-8"
     )
-    tasks = parse_file(bare, EXAMPLE_PHASE)
+    tasks = parse_file(bare, roadmap_example.phase)
     assert tasks[0].done_when == "first."
     block = prompt_workflow._done_when_block(
         (header + "  - Done when: first.\n  Done when: second.\n").splitlines(),
@@ -462,12 +487,14 @@ def test_a_second_done_when_line_is_never_merged(tmp_path: Path) -> None:
     assert "second." in block
 
     # And the doc's §6 bullet states the distinction rather than the false blanket claim.
-    text = DOC.read_text(encoding="utf-8")
+    text = roadmap_example.doc.read_text(encoding="utf-8")
     assert "**truncates the" in text  # the bulleted-second truncation rule is stated
     assert "_done_when_block` includes the second" not in text  # the old false claim is gone
 
 
-def test_a_misindented_field_is_swallowed_into_the_done_when_block(tmp_path: Path) -> None:
+def test_a_misindented_field_is_swallowed_into_the_done_when_block(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
     """The doc's indent trap: four spaces is not a boundary, so the field leaks in."""
     text = (
         "## Epic A: Alpha\n\n"
@@ -479,7 +506,7 @@ def test_a_misindented_field_is_swallowed_into_the_done_when_block(tmp_path: Pat
     path = tmp_path / "07 - Indent.md"
     path.write_text(text, encoding="utf-8")
 
-    tasks = parse_file(path, EXAMPLE_PHASE)
+    tasks = parse_file(path, roadmap_example.phase)
     block = prompt_workflow._done_when_block(text.splitlines(), tasks[0].line - 1)
 
     assert "Tests:" in block  # mis-indented: swallowed into the Done-when block
@@ -491,7 +518,9 @@ def test_a_misindented_field_is_swallowed_into_the_done_when_block(tmp_path: Pat
 # --------------------------------------------------------------------------- #
 
 
-def test_missing_period_collapses_the_id(tmp_path: Path) -> None:
+def test_missing_period_collapses_the_id(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
     """E0.7 rule 1 / the doc's §5 trap, asserted rather than described."""
     text = (
         "## Epic E0: Extraction\n\n"
@@ -501,30 +530,32 @@ def test_missing_period_collapses_the_id(tmp_path: Path) -> None:
     path = tmp_path / "07 - Collapsed.md"
     path.write_text(text, encoding="utf-8")
 
-    tasks = parse_file(path, EXAMPLE_PHASE)
+    tasks = parse_file(path, roadmap_example.phase)
 
     assert [task.task for task in tasks] == ["E0"]
     assert tasks[0].title == "1 Create the new repository"
     assert tasks[0].epic == "E"
-    assert find_task(tasks, EXAMPLE_PHASE, "E0", "E0.1") is None
+    assert find_task(tasks, roadmap_example.phase, "E0", "E0.1") is None
 
 
-def test_phase_id_comes_from_the_filename_not_the_heading(tmp_path: Path) -> None:
+def test_phase_id_comes_from_the_filename_not_the_heading(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
     lines = (
         "{heading}\n\n## Epic A: Alpha\n\n- [ ] **A1. One task**\n  - Done when: done.\n"
     )
 
     # Matching heading sets the cosmetic title; the phase is still the filename's `07`.
-    matching = tmp_path / EXAMPLE_NAME
+    matching = tmp_path / roadmap_example.name
     matching.write_text(lines.format(heading="# Phase 07: Seven"), encoding="utf-8")
-    task = parse_file(matching, EXAMPLE_PHASE)[0]
+    task = parse_file(matching, roadmap_example.phase)[0]
     assert task.phase == "07"
     assert task.phase_title == "Seven"
 
     # `7` is the same phase (`parse_file`'s guard strips the leading zero)...
     stripped = tmp_path / "07 - Stripped.md"
     stripped.write_text(lines.format(heading="# Phase 7: Seven"), encoding="utf-8")
-    assert parse_file(stripped, EXAMPLE_PHASE)[0].phase_title == "Seven"
+    assert parse_file(stripped, roadmap_example.phase)[0].phase_title == "Seven"
 
     # ...but a heading for `0` never matches a `00 -` file, and the phase is unaffected.
     zero = tmp_path / "00 - Zero.md"
@@ -550,7 +581,9 @@ def test_documented_rejected_filenames(filename: str) -> None:
     assert _FILENAME_RE.match(filename) is None
 
 
-def test_epic_heading_does_not_supply_the_epic(tmp_path: Path) -> None:
+def test_epic_heading_does_not_supply_the_epic(
+    tmp_path: Path, roadmap_example: RoadmapExample
+) -> None:
     """`## Epic X:` is cosmetic: `epic` is derived, so a mismatched heading is inert."""
     text = (
         "## Epic ZZ: Mismatched\n\n"
@@ -560,8 +593,8 @@ def test_epic_heading_does_not_supply_the_epic(tmp_path: Path) -> None:
     path = tmp_path / "07 - Mismatched.md"
     path.write_text(text, encoding="utf-8")
 
-    task = parse_file(path, EXAMPLE_PHASE)[0]
+    task = parse_file(path, roadmap_example.phase)[0]
 
     assert task.epic == "E5"
     assert task.epic_title == "Mismatched"
-    assert find_task([task], EXAMPLE_PHASE, "E5", "E5.1") is not None
+    assert find_task([task], roadmap_example.phase, "E5", "E5.1") is not None
