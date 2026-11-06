@@ -551,7 +551,7 @@
 
 ## Epic E9: Documentation
 
-- [ ] **E9.1. Rewrite `design.md`**
+- [x] **E9.1. Rewrite `design.md`**
   Two-root model, worktree model, config and stage contracts, frozen GitHub contracts, state
   locations, distribution. Replace D4/F1–F6/E4 and the `aidt/` layout tree; keep the design-of-record
   tone.
