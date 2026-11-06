@@ -26,13 +26,14 @@ AIDT is distributed from git, not PyPI. D9 fixes two install forms, both pinned 
 
 | Form | Command | Use it for |
 |---|---|---|
-| **Primary — `uv tool install`** | `uv tool install "git+https://github.com/curiouslittledroid/aidt@<tag>"` | An `aidw` on `PATH` for everyday use, in its own uv-managed tool environment. |
-| **Secondary — `uvx`** | `uvx --from "git+https://github.com/curiouslittledroid/aidt@<tag>" aidw --version` | A one-off run without installing anything (swap `--version` for any other subcommand). |
+| **Primary — `uv tool install`** | `uv tool install "git+https://github.com/curiouslittledroid/aidt@v0.1.0"` | An `aidw` on `PATH` for everyday use, in its own uv-managed tool environment. |
+| **Secondary — `uvx`** | `uvx --from "git+https://github.com/curiouslittledroid/aidt@v0.1.0" aidw --version` | A one-off run without installing anything (swap `--version` for any other subcommand). |
 
-`<tag>` is a **placeholder for a release tag**, and no release tag exists yet — E8.5 cuts the
-first one and documents the release process. (The repository's `baseline-verbatim` tag marks the
-verbatim import, not a release.) Until then, pin a commit SHA instead; `@main` also works but is
-unpinned and therefore not reproducible.
+`v0.1.0` is the first release tag; replace it with the `v<X.Y.Z>` release you have verified.
+Tags are cut on merged `main` — the version bump, the tag command and the install verification
+are the release process in [`docs/releasing.md`](./docs/releasing.md). (The repository's
+`baseline-verbatim` tag marks the verbatim import, not a release.) If no release fits, pin a
+commit SHA instead; `@main` also works but is unpinned and therefore not reproducible.
 
 The `uvx` form needs `--from <git-url>`: a bare `uvx aidw` resolves a package named `aidw` from
 PyPI, which is not this repository.
