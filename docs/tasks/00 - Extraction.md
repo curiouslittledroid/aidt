@@ -570,10 +570,17 @@
     `tests/test_roadmap.py`, `tests/test_target_repo_config_doc.py` and the shared §9 extraction
     in `tests/conftest.py:roadmap_example`.
 
-- [ ] **E9.3. Move this document to history**
+- [x] **E9.3. Move this document to history**
   `docs/migration/EXTRACTION.md`, with a header noting it is historical.
   - Deliverable: moved file.
   - Done when: the tasks it contains are superseded by the repo's own roadmap.
+  - Notes: no vector-matrix or coverage-catalog change — this repo has neither artifact
+    (`docs/rules-coverage/`, `tests/integration/`, the `srd:*` scripts), so there is nothing to
+    record as `not_applicable` and no claim is eligible for matrix coverage (E9.2 precedent). The
+    historical status is still executable, not prose: `tests/test_extraction_doc.py` pins the
+    header, the absent live-status claims, and the surviving §2/§6/§10 decision trail. In place,
+    not relocated: the file stays at `docs/migration/EXTRACTION.md`, the path
+    `tests/test_design_doc.py::test_contract_links_are_existing_cross_references` pins.
 
 - [ ] **E9.4. README rewrite**
   Purpose, install, quickstart against a target repo, the `aidw/` naming note, troubleshooting

@@ -1,9 +1,16 @@
 # AIDT Extraction Plan
 
-**Status:** approved plan, not yet started. No code has moved.
-**Audience:** a fresh agent session with no prior context, or the project owner.
-**Source of truth today:** `aidt/` inside the Mythical Forge repo. The initial commit of the
-new repo is a verbatim copy of this directory at a recorded SHA (see §5.2).
+**Status: historical — the extraction is complete.** This document is the plan that produced
+this repository, kept at this path as the record of how it was carried out. It is not a live
+source of truth and nothing in it should be actioned: every task in §6 (E0–E9) has been
+superseded.
+**Read instead:** `design.md` — the design of record — and `docs/tasks/00 - Extraction.md` —
+this repo's own roadmap, which supersedes §6's task list (E0–E9).
+**Audience:** a reader tracing *why* the toolkit is shaped as it is, and the project owner.
+**Provenance:** the plan was written against the `aidt/` directory inside the Mythical Forge
+repo, and the initial commit of the new repo was a verbatim copy of that directory at a
+recorded SHA (§5.2). The Mythical Forge references below are that history, not a claim about
+where the toolkit lives today.
 
 ---
 
