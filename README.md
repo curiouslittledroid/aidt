@@ -1,9 +1,14 @@
 # AIDT — AI Developer Tools
 
 AIDT is a developer-workflow toolkit that drives the [Pi](https://github.com/badlogic/pi)
-coding agent from the command line to develop the Mythical Forge application. It is
-**separate from the Mythical Forge product**, is not built or tested by the product's
-pnpm pipeline, and creates no AWS resources.
+coding agent from the command line through the SDLC stages of a **target repo** — any git
+repository you point it at. A developer selects a roadmap task, and `aidw` drives one or more
+specialised agents through the workflow's stages, pausing at human decision gates and
+recording every stage, gate and cost.
+
+The toolkit is installed once from a tag and never vendored into the repository it works on:
+the **toolkit root** and the **target repo root** are two distinct roots, never
+interchangeable (design.md §1.1).
 
 The repository is `aidt`; the package and CLI are `aidw` — see
 [Repository, naming, and provenance](#repository-naming-and-provenance).
@@ -148,10 +153,6 @@ Two roots, resolved independently:
 difference can be diffed against a known-good reference. The extraction plan of record is
 [`docs/migration/EXTRACTION.md`](./docs/migration/EXTRACTION.md).
 
-> **Interim state.** Sections below still read from the pre-extraction viewpoint, where the
-> toolkit lived at `aidt/` inside the Mythical Forge repository (for example `cd aidt`, or
-> `aidt/runs/`). They are rewritten in E9.4; the naming and roots above are the current truth.
-
 ## Status
 
 All seven design phases are complete: `prompt`, `implement`, `review`, `fix`, the `run`
@@ -175,39 +176,60 @@ approval decisions can be applied on their own.
 
 | Requirement | Check |
 |---|---|
-| Python ≥ 3.11 and [`uv`](https://docs.astral.sh/uv/) (managed environment) | `uv run aidw doctor` |
+| `aidw` installed from a release tag (→ [Install](#install)) | `aidw --version` |
 | `python3` ≥ 3.9 on `PATH` for the review/fix prompts, which invoke the bundled helper scripts directly (`aidw` itself uses its own interpreter) | `python3 --version` |
 | `pi` on `PATH`, authenticated for the configured providers | `pi --list-models` |
 | `gh` ≥ 2.94.0 and authenticated (review/fix workflows) | `gh --version`, `gh auth status` |
-| AIDT-owned prompts/scripts present | `uv run aidw prompts check` |
-| Valid agent configs | `uv run aidw agents validate --strict` |
+| AIDT-owned prompts/scripts present in the toolkit | `aidw prompts check` |
+| Valid agent configs in the toolkit | `aidw agents validate --strict` |
 
-Run everything from `aidt/` (paths are auto-detected inside the Mythical Forge git
-repository):
+Run every `aidw` command from the control worktree `main/`: the target repo is auto-detected
+via git from the working directory, and `--repo <path>` overrides it (design.md §1.1, F6).
 
 `aidw doctor` exits `0` when nothing **fails** (warnings — e.g. a dirty tree — are fine).
 Fix any `FAIL` before starting a workflow.
 
-AIDT is self-contained: it never reads `.pi/prompts/`. `aidt/prompts/` is AIDT's own source
-of truth and is edited freely.
+AIDT is self-contained: it never reads `.pi/prompts/`. `prompts/` in the toolkit root is
+AIDT's own source of truth and is edited freely.
 
 ## Quickstart
 
-```bash
-cd aidt
-uv sync                 # create the managed environment and lockfile
+An operator needs three things: `aidw` on `PATH`, a bootstrapped workspace, and a target repo
+with a roadmap.
 
-uv run aidw doctor               # validate the environment
-uv run aidw agents validate      # validate the agent configs
-uv run aidw prompts check        # required prompts/scripts present
-uv run aidw --help               # list commands
-uv run aidw tasks --todo
-```
+1. **Install** the toolkit, once, from a release tag (details in [Install](#install)):
+
+   ```bash
+   uv tool install "git+https://github.com/curiouslittledroid/aidt@v0.1.0"
+   ```
+
+2. **Bootstrap** the target repo's workspace once — one bare repo plus sibling worktrees
+   (details in [Workspace layout and bootstrap](#workspace-layout-and-bootstrap)):
+
+   ```bash
+   git clone --bare <target-repo-remote> bare.git
+   git -C bare.git worktree add ../main main
+   ```
+
+3. **Run from the control worktree**, where the base branch is checked out:
+
+   ```bash
+   aidw doctor                          # environment: toolkit, git/gh/pi, roots, prompts, agents
+   aidw tasks --todo                    # the target repo's unchecked roadmap tasks
+   aidw prompt <phase> <epic> <task>    # author + review that task's prompt (--dry-run: plan only)
+   ```
+
+`aidw prompt` creates the task's branch and worktree itself and runs its stages inside it; a
+real run needs `main` checked out and a clean tree in the control worktree, while `--dry-run`
+plans the stages from any branch without those preconditions. From there the workflow chains in
+[Workflows](#workflows) take over.
 
 ## Workflows
 
 Every workflow is atomic, resumable where noted, and records state under
-`aidt/runs/<run-id>/`, where `<run-id>` is `<utc-stamp>-<task-or-pr>-<workflow>` — for example
+`<state root>/<repo-slug>/runs/<run-id>/` — the state root is outside every worktree, so
+pruning a worktree can never delete a run (design.md §9.1). `<run-id>` is
+`<utc-stamp>-<task-or-pr>-<workflow>` — for example
 `20261022T073150Z-03.1-A2-implement`, so several runs of one task are distinguishable by name
 (`-prompt`, `-implement`, `-review`, `-fix`, `-approve`). All support `--dry-run` (no Pi, no writes; `fix --dry-run` still
 performs a read-only `gh` select), `--yes` (approve all gates), `--strict` (treat config
@@ -223,18 +245,20 @@ final `approve-task-prompt` gate is **optional and off by default** — the revi
 verifies the prompt. Add `--require-approval` to pause for a human decision.
 
 ```bash
-uv run aidw tasks --todo --phase 03        # find a task
-uv run aidw tasks --show "03 E4 E4.1"      # task detail, branch, Done when, specs
-uv run aidw prompt 03 E4 E4.1 --dry-run    # plan only; no Pi, no writes
-uv run aidw prompt 03 E4 E4.1              # real run; no approval gate
-uv run aidw prompt 03 E4 E4.1 --require-approval   # pause for human verification
+aidw tasks --todo --phase 03        # find a task
+aidw tasks --show "03 E4 E4.1"      # task detail, branch, Done when, specs
+aidw prompt 03 E4 E4.1 --dry-run    # plan only; no Pi, no writes
+aidw prompt 03 E4 E4.1              # real run; no approval gate
+aidw prompt 03 E4 E4.1 --require-approval   # pause for human verification
 ```
 
-A **real run requires `main` and a clean working tree** — the `task-prompt` prompt creates
-the `<phase>-<task>` branch from `main` and commits the generated prompt. `--dry-run` plans
-the stages from any branch without those preconditions.
+A **real run requires `main` and a clean working tree** in the control worktree: AIDT creates
+the `<phase>-<task>` branch and its worktree itself, runs the stages inside it, and commits the
+reviewed prompt there — no stage runs `git checkout -b`. `--dry-run` plans the stages from any
+branch without those preconditions.
 
-The generated prompt lands at `docs/task-prompts/<phase>-<task>-prompt.md`.
+The generated prompt lands in the target repo's task-prompts directory,
+`docs/task-prompts/<phase>-<task>-prompt.md` by default (`paths.task_prompts_dir`).
 
 ### `aidw implement` — implement a task prompt and open the PR
 
@@ -253,10 +277,10 @@ I6 pr                             pr-publisher (fresh)
 
 ```bash
 # plan only: prints I1–I6 with agents/models; no Pi, no git or GitHub writes
-uv run aidw implement docs/task-prompts/03-E4.1-prompt.md --dry-run
+aidw implement docs/task-prompts/03-E4.1-prompt.md --dry-run
 
 # real run on branch 03-E4.1
-uv run aidw implement docs/task-prompts/03-E4.1-prompt.md
+aidw implement docs/task-prompts/03-E4.1-prompt.md
 ```
 
 Preflight refuses to run on `main`, when the current branch does not match the task id
@@ -274,8 +298,8 @@ Resume a run after a failure — completed stages are never re-run; the gate is 
 once approved:
 
 ```bash
-uv run aidw implement docs/task-prompts/03-E4.1-prompt.md --resume
-uv run aidw implement docs/task-prompts/03-E4.1-prompt.md --resume --from test
+aidw implement docs/task-prompts/03-E4.1-prompt.md --resume
+aidw implement docs/task-prompts/03-E4.1-prompt.md --resume --from test
 ```
 
 `--parallel` runs `test` and `update-architecture` concurrently (disjoint files: package
@@ -293,20 +317,19 @@ publisher script. Publishing is **ungated**: the human decision happens on GitHu
 `aidw fix` (design §6, E2).
 
 ```bash
-uv run aidw review --pr 42 --dry-run   # plan R1/R2 + print the publisher argv
-uv run aidw review --pr 42             # live review + publish
+aidw review --pr 42 --dry-run   # plan R1/R2 + print the publisher argv
+aidw review --pr 42             # live review + publish
 ```
 
 Preflight reads the PR via `gh` (read-only) and refuses unless the PR targets `main` and the
 PR head's worktree exists locally; it reviews **that** worktree, so it can be run from the
-control root (or the bare directory's `main` checkout) while the task branch is checked out
-in a sibling directory. When the worktree is missing it prints the `git worktree add` line to
-create it and stops. A `Blocked` verdict, an ambiguous verdict, or a finding that will not
-parse into a manifest fails closed: findings are recorded under
-`runs/<id>/artifacts/findings.json`, but nothing is published.
+control worktree while the task branch is checked out in a sibling directory. When the
+worktree is missing it prints the `git worktree add` line to create it and stops. A `Blocked`
+verdict, an ambiguous verdict, or a finding that will not parse into a manifest fails closed:
+findings are recorded under `<run-id>/artifacts/findings.json`, but nothing is published.
 
 AIDT never calls a mutating `gh` command. GitHub writes only ever go through the bundled
-Python scripts under `aidt/prompts/scripts/review-followup/` (design §13).
+Python scripts under `prompts/scripts/review-followup/` in the toolkit root (design §13).
 
 ### `aidw approve-followups` — approve review follow-up issues
 
@@ -315,9 +338,9 @@ Applies the human approval decision to a PR's open review follow-up issues by ru
 record the decision without starting the `aidw fix` loop:
 
 ```bash
-uv run aidw approve-followups --pr 42 --dry-run   # list the child issues; no writes
-uv run aidw approve-followups --pr 42             # confirm at the gate, then approve
-uv run aidw approve-followups --pr 42 --yes       # approve without prompting
+aidw approve-followups --pr 42 --dry-run   # list the child issues; no writes
+aidw approve-followups --pr 42             # confirm at the gate, then approve
+aidw approve-followups --pr 42 --yes       # approve without prompting
 ```
 
 Preflight requires `gh` and a PR that exists. The prompt adds `approve-fix` and removes
@@ -343,8 +366,8 @@ review → fix → re-review loop one approved child at a time:
 ```
 
 ```bash
-uv run aidw fix --pr 42 --dry-run              # lists the next approved child via select
-uv run aidw fix --pr 42 --max-iterations 5     # live loop
+aidw fix --pr 42 --dry-run              # lists the next approved child via select
+aidw fix --pr 42 --max-iterations 5     # live loop
 ```
 
 The re-review models must differ from the fixer model; `agents validate`/`aidw fix` warn
@@ -364,9 +387,9 @@ Approval flow: after `review` publishes children, review them on GitHub and reco
 ### `aidw run` — chains
 
 ```bash
-uv run aidw run task-to-pr 03 E4 E4.1       # prompt, then implement
-uv run aidw run prompt-to-fix 03 E4 E4.1    # prompt, implement, review, follow-ups, fix
-uv run aidw run review-and-fix --pr 42      # review, then fix
+aidw run task-to-pr 03 E4 E4.1       # prompt, then implement
+aidw run prompt-to-fix 03 E4 E4.1    # prompt, implement, review, follow-ups, fix
+aidw run review-and-fix --pr 42      # review, then fix
 ```
 
 A chain stops at the first non-zero exit and returns that code. For `review-and-fix`, the
@@ -406,10 +429,10 @@ published by an earlier round of the same PR keep the loop, and if no record is 
 ### Roadmap inspection
 
 ```bash
-uv run aidw tasks                  # all tasks
-uv run aidw tasks --todo           # unchecked only
-uv run aidw tasks --phase 03 --epic E4
-uv run aidw tasks --next --phase 03
+aidw tasks                  # all tasks
+aidw tasks --todo           # unchecked only
+aidw tasks --phase 03 --epic E4
+aidw tasks --next --phase 03
 ```
 
 ### `aidw gate` — whole-repo verification gates
@@ -421,12 +444,13 @@ of running it again**, so a full suite is bought once per run rather than once p
 implement chain the same suite is asked for at several stages and answered once.
 
 ```bash
-# the command is the repo's own and goes after -- (click stops parsing options there)
-uv run aidw gate run suite -- uv run --frozen pytest
-uv run aidw gate run suite -- pnpm -r test
+# the command is the target repo's own and goes after -- (click stops parsing options there),
+# so the payload keeps its real form even though the aidw command position never does
+aidw gate run suite -- uv run --frozen pytest
+aidw gate run suite -- pnpm -r test
 
 # list the outcomes this run recorded
-uv run aidw gate list            # or: uv run aidw runs show <run-id>
+aidw gate list            # or: aidw runs show <run-id>
 ```
 
 A gate is identified by its key (`suite`, `lint`, `build` — whatever the stages agree on),
@@ -455,7 +479,7 @@ chain, because `record` (I5) writes its results document *after* running the gat
 command cannot read:
 
 ```bash
-uv run aidw gate run suite \
+aidw gate run suite \
   --ignore docs/implementation-results --ignore docs/architecture \
   --ignore docs/tasks --ignore docs/task-prompts \
   -- uv run --frozen pytest
@@ -494,13 +518,14 @@ supported way to smoke-test an agent.
 
 ```bash
 # plan only: writes state.json + the rendered prompt, does not invoke Pi
-uv run aidw exec --agent code-reviewer --prompt code-review --dry-run
+aidw exec --agent code-reviewer --prompt code-review --dry-run
 
 # live run
-uv run aidw exec --agent code-reviewer --prompt tests/fixtures/noop.md --label smoke
+aidw exec --agent code-reviewer --prompt tests/fixtures/noop.md --label smoke
 ```
 
-Run artifacts land under `aidt/runs/<utc-stamp>-<task-or-pr>-<workflow>/` (gitignored):
+Run artifacts land under `<state root>/<repo-slug>/runs/<utc-stamp>-<task-or-pr>-<workflow>/`,
+never inside a working tree (design.md §9.1; [Workflows](#workflows) has the run-id shape):
 `state.json`, `run.log`,
 `prompts/<stage>.rendered.md`, `stages/<stage>.jsonl` (the raw Pi event stream) with its
 `.out.txt` and `.meta.json` siblings, and `artifacts/`. `state.json` starts with a `totals`
@@ -515,7 +540,7 @@ counters, and the `stages/<stage>.out.txt` path:
 ```text
 stage:  task-review-1 [succeeded] model=openrouter/meta/muse-spark-1.3 132.3s cost=$0.0287 32.0 out-tok/s
         usage: total=50.6k in=193 out=16 cache_read=50.4k cache_write=0 reasoning=0 cost=$0.0287
-        out:   aidt/runs/<run-id>/stages/task-review-1.out.txt
+        out:   <state root>/<repo-slug>/runs/<run-id>/stages/task-review-1.out.txt
 ```
 
 Every stage also records `generation_seconds` and `output_tokens_per_second`: the time Pi spent
@@ -543,20 +568,20 @@ events Pi streams:
 clean; `--progress` forces it on and `--no-progress` turns it off.
 
 ```bash
-uv run aidw runs list
-uv run aidw runs show <run-id>
+aidw runs list
+aidw runs show <run-id>
 ```
 
 ### Agents
 
-Agents are defined by YAML under `agent-configs/`, each with its own model, system
+Agents are defined by YAML under `agent-configs/` in the toolkit root, each with its own model, system
 prompt, context file (`agents/<id>/AGENTS.md`) and **tool allowlist**. Tool access is
 deny-by-default: an agent gets exactly the tools listed, and an empty list means no tools.
 
 ```bash
-uv run aidw agents list
-uv run aidw agents show code-reviewer
-uv run aidw agents validate --strict
+aidw agents list
+aidw agents show code-reviewer
+aidw agents validate --strict
 ```
 
 To change an agent's model, edit its YAML. Reviewer agents must use a different model
@@ -565,26 +590,21 @@ fails under `--strict`).
 
 ### Prompts and helper scripts
 
-`aidt/prompts/` is **AIDT's own** prompt and helper-script tree — the source of truth for
-every workflow. It is edited freely as the workflows evolve; it is not copied from, or
-compared with, any other directory. New instructions and new subcommands in the bundled
-scripts (for example `review-followup approve`) are expected.
+`prompts/` in the toolkit root is **AIDT's own** prompt and helper-script tree — the source of
+truth for every workflow. It is edited freely as the workflows evolve; it is not copied from,
+or compared with, any other directory. New instructions and new subcommands in the bundled
+scripts (for example `review-followup approve`) are expected. A target repo overrides a
+prompt per stage under its own `aidw/prompts/` — see the `aidw/` note in
+[Repository, naming, and provenance](#repository-naming-and-provenance).
 
 ```bash
-uv run aidw prompts list     # every prompt/script AIDT owns
-uv run aidw prompts check    # required files present, no .pi/prompts references
+aidw prompts list     # every prompt/script AIDT owns
+aidw prompts check    # required files present, no .pi/prompts references
 ```
 
 `aidw prompts check` (and `aidw doctor`) fail when a required prompt/script is missing or a
-file reaches outside `aidt/`, so a workflow cannot die at Pi-invocation time.
-
-If `uv` is not on your `PATH`, invoke it by full path (e.g. `~/.local/bin/uv`).
-
-To invoke without `uv` (dependencies must already be importable):
-
-```bash
-./aidt/aidw/aidw doctor
-```
+file reaches outside the toolkit root, so a workflow cannot die at Pi-invocation time
+(`aidw/inventory.py` holds the required inventory).
 
 ## Commands
 
@@ -653,7 +673,7 @@ terminal, not an auto-approval for a script, so `--yes` remains the way through 
 
 - `--no-retry-transient` (global) disables the single automatic retry on a clearly
   transient Pi invocation error (network/provider 5xx). Gate failures are never retried.
-- Per-agent `max_cost_usd` in `aidt/agent-configs/<agent>.yaml` fails a stage with
+- Per-agent `max_cost_usd` in `agent-configs/<agent>.yaml` (toolkit root) fails a stage with
   `cost_ceiling` when its cost exceeds the ceiling. Real cost is recorded per stage in
   `state.json` and `.meta.json`; the run's combined `totals` is at the top of `state.json`.
 - A stage that spends tokens at a `$0.0000` cost is reported as a pricing gap, not a free
@@ -668,7 +688,7 @@ terminal, not an auto-approval for a script, so `--yes` remains the way through 
 - Never commits in `implement`/`fix` (the `/pr` agent and the fixer own/leave changes; the
   fix loop leaves fixes **uncommitted** for you or CI to commit).
 - Python never calls a mutating `gh` command; GitHub writes go through the bundled
-  Python scripts under `aidt/prompts/scripts/review-followup/`.
+  Python scripts under `prompts/scripts/review-followup/` in the toolkit root.
 - `implement`/`fix` refuse to run on `main` or on a branch that is not the task/PR head.
 - Never skips a verification gate it cannot prove redundant. `aidw gate run` reuses an outcome
   only for the same run, the same key and command, the same declared scope, and content that
@@ -684,9 +704,12 @@ terminal, not an auto-approval for a script, so `--yes` remains the way through 
 | `branch mismatch` | Check out the task/PR head branch. |
 | `provider error: 402` / stage `failed` | Provider credits/limits. Top up or switch the agent's model; not transient, so it is not retried. |
 | `verdict: ambiguous` / run `blocked` | The model did not end with a clear verdict. Inspect `stages/<stage>.out.txt`, re-run, or set a stronger reviewer model. |
-| `prompts check` fails | A required prompt/script is missing, or a file references `.pi/prompts`. Fix the file or `aidt/aidw/inventory.py`. |
+| `prompts check` fails | A required prompt/script is missing, or a file references `.pi/prompts`. Fix the file or the inventory in `aidw/inventory.py`. |
 | `gh` errors in review/fix | `gh auth status`; the PR must be **OPEN** and target `main`. |
-| `Unknown JSON field: "subIssues"` in a review/fix stage | A stale or shadowed `gh` is first on `PATH` (sub-issues need `gh` ≥ 2.94.0). `aidw doctor` fails this as `gh version`; upgrade `gh` and check `which -a gh`. |
+| `Unknown JSON field: "subIssues"` in a review/fix stage | A stale or shadowed `gh` is first on `PATH`: the review-followup scripts read native `subIssues`/`parent` fields, and sub-issues need `gh` ≥ 2.94.0. `aidw doctor` **FAILs** this as `gh version` before any stage starts; upgrade `gh`, and run `which -a gh` to find the shadowing binary (design.md §12.4). |
+| `Refusing to run: … is itself a registered worktree` (**`clone-of-a-worktree`**) | `main/` is a plain clone with worktrees hanging off it, so run state would land inside a prunable tree. `aidw/layout.py:check_layout` refuses to run, and `aidw doctor` **FAILs** the `control worktree` check with the re-bootstrap commands. See [Supported and rejected layouts](#supported-and-rejected-layouts). |
+| `'<path>' is a bare repository: it has no working tree` (**the bare directory as the target**) | You are running inside `bare.git`. Run every command from the control worktree `main/`; `aidw doctor` **FAILs** the `target repo` check, and the refusal prints the `git worktree add ../main main` line to run. See [Supported and rejected layouts](#supported-and-rejected-layouts). |
+| `fatal: '<branch>' is already checked out at '<path>'` (**creating the branch on `main`, then moving it**) | git allows one checkout per branch, so a branch checked out in `main/` cannot be checked out in a worktree. Let `aidw prompt` create the task branch and its worktree — no `aidw doctor` check covers this one. See [Supported and rejected layouts](#supported-and-rejected-layouts). |
 | A stage is stuck/slow | Wall-clock timeout per agent (`timeout_seconds`); the process group is terminated and the partial log kept. |
 | Need to continue after a failure | `aidw implement ... --resume` (or `--from <stage>`). `fix` has no resume in v1. |
 | A gate re-ran when you expected a citation | Its key, command or `--ignore` scope differs from the earlier ask, the base branch does not resolve, or the content changed outside the declared scope. `aidw gate list` shows what was recorded and with which scope. |
@@ -694,34 +717,70 @@ terminal, not an auto-approval for a script, so `--yes` remains the way through 
 
 ## Layout
 
+The toolkit repo is self-contained: everything the toolkit needs at runtime is inside the
+installed package plus the three repo-root sibling directories that ship in the wheel, and
+everything else is development-time. [`design.md` §3](./design.md) is the authority for the
+full tree and for the runtime/development split — this is the same tree, annotated for an
+operator:
+
 ```text
-aidt/
-├── design.md          # the design document
-├── pyproject.toml     # uv-managed project
-├── aidw/              # the Python package + CLI
-├── agent-configs/     # per-agent YAML (Phase 1)
-├── agents/            # per-agent AGENTS.md / SYSTEM.md (Phase 1)
-├── prompts/           # AIDT's own prompts and helper scripts
-├── runs/              # per-run artifacts (gitignored; Phase 2)
-└── tests/             # pytest unit tests
+aidt/                          # toolkit root
+├── aidw/                      # the importable Python package + CLI
+├── prompts/                   # toolkit DEFAULT prompts (+ scripts/review-followup/)
+├── agent-configs/             # default agent configs (a target repo may shadow them)
+├── agents/                    # default per-agent AGENTS.md / SYSTEM.md fragments
+├── docs/                      # contract docs, this repo's roadmap, task prompts, results
+├── tests/                     # pytest
+├── fixtures/target-repo/      # a fixture target repo used by the interface tests
+├── design.md                  # design of record
+├── README.md                  # this operator guide
+├── pyproject.toml             # uv-managed; hatchling build; `aidw` console script
+├── uv.lock
+└── .github/workflows/ci.yml   # pytest + doctor on every push and PR
 ```
+
+Nothing generated is written into the toolkit repo or into a target repo: runs, locks and
+caches live in the state root (design.md §3.3, §9.1). Machine-local content is gitignored and
+never committed — `.venv/`, `.pytest_cache/`, and the `.aidw/` state directory a single
+checkout resolves inside its own tree (design.md §9.1's warned case).
 
 ### Documentation
 
-Two shipped contracts are the reference for what AIDT reads around a target repo:
+Three shipped contracts are the reference for what AIDT reads around a target repo:
 
 - [`docs/target-repo-config.md`](./docs/target-repo-config.md) — the `<target>/aidw/config.yaml`
   contract: every field, its type, its default, its provenance and the worked examples.
 - [`docs/roadmap-format.md`](./docs/roadmap-format.md) — the roadmap format AIDT owns, with the
   canonical worked example the parser tests read.
+- [`docs/releasing.md`](./docs/releasing.md) — the tag-based release process, the two install
+  forms, and how a target repo pins and upgrades `requires_toolkit`.
+
+Each is cross-linked rather than restated here: a second copy of a field table or an example
+drifts from the one the parser and config tests read.
 
 ## Development
 
+This is the one place the **checkout** forms belong. Everywhere else in this guide the command
+position is the installed `aidw`, because an operator reading it has already installed the
+toolkit. Here you are working on the toolkit itself:
+
 ```bash
-cd aidt
-uv run pytest
+uv sync --frozen                # create the managed environment from uv.lock
+uv run --frozen pytest          # the whole suite
 uv run aidw doctor
+uv run aidw agents validate --strict
+uv run aidw prompts check
 ```
 
-AIDT tests are intentionally **not** wired into the product's `pnpm -r test` CI (design F5);
-a non-blocking CI job for AIDT is a candidate follow-up (design §18). See `design.md` §15.
+If `uv` is not on your `PATH`, invoke it by full path (e.g. `~/.local/bin/uv`), or run the
+console script from the managed environment: `.venv/bin/aidw doctor`.
+
+`pytest` is the only verification (design.md §15), and this repository has its own CI:
+[`.github/workflows/ci.yml`](./.github/workflows/ci.yml) runs `uv sync --frozen`, then
+`uv run --frozen pytest` and `uv run aidw doctor` on every push and PR. CI installs Pi first.
+`uv.lock` is committed and CI is frozen, so adding a dependency means editing
+`pyproject.toml` **and** re-syncing the lock in the same change. No test may invoke a real Pi
+model: the argv/plan are faked and `--dry-run` is the integration seam.
+
+A target repo's pipeline is unrelated to any of this: the toolkit is never vendored into a
+target repo, and a target repo is never a toolkit checkout.
