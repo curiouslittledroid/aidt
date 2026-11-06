@@ -1,12 +1,17 @@
 """Contract tests for ``aidw doctor``.
 
-Three halves: the environment checks (``pi``/``gh``/``git`` versions, dependencies) with
-faked binaries; the E2.8 target-layout checks (``git version``, ``repo root``/
-``target repo``, ``workspace root``, ``state root``, ``control worktree``) against *real*
-temporary repositories — a bare repo, the supported bare + sibling-worktree layout, a
-single-checkout plain clone and the §3.2 clone-of-a-worktree trap; and the E3.5
-``target config`` check against ``<target>/aidw/config.yaml`` (valid, missing, malformed
-and incompatible).
+Three halves: the environment checks (``pi``/``gh``/``git``/``toolkit`` versions,
+dependencies) with faked binaries; the E2.8 target-layout checks (``git version``,
+``repo root``/``target repo``, ``workspace root``, ``state root``, ``control worktree``)
+against *real* temporary repositories — a bare repo, the supported bare +
+sibling-worktree layout, a single-checkout plain clone and the §3.2
+clone-of-a-worktree trap; and the E3.5 ``target config`` plus E8.3 ``compat status``
+checks against ``<target>/aidw/config.yaml`` (valid, missing, malformed and
+incompatible).
+
+E8.3 splits the D10 verdict out of ``target config``: ``compat status`` is the only
+check that calls ``check_compatibility``, so an incompatible config is exactly one
+FAIL. The seeded sweep at the bottom pins that split over generated configs.
 
 The repo fixtures are deliberately local: E2.9's ``worktree_repo`` fixture covers only
 the bare + ``main`` + ``task`` layout, while these tests add the bare-only, trap and
@@ -17,24 +22,29 @@ output rather than a stubbed guard.
 from __future__ import annotations
 
 import os
+import random
 import subprocess
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
-from aidw import doctor, git
+from aidw import __version__, doctor, git
 from aidw.cli import app
+from aidw.config import ERROR
 from aidw.doctor import (
     FAIL,
     NO_TARGET_CONFIG,
     OK,
     WARN,
+    _check_compat,
     _check_dependencies,
     _check_gh_version,
     _check_git_version,
     _check_pi,
     _check_python,
+    _check_target_config,
+    _check_toolkit_version,
     _missing_gh_capabilities,
     _parse_gh_version,
     _parse_git_version,
@@ -43,7 +53,12 @@ from aidw.doctor import (
     run_doctor,
 )
 from aidw.paths import TargetRepo, WorkspacePaths
-from aidw.target_config import load_target_config, resolve_config
+from aidw.target_config import (
+    check_compatibility,
+    format_issues,
+    load_target_config,
+    resolve_config,
+)
 
 runner = CliRunner()
 
@@ -450,9 +465,23 @@ def test_git_version_is_checked_outside_a_repository(
     checks = collect_checks()
 
     assert _named(checks, "git version").status == OK
+    # E8.3: the toolkit version is the second environment fact that must survive the
+    # repo early return, and is ordered with the git floor before the refusal.
+    assert _named(checks, "toolkit version").status == OK
+    assert _named(checks, "toolkit version").detail == __version__
     names = [check.name for check in checks]
-    assert names.index("git version") < names.index("repo root")
+    assert names.index("git version") < names.index("toolkit version")
+    assert names.index("toolkit version") < names.index("repo root")
     assert _named(checks, "repo root").status == FAIL
+
+
+def test_toolkit_version_check_reports_the_package_version() -> None:
+    """E8.3: informational, always OK, and sourced from `aidw.__version__`."""
+    check = _check_toolkit_version()
+
+    assert check.name == "toolkit version"
+    assert check.status == OK
+    assert check.detail == __version__
 
 
 def test_recorded_git_version_gate_row_matches_doctor_behaviour() -> None:
@@ -675,6 +704,9 @@ def test_supported_layout_reports_the_new_checks_ok_from_each_worktree(
         # archify, …) legitimately may warn in a temporary repository.
         for name in NEW_CHECKS:
             assert _named(checks, name).status == OK, (start, name)
+        # E8.3: a config-less repo is compatible by default (§3.4), so the new verdict
+        # check is OK here too — the gate does not go red for the defaults case.
+        assert _named(checks, "compat status").status == OK
         assert _named(checks, "workspace root").detail == str(tmp_path.resolve())
         assert run_doctor(explicit=start) == 0
 
@@ -724,6 +756,73 @@ def test_missing_target_config_reports_defaults(
     assert declared.issues == []
     assert resolve_config(declared)["schema_version"].is_set is False
     assert run_doctor(explicit=control) == 0
+
+
+COMPAT_STATUS_CASES = [
+    pytest.param(None, OK, None, id="config-less"),
+    pytest.param("schema_version: 1\n", OK, None, id="supported-schema"),
+    pytest.param(
+        'schema_version: 1\nrequires_toolkit: ">=99.0.0"\n',
+        FAIL,
+        "requires_toolkit",
+        id="unsatisfied-requires-toolkit",
+    ),
+    pytest.param("schema_version: 2\n", FAIL, "schema_version", id="newer-schema"),
+]
+
+
+@pytest.mark.parametrize(("text", "status", "field_name"), COMPAT_STATUS_CASES)
+def test_compat_status_reports_the_d10_verdict(
+    tmp_path: Path,
+    fake_external_clis: None,  # noqa: ARG001
+    text: str | None,
+    status: str,
+    field_name: str | None,
+) -> None:
+    """E8.3/D10: `compat status` is the single compatibility verdict.
+
+    The config-less vector is the §3.4 valid defaults case, not a refusal: the check
+    must not pre-test the file's existence.
+    """
+    _bare, control = _make_supported(tmp_path)
+    if text is not None:
+        _write_target_config(control, text)
+    checks = collect_checks(explicit=control)
+
+    compat = _named(checks, "compat status")
+
+    assert compat.status == status, compat.detail
+    if field_name is None:
+        assert __version__ in compat.detail
+    else:
+        assert field_name in compat.detail
+    # A bare/incompatible config is a non-zero doctor exit; compatible ones stay green.
+    assert run_doctor(explicit=control) == (1 if status == FAIL else 0)
+
+
+def test_collect_checks_evaluates_compatibility_once(
+    tmp_path: Path,
+    fake_external_clis: None,  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E8.3: moving the verdict creates one compatibility evaluation, not two."""
+    _bare, control = _make_supported(tmp_path)
+    _write_target_config(control, "schema_version: 2\n")
+    calls: list[tuple[object, str]] = []
+    real_check_compatibility = doctor.check_compatibility
+
+    def spy(declared: object, *, toolkit_version: str) -> list[object]:
+        calls.append((declared, toolkit_version))
+        return real_check_compatibility(declared, toolkit_version=toolkit_version)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(doctor, "check_compatibility", spy)
+
+    checks = collect_checks(explicit=control)
+
+    assert len(calls) == 1
+    assert calls[0][1] == __version__
+    assert _named(checks, "target config").status == OK
+    assert _named(checks, "compat status").status == FAIL
 
 
 MALFORMED_CONFIG_CASES = [
@@ -814,29 +913,47 @@ def test_incompatible_target_config_fails_naming_the_field(
     text: str,
     field_name: str,
 ) -> None:
-    """§3.11/D10: doctor also refuses an incompatible config, naming the field."""
+    """§3.11/D10: the compatibility refusal is `compat status`, naming the field.
+
+    E8.3 moved the verdict out of ``target config`` instead of copying it: the same
+    config is ``OK`` on that line (it parses, resolves and its read-paths exist).
+    """
     _bare, control = _make_supported(tmp_path)
     _write_target_config(control, text)
+    checks = collect_checks(explicit=control)
 
-    check = _named(collect_checks(explicit=control), "target config")
+    target = _named(checks, "target config")
+    compat = _named(checks, "compat status")
 
-    assert check.status == FAIL
-    assert field_name in check.detail
+    assert target.status == OK, target.detail
+    assert field_name not in target.detail
+    assert compat.status == FAIL
+    assert field_name in compat.detail
     assert run_doctor(explicit=control) == 1
 
 
 def test_malformed_and_incompatible_errors_are_both_reported(
     tmp_path: Path, fake_external_clis: None  # noqa: ARG001
 ) -> None:
-    """The loader's ERROR issues and the compatibility refusals are unioned, not either/or."""
+    """Loader ERRORs stay on `target config`; the D10 verdict is `compat status`.
+
+    E8.3 split what E3.5 unioned: two independent failures, two named checks, each
+    surface naming only its own field path — never both on both lines.
+    """
     _bare, control = _make_supported(tmp_path)
     _write_target_config(control, "schema_version: 2\nbogus: true\n")
+    checks = collect_checks(explicit=control)
 
-    check = _named(collect_checks(explicit=control), "target config")
+    target = _named(checks, "target config")
+    compat = _named(checks, "compat status")
 
-    assert check.status == FAIL
-    assert "unknown key `bogus`" in check.detail
-    assert "`schema_version` 2 is newer" in check.detail
+    assert target.status == FAIL
+    assert "unknown key `bogus`" in target.detail
+    assert "`schema_version` 2 is newer" not in target.detail
+    assert compat.status == FAIL
+    assert "`schema_version` 2 is newer" in compat.detail
+    assert "bogus" not in compat.detail
+    assert run_doctor(explicit=control) == 1
 
 
 def test_bare_target_does_not_run_the_target_config_check(
@@ -849,6 +966,8 @@ def test_bare_target_does_not_run_the_target_config_check(
 
     assert _named(checks, "target repo").status == FAIL
     assert "target config" not in [check.name for check in checks]
+    # E8.3: `compat status` is target-side too, so it is skipped with it.
+    assert "compat status" not in [check.name for check in checks]
 
 
 def test_target_config_check_is_read_only_and_leaves_the_config_untouched(
@@ -946,7 +1065,8 @@ def test_target_config_verdict_is_invariant_to_the_working_directory(
 ) -> None:
     """Metamorphic: the verdict follows the resolved target, never the cwd."""
     _bare, control = _make_supported(tmp_path)
-    _write_target_config(control, "schema_version: 2\n")
+    # A loader ERROR (E8.3 moved the compatibility verdict to `compat status`).
+    _write_target_config(control, "schema_version: 1\nbogus: true\n")
 
     from_control = _named(collect_checks(explicit=control), "target config")
     elsewhere = tmp_path / "elsewhere"
@@ -1015,3 +1135,97 @@ def test_verdict_is_invariant_to_the_working_directory(
         (c.name, c.status, c.detail) for c in collect_checks(explicit=control)
     ]
     assert from_elsewhere == from_control
+
+
+# ---------------------------------------------------------------------------
+# E8.3 property sweep: the compat verdict lives on exactly one check
+# ---------------------------------------------------------------------------
+
+#: Pinned seed and run count (AGENTS.md "Tests": pytest only, no ``hypothesis``, so the
+#: generator below is the reproducible sample and there is no shrinking). The claim it
+#: sweeps is the split E8.3 makes: `compat status` FAILs exactly when
+#: ``check_compatibility`` returns issues, and `target config` never repeats that verdict.
+COMPAT_PROPERTY_SEED = 8301
+COMPAT_PROPERTY_RUNS = 120
+
+_SCHEMA_VERSION_SAMPLES: tuple[int | None, ...] = (None, 1, 2, 3)
+_REQUIRES_TOOLKIT_SAMPLES: tuple[str | None, ...] = (
+    None,
+    ">=0.1.0",
+    ">=99.0.0",
+    f">={__version__}",
+    "banana",
+)
+#: ``bogus`` is a real loader ERROR (unknown key), so a sample can be malformed *and*
+#: incompatible: the case where copying instead of moving the verdict would double-report.
+_UNKNOWN_KEY_SAMPLES: tuple[str | None, ...] = (None, "bogus")
+
+
+def _sample_config_text(rng: random.Random) -> str | None:
+    """One seeded config text, or ``None`` for the config-less §3.4 defaults case."""
+    schema_version = rng.choice(_SCHEMA_VERSION_SAMPLES)
+    requires_toolkit = rng.choice(_REQUIRES_TOOLKIT_SAMPLES)
+    unknown_key = rng.choice(_UNKNOWN_KEY_SAMPLES)
+    lines: list[str] = []
+    if schema_version is not None:
+        lines.append(f"schema_version: {schema_version}")
+    if requires_toolkit is not None:
+        lines.append(f'requires_toolkit: "{requires_toolkit}"')
+    if unknown_key is not None:
+        lines.append(f"{unknown_key}: true")
+    return "\n".join(lines) + "\n" if lines else None
+
+
+def _aidw_listing(repo: Path) -> list[Path]:
+    """The configured ``aidw/`` entries, or ``[]`` when the repo has no such folder."""
+    aidw_dir = repo / "aidw"
+    return sorted(aidw_dir.iterdir()) if aidw_dir.exists() else []
+
+
+def test_compat_verdict_lives_on_exactly_one_check(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """Seeded property run (seed/numRuns pinned above) over generated target configs.
+
+    For each sample: `compat status` FAILs iff ``check_compatibility`` returns issues and
+    renders them through ``format_issues`` verbatim; `target config` never carries those
+    compatibility messages (the verdict was moved, not copied). Each call is read-only.
+    """
+    _bare, control = _make_supported(tmp_path)
+    config_path = control / "aidw" / "config.yaml"
+    rng = random.Random(COMPAT_PROPERTY_SEED)
+
+    for _ in range(COMPAT_PROPERTY_RUNS):
+        text = _sample_config_text(rng)
+        if text is None:
+            if config_path.exists():
+                config_path.unlink()
+        else:
+            _write_target_config(control, text)
+        before_listing = _aidw_listing(control)
+        before_text = config_path.read_text(encoding="utf-8") if text is not None else None
+
+        declared = load_target_config(config_path)
+        expected = check_compatibility(declared, toolkit_version=__version__)
+        compat = _check_compat(control)
+        target = _check_target_config(control)
+
+        assert (compat.status == FAIL) is bool(expected), (text, compat.detail)
+        if expected:
+            rendered = format_issues(expected)
+            assert rendered in compat.detail
+            assert rendered not in target.detail
+        else:
+            assert compat.status == OK
+            assert __version__ in compat.detail
+        # A malformed config is still the loader's FAIL on `target config`; an
+        # otherwise-valid one is OK there regardless of the compatibility verdict (the
+        # fixture repo carries every §3.4 read-path, so `validate_paths` cannot fail).
+        loader_errors = [issue for issue in declared.issues if issue.level == ERROR]
+        assert target.status == (FAIL if loader_errors else OK), target.detail
+        if loader_errors:
+            assert format_issues(loader_errors) in target.detail
+        # Read-only (§3.1): the config and its directory are untouched.
+        assert _aidw_listing(control) == before_listing
+        if before_text is not None:
+            assert config_path.read_text(encoding="utf-8") == before_text

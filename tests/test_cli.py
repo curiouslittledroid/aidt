@@ -92,6 +92,61 @@ def test_version_command() -> None:
     assert result.stdout.strip() == f"aidt {__version__}"
 
 
+def test_version_flag_prints_the_toolkit_version() -> None:
+    """E8.3: the eager top-level flag uses the `version` subcommand's text."""
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip() == f"aidt {__version__}"
+    # Not click/typer's default `<prog>, version <v>` rendering.
+    assert "version " not in result.stdout.replace(f"aidt {__version__}", "")
+
+
+def test_version_flag_agrees_with_the_version_command() -> None:
+    """One format and one source (`aidw.__version__`), asserted in one place."""
+    flag = runner.invoke(app, ["--version"])
+    command = runner.invoke(app, ["version"])
+
+    assert (flag.exit_code, flag.stdout) == (command.exit_code, command.stdout)
+
+
+def test_version_flag_needs_no_target_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The roadmap's "without a target repo" predicate: `/tmp`, no git repo at all.
+
+    A `--version` routed through `_roots()` fails here with `RepoNotFoundError`
+    (exit 4), which is the regression this pins.
+    """
+    monkeypatch.chdir(tmp_path)
+    assert not (tmp_path / ".git").exists()
+
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip() == f"aidt {__version__}"
+    assert "not a git repository" not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_version_flag_resolves_no_target_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """E8.3: `--version` is eager and must not call the single target-resolution site.
+
+    Patching `TargetRepo.resolve` (the only place a target is resolved from cwd) proves
+    the flag exits before any target work rather than merely succeeding in a repo.
+    """
+
+    def _explode(*_args: object, **_kwargs: object) -> TargetRepo:
+        raise AssertionError("--version must not resolve a target repo")
+
+    monkeypatch.setattr(TargetRepo, "resolve", staticmethod(_explode))
+
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip() == f"aidt {__version__}"
+
+
 def test_help_lists_workflow_groups() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
