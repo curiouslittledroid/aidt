@@ -533,7 +533,7 @@
   - Deliverable: state changes plus tests.
   - Done when: an old run's `state.json` explains which toolkit and config produced it.
 
-- [ ] **E8.3. Version reporting**
+- [x] **E8.3. Version reporting**
   `aidw --version`, and doctor reporting toolkit version, git version, and compat status.
   - Deliverable: CLI + doctor.
   - Done when: version output is available without a target repo.

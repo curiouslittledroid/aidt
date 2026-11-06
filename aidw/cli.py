@@ -171,6 +171,33 @@ def _gate_default_value(value: Optional[GateDefault]) -> Optional[str]:
     return value.value if value is not None else None
 
 
+def _version_line() -> str:
+    """The one rendering of the toolkit version (E8.3, design §17 Q1).
+
+    Both surfaces use it: the ``version`` subcommand and the eager top-level
+    ``--version`` flag. The version itself is :data:`aidw.__version__` — never a
+    ``git``/``uv`` shell-out or a ``pyproject.toml`` parse (E1.6, §17 P1) — so the
+    two cannot disagree about what this checkout ships.
+    """
+    return f"aidt {__version__}"
+
+
+def _version_callback(value: bool) -> bool:
+    """Print :func:`_version_line` and exit before any target resolution.
+
+    Eager and target-free (E8.3, EXTRACTION.md §3.11): Click runs eager options before
+    the rest of the parameter processing, so ``aidw --version`` works from a directory
+    that is not a repository at all. Routing it through :func:`_roots` would make it
+    fail with ``RepoNotFoundError`` outside a repo — the exact predicate the roadmap
+    states as "without a target repo". The default ``<prog>, version <v>`` rendering
+    is deliberately not used: it disagrees with the ``version`` subcommand.
+    """
+    if value:
+        typer.echo(_version_line())
+        raise typer.Exit(EXIT_OK)
+    return value
+
+
 def _gate_default_option() -> Optional[GateDefault]:
     """Build a fresh OptionInfo per command; Click mutates these during decoration."""
     return typer.Option(
@@ -222,6 +249,13 @@ def _main(
             "interactive terminal)."
         ),
     ),
+    version: Optional[bool] = typer.Option(
+        None,
+        "--version",
+        is_eager=True,
+        callback=_version_callback,
+        help="Print the toolkit version and exit (same text as `aidw version`).",
+    ),
 ) -> None:
     """AIDT = AI Developer Tools — Pi-driven workflows for Mythical Forge.
 
@@ -239,7 +273,7 @@ def _main(
 @app.command()
 def version() -> None:
     """Print the AIDT version."""
-    typer.echo(f"aidt {__version__}")
+    typer.echo(_version_line())
 
 
 @app.command()

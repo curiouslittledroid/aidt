@@ -11,7 +11,10 @@ honoured and a bare directory is reachable), and the workspace root, state root 
 control worktree are classified by :func:`aidw.layout.check_layout` — the same guard
 ``cli._roots`` uses — rather than by a doctor-local copy of its rules. Once a working
 tree exists, ``target config`` (E3.5) reports the ``<target>/aidw/config.yaml`` path, its
-resolved ``schema_version`` and any validation or compatibility error (§3.4/§3.11, D10).
+resolved ``schema_version`` and any validation error (§3.4), and ``compat status``
+(E8.3) reports the D10 compatibility verdict on its own line (§3.11). ``toolkit version``
+reports ``aidw.__version__`` as an environment check, so it survives the repo early
+return the same way ``git version`` does.
 
 See ``design.md`` §12/§14 and ``docs/migration/EXTRACTION.md``
 §3.1/§3.2/§3.4/§3.10/§3.11.
@@ -40,6 +43,7 @@ from aidw.paths import (
 )
 from aidw.target_config import (
     ERROR,
+    TargetConfig,
     check_compatibility,
     format_issues,
     load_target_config,
@@ -54,6 +58,18 @@ FAIL = "FAIL"
 #: How the target-config check renders "no ``aidw/config.yaml``": §3.4's valid default
 #: case. Shared by the path and the schema-version column so the wording cannot drift.
 NO_TARGET_CONFIG = "none (defaults)"
+
+
+def _config_source(declared: TargetConfig) -> str:
+    """The config path both target-side checks render, or the defaults sentinel.
+
+    Shared by ``target config`` and ``compat status`` (E8.3) so the two lines can never
+    disagree about which file the verdict was made against.
+    """
+    if declared.source_path is None:
+        return NO_TARGET_CONFIG
+    return str(declared.source_path.resolve())
+
 
 _SYMBOL = {OK: "  ok  ", WARN: " warn ", FAIL: " fail "}
 
@@ -333,6 +349,22 @@ def _check_mcp(root: Path) -> Check:
     return Check("mcp config", WARN, f"missing {path}")
 
 
+def _check_toolkit_version() -> Check:
+    """Report the toolkit version this checkout ships (E8.3, EXTRACTION.md §3.11).
+
+    Informational and always ``OK``: the requirement is that doctor *states* the version
+    the compatibility verdict was made against (D10), not that some version is wrong. The
+    value is :data:`aidw.__version__` — the same single source the ``aidw --version``
+    flag uses (E1.6, design §17 P1) — never a hardcoded literal, a ``git``/``uv``
+    shell-out or a ``pyproject.toml`` parse.
+
+    An environment check, so it sits with ``git version`` *before* the
+    ``TargetRepo.resolve`` try/except: doctor must still name the version when it is run
+    outside any repository (§3.3).
+    """
+    return Check("toolkit version", OK, __version__)
+
+
 def _check_target_config(root: Path) -> Check:
     """Report the target repo's ``aidw/config.yaml``: path, schema version, errors.
 
@@ -344,39 +376,36 @@ def _check_target_config(root: Path) -> Check:
     target repo with no ``aidw/`` folder is valid").
 
     The failure decision is the loader's ``ERROR`` issues unioned with
-    :func:`aidw.target_config.check_compatibility` (D10: an unsupported
-    ``schema_version`` or an unsatisfied ``requires_toolkit``) and, once those pass,
-    with :func:`aidw.target_config.validate_paths` (E3.7: a §3.4 read-path that does not
+    :func:`aidw.target_config.validate_paths` (E3.7: a §3.4 read-path that does not
     exist, named by the config *or* by a toolkit default). It never comes from the merged
     output: ``resolve_config``'s contract is that callers refuse a broken config *before*
-    resolving, so the config is resolved exactly once, after both refusals, and the same
-    resolution feeds the path check and the schema-version line — the two cannot disagree
-    about what the config resolved to. The loader's messages already name the full field
-    path (``unknown key paths.foo``), and :func:`format_issues` is the same formatter
-    ``aidw config show`` and the workflow preflights use, so the report names the field
-    rather than paraphrasing it.
+    resolving, so the config is resolved exactly once, after the loader refusal, and the
+    same resolution feeds the path check and the schema-version line — the two cannot
+    disagree about what the config resolved to. The loader's messages already name the
+    full field path (``unknown key paths.foo``), and :func:`format_issues` is the same
+    formatter ``aidw config show`` and the workflow preflights use, so the report names
+    the field rather than paraphrasing it.
+
+    The D10 compatibility verdict is **not** part of this decision (E8.3): it moved to
+    :func:`_check_compat` so the roadmap's three items are three named checks and
+    :func:`aidw.target_config.check_compatibility` is evaluated exactly once. Unioning it
+    here as well would report the same incompatible ``schema_version``/``requires_toolkit``
+    on two lines.
 
     Read-only: one file read, one ``exists()`` per set read-path, nothing written (§3.1).
     ``ensure_write_targets`` is deliberately **not** called here — doctor must never
-    create a directory a stage has not asked for — and the toolkit version is passed in
-    from :data:`aidw.__version__` rather than hardcoded, so doctor cannot claim a
-    compatibility verdict for a version other than the one it ships in.
+    create a directory a stage has not asked for.
     """
     config_path = root / "aidw" / "config.yaml"
     declared = load_target_config(config_path)
 
     issues = [issue for issue in declared.issues if issue.level == ERROR]
-    issues.extend(check_compatibility(declared, toolkit_version=__version__))
 
-    source = (
-        str(declared.source_path.resolve())
-        if declared.source_path is not None
-        else NO_TARGET_CONFIG
-    )
+    source = _config_source(declared)
     if issues:
         return Check("target config", FAIL, f"{source}\n{format_issues(issues)}")
 
-    # E3.7: resolved exactly once, after the two refusals above, and reused for both the
+    # E3.7: resolved exactly once, after the loader refusal above, and reused for both the
     # read-path check and the schema-version line. The path issues join the same list so
     # the FAIL/OK decision stays a single one (§3.4 "Configured read-paths must exist").
     resolved = resolve_config(declared)
@@ -397,6 +426,37 @@ def _check_target_config(root: Path) -> Check:
         "target config",
         OK,
         f"{source} — schema version {schema_version.value} ({schema_version.source})",
+    )
+
+
+def _check_compat(root: Path) -> Check:
+    """Report the D10 compatibility verdict for the target's declared config (E8.3).
+
+    EXTRACTION.md §3.11: the toolkit refuses an unsupported ``schema_version`` or an
+    unsatisfied ``requires_toolkit``. :func:`aidw.target_config.check_compatibility` is
+    the single decision source and is evaluated here **once** — the verdict was moved
+    out of :func:`_check_target_config`, not copied, so an incompatible config is one
+    FAIL on one named line instead of two.
+
+    A missing ``aidw/config.yaml`` is §3.4's valid defaults case: the loader returns
+    ``source_path is None`` with no issues, so :func:`check_compatibility` returns
+    ``[]`` and this check is ``OK``. That is why the file is **not** pre-tested with
+    ``exists()``/``is_file()``: a pre-check would turn every config-less repo red. When
+    the verdict is a refusal, the messages are surfaced through :func:`format_issues`
+    verbatim — they already name ``schema_version``/``requires_toolkit`` and the reason.
+
+    Read-only: one file read, nothing written (§3.1). The toolkit version is passed in
+    from :data:`aidw.__version__` (E1.6), never hardcoded, so the verdict cannot be
+    claimed for a version other than the one this package ships.
+    """
+    declared = load_target_config(root / "aidw" / "config.yaml")
+    issues = check_compatibility(declared, toolkit_version=__version__)
+    if issues:
+        return Check("compat status", FAIL, format_issues(issues))
+    return Check(
+        "compat status",
+        OK,
+        f"{_config_source(declared)} — toolkit {__version__} is compatible",
     )
 
 
@@ -540,9 +600,10 @@ def collect_checks(explicit: Path | None = None) -> list[Check]:
         _check_pi(),
         _check_gh(),
         _check_gh_version(),
-        # Environment checks run outside any repository, so the git floor is verified
-        # before the target is resolved (§3.2).
+        # Environment checks run outside any repository, so the git floor and the
+        # toolkit version are verified before the target is resolved (§3.2/§3.11).
         _check_git_version(),
+        _check_toolkit_version(),
         # Must precede the target try/except: that branch returns early, and the
         # toolkit root is deliberately resolvable with no repository at all.
         _check_toolkit_root(),
@@ -566,6 +627,7 @@ def collect_checks(explicit: Path | None = None) -> list[Check]:
     # After the early returns above: the config lives in the target's *working tree*, so
     # a bare directory must short-circuit first (it has no ``aidw/`` to read).
     checks.append(_check_target_config(target.root))
+    checks.append(_check_compat(target.root))
 
     aidt = toolkit_root()
     checks.append(_check_prompts(aidt))
