@@ -44,6 +44,7 @@ from aidw.state import (
 from aidw.target_config import (
     SOURCE_CONFIG,
     agent_configs_override,
+    config_identity,
     resolve_workflow_config,
 )
 
@@ -222,6 +223,7 @@ def run(
         return 4
 
     try:
+        config_schema_version, config_hash = config_identity(resolved_config)
         state = create_run(
             runs_root,
             repo.root,
@@ -233,6 +235,11 @@ def run(
             },
             strict=strict,
             branch=branch,
+            # EXTRACTION.md §3.11 (E8.2): what produced this run, for after-the-fact
+            # explanation. `exec` records the version only (it resolves no config).
+            toolkit_version=__version__,
+            config_schema_version=config_schema_version,
+            config_hash=config_hash,
         )
         directory = run_dir(runs_root, state.run_id)
         logger = RunLogger(directory, stream=stream)

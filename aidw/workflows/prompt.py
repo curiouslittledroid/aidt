@@ -124,6 +124,7 @@ from aidw.target_config import (
     ConfigOverrides,
     ResolvedConfig,
     agent_configs_override,
+    config_identity,
     resolve_workflow_config,
     validate_paths,
 )
@@ -1590,6 +1591,9 @@ def run(
         return EXIT_REFUSED
 
     try:
+        # EXTRACTION.md §3.11 (E8.2): what produced this run. One helper so the five
+        # workflows cannot record different values for one config.
+        config_schema_version, config_hash = config_identity(resolved_config)
         state = create_run(
             runs_root,
             target.root,
@@ -1598,6 +1602,9 @@ def run(
             task={"phase": phase, "epic": epic, "task": task, "title": entry.title},
             strict=strict,
             branch=branch_name,
+            toolkit_version=__version__,
+            config_schema_version=config_schema_version,
+            config_hash=config_hash,
         )
         directory = run_dir(runs_root, state.run_id)
         logger = RunLogger(directory, stream=stream)

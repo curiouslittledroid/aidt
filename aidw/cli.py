@@ -923,6 +923,9 @@ def exec_stage(
         typer.echo(str(exc), err=True)
         raise typer.Exit(EXIT_USAGE) from exc
 
+    # `exec` resolves no target config (wiring the config preflight into it would change
+    # its failure surface, which E8.2 does not own), so it records the toolkit version and
+    # leaves both config fields `None` rather than asserting an identity it never used.
     run = state_mod.create_run(
         runs_root,
         repo.root,
@@ -930,6 +933,7 @@ def exec_stage(
         label=label,
         strict=strict,
         branch=git.current_branch(repo.root),
+        toolkit_version=__version__,
     )
     directory = state_mod.run_dir(runs_root, run.run_id)
     logger = RunLogger(directory, stream=bool(_state["verbose"]))

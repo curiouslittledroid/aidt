@@ -43,6 +43,7 @@ import ast
 import copy
 import dataclasses
 import fnmatch
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -84,6 +85,7 @@ from aidw.target_config import (
     WorkflowConfig,
     agent_configs_override,
     check_compatibility,
+    config_identity,
     ensure_write_targets,
     format_issues,
     load_target_config,
@@ -2582,3 +2584,263 @@ def test_read_path_validation_property(tmp_path: Path) -> None:
 
         assert write_issues == []
         assert (root / "docs" / "architecture").is_dir() is not case["architecture_disabled"]
+
+
+# --------------------------------------------------------------------------- #
+# Config identity for state.json (E8.2, EXTRACTION.md §3.11, D9/D10)
+# --------------------------------------------------------------------------- #
+#
+# :func:`config_identity` is the one place the two values E8.2 records in every run's
+# ``state.json`` are computed, so the five workflows cannot drift. The vectors below are
+# hand-calculated: the hash is recomputed from the documented canonicalisation
+# (``json.dumps(resolved.to_dict(), sort_keys=True)``), not copied from the helper's
+# output, and the metamorphic cases prove it tracks *the resolved* config — a declared
+# value that equals its default must fingerprint differently, because provenance is part
+# of the identity.
+
+#: Pinned seed and run count for the seeded property test below (same convention as the
+#: E3.2/E3.3 property runs: pytest only, no hypothesis, so a fixed sample and no
+#: shrinking).
+IDENTITY_PROPERTY_SEED = 3821
+IDENTITY_PROPERTY_RUNS = 64
+
+
+def _expected_hash(resolved: ResolvedConfig) -> str:
+    """The hand-computed fingerprint of Requirement 1/3's canonicalisation."""
+    payload = json.dumps(resolved.to_dict(), sort_keys=True)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def test_config_identity_hashes_the_resolved_config_as_documented(tmp_path: Path) -> None:
+    """Requirement 1/3: ``sha256:<hex>`` over ``json.dumps(to_dict(), sort_keys=True)``.
+
+    The payload is the same object ``aidw config show --json`` prints
+    (``{"config": resolved.to_dict()}``), which is what makes the recorded fingerprint
+    reproducible from an operator-visible command.
+    """
+    resolved = _resolve_loaded(tmp_path, {"schema_version": 1, "max_revisions": 4})
+
+    _, config_hash = config_identity(resolved)
+
+    assert config_hash == _expected_hash(resolved)
+    assert config_hash.startswith("sha256:")
+    assert len(config_hash) == len("sha256:") + 64
+    int(config_hash.removeprefix("sha256:"), 16)
+    # Sanity check on the hand calculation itself: the payload really is the flat
+    # ``path -> {value, source}`` dump, not the resolved *values* alone.
+    assert '"max_revisions"' in json.dumps(resolved.to_dict(), sort_keys=True)
+
+
+def test_config_identity_schema_version_is_the_config_schema_not_the_state_schema(
+    tmp_path: Path,
+) -> None:
+    """Requirement 1: ``schema_version: 1`` in the config resolves to ``config_schema_version == 1``.
+
+    The key name is prompt-fixed: ``state.json``'s bare ``schema_version`` is the *state*
+    schema (``aidw.state.SCHEMA_VERSION``), and ``aidw.state.load`` refuses a mismatch, so
+    the config's version cannot reuse it.
+    """
+    resolved = _resolve_loaded(tmp_path, {"schema_version": 1})
+
+    config_schema_version, _ = config_identity(resolved)
+
+    assert config_schema_version == 1
+    assert config_schema_version == resolved["schema_version"].value
+
+
+def test_config_identity_schema_version_is_none_for_a_config_less_repo(
+    tmp_path: Path,
+) -> None:
+    """Requirement 1: a repo with no ``aidw/`` folder has no resolved config version.
+
+    §3.4 requires ``schema_version`` *in* a config file and it has no toolkit default, so
+    the leaf stays unset — ``None``, never a fabricated ``0``.
+    """
+    declared = load_target_config(tmp_path / "aidw" / "config.yaml")
+    assert declared.issues == [], format_issues(declared.issues)
+    resolved = resolve_config(declared)
+    assert not resolved["schema_version"].is_set
+
+    config_schema_version, config_hash = config_identity(resolved)
+
+    assert config_schema_version is None
+    assert config_hash == _expected_hash(resolved)
+
+
+def test_config_identity_is_deterministic_across_two_resolutions(
+    tmp_path: Path,
+) -> None:
+    """Requirement: two ``resolve_config`` calls on one fixture fingerprint identically."""
+    declared = _load(tmp_path, {"schema_version": 1, "paths": {"roadmap_dir": "tasks"}})
+
+    first = config_identity(resolve_config(declared))
+    second = config_identity(resolve_config(declared))
+
+    assert first == second
+
+
+def test_config_identity_changes_when_one_resolved_leaf_changes(
+    tmp_path: Path,
+) -> None:
+    """A different resolved config is a different identity (one leaf is enough)."""
+    baseline = config_identity(_resolve_loaded(tmp_path / "a", {"schema_version": 1}))[1]
+    changed = config_identity(
+        _resolve_loaded(tmp_path / "b", {"schema_version": 1, "max_revisions": 5})
+    )[1]
+
+    assert baseline != changed
+
+
+def test_config_identity_separates_a_declared_default_from_the_default(
+    tmp_path: Path,
+) -> None:
+    """Provenance is part of the identity: ``max_revisions: 3`` is not the default ``3``.
+
+    ``resolve_config`` records ``source`` per leaf, so a declared value equal to the
+    toolkit default fingerprints differently from the same value it never declared. That
+    is deliberate (§3.11 leaves the canonicalisation open; E8.2 pins ``to_dict()``): the
+    fingerprint answers "which resolved config produced this run", and those two are not
+    the same resolved config.
+    """
+    silent = _resolve_loaded(tmp_path / "silent", {"schema_version": 1})
+    declared = _resolve_loaded(
+        tmp_path / "declared",
+        {"schema_version": 1, "max_revisions": DEFAULT_MAX_REVISIONS},
+    )
+
+    # Same value, different provenance — this is the whole point, so pin both halves.
+    assert silent["max_revisions"].value == declared["max_revisions"].value
+    assert silent["max_revisions"].source == SOURCE_DEFAULT
+    assert declared["max_revisions"].source == SOURCE_CONFIG
+    assert config_identity(silent)[1] != config_identity(declared)[1]
+
+
+def test_config_identity_is_pure_and_never_mutates_the_resolved_config(
+    tmp_path: Path,
+) -> None:
+    """No input mutation and no I/O: two calls leave the resolved config untouched."""
+    resolved = _resolve_loaded(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "max_revisions": 2,
+            "workflows": {"implement": {"stages": [{"id": "implement"}]}},
+        },
+    )
+    before = copy.deepcopy(resolved.to_dict())
+    listing = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+
+    config_identity(resolved)
+    config_identity(resolved)
+
+    assert resolved.to_dict() == before
+    # ``to_dict`` builds fresh dicts per call, so the identity pass observed no writes.
+    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == listing
+
+
+def test_config_identity_is_computed_from_the_resolved_config_not_the_declaration(
+    tmp_path: Path,
+) -> None:
+    """A raw-text or declared-only hash would stop meaning "the resolved config".
+
+    Two configs that differ only in a YAML comment/whitespace resolve identically, so
+    they fingerprint identically; a declared leaf that resolves to a different value
+    does not.
+    """
+    first = _write_text(
+        tmp_path / "first",
+        "schema_version: 1\nmax_revisions: 2  # the budget\n",
+    )
+    second = _write_text(
+        tmp_path / "second",
+        "# leading comment\nschema_version:   1\n\nmax_revisions: 2\n",
+    )
+    other = _write_text(tmp_path / "other", "schema_version: 1\nmax_revisions: 3\n")
+
+    def _identity(path: Path) -> tuple[int | None, str]:
+        declared = load_target_config(path)
+        assert declared.issues == [], format_issues(declared.issues)
+        return config_identity(resolve_config(declared))
+
+    assert _identity(first) == _identity(second)
+    assert _identity(first) != _identity(other)
+
+
+def _random_identity_config(rng: random.Random) -> dict[str, Any]:
+    """A random loader-valid config for the seeded identity property run.
+
+    Deliberately overrides a *declared* leaf in most cases, because the interesting
+    property is that the fingerprint tracks resolved values *and* their provenance.
+    """
+    config: dict[str, Any] = {"schema_version": 1}
+    if rng.random() < 0.7:
+        config["max_revisions"] = rng.choice([1, 2, 3, 5, 9])
+    if rng.random() < 0.5:
+        config["repo"] = {
+            "base_branch": rng.choice(["main", "trunk"]),
+            "branch_pattern": rng.choice(["{phase}-{task}", "{task}"]),
+        }
+    if rng.random() < 0.5:
+        config["paths"] = {"roadmap_dir": rng.choice(["docs/tasks", "tasks"])}
+    if rng.random() < 0.4:
+        config["workflows"] = {
+            rng.choice(["prompt", "implement"]): {
+                "stages": [{"id": rng.choice(["author", "review", "implement"])}]
+            }
+        }
+    return config
+
+
+def test_config_identity_property(tmp_path: Path) -> None:
+    """Seeded property run over the identity invariants (seed/numRuns pinned above).
+
+    For every generated config: the hash has the documented shape and equals the
+    hand-computed canonicalisation of the *current* resolved dump; the schema version is
+    ``resolved["schema_version"].value`` exactly when that leaf is set and ``None`` when
+    it is not; the identity is deterministic per resolved config; and changing one
+    resolved leaf's value changes the identity (metamorphic — a constant hash would pass
+    everything else).
+    """
+    rng = random.Random(IDENTITY_PROPERTY_SEED)
+
+    for index in range(IDENTITY_PROPERTY_RUNS):
+        config_data = _random_identity_config(rng)
+        declared = _load(tmp_path / f"run-{index}", config_data)
+        assert declared.issues == [], format_issues(declared.issues)
+        resolved = resolve_config(declared)
+        before = copy.deepcopy(resolved.to_dict())
+
+        config_schema_version, config_hash = config_identity(resolved)
+
+        assert config_hash == _expected_hash(resolved)
+        assert config_hash.startswith("sha256:")
+        assert len(config_hash) == len("sha256:") + 64
+        int(config_hash.removeprefix("sha256:"), 16)
+        assert config_schema_version == resolved["schema_version"].value
+        assert config_schema_version == 1  # the fixtures always declare schema_version: 1
+        # Deterministic for one resolved config, and pure.
+        assert (config_schema_version, config_hash) == config_identity(resolved)
+        assert resolved.to_dict() == before
+
+        # Metamorphic: one different resolved value must change the fingerprint.
+        bumped = resolve_config(
+            _load(tmp_path / f"run-{index}-bumped", {**config_data, "max_revisions": 7})
+        )
+        assert config_identity(bumped)[1] != config_hash
+
+
+def test_unset_schema_leaf_yields_none_even_in_a_resolved_config(
+    tmp_path: Path,
+) -> None:
+    """Requirement 1's ``is_set`` guard, isolated from the loader.
+
+    A hand-built :class:`ResolvedConfig` whose ``schema_version`` entry exists but never
+    resolved (``value is None``, ``source is None``) must give ``None``, not the entry's
+    ``None`` value smeared into a truthy-looking key.
+    """
+    resolved = resolve_config(TargetConfig())
+    assert resolved["schema_version"] == ResolvedValue(None, None)
+
+    config_schema_version, _ = config_identity(resolved)
+
+    assert config_schema_version is None

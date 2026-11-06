@@ -136,6 +136,18 @@ class RunState:
     created_at: str
     repo_root: str
     schema_version: int = SCHEMA_VERSION
+    #: Identity of what produced the run (E8.2, EXTRACTION.md §3.11, D9/D10): the toolkit
+    #: version from :data:`aidw.__version__`, the *target config* schema version (never the
+    #: state schema above — that key is taken and ``load`` refuses a mismatch), and a
+    #: ``sha256:<hex>`` fingerprint of the resolved config.
+    #:
+    #: Additive at the same ``SCHEMA_VERSION``, following the throughput-fields precedent
+    #: (design §9.2): each defaults to ``None`` so a ``state.json`` written before these
+    #: fields existed still loads, and a caller that does not hold a resolved config (for
+    #: example ``aidw exec``) records ``None`` rather than inventing one.
+    toolkit_version: str | None = None
+    config_schema_version: int | None = None
+    config_hash: str | None = None
     git: dict[str, Any] = field(default_factory=dict)
     task: dict[str, Any] = field(default_factory=dict)
     pr: dict[str, Any] = field(default_factory=dict)
@@ -249,12 +261,18 @@ def create_run(
     pr: dict[str, Any] | None = None,
     strict: bool = False,
     branch: str | None = None,
+    toolkit_version: str | None = None,
+    config_schema_version: int | None = None,
+    config_hash: str | None = None,
 ) -> RunState:
     state = RunState(
         run_id=new_run_id(label, workflow),
         workflow=workflow,
         created_at=utcnow_iso(),
         repo_root=str(repo_root),
+        toolkit_version=toolkit_version,
+        config_schema_version=config_schema_version,
+        config_hash=config_hash,
         strict=strict,
         task=task or {},
         pr=pr or {},

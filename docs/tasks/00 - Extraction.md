@@ -528,7 +528,7 @@
   - Deliverable: working install.
   - Done when: `uv tool install` then `aidw doctor` works from a directory unrelated to any repo.
 
-- [ ] **E8.2. `state.json` records identity**
+- [x] **E8.2. `state.json` records identity**
   Record `toolkit_version`, resolved `schema_version`, and a hash of the resolved config.
   - Deliverable: state changes plus tests.
   - Done when: an old run's `state.json` explains which toolkit and config produced it.
