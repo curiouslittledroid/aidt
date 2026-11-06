@@ -487,11 +487,31 @@
     evidence bundle's gate heading now names both D16 sources even when a repo has only
     `AGENTS.md`.
 
-- [ ] **E7.4. Neutralise the agent guidance**
+- [x] **E7.4. Neutralise the agent guidance**
   Per §4.3: `agents/implementer/AGENTS.md`, `agents/recorder/AGENTS.md`,
   `agents/pr-publisher/AGENTS.md`, `agents/task-author/AGENTS.md`.
   - Deliverable: four edited files.
   - Done when: no `agents/*/AGENTS.md` names a product, a package manager, or a product doc.
+  - Notes: delivered as the four neutralised files — `agents/implementer/AGENTS.md` (only
+    `/impliment-task`; traceability/architecture gone per D13, stack rules deferred to
+    `AGENTS.md` / `aidw/conventions.md` per D16), `agents/recorder/AGENTS.md`
+    (`paths.build_results_template` / `paths.implementation_results_dir`),
+    `agents/pr-publisher/AGENTS.md` (`<phase>-<task>` example, repo conventions deferred),
+    `agents/task-author/AGENTS.md` (AIDT owns branch setup, §3.2) — plus
+    `tests/test_agent_guidance_neutrality.py`, which greps the whole `agents/*/AGENTS.md` glob
+    with the four-category vocabulary mirrored from `tests/test_prompt_neutrality.py`. The
+    Done-when is asserted by
+    `test_no_agents_guidance_names_a_product_package_manager_or_product_doc`; the core drop by
+    `test_the_implementer_names_no_traceability_or_architecture_stage`. No vector-matrix or
+    coverage-catalog change: this repo has neither artifact (`docs/rules-coverage/`,
+    `tests/integration/`, the `srd:*` scripts) and E7.4 adds no Rules Engine action and no
+    implemented product claim, so nothing is eligible for matrix coverage. Flags: the
+    `tests/test_prompt_workflow.py` L1.3 pin that asserted the old "before creating or
+    switching to the branch" wording was rewritten to the new §3.2 contract, and the
+    task-author's second hard rule was reworded for the same reason, so neither still instructs
+    the agent to branch; `agent-configs/implementer.yaml`'s `description:` still claims the
+    agent owns traceability and architecture docs (§4.3 declares the configs portable as-is,
+    so it is left for E7.5 or a follow-up).
 
 - [ ] **E7.5. Inventory split**
   `inventory.py`: separate the toolkit's **default** prompts/scripts from the prompts **resolved** for
