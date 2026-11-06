@@ -582,8 +582,17 @@
     not relocated: the file stays at `docs/migration/EXTRACTION.md`, the path
     `tests/test_design_doc.py::test_contract_links_are_existing_cross_references` pins.
 
-- [ ] **E9.4. README rewrite**
+- [x] **E9.4. README rewrite**
   Purpose, install, quickstart against a target repo, the `aidw/` naming note, troubleshooting
   (including the stale-gh and worktree-layout failures).
   - Deliverable: README.
   - Done when: the §0 audience can operate the toolkit without reading `aidw/`.
+  - Notes: no vector-matrix or coverage-catalog change — this repo has neither artifact
+    (`docs/rules-coverage/`, `tests/integration/`, the `srd:*` scripts), so there is nothing to
+    record as `not_applicable` and no claim is eligible for matrix coverage (E9.2/E9.3
+    precedent). E9.4 adds no Rules Engine action and no implemented product claim: it is a
+    document rewrite plus one drift-proof test. The traceability evidence is
+    `tests/test_readme_doc.py` (14 tests: the stale-marker sweep, the operator quickstart, the
+    `aidw/` dual-role note, the stale-`gh` and worktree-layout troubleshooting rows, the
+    design.md §3 layout, the three contract-doc links, and a seeded property run at
+    `README_PROPERTY_SEED = 9401` / `README_PROPERTY_RUNS = 40`).
