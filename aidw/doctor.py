@@ -401,7 +401,9 @@ def _check_target_config(root: Path) -> Check:
 
 
 def _check_prompts(aidt: Path) -> Check:
-    issues = inventory.check(aidt)
+    # Toolkit defaults only (E7.5 requirement 7): the resolved-per-target half lives in
+    # ``aidw prompts check``, which knows the target; doctor stays toolkit-side.
+    issues = inventory.check_defaults(aidt)
     errors = [issue for issue in issues if issue.level == "error"]
     if errors:
         return Check("prompts", FAIL, errors[0].message)
