@@ -252,6 +252,10 @@ def test_exec_dry_run_writes_one_run_under_the_state_root(tmp_path: Path) -> Non
     assert (directory / "state.json").is_file()
     assert (directory / "run.log").is_file()
     assert (directory / "prompts" / "code-review.rendered.md").is_file()
+    exec_state = state_mod.load(directory)
+    assert exec_state.toolkit_version == __version__
+    assert exec_state.config_schema_version is None
+    assert exec_state.config_hash is None
     assert not (toolkit_root() / "runs" / directory.name).exists()
 
 

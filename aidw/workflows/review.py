@@ -55,6 +55,7 @@ from aidw.state import (
 from aidw.target_config import (
     SOURCE_CONFIG,
     agent_configs_override,
+    config_identity,
     resolve_workflow_config,
 )
 from aidw.verdict import APPROVE, BLOCKED as VERDICT_BLOCKED, parse_verdict
@@ -295,6 +296,9 @@ def run(
         return 4
 
     try:
+        # EXTRACTION.md §3.11 (E8.2): what produced this run. One helper so the
+        # five workflows cannot record different values for one config.
+        config_schema_version, config_hash = config_identity(resolved_config)
         state = create_run(
             runs_root,
             repo.root,
@@ -306,6 +310,9 @@ def run(
                 **({"force_model": True} if force_model else {}),
             },
             strict=strict,
+            toolkit_version=__version__,
+            config_schema_version=config_schema_version,
+            config_hash=config_hash,
             branch=branch,
         )
         directory = run_dir(runs_root, state.run_id)

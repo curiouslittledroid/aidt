@@ -62,6 +62,8 @@ is a pattern, not a path, and is neither classified nor existence-checked.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
@@ -1359,6 +1361,44 @@ def resolve_config(
             )
 
     return ResolvedConfig(merge.entries)
+
+
+#: Prefix on :func:`config_identity`'s hash, so the algorithm is self-describing in
+#: ``state.json`` (EXTRACTION.md §3.11 leaves the algorithm open; E8.2 fixes it).
+CONFIG_HASH_PREFIX = "sha256:"
+
+
+def config_identity(resolved: ResolvedConfig) -> tuple[int | None, str]:
+    """The resolved config's identity for ``state.json`` (E8.2, EXTRACTION.md §3.11).
+
+    Returns ``(config_schema_version, config_hash)`` together so the five workflows that
+    write a run record cannot record one without the other, or compute either differently:
+
+    - ``config_schema_version`` is the **config** schema version and nothing else. The
+      bare ``schema_version`` key in ``state.json`` is the *state* schema
+      (:data:`aidw.state.SCHEMA_VERSION`), which ``aidw.state.load`` refuses when it
+      differs, so reusing that key for §3.11's "resolved ``schema_version``" would break
+      every load. It is ``None`` for a config-less repo: ``schema_version`` is required
+      *in* a config file and deliberately has no toolkit default (§3.4), so a repo with
+      no ``aidw/`` folder has no resolved version to record.
+    - ``config_hash`` is ``sha256:<hex>`` over
+      ``json.dumps(resolved.to_dict(), sort_keys=True)`` — the same object
+      ``aidw config show --json`` prints, so an operator can reproduce the fingerprint
+      from a visible command. Hashing the **resolved** mapping (not the raw
+      ``config.yaml`` text, whose hash would move on a comment edit, and not the declared
+      :class:`TargetConfig`) is what makes it mean "the config this run actually used":
+      each leaf carries its ``source``, so a declared ``max_revisions: 3`` fingerprints
+      differently from the default ``3`` — provenance is part of the identity.
+
+    Pure: no I/O, and ``resolved`` (its entries and their containers) is never mutated.
+    """
+    entry = resolved.get("schema_version")
+    schema_version: int | None = (
+        entry.value if entry is not None and entry.is_set else None
+    )
+    payload = json.dumps(resolved.to_dict(), sort_keys=True)
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return schema_version, f"{CONFIG_HASH_PREFIX}{digest}"
 
 
 def resolve_workflow_config(

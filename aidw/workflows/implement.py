@@ -86,6 +86,7 @@ from aidw.target_config import (
     SOURCE_CONFIG,
     ResolvedConfig,
     agent_configs_override,
+    config_identity,
     resolve_workflow_config,
 )
 
@@ -636,6 +637,9 @@ def run(
             directory = run_dir(runs_root, state.run_id)
             logger = RunLogger(directory, stream=stream)
         else:
+            # EXTRACTION.md §3.11 (E8.2): what produced this run. One helper so the
+            # five workflows cannot record different values for one config.
+            config_schema_version, config_hash = config_identity(resolved_config)
             state = create_run(
                 runs_root,
                 target.root,
@@ -644,6 +648,9 @@ def run(
                 task={"phase": phase, "task": task, "prompt_path": prompt_rel},
                 strict=strict,
                 branch=branch_name,
+                toolkit_version=__version__,
+                config_schema_version=config_schema_version,
+                config_hash=config_hash,
             )
             if pr is not None:
                 state.pr = {**state.pr, "number": pr}

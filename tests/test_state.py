@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 import pytest
@@ -216,3 +217,173 @@ def test_old_state_without_throughput_still_loads(tmp_path: Path) -> None:
     assert loaded.stages[0].tool_seconds is None
     assert loaded.stages[0].tool_breakdown is None
     assert loaded.stages[0].output_tokens_per_second is None
+
+
+# ---------------------------------------------------------------------------
+# Run identity: toolkit version, config schema version, config hash (E8.2, §3.11)
+# ---------------------------------------------------------------------------
+#
+# Three additive fields at the existing ``SCHEMA_VERSION`` (the throughput-fields
+# precedent, design §9.2): ``None`` by default so a state.json written before them still
+# loads, and the *config* schema version is deliberately not named ``schema_version`` —
+# that key is the state schema, which ``load`` refuses when it differs.
+
+#: Pinned seed and run count for the seeded round-trip sweep below. This repo has no
+#: ``hypothesis`` dependency (AGENTS.md "Tests"), so the property run is a reproducible
+#: seeded sample: same seed + same count => same cases on every machine.
+IDENTITY_PROPERTY_SEED = 8211
+IDENTITY_PROPERTY_RUNS = 32
+
+
+def test_create_run_records_toolkit_version_and_config_identity(tmp_path: Path) -> None:
+    """Requirement 2: ``create_run`` stores all three and ``state.json`` carries them."""
+    run = create_run(
+        tmp_path,
+        tmp_path,
+        "prompt",
+        label="t",
+        toolkit_version="0.1.0",
+        config_schema_version=1,
+        config_hash="sha256:" + "ab" * 32,
+    )
+
+    data = json.loads((tmp_path / run.run_id / "state.json").read_text(encoding="utf-8"))
+    assert data["toolkit_version"] == "0.1.0"
+    assert data["config_schema_version"] == 1
+    assert data["config_hash"] == "sha256:" + "ab" * 32
+
+    loaded = load(tmp_path / run.run_id)
+    assert loaded.toolkit_version == "0.1.0"
+    assert loaded.config_schema_version == 1
+    assert loaded.config_hash == "sha256:" + "ab" * 32
+    # Additive: the state schema itself did not move (design §9.2's precedent).
+    assert loaded.schema_version == state.SCHEMA_VERSION == 1
+
+
+def test_create_run_defaults_the_identity_fields_to_none(tmp_path: Path) -> None:
+    """Requirement 2/traps: the kwargs stay optional, so the direct-test call sites hold.
+
+    A caller with no resolved config (``aidw exec`` records the version only) must be
+    able to say "unknown" rather than invent an identity.
+    """
+    run = create_run(tmp_path, tmp_path, "stage", label="t")
+
+    assert run.toolkit_version is None
+    assert run.config_schema_version is None
+    assert run.config_hash is None
+    loaded = load(tmp_path / run.run_id)
+    assert (
+        loaded.toolkit_version,
+        loaded.config_schema_version,
+        loaded.config_hash,
+    ) == (None, None, None)
+
+
+def test_old_state_without_identity_still_loads(tmp_path: Path) -> None:
+    """Requirement 5: a state.json without the three fields loads, with all three ``None``.
+
+    Mirrors :func:`test_old_state_without_throughput_still_loads`: the existing
+    ``_filter``/defaults path already handles absent keys, so this is the regression pin,
+    not special-casing.
+    """
+    directory = tmp_path / "run"
+    directory.mkdir()
+    (directory / "state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": state.SCHEMA_VERSION,
+                "run_id": "x",
+                "workflow": "w",
+                "created_at": "t",
+                "repo_root": "/",
+                "stages": [{"name": "s", "agent": "a", "model": "m"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load(directory)
+
+    assert loaded.toolkit_version is None
+    assert loaded.config_schema_version is None
+    assert loaded.config_hash is None
+    assert loaded.schema_version == state.SCHEMA_VERSION
+
+
+def test_identity_fields_do_not_disturb_the_recorded_totals_block(tmp_path: Path) -> None:
+    """Traps: ``totals`` stays immediately after ``schema_version`` in ``to_dict()``.
+
+    ``test_saved_state_has_totals_at_the_top`` pins that for a state without the identity
+    fields; this pins it for one that carries them, so the new fields cannot be inserted
+    between the two.
+    """
+    run = create_run(
+        tmp_path,
+        tmp_path,
+        "stage",
+        label="t",
+        toolkit_version="0.1.0",
+        config_schema_version=1,
+        config_hash="sha256:" + "cd" * 32,
+    )
+    save(tmp_path / run.run_id, run)
+
+    keys = list(
+        json.loads((tmp_path / run.run_id / "state.json").read_text(encoding="utf-8"))
+    )
+    assert keys.index("totals") == keys.index("schema_version") + 1
+    assert keys.index("toolkit_version") == keys.index("totals") + 1
+    assert keys.index("config_schema_version") == keys.index("toolkit_version") + 1
+    assert keys.index("config_hash") == keys.index("config_schema_version") + 1
+
+
+def test_identity_fields_round_trip_property(tmp_path: Path) -> None:
+    """Seeded round-trip sweep over the three additive fields (seed/numRuns pinned above).
+
+    Invariants: any combination of ``None`` and a value round-trips through
+    ``save``/``load`` unchanged, the state schema stays ``SCHEMA_VERSION``, and dropping
+    the three keys from the serialized record yields the same state with all three
+    ``None`` (which is exactly what an older ``state.json`` looks like).
+    """
+    rng = random.Random(IDENTITY_PROPERTY_SEED)
+    versions = [None, "0.1.0", "1.4.2", "2.0.0rc1"]
+    schemas = [None, 1, 2]
+
+    for index in range(IDENTITY_PROPERTY_RUNS):
+        toolkit_version = rng.choice(versions)
+        config_schema_version = rng.choice(schemas)
+        config_hash = (
+            None
+            if rng.random() < 0.3
+            else "sha256:" + "".join(rng.choice("0123456789abcdef") for _ in range(64))
+        )
+        run = create_run(
+            tmp_path,
+            tmp_path,
+            "stage",
+            label=f"t-{index}",
+            toolkit_version=toolkit_version,
+            config_schema_version=config_schema_version,
+            config_hash=config_hash,
+        )
+        directory = tmp_path / run.run_id
+        save(directory, run)
+
+        loaded = load(directory)
+
+        assert loaded.toolkit_version == toolkit_version
+        assert loaded.config_schema_version == config_schema_version
+        assert loaded.config_hash == config_hash
+        assert loaded.schema_version == state.SCHEMA_VERSION
+
+        # The pre-E8.2 shape of this same run: absent keys, same run, three ``None``s.
+        data = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+        for key in ("toolkit_version", "config_schema_version", "config_hash"):
+            del data[key]
+        old = RunState.from_dict(data)
+        assert old.run_id == run.run_id
+        assert (
+            old.toolkit_version,
+            old.config_schema_version,
+            old.config_hash,
+        ) == (None, None, None)

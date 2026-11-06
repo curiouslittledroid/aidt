@@ -17,6 +17,7 @@ from aidw.cli import app
 from aidw.config import ERROR, Issue
 from aidw.paths import ToolkitPaths, TargetRepo, WorkspacePaths, repo_root, toolkit_root
 from aidw.prompts import PromptError, render_prompt_file
+from aidw.target_config import config_identity, resolve_workflow_config
 from aidw.workflows import prompt as prompt_workflow
 
 #: Test-only run label. It keeps test-created runs identifiable and lets the session
@@ -102,6 +103,47 @@ def test_prompt_workflow_dry_run(tmp_path: Path, monkeypatch, capsys) -> None:
     assert "branch-setup (planned): worktree add -b 03-E4.1" in out
     assert "a real run requires the base branch `main`" in out
     assert not _task_worktree(tmp_path).exists()
+
+
+def test_prompt_workflow_dry_run_records_run_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """E8.2/EXTRACTION.md §3.11: every run's ``state.json`` explains what produced it.
+
+    Asserted on the dry-run seam because it reaches ``create_run`` without invoking Pi: the
+    record carries ``toolkit_version == aidw.__version__`` plus the identity of the
+    **resolved** target config this run used — the same two values
+    :func:`aidw.target_config.config_identity` computes for the same fixture here, so a
+    workflow that recorded a different config (or only the declared one) fails.
+    """
+    _patch_prompt_repo(
+        tmp_path,
+        monkeypatch,
+        config_text="schema_version: 1\nmax_revisions: 2\n",
+    )
+    monkeypatch.setattr(git, "current_branch", lambda repo: "feature-branch")
+    repo = _roots(tmp_path)["repo"]
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        dry_run=True,
+    )
+
+    assert code == 0
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    expected_config_schema_version, expected_config_hash = config_identity(
+        resolve_workflow_config(repo.root, toolkit_version=__version__)[0]
+    )
+    assert latest.toolkit_version == __version__
+    assert latest.config_schema_version == expected_config_schema_version == 1
+    assert latest.config_hash == expected_config_hash
+    assert latest.config_hash.startswith("sha256:")
+    # Additive at the same state schema (design §9.2's precedent).
+    assert latest.schema_version == state.SCHEMA_VERSION
 
 
 def test_prompt_workflow_unknown_task(tmp_path: Path, monkeypatch) -> None:
