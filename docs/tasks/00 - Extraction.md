@@ -538,7 +538,7 @@
   - Deliverable: CLI + doctor.
   - Done when: version output is available without a target repo.
 
-- [ ] **E8.4. Install and worktree guide**
+- [x] **E8.4. Install and worktree guide**
   README: install paths (primary `uv tool install`, secondary `uvx`), the bare+worktree bootstrap
   from §3.2, and the supported/rejected layouts.
   - Deliverable: README sections.
