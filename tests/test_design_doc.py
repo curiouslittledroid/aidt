@@ -212,6 +212,26 @@ def test_section_91_matches_the_extraction_state_and_lock_layout() -> None:
     assert "never in a working tree" in section
 
 
+def test_section_91_tree_locks_child_is_branch_lock() -> None:
+    """Regression (issue #130): the §9.1 tree child of `locks/` is `<branch>.lock`.
+
+    The trigger: the tree rendered the lock as ``└── locks/<branch>.lock`` *under*
+    ``└── locks/``, so a reader resolving the literal read
+    ``<state root>/<repo-slug>/locks/locks/<branch>.lock`` — one `locks/` level deeper
+    than the prose above the tree and EXTRACTION.md §3.10, and a path `aidw/lock.py`
+    (`locks_dir()` + `lock_filename()`) never writes.
+    """
+    design = _design_md()
+    section = _section(design, "### 9.1 Layout", "### 9.2 `state.json` (schema)")
+
+    tree_start = section.index("```text\n") + len("```text\n")
+    tree = section[tree_start : section.index("\n```", tree_start)]
+
+    # `locks/` is a single level; its child is the lock file itself, not another `locks/`.
+    assert "└── locks/\n    └── <branch>.lock" in tree
+    assert "locks/<branch>.lock" not in tree
+
+
 def test_section_92_records_config_identity_fields() -> None:
     """The state example must reconcile D10/P1 identity fields with the schema."""
     design = _design_md()

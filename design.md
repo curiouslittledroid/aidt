@@ -825,7 +825,7 @@ Run state lives in the **state root**, keyed by repo slug, never in a working tr
 │       └── prompts/
 │           └── impliment-task.rendered.md
 └── locks/
-    └── locks/<branch>.lock               # one run per branch/worktree
+    └── <branch>.lock                     # one run per branch/worktree
 ```
 
 - `state root` = `$AIDW_STATE_DIR` if set, else `<workspace root>/.aidw/state`, else
