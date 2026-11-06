@@ -544,7 +544,7 @@
   - Deliverable: README sections.
   - Done when: a reader can bootstrap a bare+worktree workspace from the README alone.
 
-- [ ] **E8.5. Release process**
+- [x] **E8.5. Release process**
   Tag-based releases; document how a target repo pins `requires_toolkit`.
   - Deliverable: a short release doc plus the first tag.
   - Done when: a target repo can pin and upgrade deliberately.
