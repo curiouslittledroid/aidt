@@ -1326,7 +1326,15 @@ def prompts(
             typer.echo("  none")
         for path in overrides:
             rel = path.relative_to(target_prompts).as_posix()
-            marker = " (shadows a required prompt)" if path.name in shadowed else ""
+            # A shadow is the direct child `<target>/aidw/prompts/<name>` — the only
+            # level `resolve_prompt` searches (§3.6) — so a same-basename file in a
+            # nested directory never carries the marker (mirrors `check_resolved`'s
+            # `path.parent == root` gate).
+            marker = (
+                " (shadows a required prompt)"
+                if path.parent == target_prompts and path.name in shadowed
+                else ""
+            )
             typer.echo(f"  {'/'.join(inventory.TARGET_PROMPTS_SUBDIR)}/{rel}{marker}")
         return
 

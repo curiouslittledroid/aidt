@@ -1771,6 +1771,36 @@ def test_prompts_list_prints_the_toolkit_and_the_target_override_trees(
     assert "  aidw/prompts/repo-only.md\n" in result.stdout
 
 
+def test_prompts_list_marks_only_the_direct_shadow_child(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A nested same-basename file never carries the shadow marker.
+
+    `resolve_prompt` searches only the direct child ``<target>/aidw/prompts/<name>``
+    (§3.6), so a nested ``extra/code-review.md`` is an ordinary repo-added file —
+    printing the marker on it would disagree with what the stage runner runs
+    (review follow-up #120).
+    """
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_prompt_target(
+        tmp_path / "target",
+        {
+            "code-review.md": "# direct shadow\n",
+            "extra/code-review.md": "# nested same-basename file\n",
+        },
+    )
+
+    result = runner.invoke(app, ["--repo", str(repo), "prompts", "list"])
+
+    assert result.exit_code == 0, result.output
+    # The direct child shadows and is marked; the nested same-basename file is not.
+    assert "  aidw/prompts/code-review.md (shadows a required prompt)\n" in result.stdout
+    assert "  aidw/prompts/extra/code-review.md\n" in result.stdout
+    assert "(shadows a required prompt)" not in result.stdout.split(
+        "aidw/prompts/extra/code-review.md", 1
+    )[1].splitlines()[0]
+
+
 def test_prompts_list_without_target_overrides_says_so(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
     repo = _init_prompt_target(tmp_path / "target")
