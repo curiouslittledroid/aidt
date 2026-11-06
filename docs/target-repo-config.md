@@ -57,9 +57,9 @@ In the tables below:
   no default and must be present for the object it belongs to.
 - A container (`repo`, `paths`, `workflows`, `github`, `markers`, `labels`) is itself unset when
   absent; its leaves resolve individually.
-- **Effect** names the consumer that reads the field. E4–E6 rewire each consumer to the *resolved*
-  value; until then the consumer named there owns the behaviour, with the default value
-  hard-coded at that site.
+- **Effect** names the consumer that reads the field. The consumer named there reads the
+  **resolved** value — with one documented exception: the two `repo:` leaves, whose consumers
+  hold the same literals on `aidw.paths.TargetRepo` (see "Override precedence" below).
 
 ### Top level
 
@@ -300,9 +300,16 @@ the first decides a *value*, the second decides which *prompt file* a stage runs
 `aidw config show` prints one line per resolved leaf with its source, and `--json` emits the same
 flat dotted-path map with `{"value": …, "source": …}` per leaf (`{"value": null}` when unset).
 
-Note that `repo.base_branch`/`repo.branch_pattern` also have a second, frozen home today
-(`aidw.paths.TargetRepo`'s dataclass defaults, equal to `TOOLKIT_DEFAULTS`); E4/E5 rewire the
-consumers to the resolved value.
+`repo.base_branch` and `repo.branch_pattern` have **two equal-valued homes**: the resolved
+`TOOLKIT_DEFAULTS` leaves (`aidw/target_config.py`, seeded from EXTRACTION.md §3.4) and
+`aidw.paths.TargetRepo`'s frozen dataclass defaults, which `tests/test_target_config.py` pins
+equal. The consumers read the `TargetRepo` dataclass defaults: `implement`, `fix`, `review`,
+`prompt` and `run` all take their base branch and branch/worktree pattern from the resolved
+`TargetRepo` they were handed, and **no production code reads the resolved `repo.*` leaves**. A
+`repo:` block therefore declares and displays a value in `aidw config show` (provenance
+`config`) that those workflows do not consult: the dataclass literal is what governs the branch
+point, the branch and worktree name, and the ref the recorded gate change set is measured
+against. Read the resolved leaves for provenance; read `aidw.paths.TargetRepo` for behaviour.
 
 ### Prompt resolution: explicit path, then filename shadowing, then the toolkit, then an error
 

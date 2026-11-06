@@ -706,6 +706,15 @@ aidt/
 └── tests/             # pytest unit tests
 ```
 
+### Documentation
+
+Two shipped contracts are the reference for what AIDT reads around a target repo:
+
+- [`docs/target-repo-config.md`](./docs/target-repo-config.md) — the `<target>/aidw/config.yaml`
+  contract: every field, its type, its default, its provenance and the worked examples.
+- [`docs/roadmap-format.md`](./docs/roadmap-format.md) — the roadmap format AIDT owns, with the
+  canonical worked example the parser tests read.
+
 ## Development
 
 ```bash
