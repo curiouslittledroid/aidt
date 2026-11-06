@@ -227,6 +227,35 @@ def _unguarded_branch_recipes(text: str) -> list[str]:
     return unguarded
 
 
+#: §3.2's one legal "creates" sentence: the fact is that ``aidw prompt`` — AIDT, not the
+#: agent — creates the task branch and its worktree. It is stripped before the guard below
+#: runs. Backtick-insensitive, because the file wraps the command in a code span
+#: (`` `aidw prompt` ``); whitespace is flattened by the caller, because the file
+#: hard-wraps mid-sentence (review follow-up #116).
+_LEGAL_PROMPT_CREATES = re.compile(
+    r"aidw\s+prompt\s+creates\s+the\s+task\s+branch\s+and\s+its\s+worktree",
+    re.IGNORECASE,
+)
+
+#: The "creates" form ``_BRANCH_RECIPE`` deliberately does not match — in both orders the
+#: claim occurs in: the base revision's task-author wording put the branch first ("…branch
+#: the prompt creates."), a reworded revert puts it last ("the prompt creates the …
+#: branch"). ``_BRANCH_RECIPE`` keeps §3.2's own sentence legal by skipping ``creates``
+#: entirely, so it can never catch this claim on its own; this guard is the whole-glob half
+#: of Requirement 4 (review follow-up #116).
+_PROMPT_CREATES_BRANCH = re.compile(
+    r"\bprompt\b[^.]{0,40}?\bcreates\b[^.]{0,40}?\bbranch\b"
+    r"|\bbranch\b[^.]{0,40}?\bprompt\b[^.]{0,40}?\bcreates\b",
+    re.IGNORECASE,
+)
+
+
+def _prompt_creates_branch_claims(text: str) -> list[str]:
+    """Remaining "a prompt creates the branch" claims after the one legal sentence goes."""
+    flat = " ".join(text.split()).replace("`", "")
+    return _PROMPT_CREATES_BRANCH.findall(_LEGAL_PROMPT_CREATES.sub("", flat))
+
+
 # --------------------------------------------------------------------------- #
 # The seed is the whole glob, and every config can still reach its file
 # --------------------------------------------------------------------------- #
@@ -410,10 +439,53 @@ def test_the_implementer_names_no_traceability_or_architecture_stage() -> None:
 
     for dropped in DROPPED_STAGES:
         assert dropped not in text, dropped
-    assert "/impliment-task" in text
+    assert re.findall(r"(?<![A-Za-z0-9_])/[a-z][a-z0-9-]*", text) == ["/impliment-task"]
     assert "do not open a pr" in text.lower()
     assert "AGENTS.md" in text
     assert "aidw/conventions.md" in text
+
+
+#: Review follow-up #117: the config's ``description:`` is what a human or router reads to
+#: pick the agent, so it is guidance text under the same contract as the ``AGENTS.md`` file
+#: it points at — and the pre-E7.4 clause ("then owns traceability and architecture docs in
+#: the same session") contradicted the neutralised guidance (D13) while the sweep only reads
+#: ``agents/*/AGENTS.md``. ``same session`` is guarded too because the promise's effect —
+#: routing traceability/architecture work to the implementer — lives in that clause, not in
+#: the two vocabulary words alone.
+_CONFIG_DROPPED_CLAUSES = ("traceability", "architecture", "same session")
+
+
+def _config_description(name: str) -> str:
+    """The ``description:`` field of ``agent-configs/<name>.yaml``, whitespace flattened."""
+    path = toolkit_root() / "agent-configs" / f"{name}.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return " ".join(str(raw["description"]).split())
+
+
+def _config_description_claims(text: str) -> list[str]:
+    """Every pre-E7.4 duty clause token present in a config description."""
+    flat = " ".join(text.split()).lower()
+    return [token for token in _CONFIG_DROPPED_CLAUSES if token in flat]
+
+
+def test_the_implementer_config_description_promises_no_traceability_or_architecture_duty() -> None:
+    """Review follow-up #117: the catalogue entry matches the neutralised guidance (D13).
+
+    The description is router-facing, so the pre-E7.4 clause there reintroduces the duty the
+    neutralised ``agents/implementer/AGENTS.md`` denies even though the sweep never reads
+    the YAML. The neutral duty — leaving the change uncommitted — must be present instead.
+    """
+    assert _config_description_claims(_config_description("implementer")) == []
+    assert "uncommitted" in _config_description("implementer").lower()
+
+
+def test_the_config_description_guard_is_live() -> None:
+    """The guard is live on exactly the reverted wording review follow-up #117 quotes."""
+    reverted = (
+        "Implements a task prompt as code plus module contract/property tests, then owns "
+        "traceability and architecture docs in the same session."
+    )
+    assert _config_description_claims(reverted) == list(_CONFIG_DROPPED_CLAUSES)
 
 
 @pytest.mark.parametrize("name", sorted(_iter_agents()))
@@ -458,6 +530,8 @@ def test_the_pr_publisher_uses_a_generic_task_id_example() -> None:
     assert "`## Verification`" in text
     assert "Never merge" in text
     assert "base branch" in text
+    assert "Repo-specific PR conventions come from the repo's" in text
+    assert "AGENTS.md" in text and "aidw/conventions.md" in text
 
 
 def test_the_task_author_states_aidt_owns_branch_setup() -> None:
@@ -474,9 +548,14 @@ def test_no_agents_guidance_claims_a_prompt_creates_the_branch(name: str) -> Non
     """Requirement 4: no file may say the task prompt creates the ``{phase}-{task}`` branch.
 
     A recipe is legal only as a prohibition (``task-fixer`` tells the agent *not* to create a
-    branch), so the guard mirrors the recipe guard in ``test_prompt_neutrality.py``.
+    branch), so the guard mirrors the recipe guard in ``test_prompt_neutrality.py``. The
+    "creates" form is guarded separately (review follow-up #116): ``_BRANCH_RECIPE`` skips
+    ``creates`` to keep §3.2's own sentence legal, so this second assertion is what catches
+    a revert of the E7.4 task-author wording — verbatim or reworded — anywhere in the glob,
+    not just in the one file and one exact variant ``test_prompt_workflow.py`` pins.
     """
     assert _unguarded_branch_recipes(_read(name)) == [], name
+    assert _prompt_creates_branch_claims(_read(name)) == [], name
 
 
 def test_the_branch_guard_rejects_an_instructed_recipe() -> None:
@@ -487,6 +566,32 @@ def test_the_branch_guard_rejects_an_instructed_recipe() -> None:
     assert (
         _unguarded_branch_recipes("AIDT owns branch setup: `aidw prompt` creates the task branch.")
         == []
+    )
+
+
+def test_the_prompt_creates_guard_rejects_the_reverted_wording() -> None:
+    """Review follow-up #116's trigger: the guard is live on both halves of the claim.
+
+    The pre-E7.4 task-author sentence passes ``_unguarded_branch_recipes`` (reproduced in the
+    issue) yet must fail this guard; §3.2's own sentence, once the allowlist strips it, must
+    not. A reworded forward-order claim — the form a revert into any *other* guidance file
+    would take, since the other files never carried the original sentence — is caught too.
+    """
+    reverted = (
+        "Work only on the dedicated `{phase}-{task}` branch the prompt creates. "
+        "Never write on `main`."
+    )
+    assert _unguarded_branch_recipes(reverted) == []
+    assert _prompt_creates_branch_claims(reverted) != []
+    assert _prompt_creates_branch_claims(
+        "AIDT owns branch setup: `aidw prompt` creates the task branch and its worktree "
+        "before this stage runs."
+    ) == []
+    assert (
+        _prompt_creates_branch_claims(
+            "The task prompt creates the dedicated `{phase}-{task}` branch for you."
+        )
+        != []
     )
 
 

@@ -1,5 +1,5 @@
 id: implementer
-description: Implements a task prompt as code plus module contract/property tests, then owns traceability and architecture docs in the same session.
+description: Implements a task prompt as code plus module contract/property tests, then leaves the change uncommitted for the repo's verification and delivery stages.
 provider: openrouter
 model: openrouter/deepseek/deepseek-v4.1-flash
 thinking: high
