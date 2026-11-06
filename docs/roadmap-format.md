@@ -8,8 +8,8 @@ It deliberately documents behaviour the shipped parser already has; it introduce
 |---|---|
 | This doc | E5.1 (done) |
 | Driving the parser from `paths.roadmap_dir` + `paths.roadmap_glob` | E5.2 (done — see §3) |
-| Format *validation* with file/line/rule errors | E5.3 (not done — see §10) |
-| Promoting this doc's example to the single source the parser tests read | E5.4 (not done) |
+| Format *validation* with file/line/rule errors | E5.3 (done — `aidw/roadmap.py:validate_tasks`, surfaced by `aidw tasks --validate`; see §10) |
+| Promoting this doc's example to the single source the parser tests read | E5.4 (done — `tests/conftest.py:roadmap_example`; see §9) |
 
 **The code wins.** `aidw/roadmap.py` is normative. Every structural claim below is derived
 from the five compiled patterns in that module (`TASK_RE`, `EPIC_RE`, `PHASE_RE`, `DONE_RE`)
@@ -44,7 +44,8 @@ repo-specific parser. A second dialect defeats the point of the toolkit owning t
 
 Where the roadmap is read:
 
-- `aidw tasks` — lists entries, `--todo`, `--phase`, `--epic`, `--show`, `--next` (design §11).
+- `aidw tasks` — lists entries, `--todo`, `--phase`, `--epic`, `--show`, `--next`, `--validate`
+  (design §11).
 - `aidw prompt` — resolves `<phase> <epic> <task>` to an entry; a missing entry exits `2`
   ("roadmap task not found"), and the entry feeds the stage evidence bundle (design §8.1,
   L2.4). The prompt stage re-reads the entry's own file for the full `Done when` block and the
@@ -57,7 +58,8 @@ Where the roadmap is read:
 ## 2. The contract is five regexes
 
 These are the shipped patterns, character for character. A line that matches none of them is
-ignored — the parser never guesses, never repairs and never reports (validation is E5.3).
+ignored — the parser never guesses, never repairs and never reports (validation is the separate
+`validate_tasks` pass, §10).
 
 | Name | Pattern | What it produces |
 |---|---|---|
@@ -211,8 +213,9 @@ second.
 ## 6. The `Done when` block (`DONE_RE`)
 
 `Done when` is the acceptance check for the entry and is **required** for a well-formed
-roadmap. (Requirement is documented here; *enforcement* — file, line and rule in an error — is
-E5.3. The parser accepts an entry without one.)
+roadmap. The parser accepts an entry without one and stays silent (it never reports, §10); the
+requirement is checked by the separate `validate_tasks` pass, whose first rule is
+`missing Done when`.
 
 The canonical form is a two-space bullet directly under the entry:
 
@@ -411,10 +414,26 @@ its period.
 
 Deliberately out of scope, so a format problem is not mistaken for a parser bug:
 
-- **No validation.** A malformed entry is skipped, not reported; a missing `Done when`, a
-  duplicate id and an entry outside an epic all parse. E5.3 owns file/line/rule errors.
-- **No duplicate-id detection.** Two entries with the same id produce two `RoadmapTask`s;
-  `find_task` returns the first.
+- **The parser never reports.** `parse_file` and `load_tasks` are silent: a malformed entry is
+  skipped, not reported, and a missing `Done when`, a duplicate id and an entry outside an epic
+  all parse. They never repair a file either — the parsed fields are a function of the bytes.
+- **Validation is a separate, pure pass.** `aidw/roadmap.py:validate_tasks` takes the parsed
+  list, reads it without mutating it and without re-reading any file, and reports exactly three
+  rules, each under the module's own rule token (`RULE_MISSING_DONE_WHEN`,
+  `RULE_DUPLICATE_ID`, `RULE_OUTSIDE_EPIC`):
+  - `missing Done when` — the entry's `done_when` is empty (§6).
+  - `duplicate id` — a repeated `(phase, task)` pair. The key is the pair, not the id alone: the
+    branch is `{phase}-{task}` and `find_task` matches phase+task, so the same id in another
+    phase file is a different task. The later entry is the issue, and its message names the
+    earlier `file:line`. Both entries still parse; `find_task` returns the first.
+  - `entry outside an epic` — `epic_title is None`, i.e. the entry appears before any
+    `## Epic` heading (§4). Deliberately **not** `epic`: `derive_epic` derives it from the id
+    and never returns `None`.
+
+  `aidw tasks --validate` is the only caller: it surfaces the report as
+  `{file}:{line}: {rule} — {message}`, one line per issue, over the whole roadmap, so the
+  filters `--todo`/`--phase`/`--epic` never narrow what is validated. A malformed roadmap exits
+  non-zero. `parse_file`/`load_tasks` and their other callers are unchanged.
 - **No dependency graph.** `--next` is the first unchecked entry in file order, and
   prerequisite ordering is the operator's responsibility (design §11).
 - **No field storage.** `Tests:`/`Deliverable:`/`Notes:` are not parsed into fields (§7).

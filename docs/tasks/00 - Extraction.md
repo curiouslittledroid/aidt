@@ -558,10 +558,17 @@
   - Deliverable: rewritten design.
   - Done when: no section describes the toolkit as living inside a product repo.
 
-- [ ] **E9.2. Write the two contract docs**
+- [x] **E9.2. Write the two contract docs**
   `docs/target-repo-config.md` (E3.6) and `docs/roadmap-format.md` (E5.1).
   - Deliverable: both docs complete and cross-linked from the README.
   - Done when: both examples validate against the shipped schema/parser.
+  - Notes: reconciliation pass, not a rewrite — both docs already existed and already validated. No
+    vector-matrix or coverage-catalog change: this repo has neither artifact (`docs/rules-coverage/`,
+    `tests/integration/`, the `srd:*` scripts) and E9.2 adds no Rules Engine action and no
+    implemented product claim, so nothing is eligible for matrix coverage. The traceability
+    evidence is the two contracts' own drift tests: `tests/test_roadmap_format.py`,
+    `tests/test_roadmap.py`, `tests/test_target_repo_config_doc.py` and the shared §9 extraction
+    in `tests/conftest.py:roadmap_example`.
 
 - [ ] **E9.3. Move this document to history**
   `docs/migration/EXTRACTION.md`, with a header noting it is historical.

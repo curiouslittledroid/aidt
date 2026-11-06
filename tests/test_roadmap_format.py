@@ -8,6 +8,11 @@ extraction itself, including its "exactly one complete worked example" guard, li
 ``tests/conftest.py`` (``roadmap_example``, E5.4) so a second example cannot satisfy one
 copy of the selector while the other still finds "one" (EXTRACTION.md §3.7).
 
+Since E9.2 the doc's status table and §10 also state the **shipped** validation split — the
+parser stays silent while ``aidw/roadmap.py:validate_tasks`` reports exactly three rules,
+surfaced by ``aidw tasks --validate`` — so the pre-shipped "not done"/"No validation" wording
+fails here instead of misleading a reader.
+
 Nothing here re-implements a rule: every assertion compares the doc's claims against
 ``aidw/roadmap.py`` (the four entry patterns, ``_FILENAME_RE``, ``CITATION_RE``,
 ``derive_epic``) and against ``aidw/workflows/prompt.py`` (``_done_when_block`` and
@@ -17,6 +22,7 @@ edit that contradicts the code therefore fails here instead of at the next roadm
 
 from __future__ import annotations
 
+import re
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -29,6 +35,9 @@ from aidw.roadmap import (
     DONE_RE,
     EPIC_RE,
     PHASE_RE,
+    RULE_DUPLICATE_ID,
+    RULE_MISSING_DONE_WHEN,
+    RULE_OUTSIDE_EPIC,
     TASK_RE,
     _FILENAME_RE,
     derive_epic,
@@ -49,6 +58,92 @@ if TYPE_CHECKING:  # pragma: no cover - type-only
 #: The toolkit's default ``paths.roadmap_glob`` (``TOOLKIT_DEFAULTS.paths``, D17). Passed
 #: explicitly because :func:`aidw.roadmap.load_tasks` carries no pattern of its own.
 DEFAULT_GLOB = "[0-9]* - *.md"
+
+#: The stale claims E9.2 reconciled away (the Done-when rg gate's alternatives). E5.3 and E5.4
+#: both shipped, and §10 now describes the separate ``validate_tasks`` pass instead of absent
+#: validation, so any of these in the doc is drift back to the pre-shipped wording.
+STALE_VALIDATION_CLAIMS = ("not done", "No validation", "No duplicate-id detection")
+
+#: §10's heading, number preserved: ``aidw/roadmap.py`` and ``tests/test_roadmap_validate.py``
+#: both cite "roadmap-format.md §10".
+SECTION_10_HEADING = "## 10. What the parser does not do (v1)"
+
+
+def _section(text: str, prefix: str, *, level: int = 2) -> str:
+    """The block headed by ``prefix``, up to the next heading of ``level`` or shallower.
+
+    Mirrors ``tests/test_target_repo_config_doc.py:_section``: a renamed or deleted section
+    raises instead of silently producing an empty string that every assertion then passes.
+    """
+    lines = text.splitlines()
+    start = next((index for index, line in enumerate(lines) if line.startswith(prefix)), None)
+    assert start is not None, f"missing heading {prefix!r} in the roadmap format doc"
+    stop = re.compile(rf"^#{{1,{level}}} ")
+    for index in range(start + 1, len(lines)):
+        if stop.match(lines[index]):
+            return "\n".join(lines[start:index])
+    return "\n".join(lines[start:])
+
+
+def _status_rows(text: str) -> list[str]:
+    """The activity/owner table rows at the top of the doc (header and rules dropped)."""
+    lines = text.splitlines()
+    start = next(
+        (index for index, line in enumerate(lines) if line.startswith("| Activity | Owner |")),
+        None,
+    )
+    assert start is not None, "missing the status table"
+    rows = []
+    for line in lines[start + 1 :]:
+        if not line.startswith("|"):
+            break
+        if set(line) <= set("|-: "):
+            continue
+        rows.append(line)
+    assert len(rows) >= 4, f"status table lost its rows: {rows}"
+    return rows
+
+
+def _assert_status_table_is_reconciled(text: str) -> None:
+    """E5.3/E5.4 are marked done and point at the shipped artefact by symbol (E9.2)."""
+    rows = _status_rows(text)
+    validation = next(row for row in rows if "Format *validation*" in row)
+    example = next(row for row in rows if "single source" in row)
+    for row in (validation, example):
+        for stale in STALE_VALIDATION_CLAIMS:
+            assert stale not in row, f"stale claim {stale!r} in {row!r}"
+        assert "done" in row, row
+    assert "`aidw/roadmap.py:validate_tasks`" in validation
+    assert "aidw tasks --validate" in validation
+    assert "§10" in validation
+    assert "`tests/conftest.py:roadmap_example`" in example
+    assert "§9" in example
+
+
+def _assert_section_10_is_reconciled(text: str) -> None:
+    """§10 states the shipped split: silent parser, separate pure validator, three rules."""
+    section = _section(text, SECTION_10_HEADING)
+    for stale in STALE_VALIDATION_CLAIMS:
+        assert stale not in section, f"stale claim {stale!r} in §10"
+
+    # The parser stays silent; validation is the separate, pure pass.
+    assert "`parse_file`" in section and "`load_tasks`" in section
+    assert "silent" in section
+    assert "`aidw/roadmap.py:validate_tasks`" in section
+    assert "pure" in section
+
+    # Exactly the three rules, under the module's own tokens (never a paraphrase).
+    for rule in (RULE_MISSING_DONE_WHEN, RULE_DUPLICATE_ID, RULE_OUTSIDE_EPIC):
+        assert f"`{rule}`" in section, f"rule token {rule!r} missing from §10"
+
+    # The CLI surface and its exact line format.
+    assert "aidw tasks --validate" in section
+    assert "{file}:{line}: {rule} — {message}" in section
+
+    # The two traps, stated precisely: pair keying, and `epic_title` rather than `epic`.
+    assert "(phase, task)" in section
+    assert "epic_title is None" in section
+    assert "**not** `epic`" in section
 
 
 def _snapshot(tasks: list) -> list[tuple]:
@@ -136,6 +231,91 @@ def test_doc_states_the_default_globs_spacing_is_convention_not_strictness(
     assert "canonical convention" in text
     assert "no two-digit prefix" in text
     assert "not `.md`" in text
+
+
+# --------------------------------------------------------------------------- #
+# E9.2: the reconciliation, pinned so it cannot silently revert
+# --------------------------------------------------------------------------- #
+
+
+def test_status_table_marks_the_validation_tasks_shipped(
+    roadmap_example: RoadmapExample,
+) -> None:
+    """E5.3/E5.4 shipped: the status table says so and names the shipped artefact."""
+    _assert_status_table_is_reconciled(roadmap_example.doc.read_text(encoding="utf-8"))
+
+
+def test_section_10_states_the_shipped_validation_contract(
+    roadmap_example: RoadmapExample,
+) -> None:
+    """`parse_file`/`load_tasks` silent; `validate_tasks` reports the three rules (§10)."""
+    _assert_section_10_is_reconciled(roadmap_example.doc.read_text(encoding="utf-8"))
+
+
+def test_the_three_surfaces_name_the_shipped_validation(
+    roadmap_example: RoadmapExample,
+) -> None:
+    """The Done-when's rg hits: the status table, §6 and §10 all name the shipped pass."""
+    text = roadmap_example.doc.read_text(encoding="utf-8")
+
+    assert any("validate_tasks" in row for row in _status_rows(text))
+    assert "validate_tasks" in _section(text, "## 6. ")
+    assert "validate_tasks" in _section(text, SECTION_10_HEADING)
+    assert "aidw tasks --validate" in _section(text, SECTION_10_HEADING)
+
+
+def test_section_1_lists_validate_in_the_tasks_surface(
+    roadmap_example: RoadmapExample,
+) -> None:
+    """`--validate` is part of the documented `aidw tasks` surface (§1)."""
+    section = _section(
+        roadmap_example.doc.read_text(encoding="utf-8"), "## 1. One format, one owner"
+    )
+    tasks_line = next(
+        line for line in section.splitlines() if line.strip().startswith("- `aidw tasks`")
+    )
+    assert "--validate" in tasks_line
+
+
+def test_section_10_uses_the_modules_rule_tokens_verbatim(
+    roadmap_example: RoadmapExample,
+) -> None:
+    """The doc's rule list is the module's `RULE_*` set — re-typing it would let it drift."""
+    section = _section(roadmap_example.doc.read_text(encoding="utf-8"), SECTION_10_HEADING)
+    tokens = (RULE_MISSING_DONE_WHEN, RULE_DUPLICATE_ID, RULE_OUTSIDE_EPIC)
+
+    assert len(set(tokens)) == 3
+    assert [token for token in tokens if f"`{token}`" in section] == list(tokens)
+
+
+def test_the_reconciliation_pins_are_not_vacuous(roadmap_example: RoadmapExample) -> None:
+    """Doctoring the doc back to the stale wording fails the pins (they are not vacuous).
+
+    Metamorphic and deterministic: the doc's current bytes are edited in memory only — the
+    real document is never written to — and each re-introduced stale claim must flip the
+    reconciler from passing to `AssertionError`. This is the same drift-proof shape as
+    `tests/test_roadmap.py::test_a_broken_done_when_line_in_the_doc_example_changes_done_when`.
+    """
+    text = roadmap_example.doc.read_text(encoding="utf-8")
+    _assert_status_table_is_reconciled(text)
+    _assert_section_10_is_reconciled(text)
+
+    header = SECTION_10_HEADING + "\n"
+    assert header in text
+    for stale in STALE_VALIDATION_CLAIMS:
+        doctored = text.replace(header, f"{header}\n- **{stale}.**\n", 1)
+        assert doctored != text, f"could not re-introduce {stale!r}"
+        with pytest.raises(AssertionError):
+            _assert_section_10_is_reconciled(doctored)
+
+    # A status row marked "not done" again is caught by the same pin.
+    validation_row = next(row for row in _status_rows(text) if "Format *validation*" in row)
+    regressed = text.replace(
+        validation_row, validation_row.replace("(done —", "(not done —"), 1
+    )
+    assert regressed != text
+    with pytest.raises(AssertionError):
+        _assert_status_table_is_reconciled(regressed)
 
 
 # --------------------------------------------------------------------------- #

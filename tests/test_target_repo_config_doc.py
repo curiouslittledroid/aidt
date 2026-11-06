@@ -24,6 +24,11 @@ against the code, so prose drift fails here instead of at a reader's desk:
   ``override > config > default`` value order, so an edit that flattens or swaps them fails;
 - resolving the examples is pure: ``TOOLKIT_DEFAULTS`` is not mutated and no resolved
   container aliases the declared config or the defaults;
+- since E9.2 the two ``repo:`` leaves' **two equal-valued homes** are stated as shipped — the
+  resolved ``TOOLKIT_DEFAULTS`` leaves plus ``aidw.paths.TargetRepo``'s frozen dataclass
+  defaults, test-pinned equal — with the workflows named as reading the dataclass and **no**
+  forward-looking "rewire"/"until then" promise. Asserted by semantic presence and proved
+  non-vacuous by doctoring the paragraph out and the banned phrases back in;
 - the E6.4 freeze narrative lives in the ``github:`` section, *before* its default tables, and
   states the semantics a config editor must know: the exact-match lookup symbol
   (``find_parent_issues``, in the bundled script rather than ``aidw/github.py``), both rename
@@ -48,7 +53,7 @@ from pathlib import Path
 import pytest
 
 from aidw.config import ERROR
-from aidw.paths import toolkit_root
+from aidw.paths import TargetRepo, toolkit_root
 from aidw.target_config import (
     DEFAULT_MAX_REVISIONS,
     GITHUB_KEYS,
@@ -550,6 +555,89 @@ def test_prompt_precedence_order_is_documented():
     positions = [section.index(anchor) for anchor in anchors]
     assert positions == sorted(positions), f"prompt precedence out of order: {positions}"
     assert len(set(positions)) == len(anchors)
+
+
+# ---------------------------------------------------------------------------
+# E9.2: the `repo:` leaves' two homes, stated as shipped
+# ---------------------------------------------------------------------------
+
+#: Forward-looking phrasing E9.2 reconciled away. The `repo:` consumers read
+#: `aidw.paths.TargetRepo`'s dataclass defaults, so a note promising a later wiring of the
+#: resolved leaves misdescribes the shipped code.
+STALE_WIRING_PHRASES = ("rewire", "until then")
+
+#: The workflows that take their base branch and branch/worktree pattern from the `TargetRepo`
+#: dataclass they were handed (EXTRACTION.md §3.4/§3.12).
+REPO_LEAF_CONSUMERS = ("implement", "fix", "review", "prompt", "run")
+
+
+def _assert_repo_dual_home_is_stated(text: str) -> None:
+    """The shipped reality: two equal-valued homes, the dataclass as what consumers read."""
+    section = _section(text, "## Override precedence", level=2)
+
+    for stale in STALE_WIRING_PHRASES:
+        assert stale not in text, f"stale forward-looking phrasing {stale!r} in the doc"
+
+    # Both homes, for both leaves, by symbol, and the test that pins them equal.
+    assert "`aidw.paths.TargetRepo`" in section
+    assert "TOOLKIT_DEFAULTS" in section
+    assert "dataclass defaults" in section
+    assert "tests/test_target_config.py" in section
+    for leaf in ("repo.base_branch", "repo.branch_pattern"):
+        assert leaf in section, f"leaf {leaf!r} not named in the dual-home note"
+
+    # The readers are the workflows, and the resolved leaves have no production reader.
+    for workflow in REPO_LEAF_CONSUMERS:
+        assert workflow in section, f"consumer {workflow!r} not named in the dual-home note"
+    assert "no production code reads the resolved `repo.*` leaves" in section
+
+
+def test_the_repo_leaves_dual_home_is_stated_as_shipped():
+    """E9.2: no `rewire`/`until then`; the `TargetRepo` defaults are the consumers' home."""
+    _assert_repo_dual_home_is_stated(_doc())
+
+
+def test_the_field_inventory_drops_the_forward_looking_effect_note():
+    """The Field-inventory intro still names the effect consumer, without a future promise."""
+    intro = _section(_doc(), "## Field inventory", level=2)
+    section = intro.split("### Top level", 1)[0]
+
+    assert "Effect** names the consumer that reads the field" in section
+    for stale in STALE_WIRING_PHRASES:
+        assert stale not in section
+    assert "`aidw.paths.TargetRepo`" in section
+
+
+def test_the_documented_two_homes_are_equal_in_the_code():
+    """Proves the doc's "equal-valued" claim against the two real homes."""
+    assert TargetRepo.base_branch == TOOLKIT_DEFAULTS.repo.base_branch
+    assert TargetRepo.branch_pattern == TOOLKIT_DEFAULTS.repo.branch_pattern
+
+
+def test_the_dual_home_pin_is_not_vacuous():
+    """Deleting the shipped-reality statement, or re-adding a promise, fails the pin.
+
+    Metamorphic and deterministic: the doc's current bytes are edited in memory only. The
+    paragraph is removed (not replaced) to prove the pin is not satisfied by an empty doc,
+    and each stale phrase is re-inserted at the heading to prove the ban is live.
+    """
+    doc = _doc()
+    _assert_repo_dual_home_is_stated(doc)
+
+    section = _section(doc, "## Override precedence", level=2)
+    start = section.index("`repo.base_branch` and `repo.branch_pattern` have")
+    end = section.index("\n\n", start)
+    assert end > start
+    doctored = doc.replace(section[start:end], "", 1)
+    assert doctored != doc
+    with pytest.raises(AssertionError):
+        _assert_repo_dual_home_is_stated(doctored)
+
+    for stale in STALE_WIRING_PHRASES:
+        doctored = doc.replace("## Override precedence", f"## Override precedence ({stale})", 1)
+        assert doctored != doc
+        with pytest.raises(AssertionError):
+            _assert_repo_dual_home_is_stated(doctored)
 
 
 # ---------------------------------------------------------------------------
