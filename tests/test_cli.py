@@ -11,7 +11,8 @@ import pytest
 
 from typer.testing import CliRunner
 
-from aidw import __version__, github
+from aidw import __version__, github, inventory
+from aidw.config import ERROR, Issue
 from aidw import state as state_mod
 from aidw.cli import EXIT_REFUSED, EXIT_STAGE_FAILURE, EXIT_USAGE, app
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths, toolkit_root
@@ -1616,3 +1617,174 @@ def test_tasks_validate_fails_closed_on_a_broken_config(
     assert result.stdout == ""
     assert "cannot read/parse config" in result.stderr
     assert "no roadmap tasks found" not in result.stderr
+
+
+# --------------------------------------------------------------------------- #
+# `prompts check`/`list`: toolkit defaults vs resolved repo prompts (E7.5, §3.6)
+# --------------------------------------------------------------------------- #
+
+
+def _init_prompt_target(path: Path, overrides: dict[str, str] | None = None) -> Path:
+    """A temp git repo, optionally carrying ``<path>/aidw/prompts/<rel>`` overrides."""
+    _init_repo(path)
+    for rel, text in (overrides or {}).items():
+        target = path / "aidw" / "prompts" / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_prompts_check_is_self_hosted_green_and_reports_both_groups(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """From a repo with no ``aidw/prompts/``, every prompt is a toolkit default (§3.6).
+
+    ``prompts check`` shares the ``agents validate``/``prompts check`` stdout report
+    convention, so the two group headings and one provenance line per required prompt are
+    the contract — plus exit 0, which is what the AGENTS.md gate invokes.
+    """
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_prompt_target(tmp_path / "target")
+
+    result = runner.invoke(app, ["--repo", str(repo), "prompts", "check"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert result.stdout.startswith("prompts check — toolkit defaults (")
+    assert "prompts check — resolved repo prompts (target: " in result.stdout
+    assert str(repo.resolve()) in result.stdout
+    for name in inventory.REQUIRED_PROMPTS:
+        assert f"  {name} -> prompts/{name} (toolkit default)" in result.stdout
+    assert "toolkit defaults: 0 error(s), 0 warning(s)" in result.stdout
+    assert "resolved repo prompts: 0 error(s), 0 warning(s)" in result.stdout
+
+
+def test_prompts_check_reports_a_target_shadow_as_a_resolved_repo_prompt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_prompt_target(
+        tmp_path / "target", {"code-review.md": "# repo review\n"}
+    )
+
+    result = runner.invoke(app, ["--repo", str(repo), "prompts", "check"])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "  code-review.md -> aidw/prompts/code-review.md (repo override)"
+        in result.stdout
+    )
+    # The shadow does not affect the other names' provenance.
+    assert "  test.md -> prompts/test.md (toolkit default)" in result.stdout
+
+
+def test_prompts_check_surfaces_a_foreign_reference_in_a_target_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A target-side sentinel is a target-labelled ERROR and a non-zero exit."""
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_prompt_target(
+        tmp_path / "target", {"notes.md": "see .pi/prompts/notes.md\n"}
+    )
+
+    result = runner.invoke(app, ["--repo", str(repo), "prompts", "check"])
+
+    assert result.exit_code == EXIT_STAGE_FAILURE, result.output
+    assert result.stderr == ""
+    assert "aidw/prompts/notes.md" in result.stdout
+    assert "target repo" in result.stdout
+    # The group counts stay per-group: the defaults half is still clean.
+    assert "toolkit defaults: 0 error(s), 0 warning(s)" in result.stdout
+    assert "resolved repo prompts: 1 error(s), 0 warning(s)" in result.stdout
+
+
+def test_prompts_check_reports_both_groups_when_the_target_halves_differ(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A target-side error does not suppress the resolved provenance report."""
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_prompt_target(
+        tmp_path / "target", {"code-review.md": "see .pi/prompts/x.md\n"}
+    )
+
+    result = runner.invoke(app, ["--repo", str(repo), "prompts", "check"])
+
+    assert result.exit_code == EXIT_STAGE_FAILURE
+    assert "resolved repo prompts" in result.stdout
+    for name in inventory.REQUIRED_PROMPTS:
+        assert f"  {name} -> " in result.stdout
+
+
+def test_prompts_check_keeps_a_missing_default_and_target_error_in_separate_groups(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A missing toolkit default and a target sentinel must both reach stdout."""
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_prompt_target(
+        tmp_path / "target", {"code-review.md": "see .pi/prompts/notes.md\n"}
+    )
+
+    fake_toolkit = tmp_path / "toolkit"
+    shutil.copytree(toolkit_root() / "prompts", fake_toolkit / "prompts")
+    (fake_toolkit / "prompts" / "code-review.md").unlink()
+    fake_paths = ToolkitPaths(
+        root=fake_toolkit,
+        prompts_dir=fake_toolkit / "prompts",
+        agent_configs_dir=fake_toolkit / "agent-configs",
+        agents_dir=fake_toolkit / "agents",
+        scripts_dir=fake_toolkit / "prompts" / "scripts",
+    )
+    monkeypatch.setattr(
+        ToolkitPaths, "resolve", classmethod(lambda cls: fake_paths)
+    )
+
+    result = runner.invoke(app, ["--repo", str(repo), "prompts", "check"])
+
+    assert result.exit_code == EXIT_STAGE_FAILURE, result.output
+    assert "toolkit defaults: 1 error(s), 0 warning(s)" in result.stdout
+    assert "error: code-review.md: required prompt/script missing" in result.stdout
+    assert "resolved repo prompts: 1 error(s), 0 warning(s)" in result.stdout
+    assert "error: aidw/prompts/code-review.md:" in result.stdout
+
+
+def test_prompts_list_prints_the_toolkit_and_the_target_override_trees(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_prompt_target(
+        tmp_path / "target",
+        {"code-review.md": "# repo review\n", "repo-only.md": "# repo extra\n"},
+    )
+
+    result = runner.invoke(app, ["--repo", str(repo), "prompts", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ""
+    assert "toolkit defaults (" in result.stdout
+    assert "  scripts/review-followup/review_followup.py" in result.stdout
+    assert f"resolved repo prompts (target: {repo.resolve()}):" in result.stdout
+    assert "  code-review.md -> aidw/prompts/code-review.md (repo override)" in result.stdout
+    assert "  test.md -> prompts/test.md (toolkit default)" in result.stdout
+    assert "repo overrides (" in result.stdout
+    assert "  aidw/prompts/code-review.md (shadows a required prompt)" in result.stdout
+    # A repo-added prompt file is listed too, marked as not shadowing anything.
+    assert "  aidw/prompts/repo-only.md\n" in result.stdout
+
+
+def test_prompts_list_without_target_overrides_says_so(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AIDW_STATE_DIR", str(tmp_path / "state"))
+    repo = _init_prompt_target(tmp_path / "target")
+
+    result = runner.invoke(app, ["--repo", str(repo), "prompts", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "repo overrides (" in result.stdout
+    assert "  none" in result.stdout
+
+
+def test_prompts_rejects_an_unknown_action_before_resolving_a_target() -> None:
+    result = runner.invoke(app, ["prompts", "nonsense"])
+
+    assert result.exit_code == EXIT_USAGE
+    assert result.stdout == ""
+    assert "unknown action: nonsense" in result.stderr

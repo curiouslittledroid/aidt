@@ -513,7 +513,7 @@
     agent owns traceability and architecture docs (§4.3 declares the configs portable as-is,
     so it is left for E7.5 or a follow-up).
 
-- [ ] **E7.5. Inventory split**
+- [x] **E7.5. Inventory split**
   `inventory.py`: separate the toolkit's **default** prompts/scripts from the prompts **resolved** for
   a target repo. Keep the `.pi/prompts` sentinel.
   - Deliverable: inventory change plus tests.

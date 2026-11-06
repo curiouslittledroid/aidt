@@ -26,7 +26,7 @@ from aidw import (
     state as state_mod,
 )
 from aidw import verification
-from aidw.config import ERROR, WARNING, format_issues, load_all
+from aidw.config import ERROR, WARNING, Issue, format_issues, load_all
 from aidw.doctor import run_doctor
 from aidw.gates import GateDefault
 from aidw.layout import LayoutError, check_layout
@@ -1254,35 +1254,109 @@ def _gate_run(
     return state_mod.latest_for_branch(runs_root, branch) if branch else None
 
 
+def _prompt_group_summary(label: str, issues: list[Issue]) -> str:
+    """One group's counts, in the ``agents validate`` summary shape."""
+    errors = [issue for issue in issues if issue.level == ERROR]
+    warnings = [issue for issue in issues if issue.level == WARNING]
+    return f"{label}: {len(errors)} error(s), {len(warnings)} warning(s)"
+
+
 @app.command()
 def prompts(
     action: str = typer.Argument("list", help="list | check"),
 ) -> None:
-    """List or check the toolkit's own prompts and helper scripts."""
-    aidt = ToolkitPaths.resolve().root
+    """List or check the toolkit's defaults and the target's resolved prompts.
+
+    EXTRACTION.md §3.6 splits the inventory in two, and this command reports both:
+
+    - **toolkit defaults** — ``<toolkit>/prompts/``, the prompts and bundled scripts AIDT
+      owns (design §7.2).
+    - **resolved repo prompts** — what the target repo actually runs: a same-named file
+      in ``<target>/aidw/prompts/`` shadows the default, otherwise the default is used.
+      Each required prompt is printed with its provenance, and the target's override tree
+      gets the ``.pi/prompts``/``AIDW_SCRIPTS_DIR`` sweeps the defaults half cannot see.
+
+    The target comes from :func:`_roots`, so ``--repo``/``$AIDW_REPO`` apply here exactly
+    as in every other target-aware command (no per-subcommand flag). Self-hosted — run
+    from the toolkit repo, which has no ``aidw/prompts/`` — every required prompt simply
+    resolves to a toolkit default.
+
+    Issues go to stdout (the ``agents validate``/``prompts check`` convention) and each
+    group is summarised under its own heading. Either group's ERROR fails the command:
+    the groups are checked independently, so neither can mask the other.
+    """
+    if action not in ("list", "check"):
+        # Validated before target resolution, so a doubly-bad invocation reports the
+        # usage error rather than a repo refusal.
+        typer.echo(f"unknown action: {action} (expected list | check)", err=True)
+        raise typer.Exit(EXIT_USAGE)
+
+    target, aidt, _workspace = _roots()
+    toolkit_prompts = inventory.prompts_dir(aidt.root)
+    target_prompts = inventory.resolved_prompts_dir(target.root)
 
     if action == "list":
-        files = inventory.list_files(aidt)
+        files = inventory.list_files(aidt.root)
         if not files:
             typer.echo("no prompts found", err=True)
             raise typer.Exit(EXIT_USAGE)
+        resolved = inventory.check_resolved(aidt.root, target.root)
+
+        typer.echo(f"toolkit defaults ({toolkit_prompts}):")
         for rel in files:
-            typer.echo(rel)
+            typer.echo(f"  {rel}")
+        typer.echo(f"toolkit defaults: {len(files)} file(s)")
+        typer.echo("")
+
+        typer.echo(f"resolved repo prompts (target: {target.root}):")
+        for prompt in resolved.prompts:
+            typer.echo(f"  {prompt.name} -> {prompt.display} ({prompt.label})")
+        typer.echo("")
+
+        # Whole override tree, not only the required names: repo-added prompt files live
+        # here too, and listing them is how an operator sees what the repo brings.
+        typer.echo(f"repo overrides ({target_prompts}):")
+        shadowed = {
+            prompt.name
+            for prompt in resolved.prompts
+            if prompt.origin == inventory.ORIGIN_TARGET
+        }
+        overrides = inventory.target_prompt_files(target.root)
+        if not overrides:
+            typer.echo("  none")
+        for path in overrides:
+            rel = path.relative_to(target_prompts).as_posix()
+            marker = " (shadows a required prompt)" if path.name in shadowed else ""
+            typer.echo(f"  {'/'.join(inventory.TARGET_PROMPTS_SUBDIR)}/{rel}{marker}")
         return
 
-    if action == "check":
-        issues = inventory.check(aidt)
-        if issues:
-            typer.echo(format_issues(issues))
-        errors = [i for i in issues if i.level == ERROR]
-        warnings = [i for i in issues if i.level == WARNING]
-        typer.echo(f"prompts check: {len(errors)} error(s), {len(warnings)} warning(s)")
-        if errors:
-            raise typer.Exit(EXIT_STAGE_FAILURE)
-        return
+    # check: the two halves run independently — a failure in either is reported under
+    # its own heading, so a missing default never hides a target-side sentinel violation.
+    default_issues = inventory.check_defaults(aidt.root)
+    resolved = inventory.check_resolved(aidt.root, target.root)
+    resolved_issues = list(resolved.issues)
 
-    typer.echo(f"unknown action: {action} (expected list | check)", err=True)
-    raise typer.Exit(EXIT_USAGE)
+    typer.echo(f"prompts check — toolkit defaults ({toolkit_prompts}):")
+    if default_issues:
+        typer.echo(format_issues(default_issues))
+    typer.echo(_prompt_group_summary("toolkit defaults", default_issues))
+    typer.echo("")
+
+    typer.echo(
+        "prompts check — resolved repo prompts "
+        f"(target: {target.root}; toolkit defaults: {toolkit_prompts}):"
+    )
+    for prompt in resolved.prompts:
+        typer.echo(f"  {prompt.name} -> {prompt.display} ({prompt.label})")
+    if resolved_issues:
+        typer.echo(format_issues(resolved_issues))
+    typer.echo(_prompt_group_summary("resolved repo prompts", resolved_issues))
+
+    errors = [
+        issue for issue in (*default_issues, *resolved_issues) if issue.level == ERROR
+    ]
+    if errors:
+        raise typer.Exit(EXIT_STAGE_FAILURE)
 
 
 def _render_resolved(entry: ResolvedValue) -> str:
