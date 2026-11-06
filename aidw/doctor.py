@@ -394,9 +394,7 @@ def _check_target_config(root: Path) -> Check:
 
     Read-only: one file read, one ``exists()`` per set read-path, nothing written (§3.1).
     ``ensure_write_targets`` is deliberately **not** called here — doctor must never
-    create a directory a stage has not asked for — and the toolkit version is passed in
-    from :data:`aidw.__version__` rather than hardcoded, so doctor cannot claim a
-    compatibility verdict for a version other than the one it ships in.
+    create a directory a stage has not asked for.
     """
     config_path = root / "aidw" / "config.yaml"
     declared = load_target_config(config_path)

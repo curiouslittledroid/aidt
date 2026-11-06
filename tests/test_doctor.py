@@ -1229,3 +1229,35 @@ def test_compat_verdict_lives_on_exactly_one_check(
         assert _aidw_listing(control) == before_listing
         if before_text is not None:
             assert config_path.read_text(encoding="utf-8") == before_text
+
+
+# ---------------------------------------------------------------------------
+# Documentation contract (review follow-up #125)
+# ---------------------------------------------------------------------------
+
+
+def test_target_config_docstring_keeps_the_version_source_on_compat() -> None:
+    """`_check_target_config`'s docstring must not claim a version-passing contract.
+
+    E8.3 moved the D10 verdict to `_check_compat`, so `_check_target_config` no longer
+    references `__version__` and cannot claim the version is passed in from it. A
+    docstring clause naming `aidw.__version__` here would tell a maintainer the compat
+    verdict still lives in this function and invite re-adding the `check_compatibility`
+    union — recreating the double report
+    `test_collect_checks_evaluates_compatibility_once` pins as removed.
+    """
+    target_doc = _check_target_config.__doc__ or ""
+    assert target_doc, "_check_target_config must keep its docstring"
+
+    # The version-source contract is `_check_compat`'s alone: this function never
+    # touches `__version__`, so its docstring must not name it.
+    assert "__version__" not in target_doc
+
+    # The `ensure_write_targets` refusal sentence stays: deleting the whole final
+    # paragraph would drop the §3.1 read-only guarantee alongside the stale clause.
+    assert "``ensure_write_targets`` is deliberately **not** called here" in target_doc
+
+    # The contract itself lives on `_check_compat`, which does pass the version in.
+    compat_doc = _check_compat.__doc__ or ""
+    assert compat_doc, "_check_compat must keep its docstring"
+    assert ":data:`aidw.__version__`" in compat_doc
