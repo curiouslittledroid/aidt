@@ -521,7 +521,7 @@
 
 ## Epic E8: Packaging, distribution, versions (D9)
 
-- [ ] **E8.1. Installable package**
+- [x] **E8.1. Installable package**
   `pyproject.toml`: name `aidt` (or `aidw` — pick one and be consistent with the import name),
   version, console script `aidw`, and `uv tool install git+…@<tag>` verified from a clean machine or
   clean tool venv.

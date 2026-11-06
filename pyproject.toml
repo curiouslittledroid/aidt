@@ -26,8 +26,25 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["aidw"]
 
+# E8.1 / EXTRACTION.md §3.12: the three runtime asset dirs are repo-root *siblings* of
+# `aidw/`, so `packages = ["aidw"]` alone ships code without any prompt, agent config or
+# agent context file. Force-included to the wheel root (= site-packages), they land beside
+# `aidw/` exactly as in the checkout, which is what keeps
+# `aidw/paths.py:toolkit_root()` = `Path(__file__).parent.parent` correct in both layouts
+# with no `paths.py` change. Only runtime assets are listed: `tests/`, `docs/`,
+# `design.md`, `uv.lock` and `.github/` are dev-time and must stay out of the wheel
+# (`README.md` is wheel *metadata* via `readme = "README.md"`).
+[tool.hatch.build.targets.wheel.force-include]
+"prompts" = "prompts"
+"agent-configs" = "agent-configs"
+"agents" = "agents"
+
 [dependency-groups]
 dev = [
+    # E8.1: `tests/test_packaging.py` builds the wheel/sdist with
+    # `uv build --no-build-isolation`, so the build backend must be in the locked env —
+    # `uv run --frozen pytest` is offline, and build isolation would need the network.
+    "hatchling>=1.33",
     "pytest>=8.0",
     "pytest-xdist>=3.8.0",
 ]
