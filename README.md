@@ -20,6 +20,108 @@ and the operator guide.
 > scheduled after the migration ([`docs/migration/EXTRACTION.md`](./docs/migration/EXTRACTION.md))
 > finishes.
 
+## Install
+
+AIDT is distributed from git, not PyPI. D9 fixes two install forms, both pinned to a tag:
+
+| Form | Command | Use it for |
+|---|---|---|
+| **Primary — `uv tool install`** | `uv tool install "git+https://github.com/curiouslittledroid/aidt@<tag>"` | An `aidw` on `PATH` for everyday use, in its own uv-managed tool environment. |
+| **Secondary — `uvx`** | `uvx --from "git+https://github.com/curiouslittledroid/aidt@<tag>" aidw --version` | A one-off run without installing anything (swap `--version` for any other subcommand). |
+
+`<tag>` is a **placeholder for a release tag**, and no release tag exists yet — E8.5 cuts the
+first one and documents the release process. (The repository's `baseline-verbatim` tag marks the
+verbatim import, not a release.) Until then, pin a commit SHA instead; `@main` also works but is
+unpinned and therefore not reproducible.
+
+The `uvx` form needs `--from <git-url>`: a bare `uvx aidw` resolves a package named `aidw` from
+PyPI, which is not this repository.
+
+Smoke-check the install from the control worktree of a bootstrapped workspace (see
+[Workspace layout and bootstrap](#workspace-layout-and-bootstrap)):
+
+```bash
+aidw --version     # works anywhere, no target repo needed
+aidw doctor        # toolkit + git/gh/pi versions, workspace/state roots, prompts, agent configs
+```
+
+Every run records the toolkit version and the resolved target config in its `state.json`
+(D9, E8.2), so an old run says which toolkit and config produced it. AIDT needs **git ≥ 2.31**;
+`aidw doctor` checks that too (see below).
+
+## Workspace layout and bootstrap
+
+AIDT runs against a **workspace**: one bare repository plus sibling worktrees. Every worktree is a
+**sibling of the bare repo**, all of them are linked off the bare repo, none is a separate clone,
+and `main` is not one either (EXTRACTION.md §3.2). Supported layout:
+
+```text
+~/mythical-forge/
+├── bare.git/        # bare clone — the common dir for every worktree
+├── main/            # control worktree: base branch permanently checked out
+├── 03.1-B2/         # task worktree
+└── 04.2-A1/         # task worktree
+```
+
+Bootstrap it **once**, with the target repository's remote:
+
+```bash
+git clone --bare https://github.com/curiouslittledroid/aidt.git bare.git
+git -C bare.git worktree add ../main main
+```
+
+The remote shown is this repository's own `origin`, because `aidt` dogfoods its own workflows
+(D21); for a different target repo, substitute that repo's remote URL and the layout is the same.
+Then run every `aidw` command from the control worktree `main/` — it is the one with the base
+branch checked out.
+
+Both commands matter. Bootstrap must start from `git clone --bare`: a normal `git clone` followed
+by `git worktree add` produces the **clone-of-a-worktree** layout that
+[AIDT refuses to run on](#supported-and-rejected-layouts).
+
+Verify the result — the bare repo is the common dir from every worktree:
+
+```bash
+git -C main rev-parse --path-format=absolute --git-common-dir   # → <workspace-root>/bare.git
+```
+
+`--path-format=absolute` needs **git ≥ 2.31**, and AIDT derives the workspace root from exactly
+that command, so the layout does not work on older git. `aidw doctor`'s `git version` check fails
+below 2.31 and says to upgrade.
+
+### Task worktrees are created by AIDT
+
+The bootstrap above is **one-time** setup only. AIDT owns per-task worktree creation (D20, §3.2
+"Consequences"; E2.4/E2.5): `aidw prompt` creates the task branch's worktree and then runs its
+stages inside it. The command it runs — and the one `aidw implement` prints when the worktree for
+its branch is missing — is the §3.2 per-task form:
+
+```bash
+git -C <workspace-root>/main worktree add -b <branch> <workspace-root>/<branch> <base-branch>
+```
+
+Do not hand-run that for each task, and do not create the branch on `main` with `git checkout -b`
+or `git switch -c`: a branch already checked out in `main/` cannot be checked out a second time
+(see the rejected layouts below), and the worktree is still AIDT's to create. `aidw worktree list`
+shows the branch ↔ worktree mapping it uses.
+
+### Supported and rejected layouts
+
+Only one layout is supported: `bare.git` (the common dir) with `main/` and every task worktree as
+its **siblings**, all registered in the bare repo. `aidw doctor` confirms it with `workspace root`,
+`state root` and `control worktree` all `ok`, and run state lives at
+`<workspace-root>/.aidw/state/<repo-slug>/` (D18) — outside every worktree, so pruning a worktree
+can never delete it.
+
+Two other layouts look reasonable and are rejected, and the bare directory itself cannot be a
+target:
+
+| Layout | Why it fails |
+|---|---|
+| **`main` as a plain clone**, with worktrees hanging off it (the **clone-of-a-worktree** trap) | The worktrees register in `main/.git`, so `dirname(<absolute git-common-dir>)` is the clone folder and the state root lands **inside a prunable worktree**. `aidw/layout.py:check_layout` refuses to run on it, and `aidw doctor` fails `control worktree` with the re-bootstrap commands. |
+| **Creating the branch on `main`, then moving it** into a worktree | Impossible: git allows one checkout per branch and refuses the second, `fatal: '<branch>' is already checked out at '<path>'`. That is why the task branch is born in its own worktree. |
+| **The bare directory as the target** (`cd bare.git`) | A bare repo has no working tree, so git's `rev-parse --show-toplevel` fails. AIDT refuses and prints the `worktree add ../main main` command to run instead, and `aidw doctor` fails `target repo`. |
+
 ## Repository, naming, and provenance
 
 This repository is **`aidt`** ("AI Developer Tools") — the toolkit's own home, not a
