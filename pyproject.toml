@@ -1,6 +1,6 @@
 [project]
 name = "aidt"
-version = "0.1.0"
+version = "1.0.0"
 description = "AIDT = AI Developer Tools — Pi-driven development workflows for Mythical Forge"
 readme = "README.md"
 requires-python = ">=3.11"
