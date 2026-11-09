@@ -192,7 +192,7 @@ evidence depends on it.
     alternative: treat a truncated review as `ambiguous` and continue; design §10 forbids running
     rework on empty findings.
 
-- [ ] **H1.2. `aidw prompt` resumes instead of re-authoring** (Design 9.3, Design 14)
+- [x] **H1.2. `aidw prompt` resumes instead of re-authoring** (Design 9.3, Design 14)
   Design §9.3 gives resumability to `implement` alone; `aidw prompt` writes no `state.resume` and
   has no flag, so a blocked review (exit 3), a provider 402, or a truncated stage throws away every
   completed stage — $3.63 across the two runs in the table above, for no result.

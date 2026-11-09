@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import random
 import re
 import subprocess
 import threading
@@ -613,25 +614,41 @@ def test_invalid_agent_config_refuses_before_worktree_or_run_state(
     assert len(git.worktrees(tmp_path)) == 1  # the control worktree only
 
 
-def test_branch_already_checked_out_fails_closed_before_any_stage(
-    tmp_path: Path, monkeypatch, capsys
+def test_a_located_clean_worktree_is_reused_instead_of_added(
+    tmp_path: Path, monkeypatch
 ) -> None:
-    """``git.add_worktree`` returns None (one branch, one worktree) → exit 4, no run state."""
+    """H1.2 req 2: a re-run locates the worktree an earlier run left and never re-adds it.
+
+    ``git.add_worktree`` returns ``None`` for an already-checked-out branch, so calling it
+    unconditionally is what refused every re-run before H1.2. A clean located worktree is
+    reused: the stages run in it and the branch/worktree pair is untouched.
+    """
     _patch_prompt_repo(tmp_path, monkeypatch)
     existing = git.add_worktree(tmp_path, "03-E4.1")
-    assert existing is not None
-    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+    assert existing is not None and git.is_clean(existing)
+    added: list[str] = []
+    real_add = git.add_worktree
+
+    def tracking_add(repo, branch, **kwargs):
+        added.append(branch)
+        return real_add(repo, branch, **kwargs)
+
+    monkeypatch.setattr(git, "add_worktree", tracking_add)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
 
     code = prompt_workflow.run(
-        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL,
+        approve_all=True,
     )
 
-    assert code == 4
-    assert "branch-setup refused" in capsys.readouterr().err
-    assert state.list_runs(_runs_root(tmp_path)) == []
-    assert [entry.path for entry in git.worktrees(tmp_path) if entry.branch == "03-E4.1"] == [
-        existing
-    ]
+    assert code == 0
+    assert added == []
+    assert fake.repo_roots and all(root == existing for root in fake.repo_roots)
+    assert [
+        entry.path for entry in git.worktrees(tmp_path) if entry.branch == "03-E4.1"
+    ] == [existing]
+    assert len(state.list_runs(_runs_root(tmp_path))) == 1
 
 
 def test_task_prompt_contains_no_branch_creation_or_commit_instructions() -> None:
@@ -928,6 +945,7 @@ def test_failed_fix_stage_stops_the_run(tmp_path: Path, monkeypatch) -> None:
     assert "task-review-fixes-1-2" not in [name for name, _, _ in seen]
     latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.FAILED
+    assert latest.resume == {"next_stage": "task-review-fixes-1-1"}
     # A verdict-less failure exit records no gate and writes no summary line (Req 3).
     assert not any(g.name == "approve-task-prompt" for g in latest.gates)
     log = _run_log(tmp_path, latest.run_id)
@@ -2582,6 +2600,7 @@ def test_l13_empty_author_output_keeps_the_not_found_failure(
     assert code == 1
     latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.FAILED
+    assert latest.resume == {"next_stage": "task-prompt"}
     assert "generated task prompt not found" in capsys.readouterr().err
 
 
@@ -3970,6 +3989,7 @@ def test_l42_empty_review_exit_stays_gate_less(
     assert code == 1
     latest = state.list_runs(_runs_root(tmp_path))[-1]
     assert latest.status == state.FAILED
+    assert latest.resume == {"next_stage": "task-review-1"}
     assert not any(g.name == "approve-task-prompt" for g in latest.gates)
     log = _run_log(tmp_path, latest.run_id)
     assert "task-review-1: both attempts produced no final message" in log
@@ -5175,6 +5195,7 @@ def test_l53_strict_over_budget_refuses_before_review(
 
     assert code == 1
     assert latest.status == state.FAILED
+    assert latest.resume == {"next_stage": "task-prompt"}
     # The one-line refusal goes to stderr and names the over-budget prompt and requirement.
     assert "refusing (--strict)" in captured.err
     assert "docs/task-prompts/03-E4.1-prompt.md" in captured.err
@@ -5642,3 +5663,1019 @@ def test_a_repo_added_stage_with_an_unknown_agent_is_refused(
     assert "`repo-added-review`" in err
     assert "unknown agent `nobody`" in err
     assert state.list_runs(_runs_root(tmp_path)) == []
+
+
+# --------------------------------------------------------------------------- #
+# Resumability (H1.2, design §8.1/§9.3/§9.4/§14)
+# --------------------------------------------------------------------------- #
+
+#: Run label for a *seeded* record. ``new_run_id`` stamps whole seconds, so seeding a run
+#: and then minting a fresh one with the same label in the same test would collide on the
+#: run directory; a distinct label keeps the two run ids distinct.
+SEED_LABEL = "pytest-seed"
+
+
+def _run_prompt(tmp_path: Path, *, label: str = RUN_LABEL, **kwargs) -> int:
+    """Call ``prompt_workflow.run`` for the fixture task with this test's isolated roots."""
+    return prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=label, **kwargs
+    )
+
+
+def _only_run(tmp_path: Path) -> state.RunState:
+    runs = state.list_runs(_runs_root(tmp_path))
+    assert len(runs) == 1, [run.run_id for run in runs]
+    return runs[0]
+
+
+def _state_text(tmp_path: Path, run_id: str) -> str:
+    directory = state.run_dir(_runs_root(tmp_path), run_id)
+    return (directory / "state.json").read_text(encoding="utf-8")
+
+
+def _fail_stages(fake, names: set[str]):
+    """Wrap a fake ``run_stage`` so the named stages come back ``failed``.
+
+    The fake already wrote the stage's ``.out.txt`` and recorded it, so a resumed run has
+    exactly what a real failed stage leaves behind: a record with a status that is not
+    ``succeeded`` and recorded text the rebuild can re-parse.
+    """
+
+    def wrapped(spec, **kwargs):
+        record = fake(spec, **kwargs)
+        if spec.name in names:
+            record.status = state.FAILED
+            record.error = "injected failure"
+        return record
+
+    return wrapped
+
+
+def _explode_create(*args: object, **kwargs: object) -> object:
+    raise AssertionError("create_run must not fire on a resume")
+
+
+def _explode_locate(*args: object, **kwargs: object) -> object:
+    raise AssertionError("a resumed/declined run must not reach the worktree locate")
+
+
+def _explode_lock(*args: object, **kwargs: object) -> object:
+    raise AssertionError("this refusal must precede the worktree lock")
+
+
+#: A run that fails at a *review* stage after round 1's fixes: the shape the roadmap's
+#: "a run that failed at `task-review-2`" describes.
+FAIL_AT_REVIEW_2 = {"task-review-2"}
+
+
+def test_resume_continues_at_the_failed_review_with_one_run_id(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.2 req 1/4: resume at `task-review-2`, never re-author, never mint a second run.
+
+    Also the resume-over-a-dirty-tree case: a failed run leaves uncommitted prompt edits in
+    its own worktree, and a resume proceeds in exactly that tree (req 2's exemption).
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake1, FAIL_AT_REVIEW_2)
+    )
+
+    assert _run_prompt(tmp_path) == 1
+
+    failed = _only_run(tmp_path)
+    run_id = failed.run_id
+    assert failed.status == state.FAILED
+    assert failed.resume == {"next_stage": "task-review-2"}
+    recorded = [stage.name for stage in failed.stages]
+    assert recorded[:2] == ["task-prompt", "task-review-1"]
+    worktree = _task_worktree(tmp_path)
+    assert not git.is_clean(worktree)  # the failed run's own partial edits
+
+    seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, resume=True, approve_all=True)
+
+    assert code == 0
+    names = [name for name, _variables, _extra in seen2]
+    assert names[0] == "task-review-2"
+    assert "task-prompt" not in names
+    assert "task-review-1" not in names
+    assert not any(name.startswith("task-review-fixes-1") for name in names)
+
+    resumed = _only_run(tmp_path)  # one run directory: no `create_run` fired
+    assert resumed.run_id == run_id
+    assert resumed.status == state.SUCCEEDED
+    # H1.2 req 3: a successful run clears the resume key.
+    assert resumed.resume == {"next_stage": None}
+    assert [stage.name for stage in resumed.stages].count("task-review-2") == 1
+    review = resumed.stage("task-review-2")
+    assert review is not None and review.status == state.SUCCEEDED
+    # The skipped round is reported rather than silently dropped.
+    assert "task-review-1 [skipped]" in capsys.readouterr().out
+
+
+def test_resume_does_not_reask_an_already_approved_gate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Design §9.4: a recorded approval survives a failed stage and is not re-asked."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake1, FAIL_AT_REVIEW_2)
+    )
+    assert _run_prompt(tmp_path, require_approval=True) == 1
+
+    failed = _only_run(tmp_path)
+    failed.record_gate(
+        state.GateRecord(
+            name=prompt_workflow.GATE,
+            decision="approved",
+            mechanism="human",
+            at=state.utcnow_iso(),
+        )
+    )
+    state.save(state.run_dir(_runs_root(tmp_path), failed.run_id), failed)
+
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    def fail_if_reasked(*args, **kwargs):
+        raise AssertionError("an already-approved gate must not be re-asked")
+
+    monkeypatch.setattr(prompt_workflow, "decide", fail_if_reasked)
+    assert (
+        _run_prompt(
+            tmp_path,
+            resume=True,
+            approve_all=True,
+            require_approval=True,
+        )
+        == 0
+    )
+
+    resumed = _only_run(tmp_path)
+    assert any(
+        gate.name == prompt_workflow.GATE
+        and gate.decision == "approved"
+        and gate.mechanism == "human"
+        for gate in resumed.gates
+    )
+
+
+def test_resume_rebuilds_the_prior_rounds_fix_batch_from_its_review_text(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.2 req 4: the batch is re-parsed from the recorded review, never inferred from names.
+
+    ``TASK_REVIEW_CHANGES`` has two blocking findings plus one could-fix finding, so round
+    1 planned ``task-review-fixes-1-1``/``-1-2``/``-1-3``. Failing at ``-1-2`` leaves ``-1-1``
+    succeeded; the resume must replan the same remaining stages with the same partitions,
+    which only a real ``FixBatch`` rebuilt from the review text can produce.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake1, {"task-review-fixes-1-2"})
+    )
+
+    assert _run_prompt(tmp_path) == 1
+
+    failed = _only_run(tmp_path)
+    assert failed.resume == {"next_stage": "task-review-fixes-1-2"}
+    assert [
+        stage.name for stage in failed.stages if stage.name.startswith("task-review-fixes")
+    ] == ["task-review-fixes-1-1", "task-review-fixes-1-2"]
+
+    seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    assert _run_prompt(tmp_path, resume=True, approve_all=True) == 0
+
+    assert [name for name, _variables, _extra in seen2] == [
+        "task-review-fixes-1-2",
+        "task-review-fixes-1-3",
+        "task-review-reconcile-1",
+        "task-review-2",
+    ]
+    extras = {name: extra for name, _variables, extra in seen2}
+    # The rebuilt partition is the recorded review's: the second blocking finding, then the
+    # combined could-fix block the stage names alone cannot distinguish.
+    assert "The prompt is silent on matrix coverage" in extras["task-review-fixes-1-2"]
+    assert "The annotations contradict the import strategy" not in extras[
+        "task-review-fixes-1-2"
+    ]
+    assert "Non-blocking (could-fix) review finding" in extras["task-review-fixes-1-3"]
+    assert _only_run(tmp_path).run_id == failed.run_id
+
+
+def test_resume_rebuilds_the_unparseable_fallback_batch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.2 req 4: a review that never parsed is replanned as its single fallback stage."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_UNPARSEABLE, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake1, {"task-review-fixes-1"})
+    )
+
+    assert _run_prompt(tmp_path) == 1
+    assert _only_run(tmp_path).resume == {"next_stage": "task-review-fixes-1"}
+
+    seen2, fake2 = _fake_stages(TASK_REVIEW_UNPARSEABLE, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    assert _run_prompt(tmp_path, resume=True, approve_all=True) == 0
+
+    names = [name for name, _variables, _extra in seen2]
+    assert names[0] == "task-review-fixes-1"
+    assert not any(name.startswith("task-review-fixes-1-") for name in names)
+    extras = {name: extra for name, _variables, extra in seen2}
+    # The fallback carries the whole recorded review verbatim.
+    assert "## Review findings to address" in extras["task-review-fixes-1"]
+    assert "Something is wrong" in extras["task-review-fixes-1"]
+
+
+def test_resume_acquires_the_same_worktree_keyed_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.2 req 7: the resume takes the lock keyed on the reused worktree's path."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake1, FAIL_AT_REVIEW_2)
+    )
+    assert _run_prompt(tmp_path) == 1
+
+    keys: list[Path] = []
+    real_acquire = prompt_workflow.lock.acquire
+
+    def recording_acquire(state_root, worktree):
+        keys.append(worktree)
+        return real_acquire(state_root, worktree)
+
+    monkeypatch.setattr(prompt_workflow.lock, "acquire", recording_acquire)
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    assert _run_prompt(tmp_path, resume=True, approve_all=True) == 0
+    assert keys == [_task_worktree(tmp_path)]
+
+
+# --------------------------------------------------------------------------- #
+# Fresh re-run worktree rules (H1.2 req 2)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_fresh_rerun_refuses_a_dirty_reused_worktree(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.2 req 2: a fresh re-run neither reuses nor discards a dirty task worktree."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake1, FAIL_AT_REVIEW_2)
+    )
+    assert _run_prompt(tmp_path) == 1
+    worktree = _task_worktree(tmp_path)
+    dirty = git.status_short(worktree)
+    assert dirty != ""
+
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path)
+
+    assert code == 4
+    err = capsys.readouterr().err
+    remove_command, branch_command = prompt_workflow.worktree_clear_commands(
+        _roots(tmp_path)["workspace"], "03-E4.1", "main"
+    )
+    assert remove_command in err
+    assert branch_command in err
+    assert "aidw worktree remove 03-E4.1 --force" in err
+    assert "branch -D 03-E4.1" in err
+    # No second run, and nothing was discarded (design §13).
+    assert len(state.list_runs(_runs_root(tmp_path))) == 1
+    assert worktree.is_dir()
+    assert git.status_short(worktree) == dirty
+
+
+def test_a_fresh_rerun_refuses_a_leftover_branch(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.2 req 2: worktree removed but the branch alive — exit 4 with both clear commands."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake1, FAIL_AT_REVIEW_2)
+    )
+    assert _run_prompt(tmp_path) == 1
+    worktree = _task_worktree(tmp_path)
+    assert git.remove_worktree(tmp_path, worktree, force=True)
+    assert git.worktree_for_branch(tmp_path, "03-E4.1") is None
+
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path)
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert "branch-setup refused" in err
+    assert "aidw worktree remove 03-E4.1 --force" in err
+    assert "branch -D 03-E4.1" in err
+    assert len(state.list_runs(_runs_root(tmp_path))) == 1
+
+
+def test_resume_refuses_when_its_worktree_is_missing(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.2 req 2: a resume never recreates the failed run's missing worktree."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake, FAIL_AT_REVIEW_2)
+    )
+    assert _run_prompt(tmp_path) == 1
+    failed = _only_run(tmp_path)
+    before = _state_text(tmp_path, failed.run_id)
+    worktree = _task_worktree(tmp_path)
+    assert git.remove_worktree(tmp_path, worktree, force=True)
+    assert git.worktree_for_branch(tmp_path, "03-E4.1") is None
+
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, resume=True, approve_all=True)
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert failed.run_id in err
+    assert "has no worktree" in err
+    assert _state_text(tmp_path, failed.run_id) == before
+    assert len(state.list_runs(_runs_root(tmp_path))) == 1
+
+
+# --------------------------------------------------------------------------- #
+# The stale `running` record (H1.2 req 1)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_stale_running_record_refuses_a_fresh_run_but_resume_takes_it_over(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A crashed run releases its lock and keeps a `running` record: one run id, ever."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    worktree = git.add_worktree(tmp_path, "03-E4.1")
+    assert worktree is not None
+    runs_dir = _runs_root(tmp_path)
+    crashed = state.create_run(
+        runs_dir, worktree, "prompt", label=SEED_LABEL, branch="03-E4.1"
+    )
+    directory = state.run_dir(runs_dir, crashed.run_id)
+    crashed.record_stage(
+        state.StageRecord(
+            name="task-prompt",
+            agent="task-author",
+            model="test-model",
+            status=state.FAILED,
+            error="the process died between stages",
+        )
+    )
+    state.save(directory, crashed)
+    assert state.list_runs(runs_dir)[-1].status == state.RUNNING
+
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path)
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert "still marked running" in err
+    assert crashed.run_id in err
+    assert len(state.list_runs(runs_dir)) == 1
+
+    code = _run_prompt(tmp_path, resume=True, approve_all=True)
+
+    assert code == 0
+    # The in-flight stage's record is not `succeeded`, so it re-runs — no `next_stage` was
+    # ever stamped, which is exactly what a crash leaves behind.
+    assert [name for name, _variables, _extra in seen][0] == "task-prompt"
+    resumed = _only_run(tmp_path)
+    assert resumed.run_id == crashed.run_id
+    assert resumed.status == state.SUCCEEDED
+
+
+def test_a_declined_resume_leaves_no_side_effect(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.2 req 1: answering no exits 4 before the locate, the lock and any write."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake1, FAIL_AT_REVIEW_2)
+    )
+    assert _run_prompt(tmp_path) == 1
+    failed = _only_run(tmp_path)
+    before = _state_text(tmp_path, failed.run_id)
+
+    monkeypatch.setattr(prompt_workflow, "_confirm_resume", lambda assume_yes: False)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+    monkeypatch.setattr(git, "worktree_for_branch", _explode_locate)
+    monkeypatch.setattr(prompt_workflow.lock, "acquire", _explode_lock)
+
+    code = _run_prompt(tmp_path, resume=True)
+
+    assert code == 4
+    out = capsys.readouterr()
+    assert "resume declined." in out.err
+    # The completed-stages print happens before the question, then nothing else does.
+    assert "completed stages:" in out.out
+    assert failed.run_id in out.out
+    assert _state_text(tmp_path, failed.run_id) == before
+    assert len(state.list_runs(_runs_root(tmp_path))) == 1
+
+
+def test_resume_without_a_matching_run_is_a_usage_error(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = _run_prompt(tmp_path, resume=True)
+
+    assert code == 2
+    assert "no prompt run to resume for `03-E4.1`" in capsys.readouterr().err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert len(git.worktrees(tmp_path)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# `--from` (H1.2 req 5)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "bogus",
+        "task-prompt-fixes-1",
+        "task-review-5",  # out of budget under the default 3
+        "task-review-0",
+        "task-review-fixes-3-1",  # round 3 has no fix batch at budget 3
+        "task-review-reconcile-3",
+        "task-review-fixes-1-0",  # a finding index starts at 1
+        "task-review-fixes-1-2-extra",
+    ],
+)
+def test_an_unknown_or_out_of_budget_from_stage_is_a_usage_error(
+    tmp_path: Path, monkeypatch, capsys, name: str
+) -> None:
+    """H1.2 req 5: the grammar is the loop's, bounded by the resolved ``max_revisions``."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, from_stage=name, dry_run=True)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert f"unknown stage `{name}`" in err
+    assert "max_revisions=3" in err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+    assert len(git.worktrees(tmp_path)) == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "max_revisions", "valid"),
+    [
+        ("task-prompt", 1, True),
+        ("task-review-1", 1, True),
+        ("task-review-3", 3, True),
+        ("task-review-4", 3, False),
+        ("task-review-fixes-1", 3, True),
+        ("task-review-fixes-1-42", 3, True),  # a finding index is not budgeted
+        ("task-review-fixes-2-1", 3, True),
+        ("task-review-fixes-3-1", 3, False),  # the terminal round has no fix batch
+        ("task-review-reconcile-2", 3, True),
+        ("task-review-reconcile-3", 3, False),
+        ("task-review-1", 0, False),  # a zero budget accepts nothing
+        ("task-review-fixes-1", 1, False),
+        ("task-prompt", 0, True),
+        ("impliment-task", 3, False),
+    ],
+)
+def test_is_from_stage_is_the_loops_bounded_grammar(
+    name: str, max_revisions: int, valid: bool
+) -> None:
+    """H1.2 req 5's predicate, pinned directly (pure, no run state, no I/O)."""
+    assert prompt_workflow.is_from_stage(name, max_revisions) is valid
+
+
+def test_from_with_resume_re_runs_a_succeeded_stage_in_the_same_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.2 req 5: `--from` overrides `next_stage` and re-runs even succeeded records."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake1, {"task-review-fixes-1-2"})
+    )
+    assert _run_prompt(tmp_path) == 1
+    failed = _only_run(tmp_path)
+    assert failed.resume == {"next_stage": "task-review-fixes-1-2"}
+
+    seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    code = _run_prompt(
+        tmp_path, resume=True, from_stage="task-review-1", approve_all=True
+    )
+
+    assert code == 0
+    names = [name for name, _variables, _extra in seen2]
+    assert names[0] == "task-review-1"
+    assert "task-prompt" not in names
+    # Recorded `succeeded` and still forced by the explicit override.
+    assert "task-review-fixes-1-1" in names
+    assert _only_run(tmp_path).run_id == failed.run_id
+
+
+def test_from_without_resume_starts_a_fresh_run(tmp_path: Path, monkeypatch) -> None:
+    """H1.2 req 5: `--from` alone is a fresh run — new run id, fresh-re-run worktree rules."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    worktree = git.add_worktree(tmp_path, "03-E4.1")
+    assert worktree is not None
+    runs_dir = _runs_root(tmp_path)
+    seeded = state.create_run(
+        runs_dir, worktree, "prompt", label=SEED_LABEL, branch="03-E4.1"
+    )
+    seeded.status = state.FAILED
+    state.save(state.run_dir(runs_dir, seeded.run_id), seeded)
+
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = _run_prompt(tmp_path, from_stage="task-review-1", approve_all=True)
+
+    assert code == 0
+    run_ids = {run.run_id for run in state.list_runs(runs_dir)}
+    assert len(run_ids) == 2
+    assert seeded.run_id in run_ids
+    # The named review stage is absent from a fresh plan, so the author is planned afresh.
+    assert [name for name, _variables, _extra in seen][0] == "task-prompt"
+
+
+# --------------------------------------------------------------------------- #
+# Blocked runs are not resume-able (H1.2 req 6)
+# --------------------------------------------------------------------------- #
+
+
+def _blocked_run(tmp_path: Path, monkeypatch, fake) -> state.RunState:
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    assert _run_prompt(tmp_path) == 3
+    blocked = _only_run(tmp_path)
+    assert blocked.status == state.BLOCKED
+    assert blocked.resume == {}  # design §9.3: no `next_stage` on a block
+    return blocked
+
+
+def _refuse_every_side_effect(monkeypatch) -> None:
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+    monkeypatch.setattr(git, "worktree_for_branch", _explode_locate)
+    monkeypatch.setattr(prompt_workflow.lock, "acquire", _explode_lock)
+
+
+def test_blocked_resume_refuses_with_the_last_reviews_verdict(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A terminal `Request changes` is recorded in the last review's ``.out.txt``."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake)
+    before = _state_text(tmp_path, blocked.run_id)
+
+    _refuse_every_side_effect(monkeypatch)
+
+    code = _run_prompt(tmp_path, resume=True)
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert blocked.run_id in err
+    assert "blocked, not failed" in err
+    assert "task-review-3" in err  # the last recorded review
+    assert "Request changes" in err
+    assert "3 findings (2 should-fix, 1 could-fix)" in err
+    assert "denied by the review loop" in err
+    assert _state_text(tmp_path, blocked.run_id) == before
+
+
+def test_blocked_resume_names_the_authors_recorded_block(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The author's `blocked:` line is the block's own recorded reason."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _blocked_author_stages("blocked: cited Design 09 §5.2 is absent\n")
+    blocked = _blocked_run(tmp_path, monkeypatch, fake)
+    before = _state_text(tmp_path, blocked.run_id)
+
+    _refuse_every_side_effect(monkeypatch)
+
+    code = _run_prompt(tmp_path, resume=True)
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert blocked.run_id in err
+    assert "cited Design 09 §5.2 is absent" in err
+    assert _state_text(tmp_path, blocked.run_id) == before
+
+
+def test_blocked_resume_names_a_gate_denial_mechanism(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """`review-loop` marks the loop's own shapes; any other mechanism is a gate decision."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    assert (
+        _run_prompt(
+            tmp_path,
+            require_approval=True,
+            deny_gates=[prompt_workflow.GATE],
+        )
+        == 3
+    )
+    blocked = _only_run(tmp_path)
+    assert blocked.status == state.BLOCKED and blocked.resume == {}
+    before = _state_text(tmp_path, blocked.run_id)
+
+    _refuse_every_side_effect(monkeypatch)
+
+    code = _run_prompt(tmp_path, resume=True)
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert blocked.run_id in err
+    assert "denied by a human decision" in err
+    assert "--deny-gates" in err
+    assert _state_text(tmp_path, blocked.run_id) == before
+
+
+# --------------------------------------------------------------------------- #
+# `--dry-run` composition (H1.2 req 8)
+# --------------------------------------------------------------------------- #
+
+#: The planned stage lines every dry run prints (the author via ``print_stage``, the first
+#: review via the explicit planned line).
+_PLANNED_AUTHOR = "stage:  task-prompt [succeeded]"
+_PLANNED_REVIEW = "stage:  task-review-1 [succeeded] (planned)"
+
+
+def test_a_plain_dry_run_plans_the_author_and_first_review(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The unchanged baseline the composed dry run below is compared against."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    assert _run_prompt(tmp_path, dry_run=True) == 0
+
+    out = capsys.readouterr().out
+    assert _PLANNED_AUTHOR in out and _PLANNED_REVIEW in out
+    assert "branch-setup (planned)" in out
+
+
+def test_dry_run_with_resume_plans_the_fresh_baseline_and_mints_a_new_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.2 req 8: a dry run is always the fresh plan — no takeover, no locate, no confirm."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake1, FAIL_AT_REVIEW_2)
+    )
+    assert _run_prompt(tmp_path) == 1
+    failed = _only_run(tmp_path)
+
+    monkeypatch.setattr(git, "worktree_for_branch", _explode_locate)
+    monkeypatch.setattr(prompt_workflow, "_confirm_resume", _explode_lock)
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    code = _run_prompt(tmp_path, dry_run=True, resume=True, label="pytest-fresh")
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert _PLANNED_AUTHOR in out and _PLANNED_REVIEW in out
+    assert "branch-setup (planned)" in out
+    assert "completed stages:" not in out
+    assert f"resume: {failed.run_id}" not in out
+    run_ids = {run.run_id for run in state.list_runs(_runs_root(tmp_path))}
+    assert len(run_ids) == 2 and failed.run_id in run_ids  # never a takeover
+
+
+def test_dry_run_with_resume_over_a_blocked_run_still_refuses(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.2 req 8: the blocked refusal is not dry-run-gated."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake)
+
+    _refuse_every_side_effect(monkeypatch)
+
+    code = _run_prompt(tmp_path, dry_run=True, resume=True)
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert blocked.run_id in err and "Request changes" in err
+
+
+def test_dry_run_over_a_running_record_still_plans_fresh(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.2 req 8: the still-running guard is not dry-run-gated for a *fresh* run."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    runs_dir = _runs_root(tmp_path)
+    running = state.create_run(
+        runs_dir, tmp_path, "prompt", label=SEED_LABEL, branch="03-E4.1"
+    )
+    assert running.status == state.RUNNING
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    assert _run_prompt(tmp_path, dry_run=True) == 4
+    code = _run_prompt(tmp_path, dry_run=True, resume=True)
+
+    assert code == 0
+    run_ids = {run.run_id for run in state.list_runs(runs_dir)}
+    assert len(run_ids) == 2 and running.run_id in run_ids
+
+
+def test_dry_run_validates_from_without_minting_a_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.2 req 8: `--from` is still validated under `--dry-run`, before any run record."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, dry_run=True, from_stage="bogus")
+
+    assert code == 2
+    assert "unknown stage `bogus`" in capsys.readouterr().err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+
+
+# --------------------------------------------------------------------------- #
+# CLI wiring (H1.2 req 1)
+# --------------------------------------------------------------------------- #
+
+
+def test_prompt_cli_forwards_resume_and_from(tmp_path: Path, monkeypatch) -> None:
+    """`aidw prompt --resume --from <stage>` reaches the workflow with both flags."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(prompt_workflow, "run", fake_run)
+    result = runner.invoke(
+        app,
+        [
+            "--repo",
+            str(tmp_path),
+            "prompt",
+            "03",
+            "E4",
+            "E4.1",
+            "--resume",
+            "--from",
+            "task-review-2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["resume"] is True
+    assert captured["from_stage"] == "task-review-2"
+
+
+def test_runs_resume_hint_names_the_prompt_workflow(tmp_path: Path, monkeypatch) -> None:
+    """The `runs resume` hint names every workflow that has a resume path (H1.2 req 1)."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["--repo", str(tmp_path), "runs", "resume"])
+
+    assert result.exit_code == 2
+    output = result.output
+    assert "aidw prompt --resume" in output
+    assert "aidw implement --resume" in output
+    assert "`aidw fix` has no resume" in output
+
+
+# --------------------------------------------------------------------------- #
+# Property sweep: the `--from` grammar is the loop's own expansion (H1.2 req 5)
+# --------------------------------------------------------------------------- #
+
+#: Pinned seed and run count (AGENTS.md "Tests": pytest only, no ``hypothesis``, so a
+#: reproducible sample is the generator and there is no shrinking).
+PROMPT_STAGE_PROPERTY_SEED = 3120
+PROMPT_STAGE_PROPERTY_RUNS = 32
+
+
+def _synthesized_review(blocking: int, could_fix: int, *, unparseable: bool) -> str:
+    """A review body with the requested finding counts, in the reviewer's block format."""
+    if unparseable:
+        return (
+            "Priority: terrible\nConfidence: 9\nWhat I found: broken\n"
+            "\n## Verdict\n\nRequest changes\n"
+        )
+
+    def block(priority: str) -> str:
+        return (
+            "```text\n"
+            f"Priority: {priority}\n"
+            "Confidence: 4\n"
+            "What I found: something\n"
+            "Why it matters: because\n"
+            "Trigger and effect: always\n"
+            "Where: the prompt\n"
+            "Suggested fix: fix it\n"
+            "```\n"
+        )
+
+    return (
+        "\n".join(
+            [block("Should fix") for _ in range(blocking)]
+            + [block("Could fix") for _ in range(could_fix)]
+        )
+        + "\n## Verdict\n\nRequest changes\n"
+    )
+
+
+def _synthesized_batch(rng: random.Random) -> stage_registry.FixBatch:
+    """A real ``FixBatch`` built the way the loop builds one (parse, then partition)."""
+    unparseable = rng.random() < 0.2
+    text = _synthesized_review(
+        rng.randint(0, 3), rng.randint(0, 2), unparseable=unparseable
+    )
+    findings, problems = prompt_workflow.parse_review_findings(text)
+    blocking, could_fix = prompt_workflow.partition_findings(findings)
+    return stage_registry.FixBatch(
+        review_text=text,
+        blocking=tuple(blocking),
+        could_fix=tuple(could_fix),
+        unparseable=unparseable or not findings or bool(problems),
+    )
+
+
+def test_from_grammar_matches_the_prompt_loop_expansion_property() -> None:
+    """Seeded property run (seed/runs pinned above): the grammar is the loop's own bounds.
+
+    For every sampled budget and round of fix batches, the stages
+    :func:`aidw.stage_registry.expand` plans are **all** accepted by
+    :func:`aidw.workflows.prompt.is_from_stage` under that budget, in strictly increasing
+    :func:`~aidw.workflows.prompt.prompt_stage_position` order, with the round's fix count
+    reproducing the parsed partition — so ``--from`` can never accept a name the loop does
+    not plan, nor reject one it does. The predicates are also pinned as pure: repeating a
+    call returns an equal result and touches nothing.
+    """
+    rng = random.Random(PROMPT_STAGE_PROPERTY_SEED)
+
+    for case in range(PROMPT_STAGE_PROPERTY_RUNS):
+        max_revisions = rng.randint(1, 5)
+        batches = tuple(
+            _synthesized_batch(rng) for _ in range(rng.randint(0, max_revisions - 1))
+        )
+        planned = stage_registry.expand(
+            "prompt",
+            phase="03",
+            epic="E4",
+            task="E4.1",
+            rel=f"docs/task-prompts/{case}-prompt.md",
+            max_revisions=max_revisions,
+            rounds=batches,
+        )
+        names = [stage.name for stage in planned]
+
+        # Every planned name is accepted, and the plan is in canonical position order.
+        for name in names:
+            assert prompt_workflow.is_from_stage(name, max_revisions) is True
+            assert prompt_workflow.prompt_stage_position(name) is not None
+        positions = [prompt_workflow.prompt_stage_position(name) for name in names]
+        assert positions == sorted(positions)
+        assert len(set(names)) == len(names)
+        # Repeating the call is the pure, deterministic answer (no state, no I/O).
+        assert [prompt_workflow.prompt_stage_position(n) for n in names] == positions
+        assert all(
+            prompt_workflow.is_from_stage(n, max_revisions) for n in names
+        )
+
+        # The plan stops after the round that follows the batches it was given (or at the
+        # budget, whichever comes first), and the grammar's budget edge is the loop's: one
+        # review past `max_revisions` is never a valid `--from`.
+        last_review = min(len(batches) + 1, max_revisions)
+        assert f"task-review-{last_review}" in names
+        assert all(
+            prompt_workflow.prompt_stage_position(name)[0] <= last_review + 1
+            for name in names
+        )
+        assert prompt_workflow.is_from_stage(
+            f"task-review-{max_revisions + 1}", max_revisions
+        ) is False
+        # Fix rounds are bounded by `max_revisions - 1`, and each round's fix stage count
+        # is the parsed partition's (one per blocking finding plus one combined stage, or
+        # the single unparseable fallback).
+        for index, batch in enumerate(batches, start=1):
+            expected = (
+                1
+                if batch.unparseable
+                else len(batch.blocking) + (1 if batch.could_fix else 0)
+            )
+            planned_round = [
+                name
+                for name in names
+                if prompt_workflow.prompt_stage_position(name)[:2] == (index + 1, 1)
+            ]
+            assert len(planned_round) == expected
+        if max_revisions >= 2:
+            assert prompt_workflow.is_from_stage(
+                f"task-review-fixes-{max_revisions}", max_revisions
+            ) is False
+            assert prompt_workflow.is_from_stage(
+                f"task-review-reconcile-{max_revisions}", max_revisions
+            ) is False
+        else:
+            assert not any(
+                prompt_workflow.prompt_stage_position(name)[1] in (1, 2)
+                for name in names
+            )
+
+        # The rebuilt-batch reconciler is total and agrees with the recorded inventory it
+        # is given: a recorded subset of the plan passes, a name outside it does not.
+        fixes = [
+            name
+            for name in names
+            if (prompt_workflow.prompt_stage_position(name) or (0, 0, 0))[1] == 1
+        ]
+        half = rng.randint(0, len(fixes))
+        assert prompt_workflow._reconcile_recorded_fixes(fixes[:half], fixes) is None
+        if fixes:
+            assert (
+                prompt_workflow._reconcile_recorded_fixes(
+                    [*fixes, "task-review-fixes-9-9"], fixes
+                )
+                is not None
+            )
+
+
+def test_a_recorded_review_that_now_ends_the_run_refuses_to_resume(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.2 req 4: the rebuilt loop may not contradict the recorded stage inventory.
+
+    The failure this closes is a toolkit upgrade between invocations: the recorded round-1
+    review re-parses as an *exit* while the run recorded round-1's fix stages and a failed
+    `task-review-fixes-1-2`, so a walk that trusts the new verdict would "finish" a run that
+    still holds a failed stage. The resume refuses with exit 4 and writes nothing.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake1, {"task-review-fixes-1-2"})
+    )
+    assert _run_prompt(tmp_path) == 1
+    failed = _only_run(tmp_path)
+    before = _state_text(tmp_path, failed.run_id)
+
+    real_verdict = prompt_workflow.parse_verdict
+
+    def drifted_verdict(text: str):
+        # Only round 1's recorded review drifts: its fake body carries this marker.
+        if "review round 1" in text:
+            return prompt_workflow.APPROVE
+        return real_verdict(text)
+
+    monkeypatch.setattr(prompt_workflow, "parse_verdict", drifted_verdict)
+    seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    code = _run_prompt(tmp_path, resume=True, approve_all=True)
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert "cannot be rebuilt faithfully" in err
+    assert "task-review-fixes-1-1" in err
+    assert seen2 == []  # no stage ran, nothing was re-authored
+    assert _state_text(tmp_path, failed.run_id) == before

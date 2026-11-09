@@ -45,12 +45,30 @@ control worktree and a clean working tree. It then refuses (exit 4) when an earl
 the same roadmap phase file is unticked, unless ``--allow-incomplete-prereqs``
 is given, then fetches ``origin`` and refuses (exit 4) when the base branch is behind or
 diverged from ``origin/<base>``; ``--no-fetch`` skips both the fetch and the comparison.
-It derives the branch/worktree name from ``repo.branch_pattern`` and creates the task
-worktree before the author stage; a malformed pattern is a usage error (exit 2) and a git
-refusal is exit 4, both before any stage or run state (EXTRACTION.md §3.2/§3.4).
+It derives the branch/worktree name from ``repo.branch_pattern`` and **locates** the task
+worktree before the author stage, creating it only when none exists; a malformed pattern is
+a usage error (exit 2) and a git refusal is exit 4, both before any stage or run state
+(EXTRACTION.md §3.2/§3.4). A re-run or a resume finds the worktree an earlier run created
+(``git.add_worktree`` returns ``None`` for an already-checked-out branch), so a located
+worktree is reused: a resume always proceeds in the failed run's own tree, while a fresh
+re-run reuses it only when it is clean and otherwise refuses (exit 4) printing the two
+commands that clear it (H1.2, design §8.1/§13).
 A ``--dry-run`` plans the stages without those preconditions, reports the incomplete
 predecessors and the planned ``worktree add``, and never touches the network or creates a
 worktree.
+
+Resumability (H1.2, design §9.4) mirrors ``aidw implement``: ``--resume`` reads the latest
+**prompt** run for the derived branch, prints its completed stages and confirms before
+continuing; ``--from <stage>`` re-runs that stage and everything after it. A failed run
+stamps ``state.resume.next_stage`` at every ``return 1`` site and a run that succeeds clears
+it; a *blocked* run records none (design §9.3), so ``--resume`` on one refuses with exit 3
+naming the blocked shape's recorded reason instead of silently re-authoring. A resume keeps
+the run's single id and appends to the same ``state``: the loop's in-memory counters are
+reconstructed from the recorded stage records (``review_index``/``revisions`` from the stage
+names, each round's fix batch re-parsed from that round's recorded review ``.out.txt``), so
+no author or review stage is re-run to recover them and no ``FixBatch`` or baseline diff is
+fabricated. ``--dry-run`` always plans the fresh author + ``task-review-1`` baseline — never
+a resumed plan — exactly as ``implement.py`` layers the same flags.
 Before any of that — and regardless of ``--dry-run`` — the target repo's
 ``<target>/aidw/config.yaml`` is loaded and resolved (E3.2): its ``max_revisions`` is the
 budget under the CLI flag, and a config carrying validation ERRORs refuses with
@@ -81,11 +99,12 @@ uncommitted change under ``docs/task-prompts/`` in it are reported, never repair
 (design §13, L1.3).
 The approval gate is off by default; pass ``--require-approval`` to pause for a human decision.
 
-The run lock (``aidw.lock``, EXTRACTION.md §3.2/§3.10) is keyed on the **created task
-worktree** (``target.root``), acquired after branch setup — ``git worktree add`` precedes
-it — and released on every exit path. It is therefore the same key a concurrent
+The run lock (``aidw.lock``, EXTRACTION.md §3.2/§3.10) is keyed on the **task worktree**
+(``target.root``), acquired after branch setup — located or created first — and released on
+every exit path. A resume reuses the failed run's worktree, so its lock key is the same one
+the failed invocation held. It is therefore the same key a concurrent
 ``implement``/``fix``/``review``/``approve`` started in that worktree takes. A dry run
-creates no worktree, so it locks the control worktree it plans against.
+locates and creates no worktree, so it locks the control worktree it plans against.
 """
 
 from __future__ import annotations
@@ -131,10 +150,12 @@ from aidw.target_config import (
 from aidw.state import (
     BLOCKED,
     FAILED,
+    RUNNING,
     SUCCEEDED,
     GateRecord,
     RunState,
     create_run,
+    list_runs,
     run_dir,
     save,
     utcnow_iso,
@@ -1328,6 +1349,294 @@ def _with_pointer(spec: StageSpec, pointer: str, rendered: str = "") -> StageSpe
     return replace(spec, extra=_with_evidence(pointer, body))
 
 
+# ---------------------------------------------------------------------------
+# Resumability (H1.2, design §9.3/§9.4)
+# ---------------------------------------------------------------------------
+
+#: The prompt loop's stage-name grammar (H1.2 req 5), derived from
+#: :func:`aidw.stage_registry._expand_prompt_loop`'s expansion: one review per round, then
+#: that round's fix stages and its single reconcile, and the final round review-only.
+_REVIEW_STAGE_RE = re.compile(r"task-review-(\d+)")
+_FIXES_STAGE_RE = re.compile(r"task-review-fixes-(\d+)(?:-(\d+))?")
+_RECONCILE_STAGE_RE = re.compile(r"task-review-reconcile-(\d+)")
+
+
+def prompt_stage_position(name: str) -> tuple[int, int, int] | None:
+    """The canonical loop position of a prompt stage name, or ``None`` when unknown (H1.2).
+
+    Pure. ``task-prompt`` sorts before every round (position ``0``); within round ``r``
+    (position ``r + 1``) the review comes first, then the round's fix stages in finding
+    order, then its reconcile. The tuple is what ``--from``/``resume.next_stage`` compare
+    with, so "re-run from here" is one ordering rule rather than a second stage list.
+    """
+    if name == "task-prompt":
+        return (0, 0, 0)
+    match = _REVIEW_STAGE_RE.fullmatch(name)
+    if match:
+        return (int(match.group(1)) + 1, 0, 0)
+    match = _FIXES_STAGE_RE.fullmatch(name)
+    if match:
+        # The fallback stage carries no finding index; it sorts where the first would.
+        return (int(match.group(1)) + 1, 1, int(match.group(2) or 1))
+    match = _RECONCILE_STAGE_RE.fullmatch(name)
+    if match:
+        return (int(match.group(1)) + 1, 2, 0)
+    return None
+
+
+def is_from_stage(name: str, max_revisions: int) -> bool:
+    """Whether ``name`` is a grammar-valid prompt stage under this budget (H1.2 req 5).
+
+    Pure, and consulted *before* any side effect. The bounds are the loop's own: reviews
+    run ``1..max_revisions``; fix batches and reconciles run only for rounds
+    ``1..max_revisions - 1`` because ``terminal_last`` breaks before the final round's
+    body; and a fix stage's finding index has no upper bound because a review's finding
+    count is not budgeted. Every name the loop records is grammar-valid within budget, so
+    validation needs no run record — ``task-review-5`` under ``--max-revisions 3`` is
+    simply unknown.
+    """
+    position = prompt_stage_position(name)
+    if position is None:
+        return False
+    round_index, kind, index = position
+    if round_index == 0:
+        return True  # task-prompt
+    budgeted_round = round_index - 1
+    if kind == 0:
+        return 1 <= budgeted_round <= max_revisions
+    if not 1 <= budgeted_round <= max_revisions - 1:
+        return False
+    # A fix stage's finding index starts at 1 and is otherwise unbudgeted; a reconcile
+    # stage carries no index at all.
+    return kind != 1 or index >= 1
+
+
+def _unknown_from_stage_message(name: str, max_revisions: int) -> str:
+    """The exit-2 message for an unknown or out-of-budget ``--from`` name (H1.2 req 5).
+
+    The grammar has no finite name list (a fix stage's finding index is unbounded), so the
+    message states the bounded shape under the resolved budget instead of enumerating it.
+    """
+    fix_last = max_revisions - 1
+    fixes = (
+        f"`task-review-fixes-1..{fix_last}[-<n>]` and "
+        f"`task-review-reconcile-1..{fix_last}`"
+        if fix_last >= 1
+        else "no fix or reconcile stage (max_revisions=1)"
+    )
+    return (
+        f"unknown stage `{name}` for the prompt loop with max_revisions={max_revisions}: "
+        f"expected `task-prompt`, `task-review-1..{max_revisions}`, {fixes}"
+    )
+
+
+def _latest_prompt_run(runs_root: Path, branch: str) -> RunState | None:
+    """The newest **prompt** run recorded for ``branch``, or ``None`` (H1.2 req 1).
+
+    Mirrors :func:`aidw.workflows.implement._latest_implement_run`: filtered on the
+    workflow *and* the recorded branch, so an ``implement`` run for the same branch is
+    never mistaken for the run this invocation continues.
+    """
+    matches = [
+        state
+        for state in list_runs(runs_root)
+        if state.workflow == "prompt" and state.git.get("branch") == branch
+    ]
+    return matches[-1] if matches else None
+
+
+def _confirm_resume(assume_yes: bool) -> bool:
+    """Ask before a resume continues, mirroring ``implement._confirm_resume`` (H1.2 req 1).
+
+    ``--yes`` skips the question. A non-interactive session (and EOF) confirms: the
+    operator already passed ``--resume`` explicitly and a piped run has nobody to ask, the
+    same trade-off the implement workflow records.
+    """
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        return True
+    try:
+        answer = input("Resume this prompt run? [y/N] ").strip().lower()
+    except EOFError:
+        return True
+    return answer in ("y", "yes")
+
+
+def _print_completed(state: RunState) -> None:
+    for record in state.stages:
+        print(f"  {record.name}: {record.status}")
+
+
+def worktree_clear_commands(
+    workspace: WorkspacePaths, branch: str, base_branch: str
+) -> tuple[str, str]:
+    """The two copy-pasteable commands that clear a stale task worktree and branch (H1.2).
+
+    Derived from the ``aidw worktree`` surface and
+    :func:`aidw.workflows.implement.worktree_add_command`'s base-worktree ``-C`` form —
+    never a hand-rolled ``rm -rf``, ``git reset --hard`` or ``git clean``, because design
+    §13 makes the discard an explicit operator action and ``--force`` the only override.
+    """
+    base_worktree = workspace.workspace_root / base_branch
+    return (
+        f"aidw worktree remove {branch} --force",
+        f"git -C {base_worktree} branch -D {branch}",
+    )
+
+
+def _recorded_fix_rounds(state: RunState) -> int:
+    """How many fix rounds a recorded run spent, from its stage names (H1.2 req 4)."""
+    rounds = {
+        int(match.group(1))
+        for record in state.stages
+        if (match := _FIXES_STAGE_RE.fullmatch(record.name))
+    }
+    return len(rounds)
+
+
+def _recorded_fix_names(state: RunState, round_index: int) -> list[str]:
+    """The recorded fix stage names for one review round, in record order (H1.2 req 4)."""
+    names: list[str] = []
+    for record in state.stages:
+        match = _FIXES_STAGE_RE.fullmatch(record.name)
+        if match and int(match.group(1)) == round_index:
+            names.append(record.name)
+    return names
+
+
+def _reconcile_recorded_fixes(recorded: list[str], rebuilt: list[str]) -> str | None:
+    """Why a rebuilt fix batch cannot stand in for the recorded stages, or ``None`` (H1.2).
+
+    Pure. The stage names carry only counts, so the rebuilt :class:`FixBatch` (re-parsed
+    from the round's recorded review text) is the authority for what will run, and the
+    recorded names are the inventory it must be able to account for. A recorded name the
+    rebuilt plan lacks means the batch cannot be reconstructed faithfully — a parser or
+    budget change between invocations — so the caller fails closed rather than silently
+    dropping a stage. A recorded prefix shorter than the rebuilt plan is normal: that is
+    the in-flight batch a failed fix stage or a crash left half-run.
+    """
+    missing = [name for name in recorded if name not in rebuilt]
+    if not missing:
+        return None
+    return (
+        f"recorded fix stage(s) {', '.join(missing)} are not in the rebuilt batch "
+        f"({', '.join(rebuilt) or 'none'})"
+    )
+
+
+def _recorded_later_stage(
+    state: RunState, position: tuple[int, int, int]
+) -> str | None:
+    """The first recorded stage positioned after ``position``, or ``None`` (H1.2 req 4).
+
+    Pure read of the recorded stage names. A resume walks the rounds in canonical order, so
+    a recorded stage this walk never reaches means the reconstruction disagrees with what
+    the run recorded.
+    """
+    for record in state.stages:
+        recorded_position = prompt_stage_position(record.name)
+        if recorded_position is not None and recorded_position > position:
+            return record.name
+    return None
+
+
+def _last_review_record(state: RunState):
+    """The last recorded ``task-review-N`` record, or ``None`` (H1.2 req 6)."""
+    for record in reversed(state.stages):
+        if _REVIEW_STAGE_RE.fullmatch(record.name):
+            return record
+    return None
+
+
+def blocked_resume_reason(state: RunState) -> str:
+    """A blocked run's recorded reason, re-read from its own records (H1.2 req 6).
+
+    Three shapes, in the order the loop records them: the author's ``blocked:`` line; the
+    last recorded review's verdict plus findings summary (the loop's own
+    :func:`aidw.verdict.parse_verdict`/:func:`aidw.findings.parse_review_findings`, the
+    same re-read a resume rebuild uses); and a denied ``approve-task-prompt`` gate, whose
+    mechanism ``review-loop`` marks the loop's own verdict shapes while anything else is a
+    gate decision. Never raises: artifacts that are gone degrade to
+    ``the run recorded no reason`` rather than a traceback.
+    """
+    parts: list[str] = []
+    author = state.stage("task-prompt")
+    author_reason = _parse_blocked(_read_out(author)) if author is not None else None
+    if author_reason is not None:
+        parts.append(
+            "the task-prompt author reported `blocked:` "
+            f"{author_reason or '(no reason given)'}"
+        )
+    review = _last_review_record(state)
+    if review is not None:
+        text = _read_out(review) or ""
+        verdict = parse_verdict(text)
+        findings, _problems = parse_review_findings(text)
+        parts.append(
+            f"the last recorded review ({review.name}) returned "
+            f"{verdict or 'an ambiguous verdict'} — {findings_summary(findings)}"
+        )
+    gate = next(
+        (
+            gate
+            for gate in reversed(state.gates)
+            if gate.name == GATE and gate.decision == "denied"
+        ),
+        None,
+    )
+    if gate is not None:
+        if gate.mechanism == "review-loop":
+            parts.append(f"the `{GATE}` gate was denied by the review loop")
+        else:
+            parts.append(
+                f"the `{GATE}` gate was denied by a human decision "
+                f"(mechanism `{gate.mechanism}`)"
+            )
+    return "; ".join(parts) if parts else "the run recorded no reason"
+
+
+def _refuse_blocked_resume(state: RunState, branch: str) -> None:
+    """Print the exit-3 refusal for a blocked run (H1.2 req 6). Mutates nothing.
+
+    A blocked run is not a failed one: design §9.3 sets ``resume.next_stage`` only when a
+    stage fails, so there is no stage to continue from, and re-authoring would discard the
+    reviewed prompt silently. Exit 3 is design §14's "workflow blocked (needs human)" —
+    not a usage error (2) and not a preflight refusal (4), which stay reserved for the
+    no-matching-run, still-running and worktree cases. The blocked-run continuation is
+    H1.3's.
+    """
+    print(
+        f"resume refused: run {state.run_id} for `{branch}` is blocked, not failed — a "
+        "blocked run records no `resume.next_stage` (design §9.3), so there is no stage "
+        f"to continue from. Recorded reason: {blocked_resume_reason(state)}. Fix the "
+        "cause and start a fresh run; a blocked-run continuation is not implemented.",
+        file=sys.stderr,
+    )
+
+
+def _mark_failed(state: RunState, directory: Path, stage_name: str) -> None:
+    """Record a failed stop and the stage a ``--resume`` continues at (H1.2 req 3).
+
+    One helper for every ``return 1`` site in :func:`run`, because the key the resume
+    read-back keys on must not be missed at any of them.
+    """
+    state.status = FAILED
+    state.resume = {"next_stage": stage_name}
+    save(directory, state)
+
+
+def _mark_blocked(state: RunState, directory: Path) -> None:
+    """Record a blocked stop with **no** ``next_stage`` (H1.2 req 3, design §9.3).
+
+    Clearing rather than leaving the resumed run's previous ``next_stage`` in place is
+    load-bearing: a resumed failed run that ends blocked must not look resumable.
+    """
+    state.status = BLOCKED
+    state.resume = {}
+    save(directory, state)
+
+
 def run(
     *,
     phase: str,
@@ -1347,6 +1656,8 @@ def run(
     no_fetch: bool = False,
     allow_incomplete_prereqs: bool = False,
     max_revisions: int | None = None,
+    resume: bool = False,
+    from_stage: str | None = None,
     stream: bool = False,
 ) -> int:
     skip = set(skip_gates or [])
@@ -1446,6 +1757,56 @@ def run(
     # line) and never across files (phase 00's unticked backlog must not block phase 02).
     incomplete = _incomplete_predecessors(entries, entry)
 
+    # --- the run this invocation continues or replaces (H1.2 req 1/6) ------------- #
+    # The lookup runs on a fresh invocation too, mirroring `implement.run`: a crashed run
+    # releases its worktree lock but keeps a stale `running` record, and a fresh run that
+    # ignored it would mint a second run id over the same worktree. `takeover` is what the
+    # rest of this function means by "this invocation resumes": `--dry-run` never takes a
+    # run over (req 8) — it always plans the fresh author + task-review-1 baseline.
+    existing = _latest_prompt_run(runs_root, branch_name)
+    takeover = resume and not dry_run
+
+    if existing is not None and existing.status == RUNNING and not resume:
+        # Not `--dry-run`-gated: a dry run must not plan a second author over a run that a
+        # live-or-crashed process still owns. `--resume` takes the record over below.
+        print(
+            f"another prompt run for `{branch_name}` is still marked running: "
+            f"{existing.run_id}. Use --resume or finish it.",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+
+    # H1.2 req 6: a blocked run is not a failed one — design §9.3 sets
+    # `resume.next_stage` only on a stage failure, so nothing can be continued from it.
+    # Refuse with the blocked shape's own recorded reason *before* the completed-stages
+    # print, the confirmation, the worktree locate and the lock: nothing is mutated. Exit
+    # 3 is design §14's "workflow blocked (needs human)", which keeps 2 (usage) and 4
+    # (preflight refusal) for the no-run, still-running and worktree cases. Deliberately
+    # not `--dry-run`-gated: a dry run never plans an author over a blocked run.
+    if resume and existing is not None and existing.status == BLOCKED:
+        _refuse_blocked_resume(existing, branch_name)
+        return 3
+
+    # H1.2 req 1: no run to resume is a usage error, matching implement. Suppressed under
+    # `--dry-run` (implement's `resume and not dry_run` guard): no matching run simply
+    # plans a fresh run, which is the dry run's only mode.
+    if resume and not dry_run and existing is None:
+        print(f"no prompt run to resume for `{branch_name}`.", file=sys.stderr)
+        return 2
+
+    # --- --from validation (grammar only; before any side effect) ---------------- #
+    # H1.2 req 5, mirroring implement's F1 position: a typo'd or out-of-budget stage name
+    # refuses with exit 2 before the base-branch fetch, the locate and any run state — and
+    # in `--dry-run`, which validates the flag but never applies it to the plan. Validation
+    # consults only the loop's grammar under the resolved `max_revisions`, never a run
+    # record: every stage the loop records is grammar-valid within budget, so a run record
+    # would add no accepted names.
+    if from_stage is not None and not is_from_stage(from_stage, max_revisions):
+        print(
+            _unknown_from_stage_message(from_stage, max_revisions), file=sys.stderr
+        )
+        return 2
+
     # R4: the control worktree is whichever worktree has `repo.base_branch` checked out;
     # never a fixed name. The literal "main" stays out of the code.
     control_branch = git.current_branch(repo.root)
@@ -1484,14 +1845,21 @@ def run(
         # on roadmap ordering is deliberately checked before the network fetch: it is a
         # purely local, in-memory condition, so an unreachable ``origin`` must not be
         # spent first.
-        if incomplete:
-            if not allow_incomplete_prereqs:
-                _refuse_incomplete_predecessors(entry, incomplete)
-                return EXIT_REFUSED
-            _warn_incomplete_predecessors(entry, incomplete)
-        refusal = _verify_base_branch(repo, no_fetch=no_fetch)
-        if refusal is not None:
-            return refusal
+        #
+        # H1.2: the two *run-scoped* preflights — L1.2's predecessor check and L1.1's
+        # base-branch fetch — belong to the run being resumed and are not repeated
+        # (roadmap Notes). The worktree identity and the one-run-per-worktree lock below
+        # are repeated. Skipping them is what keeps a resume from re-spending the fetch
+        # and from being refused by a roadmap tick that changed after the run started.
+        if not takeover:
+            if incomplete:
+                if not allow_incomplete_prereqs:
+                    _refuse_incomplete_predecessors(entry, incomplete)
+                    return EXIT_REFUSED
+                _warn_incomplete_predecessors(entry, incomplete)
+            refusal = _verify_base_branch(repo, no_fetch=no_fetch)
+            if refusal is not None:
+                return refusal
 
     # E4.6: a declared `paths.agent_configs_dir` shadows the toolkit's agent configs by
     # id; unset passes `None` (toolkit defaults). It is a §3.4 read-path, so the
@@ -1531,12 +1899,48 @@ def run(
 
     default_rel = f"docs/task-prompts/{phase}-{task}-prompt.md"
 
-    # --- branch setup: create the task worktree (EXTRACTION.md §3.2) --------- #
-    # Inline Python, before the author stage: P1 must run in the new worktree, and a
-    # refusal must leave no stage record or run state behind. `--dry-run` prints the
-    # plan and creates nothing. `git.add_worktree` returns None (discarding git's
-    # stderr) for a branch already checked out or any other git refusal, so the failure
-    # is a generic actionable exit 4.
+    # --- resume confirmation (before the locate, the lock and any write) -------- #
+    # implement's F2 position (PR #49 review follow-up): print the completed stages and
+    # ask *before* the worktree locate, the lock and `create_run`, so a declined resume
+    # exits 4 with no side effect at all — no locate, no lock, no run state, `state.json`
+    # unchanged. `--yes` skips the question; a non-interactive session confirms.
+    if takeover and existing is not None:
+        print(f"resume: {existing.run_id}")
+        print("completed stages:")
+        _print_completed(existing)
+        if not _confirm_resume(approve_all):
+            print("resume declined.", file=sys.stderr)
+            return EXIT_REFUSED
+        # H1.2 req 4: the rebuilt batches are expanded under *this* invocation's budget,
+        # and `_expand_prompt_loop` raises for more batches than it allows. Fail closed as
+        # a usage/config error before the locate and the lock instead of crashing inside
+        # the loop; a resumed run keeps the budget it recorded (H1.3 owns recording it).
+        recorded_fix_rounds = _recorded_fix_rounds(existing)
+        if recorded_fix_rounds > max_revisions - 1:
+            print(
+                f"cannot resume run {existing.run_id}: it recorded "
+                f"{recorded_fix_rounds} fix round(s), but max_revisions="
+                f"{max_revisions} allows at most {max_revisions - 1}. Re-run with a "
+                "budget at least as large as the run used, or start a fresh run.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # --- branch setup: reuse or create the task worktree (EXTRACTION.md §3.2) --- #
+    # Inline Python, before the author stage: P1 must run in the task worktree, and a
+    # refusal must leave no stage record or run state behind. `--dry-run` prints the plan
+    # and creates nothing.
+    #
+    # H1.2: locate first and create only when none exists. `git.add_worktree` returns None
+    # (discarding git's stderr) for an already-checked-out branch, which is exactly what an
+    # earlier prompt/implement run leaves behind — so calling it unconditionally refused
+    # every re-run and every resume. A resume proceeds in the failed run's own worktree: its
+    # partial edits are the state it continues from (H1.1's accepted precedent) and its
+    # reconcile/next review still verify the result. A fresh re-run reuses a located
+    # worktree only when it is clean; a truncated fixer can leave partial prompt edits, so a
+    # dirty tree is refused rather than reused or discarded (design §13 — the discard stays
+    # operator-owned and `--force`-explicit). Both fresh-path refusals sit here: after the
+    # L1.1/L1.2 preflights, before the lock, `create_run` and any stage.
     target = repo
     if dry_run:
         planned_worktree = workspace.workspace_root / branch_name
@@ -1545,19 +1949,57 @@ def run(
             f"{planned_worktree} {repo.base_branch}"
         )
     else:
-        worktree = git.add_worktree(
-            repo.root, branch_name, base_branch=repo.base_branch
-        )
-        if worktree is None:
+        planned_worktree = (workspace.workspace_root / branch_name).resolve()
+        worktree = git.worktree_for_branch(repo.root, branch_name)
+        if worktree is not None:
+            if not takeover and not git.is_clean(worktree):
+                remove_command, branch_command = worktree_clear_commands(
+                    workspace, branch_name, repo.base_branch
+                )
+                print(
+                    f"branch-setup refused: the existing worktree for `{branch_name}` "
+                    f"at {worktree} has uncommitted changes (a truncated fixer can leave "
+                    "partial prompt edits), so a fresh run will neither reuse nor discard "
+                    "them. Inspect or commit them, or clear the worktree and branch and "
+                    "start again:",
+                    file=sys.stderr,
+                )
+                print(f"  {remove_command}", file=sys.stderr)
+                print(f"  {branch_command}", file=sys.stderr)
+                return EXIT_REFUSED
+        elif takeover and existing is not None:
+            base_worktree = workspace.workspace_root / repo.base_branch
             print(
-                f"branch-setup refused: git could not create a worktree for "
-                f"`{branch_name}` from `{repo.base_branch}` at "
-                f"{workspace.workspace_root / branch_name}. The branch may already be "
-                "checked out (one branch, one worktree) or git refused for another "
-                "reason; resolve it and re-run.",
+                f"resume refused: run {existing.run_id} has no worktree for "
+                f"`{branch_name}` (expected at {planned_worktree}). A resume continues in "
+                "the run's own worktree and never re-creates or re-authors it; re-create "
+                "the worktree for the existing branch first:",
                 file=sys.stderr,
             )
-            return 4
+            print(
+                f"  git -C {base_worktree} worktree add {planned_worktree} {branch_name}",
+                file=sys.stderr,
+            )
+            return EXIT_REFUSED
+        else:
+            worktree = git.add_worktree(
+                repo.root, branch_name, base_branch=repo.base_branch
+            )
+            if worktree is None:
+                remove_command, branch_command = worktree_clear_commands(
+                    workspace, branch_name, repo.base_branch
+                )
+                print(
+                    f"branch-setup refused: git could not create a worktree for "
+                    f"`{branch_name}` from `{repo.base_branch}` at "
+                    f"{planned_worktree}. The branch is probably left over from an "
+                    "earlier failed run (one branch, one worktree) or git refused for "
+                    "another reason; clear it and re-run:",
+                    file=sys.stderr,
+                )
+                print(f"  {remove_command}", file=sys.stderr)
+                print(f"  {branch_command}", file=sys.stderr)
+                return EXIT_REFUSED
         # Re-resolve the target and agents against the worktree: `agent.cwd` was
         # resolved against the control root and would silently keep P1 and every review
         # or fix stage in the wrong worktree (§3.2, E2.4's branch-setup order).
@@ -1591,26 +2033,73 @@ def run(
         return EXIT_REFUSED
 
     try:
-        # EXTRACTION.md §3.11 (E8.2): what produced this run. One helper so the five
-        # workflows cannot record different values for one config.
-        config_schema_version, config_hash = config_identity(resolved_config)
-        state = create_run(
-            runs_root,
-            target.root,
-            "prompt",
-            label=label or f"{phase}-{task}",
-            task={"phase": phase, "epic": epic, "task": task, "title": entry.title},
-            strict=strict,
-            branch=branch_name,
-            toolkit_version=__version__,
-            config_schema_version=config_schema_version,
-            config_hash=config_hash,
-        )
-        directory = run_dir(runs_root, state.run_id)
-        logger = RunLogger(directory, stream=stream)
+        if takeover and existing is not None:
+            # H1.2 req 4/7: one run id. Reuse the recorded object and its run directory
+            # exactly as `implement.py` does — no `create_run`, so later stages append to
+            # the same `state.stages` and the recorded gate outcomes survive `save()`
+            # (H0.1's merge-on-write). A record still marked `running` (a crashed run) is
+            # taken over the same way: its in-flight stage is not `succeeded`, so it re-runs
+            # below and no `next_stage` is needed to find it.
+            state = existing
+            directory = run_dir(runs_root, state.run_id)
+            logger = RunLogger(directory, stream=stream)
+        else:
+            # EXTRACTION.md §3.11 (E8.2): what produced this run. One helper so the five
+            # workflows cannot record different values for one config.
+            config_schema_version, config_hash = config_identity(resolved_config)
+            state = create_run(
+                runs_root,
+                target.root,
+                "prompt",
+                label=label or f"{phase}-{task}",
+                task={"phase": phase, "epic": epic, "task": task, "title": entry.title},
+                strict=strict,
+                branch=branch_name,
+                toolkit_version=__version__,
+                config_schema_version=config_schema_version,
+                config_hash=config_hash,
+            )
+            directory = run_dir(runs_root, state.run_id)
+            logger = RunLogger(directory, stream=stream)
         logger.info(f"prompt workflow {phase}/{epic}/{task}: {entry.title}")
         print(f"run:    {state.run_id}")
         print(f"task:   {entry.title}")
+
+        # --- stage selection (H1.2 req 4/5) --------------------------------------- #
+        # Two *forcing* positions: `resume.next_stage` (where the failed run stopped) and
+        # `--from` (the explicit override, applied when the loop reaches the named stage).
+        # A stage at or after a position runs even when its record says `succeeded`:
+        # "completed stages are never re-run implicitly" (design §9.4) — both flags are the
+        # explicit override. Everything else keeps its own skip decision, which is exactly
+        # `record is not succeeded`, so a stage that never ran or failed re-runs.
+        # `--from` is applied on *encounter* rather than from an up-front name list, so a
+        # grammar-valid name absent from this run's plan (a fix index that round never had)
+        # degrades as `implement.py` does: no position override, no crash.
+        resume_position: tuple[int, int, int] | None = None
+        forced_position: tuple[int, int, int] | None = None
+        if takeover and existing is not None:
+            next_stage = (existing.resume or {}).get("next_stage")
+            if isinstance(next_stage, str):
+                resume_position = prompt_stage_position(next_stage)
+                if resume_position is not None:
+                    logger.info(f"resume: continuing at {next_stage}")
+
+        def note_from(name: str) -> None:
+            """Apply the `--from` override when the loop reaches the named stage."""
+            nonlocal forced_position
+            if not dry_run and from_stage is not None and name == from_stage:
+                forced_position = prompt_stage_position(name)
+                logger.info(f"--from {name}: re-running from {name}")
+
+        def should_run(name: str) -> bool:
+            """Whether this invocation runs ``name`` (a resume reuses what succeeded)."""
+            position = prompt_stage_position(name)
+            if position is not None:
+                for bound in (resume_position, forced_position):
+                    if bound is not None and position >= bound:
+                        return True
+            record = state.stage(name)
+            return not (record is not None and record.status == SUCCEEDED)
 
         # P1 and the first review come from the registry (E4.3). The dry run plans exactly
         # what it can: `rounds=()` expands to the author plus one review (`task-review-1`),
@@ -1630,20 +2119,36 @@ def run(
         )
         author = dry_specs["task-prompt"]
 
-        # L1.3: the created worktree is deterministic, so the blocked report names it
-        # unconditionally and the old before/after branch probe is gone. No branch probe runs.
-        rec1 = run_stage(
-            author,
-            repo_root=target.root,
-            toolkit_root=aidt.root,
-            runs_root=runs_root,
-            state=state,
-            logger=logger,
-            agents=agents,
-            dry_run=dry_run,
-            config=resolved_config,
+        # H1.2 req 4: a resume that already has a succeeded author never re-authors — the
+        # recorded stage is the review loop's input, so its record (and `out.txt`) is read
+        # instead. `--from task-prompt` forces it back on, and a failed author re-runs
+        # because its record is not `succeeded`.
+        note_from(author.name)
+        author_record = state.stage(author.name)
+        reuse_author = (
+            not dry_run
+            and author_record is not None
+            and author_record.status == SUCCEEDED
+            and not should_run(author.name)
         )
-        print_stage(rec1, repo_root=target.root)
+        if reuse_author:
+            print(f"stage:  {author.name} [skipped]")
+            rec1 = author_record
+        else:
+            # L1.3: the task worktree is deterministic, so the blocked report names it
+            # unconditionally and the old before/after branch probe is gone.
+            rec1 = run_stage(
+                author,
+                repo_root=target.root,
+                toolkit_root=aidt.root,
+                runs_root=runs_root,
+                state=state,
+                logger=logger,
+                agents=agents,
+                dry_run=dry_run,
+                config=resolved_config,
+            )
+            print_stage(rec1, repo_root=target.root)
 
         if dry_run:
             rec2 = run_stage(
@@ -1659,12 +2164,14 @@ def run(
             )
             print(f"stage:  {rec2.name} [{rec2.status}] (planned) model={rec2.model}")
             state.status = SUCCEEDED
+            state.resume = {"next_stage": None}
             save(directory, state)
             print("dry-run complete; Pi not invoked")
             return 0
 
         if rec1.status != SUCCEEDED:
             print(f"task-prompt stage failed: {rec1.error}", file=sys.stderr)
+            _mark_failed(state, directory, rec1.name)
             return 1
 
         # L1.3: detect the blocked report before ``_resolve_prompt_path`` tries the first
@@ -1677,8 +2184,7 @@ def run(
             reason = blocked_reason or "no reason given"
             logger.error(f"task-prompt author reported blocked: {reason}")
             _report_blocked_leftovers(target.root, branch=branch_name)
-            state.status = BLOCKED
-            save(directory, state)
+            _mark_blocked(state, directory)
             print(f"blocked: {reason}", file=sys.stderr)
             return 3
 
@@ -1688,23 +2194,31 @@ def run(
                 f"generated task prompt not found at {default_rel}",
                 file=sys.stderr,
             )
-            state.status = FAILED
-            save(directory, state)
+            # H1.2 req 3: name the author. Its record is `succeeded`, but a resume forces
+            # from `next_stage`, so re-authoring is exactly the recovery — the alternative
+            # is a resume that fails again at this line.
+            _mark_failed(state, directory, author.name)
             return 1
         rel = prompt_path.relative_to(target.root).as_posix()
         print(f"prompt: {rel}")
-        budget_reason = _check_conciseness(prompt_path, rel)
-        if budget_reason is not None:
-            # L5.3: a workflow-level quality bound, not a gate. At the default it warns and
-            # the review loop still runs; `--strict` refuses with the stage-failure exit 1,
-            # records FAILED and no gate, and leaves the committed prompt/branch as-is
-            # (design §13/§14; no new gate-decision vocabulary, L4.2).
-            if strict:
-                print(f"refusing (--strict): {budget_reason}", file=sys.stderr)
-                state.status = FAILED
-                save(directory, state)
-                return 1
-            print(f"warning: {budget_reason}", file=sys.stderr)
+        # The conciseness budget is the author's postcondition (L5.3), so it is not
+        # re-measured on a resume: a prompt a later stage's failure left behind is not
+        # re-judged by a check the run already passed (and `--strict` must not turn a
+        # resume into a fresh failure).
+        if not reuse_author:
+            budget_reason = _check_conciseness(prompt_path, rel)
+            if budget_reason is not None:
+                # L5.3: a workflow-level quality bound, not a gate. At the default it warns
+                # and the review loop still runs; `--strict` refuses with the stage-failure
+                # exit 1, records FAILED and no gate, and leaves the committed
+                # prompt/branch as-is (design §13/§14; no new gate-decision vocabulary,
+                # L4.2). `next_stage` names the author: re-authoring is the only way a
+                # resume can clear an over-budget prompt.
+                if strict:
+                    print(f"refusing (--strict): {budget_reason}", file=sys.stderr)
+                    _mark_failed(state, directory, author.name)
+                    return 1
+                print(f"warning: {budget_reason}", file=sys.stderr)
         state.git["branch"] = branch_name
         save(directory, state)
 
@@ -1745,56 +2259,79 @@ def run(
                 rounds=fix_batches,
             )
             spec = specs[name]
-            # Round 1 is deliberately unprimed: the registry zeroes the marker on the first
-            # round (L2.3), so the independent first sample cannot anchor on a previous
-            # review. Every round still receives its evidence pointer — gathered context,
-            # not prior findings.
-            delta = ""
-            if briefs.get(name) == stage_registry.BRIEF_DELTA:
-                delta = stage_registry.render_delta_brief(
-                    previous_review=previous_review_text or "",
-                    diff=_brief_diff(
-                        index=review_index,
-                        baseline=baseline_prompt,
-                        current=_capture_prompt(prompt_path),
-                        rel=rel,
-                        verb="baseline",
-                        brief_name="delta brief",
-                    ),
+            note_from(name)
+            # H1.2 req 4: a resume reconstructs the loop by walking the *recorded* rounds,
+            # never by re-running them. A round whose record says `succeeded` is skipped and
+            # its text re-read, exactly as if it had just run — that is what keeps the
+            # verdict, the findings and the round's fix batch real rather than inferred from
+            # stage names (which carry only counts). `--from`/`next_stage` force a re-run at
+            # or after their position; a failed or missing record re-runs by default.
+            record = state.stage(name)
+            review_ran = True
+            if not should_run(name):
+                recorded_text = _read_out(record) or ""
+                if recorded_text.strip():
+                    print(f"stage:  {name} [skipped]")
+                    review_text = recorded_text
+                    review_ran = False
+                else:
+                    # A recorded review whose output is gone cannot drive the loop; re-run
+                    # it instead of fabricating a verdict from a name.
+                    print(
+                        f"warning: the recorded review `{name}` has no saved output; "
+                        "re-running it.",
+                        file=sys.stderr,
+                    )
+            if review_ran:
+                # Round 1 is deliberately unprimed: the registry zeroes the marker on the
+                # first round (L2.3), so the independent first sample cannot anchor on a
+                # previous review. Every round still receives its evidence pointer —
+                # gathered context, not prior findings.
+                delta = ""
+                if briefs.get(name) == stage_registry.BRIEF_DELTA:
+                    delta = stage_registry.render_delta_brief(
+                        previous_review=previous_review_text or "",
+                        diff=_brief_diff(
+                            index=review_index,
+                            baseline=baseline_prompt,
+                            current=_capture_prompt(prompt_path),
+                            rel=rel,
+                            verb="baseline",
+                            brief_name="delta brief",
+                        ),
+                    )
+                pointer = _stage_evidence_pointer(
+                    stage=name,
+                    directory=directory,
+                    repo=target,
+                    entry=entry,
+                    entries=entries,
+                    rel=rel,
+                    roadmap_dir=roadmap_dir,
                 )
-            pointer = _stage_evidence_pointer(
-                stage=name,
-                directory=directory,
-                repo=target,
-                entry=entry,
-                entries=entries,
-                rel=rel,
-                roadmap_dir=roadmap_dir,
-            )
-            rec = run_stage(
-                _with_pointer(spec, pointer, delta),
-                repo_root=target.root,
-                toolkit_root=aidt.root,
-                runs_root=runs_root,
-                state=state,
-                logger=logger,
-                agents=agents,
-                config=resolved_config,
-            )
-            print_stage(rec, repo_root=target.root)
-            if rec.status != SUCCEEDED:
-                state.status = FAILED
-                save(directory, state)
-                return 1
+                rec = run_stage(
+                    _with_pointer(spec, pointer, delta),
+                    repo_root=target.root,
+                    toolkit_root=aidt.root,
+                    runs_root=runs_root,
+                    state=state,
+                    logger=logger,
+                    agents=agents,
+                    config=resolved_config,
+                )
+                print_stage(rec, repo_root=target.root)
+                if rec.status != SUCCEEDED:
+                    print(f"stage {name} failed: {rec.error}", file=sys.stderr)
+                    _mark_failed(state, directory, name)
+                    return 1
 
-            review_text = _read_out(rec) or ""
-            if not review_text.strip():
-                message = empty_final_message_error(rec)
-                logger.error(message)
-                print(f"{message}; stopping.", file=sys.stderr)
-                state.status = FAILED
-                save(directory, state)
-                return 1
+                review_text = _read_out(rec) or ""
+                if not review_text.strip():
+                    message = empty_final_message_error(rec)
+                    logger.error(message)
+                    print(f"{message}; stopping.", file=sys.stderr)
+                    _mark_failed(state, directory, name)
+                    return 1
 
             verdict = parse_verdict(review_text)
             findings, problems = parse_review_findings(review_text)
@@ -1803,6 +2340,29 @@ def run(
                 print(f"verdict: {verdict}")
             else:
                 print(f"verdict: {verdict or 'ambiguous'} — {findings_summary(findings)}")
+
+            # H1.2 req 4: a *skipped* review is the record of what this run decided. If its
+            # re-parsed verdict is now an exit (approve, Blocked, or the terminal budget)
+            # while the run recorded later stages, the loop cannot be rebuilt from its
+            # records — the toolkit's parsers changed between invocations. Fail closed
+            # (exit 4, nothing written by this invocation) rather than "finishing" a run
+            # that still holds a failed stage.
+            if not review_ran and (
+                verdict in (APPROVE, VERDICT_BLOCKED)
+                or revisions >= max_revisions - 1
+            ):
+                later = _recorded_later_stage(
+                    state, prompt_stage_position(name) or (0, 0, 0)
+                )
+                if later is not None:
+                    print(
+                        f"cannot resume: the recorded review `{name}` now reads "
+                        f"`{verdict or 'ambiguous'}` and would end the run, but the run "
+                        f"recorded `{later}` after it. The loop cannot be rebuilt "
+                        "faithfully from its records; nothing was changed.",
+                        file=sys.stderr,
+                    )
+                    return EXIT_REFUSED
 
             blocking, could_fix = partition_findings(findings)
             if verdict == APPROVE and blocking:
@@ -1828,8 +2388,7 @@ def run(
                     decision="denied",
                     mechanism="review-loop",
                 )
-                state.status = BLOCKED
-                save(directory, state)
+                _mark_blocked(state, directory)
                 print(
                     f"task review approved but reported {len(blocking)} blocking "
                     f"finding(s) ({findings_summary(blocking)}); a human must settle it.",
@@ -1860,8 +2419,7 @@ def run(
                     decision="denied",
                     mechanism="review-loop",
                 )
-                state.status = BLOCKED
-                save(directory, state)
+                _mark_blocked(state, directory)
                 print(
                     "task review returned Blocked; a human must settle it.",
                     file=sys.stderr,
@@ -1889,8 +2447,7 @@ def run(
                     decision="denied",
                     mechanism="review-loop",
                 )
-                state.status = BLOCKED
-                save(directory, state)
+                _mark_blocked(state, directory)
                 print(
                     "task review did not approve within the revision budget; failing closed.",
                     file=sys.stderr,
@@ -1901,7 +2458,11 @@ def run(
             # Capture after the verdict and its Blocked/terminal exits, before the fix
             # stages run, so the next round's diff is exactly this fix batch's net effect and
             # not a cumulative diff across rounds (there is no per-round commit to diff against).
-            baseline_prompt = _capture_prompt(prompt_path)
+            # H1.2 req 4: only a round that ran *here* has a real pre-fix snapshot. On a
+            # resume the prompt already carries this round's recorded fixes, so capturing
+            # it now would fabricate a baseline — the brief degrades via `_brief_diff(...
+            # baseline=None)` instead.
+            baseline_prompt = _capture_prompt(prompt_path) if review_ran else None
             previous_review_text = review_text
             revisions += 1
             # The round's fix work as registry input (E4.3): one batch, whose partition
@@ -1953,6 +2514,63 @@ def run(
             # one per blocking finding plus one combined could-fix stage.
             fix_stage_count = len(fix_specs)
 
+            # H1.2 req 4: a *skipped* round's rebuilt batch must account for every fix stage
+            # the run recorded for it. The names carry only counts, so the re-parsed batch is
+            # the authority for what runs; a recorded name it cannot reproduce means the loop
+            # cannot be rebuilt faithfully (a parser or budget change between invocations) and
+            # the run refuses instead of silently dropping a stage. Nothing has been written
+            # in this invocation, so the refusal leaves the recorded run untouched.
+            if not review_ran:
+                rebuilt_names = [entry.name for entry in fix_specs]
+                problem = _reconcile_recorded_fixes(
+                    _recorded_fix_names(state, review_index), rebuilt_names
+                )
+                if problem is not None:
+                    print(
+                        f"cannot resume: {problem} for review round {review_index} "
+                        f"({name}); the run's fix batch cannot be rebuilt from its recorded "
+                        "review. Nothing was changed.",
+                        file=sys.stderr,
+                    )
+                    return EXIT_REFUSED
+
+            def execute_fix(spec: StageSpec, banner: str = "") -> bool:
+                """Run one fix stage unless it already succeeded; return its success (H1.2)."""
+                note_from(spec.name)
+                if not should_run(spec.name):
+                    print(f"stage:  {spec.name} [skipped]")
+                    return True
+                if banner:
+                    print(banner)
+                _snapshot_fix_stage(
+                    stage=spec.name, directory=directory, prompt_path=prompt_path
+                )
+                pointer = _stage_evidence_pointer(
+                    stage=spec.name,
+                    directory=directory,
+                    repo=target,
+                    entry=entry,
+                    entries=entries,
+                    rel=rel,
+                    roadmap_dir=roadmap_dir,
+                )
+                rec_fix = run_stage(
+                    _with_pointer(spec, pointer),
+                    repo_root=target.root,
+                    toolkit_root=aidt.root,
+                    runs_root=runs_root,
+                    state=state,
+                    logger=logger,
+                    agents=agents,
+                    config=resolved_config,
+                )
+                print_stage(rec_fix, repo_root=target.root)
+                if rec_fix.status != SUCCEEDED:
+                    print(f"stage {spec.name} failed: {rec_fix.error}", file=sys.stderr)
+                    _mark_failed(state, directory, spec.name)
+                    return False
+                return True
+
             if unparseable:
                 if problems:
                     print(
@@ -1960,32 +2578,7 @@ def run(
                         f"({problems[0]}); reworking with the whole review instead"
                     )
                 for spec in fix_specs:
-                    _snapshot_fix_stage(
-                        stage=spec.name, directory=directory, prompt_path=prompt_path
-                    )
-                    pointer = _stage_evidence_pointer(
-                        stage=spec.name,
-                        directory=directory,
-                        repo=target,
-                        entry=entry,
-                        entries=entries,
-                        rel=rel,
-                        roadmap_dir=roadmap_dir,
-                    )
-                    rec_fix = run_stage(
-                        _with_pointer(spec, pointer),
-                        repo_root=target.root,
-                        toolkit_root=aidt.root,
-                        runs_root=runs_root,
-                        state=state,
-                        logger=logger,
-                        agents=agents,
-                        config=resolved_config,
-                    )
-                    print_stage(rec_fix, repo_root=target.root)
-                    if rec_fix.status != SUCCEEDED:
-                        state.status = FAILED
-                        save(directory, state)
+                    if not execute_fix(spec):
                         return 1
             else:
                 # Blocking findings are fixed one at a time so progress is visible per change;
@@ -2004,40 +2597,14 @@ def run(
                 ):
                     prefix = f"fix {revisions}.{index}/{total}:"
                     if kind == "finding":
-                        print(
+                        banner = (
                             f"{prefix} {finding_title(group[0])} "
                             f"[{group[0].priority}]"
                         )
                     else:
                         noun = "finding" if len(group) == 1 else "findings"
-                        print(f"{prefix} {len(group)} could-fix {noun} combined")
-
-                    _snapshot_fix_stage(
-                        stage=spec.name, directory=directory, prompt_path=prompt_path
-                    )
-                    pointer = _stage_evidence_pointer(
-                        stage=spec.name,
-                        directory=directory,
-                        repo=target,
-                        entry=entry,
-                        entries=entries,
-                        rel=rel,
-                        roadmap_dir=roadmap_dir,
-                    )
-                    rec_fix = run_stage(
-                        _with_pointer(spec, pointer),
-                        repo_root=target.root,
-                        toolkit_root=aidt.root,
-                        runs_root=runs_root,
-                        state=state,
-                        logger=logger,
-                        agents=agents,
-                        config=resolved_config,
-                    )
-                    print_stage(rec_fix, repo_root=target.root)
-                    if rec_fix.status != SUCCEEDED:
-                        state.status = FAILED
-                        save(directory, state)
+                        banner = f"{prefix} {len(group)} could-fix {noun} combined"
+                    if not execute_fix(spec, banner):
                         return 1
 
             # L3.4: one reconcile stage per fix batch, after the batch and before the next
@@ -2048,45 +2615,55 @@ def run(
             # matches neither ``task-review-N`` nor ``task-review-fixes-*`` — the L3.3 snapshot
             # writer, the ``_fix_round`` regex and the harness's ``fix_status`` branch all
             # leave it alone.
-            reconcile_render = ""
-            if briefs.get(reconcile_spec.name) == stage_registry.BRIEF_RECONCILE:
-                reconcile_render = stage_registry.render_reconcile(
-                    review=review_text,
-                    diff=_brief_diff(
-                        index=review_index,
-                        baseline=baseline_prompt,
-                        # Captured here, before run_stage: this is the fix batch's net
-                        # effect, not a diff polluted by the reconcile edit itself.
-                        current=_capture_prompt(prompt_path),
-                        rel=rel,
-                        verb="reconcile",
-                        brief_name="reconcile brief",
-                    ),
+            # H1.2 req 4: a resume skips a reconcile that already succeeded, and renders the
+            # brief only when the stage actually runs (a skipped stage's diff is both wasted
+            # work and a warning the operator cannot act on).
+            note_from(reconcile_spec.name)
+            if should_run(reconcile_spec.name):
+                reconcile_render = ""
+                if briefs.get(reconcile_spec.name) == stage_registry.BRIEF_RECONCILE:
+                    reconcile_render = stage_registry.render_reconcile(
+                        review=review_text,
+                        diff=_brief_diff(
+                            index=review_index,
+                            baseline=baseline_prompt,
+                            # Captured here, before run_stage: this is the fix batch's net
+                            # effect, not a diff polluted by the reconcile edit itself.
+                            current=_capture_prompt(prompt_path),
+                            rel=rel,
+                            verb="reconcile",
+                            brief_name="reconcile brief",
+                        ),
+                    )
+                pointer = _stage_evidence_pointer(
+                    stage=reconcile_spec.name,
+                    directory=directory,
+                    repo=target,
+                    entry=entry,
+                    entries=entries,
+                    rel=rel,
+                    roadmap_dir=roadmap_dir,
                 )
-            pointer = _stage_evidence_pointer(
-                stage=reconcile_spec.name,
-                directory=directory,
-                repo=target,
-                entry=entry,
-                entries=entries,
-                rel=rel,
-                roadmap_dir=roadmap_dir,
-            )
-            rec_reconcile = run_stage(
-                _with_pointer(reconcile_spec, pointer, reconcile_render),
-                repo_root=target.root,
-                toolkit_root=aidt.root,
-                runs_root=runs_root,
-                state=state,
-                logger=logger,
-                agents=agents,
-                config=resolved_config,
-            )
-            print_stage(rec_reconcile, repo_root=target.root)
-            if rec_reconcile.status != SUCCEEDED:
-                state.status = FAILED
-                save(directory, state)
-                return 1
+                rec_reconcile = run_stage(
+                    _with_pointer(reconcile_spec, pointer, reconcile_render),
+                    repo_root=target.root,
+                    toolkit_root=aidt.root,
+                    runs_root=runs_root,
+                    state=state,
+                    logger=logger,
+                    agents=agents,
+                    config=resolved_config,
+                )
+                print_stage(rec_reconcile, repo_root=target.root)
+                if rec_reconcile.status != SUCCEEDED:
+                    print(
+                        f"stage {reconcile_spec.name} failed: {rec_reconcile.error}",
+                        file=sys.stderr,
+                    )
+                    _mark_failed(state, directory, reconcile_spec.name)
+                    return 1
+            else:
+                print(f"stage:  {reconcile_spec.name} [skipped]")
 
             # L4.2 (review follow-up #31): recorded only now that the whole fix batch and
             # its reconcile ran — ``fix_stage_count`` is predicted above, and a round line
@@ -2102,7 +2679,15 @@ def run(
                 verdict_line,
             ]
         )
-        if require_approval:
+        # design §9.4: gates already approved are not re-asked, so a resume that reaches a
+        # run whose `approve-task-prompt` gate is recorded `approved` does not prompt again.
+        already_approved = any(
+            gate.name == GATE and gate.decision == "approved" for gate in state.gates
+        )
+        if already_approved:
+            print(f"gate:   {GATE} [already approved]")
+            outcome = GateOutcome(GATE, True, "already approved")
+        elif require_approval:
             outcome = decide(
                 GATE,
                 summary,
@@ -2126,8 +2711,7 @@ def run(
             mechanism=outcome.mechanism,
         )
         if not outcome.approved:
-            state.status = BLOCKED
-            save(directory, state)
+            _mark_blocked(state, directory)
             print(f"gate {GATE} denied ({outcome.mechanism}); stopping.", file=sys.stderr)
             return 3
 
@@ -2144,7 +2728,10 @@ def run(
                 file=sys.stderr,
             )
 
+        # H1.2 req 3: a successful run clears the resume key, so a later `--resume` cannot
+        # continue past a run that already finished.
         state.status = SUCCEEDED
+        state.resume = {"next_stage": None}
         save(directory, state)
         print("prompt workflow complete")
         print(f"branch: {branch_name}")
