@@ -315,8 +315,12 @@ def run_gate(
     no path here that turns "unknown" into "skip".
 
     A run is recorded whatever its exit code, so ``aidw gate list`` shows the failure;
-    only a pass is ever cited. The caller owns persisting ``run`` (the workflow saves
-    after the stage, the CLI saves immediately).
+    only a pass is ever cited. The caller owns persisting ``run``: the workflow through
+    ``state.save`` (which merges what is already on disk), the CLI through
+    ``state.append_gate_outcomes`` (H0.1, design §9.2). Neither path replaces the other's
+    rows, so an outcome recorded by a stage's own subprocess is still there — and still
+    citable — after the workflow's next save and after the run process exits. The reuse
+    rule itself is unchanged: same key, tree, command and declared scope, and ``passed``.
     """
     command = list(command)
     ignored = normalise_ignore(ignore)

@@ -118,7 +118,7 @@ same loss is what makes `pr` (I6) re-buy the gate suite `record` (I5) already pa
 lands first because it is the cheaper half of the phase and everything else that reads gate
 evidence depends on it.
 
-- [ ] **H0.1. Keep gate outcomes across stage boundaries** (Design 9, Design 14)
+- [x] **H0.1. Keep gate outcomes across stage boundaries** (Design 9, Design 14)
   E4.8 records every `aidw gate run <key> -- <command>` outcome in run state and lets a later
   stage cite it instead of paying for it again. Nothing survives. Every `state.json` in the state
   root shows `gate_outcomes: []` (94 of 94, E6.1's red `suite` among them) because a workflow's

@@ -1182,6 +1182,10 @@ def gate(
     Nothing is skipped that cannot be proven: without a resolvable base branch, without
     a run to cite from, with a differently declared scope, or with a previously *failed*
     outcome for this tree, the command runs. Use ``--force`` to run regardless.
+
+    A recorded outcome is written to the run's ``state.json`` under that run's
+    ``state.json.lock`` (design §9.2), so it survives the workflow's next save and is
+    still there for a later stage — or a later process — to cite (H0.1).
     """
     repo, _aidt, workspace = _roots()
     runs_root = workspace.state_root / "runs"
@@ -1252,8 +1256,13 @@ def gate(
         tail=tail,
         timeout=timeout,
     )
-    if recorded is not None and not result.reused:
-        state_mod.save(state_mod.run_dir(runs_root, recorded.run_id), recorded)
+    if recorded is not None and not result.reused and result.outcome is not None:
+        # Append-only, under the state lock (H0.1 Req 3(ii)): a full-state save of the
+        # ``recorded`` copy loaded before the gate ran would drop any stage record the
+        # workflow wrote while this process was executing the command.
+        state_mod.append_gate_outcomes(
+            state_mod.run_dir(runs_root, recorded.run_id), [result.outcome]
+        )
 
     if json_output:
         typer.echo(json.dumps(result.to_dict()))
