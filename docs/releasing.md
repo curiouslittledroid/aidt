@@ -20,6 +20,37 @@ import package and console command are **`aidw`** (D7). A release is a **git tag
 Release tags carry the `v` prefix and are **annotated** (`git tag -a`); `baseline-verbatim` is
 unprefixed and is history, not distribution. The two schemes are deliberately distinct.
 
+## The helper
+
+`scripts/release.py` performs the three steps below, because the sequence has five places that
+must agree and two of them — `uv.lock` and the tag's commit — are only correct if they move in the
+same step. It is a convenience over this document, not a replacement: every rule it enforces is
+stated here, and `--dry-run` prints the edits and commands without writing, running or pushing
+anything.
+
+```bash
+uv run python scripts/release.py --root . bump 1.1.0            # gates, then branch + commit + PR
+uv run python scripts/release.py --root . bump 1.1.0 --direct   # gates, then commit on main + push
+uv run python scripts/release.py --root . tag 1.1.0             # annotated tag on merged main
+uv run python scripts/release.py --root . verify 1.1.0          # D9 install forms, clean tool venv
+```
+
+- **`bump`** rewrites the three version sites (§1), re-syncs `uv.lock`, runs the `AGENTS.md` gate
+  set, then delivers: through a PR branch by default (§1's rule), or straight to `main` with
+  `--direct` — the pre-1.0 practice, which skips review **and** CI. `--direct --tag` chains the tag.
+- **`tag`** refuses unless `main` is clean, checked out, and equal to `origin/main`, the tree
+  carries exactly the version being tagged, and the tag does not already exist locally or on
+  `origin` (§2). It never moves an existing tag.
+- **`verify`** installs the pushed tag into a throwaway tool venv and cache (`UV_TOOL_DIR`,
+  `UV_TOOL_BIN_DIR`, `UV_CACHE_DIR`) with both D9 forms and checks `aidw --version` (§3). It prints
+  the `aidw doctor` line to run by hand, because that check needs a bootstrapped workspace.
+
+`--root` is a top-level option, so it precedes the subcommand. `tests/test_release_script.py` pins
+the site patterns, the refusals and the gate list; it bumps throwaway fixtures, never this tree.
+
+**The tag is still cut by a human.** "No stage pushes tags" (§1) is about the workflows: `aidw`
+never tags or releases, and `tag` is an operator step you run after the release commit is merged.
+
 ## 1. Bump the version — three edits, in lockstep
 
 Versions are **semantic** (EXTRACTION.md §3.11): `MAJOR.MINOR.PATCH`, and which component moves is
@@ -69,7 +100,9 @@ prompts, agent configs and the `git`/`gh`/`pi` externals. A release whose smoke 
 a release — fix it and tag again with a new version, never move the tag.
 
 Ship the bump through the normal delivery path: one branch, one PR, review, merge to `main`.
-AIDT never merges, and no stage pushes tags.
+AIDT never merges, and no stage pushes tags. `scripts/release.py bump` (see [The helper](#the-helper))
+does the edits, the gates and the branch/PR for you; `--direct` skips the PR and is the reason a
+version bump can land un-reviewed, which is how CI went red on the 1.0.0 bump.
 
 ## 2. Cut the annotated tag on merged `main`
 
