@@ -7,4 +7,4 @@ of the Mythical Forge product and creates no AWS resources.
 See ``aidt/design.md`` for the full design.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
