@@ -6,10 +6,10 @@ stage that already succeeded — because `aidw prompt` cannot resume and the onl
 manual re-run from the author.
 
 This phase changes the Pi attempt loop, the delta brief's size contract, the prompt workflow's
-resumability, and — in epic H3 — which stage owns the roadmap tick. It does **not** change the
-loop's convergence rules (Phase 02), model routing, or the shape of `prompt`/`review`/`approve`;
-`implement`'s chain becomes seven stages and `fix` gains one after its loop, both for the tick
-alone.
+resumability, the run state's gate evidence (epic H0), and — in epic H3 — which stage owns the
+roadmap tick. It does **not** change the loop's convergence rules (Phase 02), model routing, or
+the shape of `prompt`/`review`/`approve`; `implement`'s chain becomes seven stages and `fix`
+gains one after its loop, both for the tick alone.
 
 ## Evidence: the runs this phase is derived from
 
@@ -86,7 +86,7 @@ was about.
 | `E2.4`/`E2.5` (AIDT owns branch creation; `aidw prompt` runs in the control worktree) | H1.2 reuses the existing task worktree instead of creating one, so it edits the same branch-setup code and must preserve the one-run-per-worktree lock (design §3.2). |
 | `E4.3` (config-driven plans) | H2.1 edits `stage_registry.render_delta_brief`, which E4.3 moved out of `prompt.py`, and must keep `--dry-run` for `prompt` byte-identical (E4.3's Done when). |
 | Phase 02 `L2.3` (delta brief) and `L3.4` (reconcile) | H2.1 changes what a later round is told. L2.3's purpose — a per-finding `resolved`/`not resolved`/`newly contradicted` verdict before any new finding — must survive the substitution. |
-| `E4.8` (whole-repo gates, recorded once and cited) | H3.2's condition is a read of the outcomes `aidw gate run` recorded (design §14); it cannot cite evidence the run does not keep. |
+| `E4.8` (whole-repo gates, recorded once and cited) | H3.2's condition is a read of the outcomes `aidw gate run` recorded (design §14); it cannot cite evidence the run does not keep. H0.1 is that half of E4.8 — the outcomes are recorded today but do not survive a stage boundary — and is a prerequisite for H3.2. |
 | `E5.1`/`E5.2` (`aidw.roadmap` and the configured `paths.roadmap_dir`) | H3.1 resolves the tick's entry through `find_task` against the resolved config, so the stage names no `docs/tasks` literal (D15/D17's two readers). |
 | `E6.1` (the incident this epic exists for) | `20261105T030527Z-00-E6.1-implement` is H3.2's acceptance replay: the stage flipped E6.1's box and reverted it against a red `suite`. |
 | `E9.1` (rewrite `design.md`) | H1.1, H1.2 and H3.1 amend design §9.3, §10 and §8.2 and record the decisions in §17; E9.1 carries them forward. |
@@ -110,6 +110,59 @@ uv run python -c 'import pathlib; from aidw.roadmap import load_tasks; t=load_ta
 Every behaviour change here is proven by a fake Pi argv or a fake stage (AGENTS.md §Tests, design
 §15) — no task in this phase may invoke a real model, and each must be observable from
 `state.json`/`run.log` without reading a transcript.
+
+## Epic H0: Keep the gate evidence
+
+H3.2 asks "is a pass recorded for the tree the tick edits". The answer today is always no, and the
+same loss is what makes `pr` (I6) re-buy the gate suite `record` (I5) already passed. This epic
+lands first because it is the cheaper half of the phase and everything else that reads gate
+evidence depends on it.
+
+- [ ] **H0.1. Keep gate outcomes across stage boundaries** (Design 9, Design 14)
+  E4.8 records every `aidw gate run <key> -- <command>` outcome in run state and lets a later
+  stage cite it instead of paying for it again. Nothing survives. Every `state.json` in the state
+  root shows `gate_outcomes: []` (94 of 94, E6.1's red `suite` among them) because a workflow's
+  `save()` rewrites the file from the in-memory `RunState` it loaded at `create_run`, dropping
+  whatever the agent's `aidw gate run` subprocess appended. The split is visible in one run:
+  `reused: gate 'srd' passed … by stage 'update-traceability'` shows intra-stage reuse working,
+  and no citation ever crosses a stage boundary — the signature of the save, not of a missing
+  rule. Measured on the three `03.1-B*` implement runs, `pr` spends 53–75s — 42–55% of its wall
+  clock — inside `aidw gate run`, re-buying `lint`/`build` that `record` had passed on the
+  identical tree minutes earlier (tree `7955d5effa2d`: passed by `record` at 06:55:07Z and
+  06:55:18Z, bought again by `pr` at 06:56:33Z and 06:56:42Z).
+  A second, independent loss is concurrent: Pi issues tool calls in parallel within one turn, so
+  one turn ran `lint`, `build` and `suite` as three simultaneous `aidw gate run` processes, each
+  read-modify-writing the same `state.json` — at most one of the three can survive even with the
+  workflow's overwrite fixed, and `aidw/runner.py`'s `_STATE_LOCK` is in-process only, so it does
+  not serialize them.
+  - Deliverable: one owner for the file. Either an append-only outcome log per run that
+    `aidw gate run` appends to and every citation reads, or a merge-on-write of `gate_outcomes`
+    performed under a cross-process file lock and published with `os.replace`, so no reader ever
+    sees a half-written `state.json` and neither writer can drop the other's rows — the loss is
+    symmetric: a stage record the workflow wrote must survive a later CLI write too. Amend design
+    §9.2's `gate_outcomes` paragraph and §14 to state who writes the file under which lock, and
+    record the decision in §17.
+  - Done when: an outcome `aidw gate run` recorded is still present and unchanged after the
+    workflow's next `save()` — the round trip, not the write; a gate `test` passed for tree `T` is
+    cited by `record` and by `pr` in one uninterrupted chain with the command executed once,
+    proven by a counter outside the repository (E4.8's own technique) rather than by output text;
+    two `aidw gate run` invocations that overlap for one run both record an outcome and neither is
+    lost; no `state.json` is observed truncated or missing a stage record while a CLI write and a
+    workflow write overlap; and `aidw gate list` / `aidw runs show` report the outcomes after the
+    run process has exited, not only while it is running.
+  - Tests: `tests/test_verification.py` extended to drive `aidw/runner.py:run_stage` with a fake
+    argv instead of faking a stage by setting `AIDW_STAGE` alone — that shortcut is why this loss
+    is green today — plus a threaded pair of `cli.invoke(app, ["gate", "run", …])` calls against
+    one run asserting both outcomes survive, and the save-after-gate round trip.
+  - Notes: rejected — "read the file at the moment of the decision", which H3.2's earlier wording
+    allowed. That answers the tick's question and leaves every agent-side citation broken,
+    including the `pr` citations above, which the agent reads during its own stage. Rejected —
+    retry the failed gate: E4.8's rule is cite-or-run, and a re-run buys the same answer for the
+    same tree. E4.8's Done when ("a run whose `test` stage gated tree `T` performs no second
+    full-suite run for `T` in `record`") is disproved by the same 94 runs and is what H0.1
+    closes; `docs/tasks/00 - Extraction.md`'s E4.8 "Progress" line should name it instead of
+    leaving the box ticked with the gap in a trailing sentence. H0.1 changes neither which stages
+    gate nor what a red gate stops.
 
 ## Epic H1: A stage that returns nothing
 
@@ -279,24 +332,25 @@ Every behaviour change here is proven by a fake Pi argv or a fake stage (AGENTS.
     "green" and E4.8's contract is cite-or-run, never assume. A skip records a skipped stage
     naming the failing gate(s) or the absence, leaves the checkbox byte-identical — nothing flips,
     so nothing needs reverting — and changes no exit status, since the red gate already decided
-    the run. The condition is only real if the evidence survives the run: every `state.json` in
-    the state root today shows `gate_outcomes: []` (94 of 94, E6.1's red `suite` among them)
-    because a workflow's `save()` rewrites the file from its in-memory copy and drops what the
-    agent's `aidw gate run` subprocess appended, so reload-and-merge (or reading the file at the
-    moment of the decision) is part of this task, not an assumption behind it.
+    the run. The condition is only real if the evidence survives the run, which today it does not:
+    every `state.json` in the state root shows `gate_outcomes: []` (94 of 94, E6.1's red `suite`
+    among them). **H0.1 lands first and fixes that** — it records the loss, its mechanism and its
+    concurrency, and it is where the fix is proven. This task names it as a predecessor rather
+    than restating it, so one decision has one owner and the tick does not carry a second,
+    differently worded copy of it.
   - Done when: replaying the E6.1 shape (green `build`/`doctor`/`agents`/`prompts`, red `suite`)
     leaves the box unticked, records the stage `skipped` naming `suite`, and writes no roadmap
     change at all; the same run with `suite` green ticks it exactly once; a second green run on an
     already-ticked box is a successful no-op; a run whose gates recorded nothing skips with its own
     reason; and no stage in the chain can tick a box the run has no evidence for.
   - Tests: `tests/test_implement_workflow.py` with fake gate outcomes and a fake stage — the skip
-    reason, the untouched file, the single tick, the missing-evidence skip — plus a state-persistence
-    test that a gate outcome written through the CLI path is still there after the workflow's next
-    save.
+    reason, the untouched file, the single tick, the missing-evidence skip — reading outcomes H0.1
+    guarantees survive. The persistence test itself belongs to H0.1, not here.
   - Notes: rejected — instruct the agent to "run the tests and tick if they pass": that is the
     judgement that produced the flip and the revert, it pays for a suite run the run has already
     recorded, and it re-opens the same red-gate hole. I3 and I4 stay ungated: they are the repo's
-    own documents, and E4.8's gate scope belongs to I5.
+    own documents, and E4.8's gate scope belongs to I5. Depends on H0.1 (the evidence) and H3.1
+    (the stage it gates).
 
 - [ ] **H3.3. Give `fix` the same tick, once its loop converges** (Design 8.4, Design 8.6, H3.1)
   `fix` is where a task the review found wanting actually finishes — every `prompt-to-fix` chain
