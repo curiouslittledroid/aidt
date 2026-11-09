@@ -2,7 +2,8 @@
 
 Runs ``pi`` non-interactively (``-p``), pipes the rendered prompt on stdin, captures
 stdout (JSONL in ``--mode json``) to a stage log, and parses the final assistant message
-and usage. Retries once on a clearly transient invocation error (design E6); never
+and usage. Retries once on a clearly transient invocation error (design E6, §10) and once
+in a **fresh session** when a clean attempt produced no final text (H1.1, §10); never
 retries a gate failure.
 """
 
@@ -59,6 +60,37 @@ class ParsedRun:
     error_message: str | None = None
     usage: Usage = field(default_factory=Usage)
 
+    @property
+    def provider_error(self) -> bool:
+        """True when the provider reported a failure inside this attempt's stream.
+
+        The same predicate :attr:`PiResult.provider_error` exposes, kept on the parsed
+        stream so the retry decision is made from one value rather than re-tested
+        inline (H1.1's provider-error precedence: a 402 is exit 0 + empty final text
+        and must never be retried as a truncation).
+        """
+        return self.stop_reason == "error" or bool(self.error_message)
+
+
+@dataclass
+class AttemptDetail:
+    """One Pi invocation's record, kept per attempt in the stage ``.meta.json`` (H1.1).
+
+    A retried stage overwrites the stage JSONL with the last attempt's transcript and
+    keeps only the final attempt's scalar fields on :class:`PiResult`, so the first
+    attempt's cost would otherwise vanish. This is the additive ``attempts_detail``
+    entry that keeps it visible: the attempt's own session id (the retry's is the base
+    ``-retry`` id), exit code, stop reason, usage counters and timing windows.
+    """
+
+    attempt: int
+    session_id: str | None
+    exit_code: int
+    stop_reason: str | None
+    usage: Usage
+    generation_seconds: float
+    tool_seconds: float
+
 
 @dataclass
 class PiResult:
@@ -83,6 +115,8 @@ class PiResult:
     tool_seconds: float | None = None
     #: Seconds per tool name, longest first (``{"bash": 12.3, "read": 4.5}``).
     tool_breakdown: dict[str, float] = field(default_factory=dict)
+    #: One entry per attempt that actually ran (H1.1); ``attempts`` is its length.
+    attempts_detail: list[AttemptDetail] = field(default_factory=list)
 
     @property
     def output_tokens_per_second(self) -> float | None:
@@ -100,7 +134,8 @@ class PiResult:
         """True when the provider/agent reported an error inside the event stream.
 
         Pi can exit 0 while the run failed (for example an OpenRouter 402 emitted
-        with ``stopReason: "error"``). Such a stage must not be reported as succeeded.
+        with ``stopReason: "error"``). Such a stage must not be reported as succeeded,
+        and (H1.1) must never be retried by the empty-final-message branch.
         """
         return self.stop_reason == "error" or bool(self.error_message)
 
@@ -348,6 +383,69 @@ def is_transient(stderr: str, exit_code: int) -> bool:
     return any(pattern in lowered for pattern in TRANSIENT_PATTERNS)
 
 
+#: Pi's session-id flag, as ``aidw.agents.build_argv`` emits it.
+SESSION_ID_FLAG = "--session-id"
+#: Suffix that makes the retry's session distinct from the truncated one (H1.1, §17 U1).
+RETRY_SESSION_SUFFIX = "-retry"
+
+
+def retry_session_id(base: str) -> str:
+    """The fresh session id a truncation retry uses (H1.1).
+
+    Deterministic from ``aidw.state.session_id``'s base id: resuming the truncated
+    session would truncate again, so the retry must not share it.
+    """
+    return f"{base}{RETRY_SESSION_SUFFIX}"
+
+
+def retry_argv(argv: list[str]) -> list[str]:
+    """Copy ``argv`` whose ``--session-id`` value is the ``-retry`` session (H1.1).
+
+    ``build_argv`` bakes the base session id into the argv before :func:`execute` runs, so
+    re-running the identical argv resumes the truncated session. Returning a copy keeps
+    the caller's argv (recorded in the stage meta) unchanged.
+
+    An invocation that carries no ``--session-id`` (only a direct :func:`execute` caller;
+    ``run_stage`` always emits one) has no context to resume: Pi starts a fresh session
+    per invocation, so that argv is returned unchanged rather than given an invented id.
+    """
+    updated = list(argv)
+    for index, item in enumerate(updated[:-1]):
+        if item == SESSION_ID_FLAG:
+            updated[index + 1] = retry_session_id(updated[index + 1])
+            break
+    return updated
+
+
+def retry_on_empty_final_message(
+    parsed: ParsedRun, exit_code: int, timed_out: bool
+) -> bool:
+    """True when a clean attempt produced no final text and may be retried once (H1.1).
+
+    One predicate, deliberately gated on ``provider_error``: a 402 is exit 0 with empty
+    final text, and design §10 says a provider error fails rather than retries. Empty
+    means what ``parse_events`` reports (it strips assistant text), so this shares the
+    out-file gate and the workflows' ``not text.strip()`` notion of empty.
+    """
+    return (
+        exit_code == 0
+        and not timed_out
+        and not parsed.provider_error
+        and parsed.final_message == ""
+    )
+
+
+def _add_usage_total(total: Usage, usage: Usage) -> None:
+    """Accumulate one attempt's counters into a stage total (H1.1)."""
+    total.input_tokens += usage.input_tokens
+    total.output_tokens += usage.output_tokens
+    total.cache_read += usage.cache_read
+    total.cache_write += usage.cache_write
+    total.reasoning += usage.reasoning
+    total.total_tokens += usage.total_tokens
+    total.cost_usd += usage.cost_usd
+
+
 def _kill_group(proc: subprocess.Popen[str]) -> None:
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -459,7 +557,17 @@ def execute(
     retry_transient: bool = True,
     progress: ProgressIndicator | None = None,
 ) -> PiResult:
-    """Run Pi, capture its JSONL transcript, and parse the final message."""
+    """Run Pi, capture its JSONL transcript, and parse the final message.
+
+    H1.1: the attempt loop gains one second attempt when a clean invocation produced no
+    final text (``retry_on_empty_final_message``), in a **fresh session** whose id is the
+    base ``-retry`` id. Both retry branches share today's cap —
+    ``max_attempts = 2 if retry_transient else 1`` — so neither can add a third attempt
+    and ``--no-retry-transient`` disables both. Usage and timing counters are summed over
+    the attempts that ran, so the stage record's cost and ``out-tok/s`` stay truthful
+    (design §9.2/§9.3); the last attempt's transcript overwrites the stage JSONL and each
+    attempt's own numbers survive in ``attempts_detail``.
+    """
     stage_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = stage_dir / f"{stage_name}.jsonl"
     out_path = stage_dir / f"{stage_name}.out.txt"
@@ -467,6 +575,14 @@ def execute(
     attempts = 0
     max_attempts = 2 if retry_transient else 1
     start = time.monotonic()
+    attempts_detail: list[AttemptDetail] = []
+    usage_total = Usage()
+    generation_total = 0.0
+    tool_total = 0.0
+    breakdown_total: dict[str, float] = {}
+    event_total = 0
+    tool_calls_total = 0
+    tool_errors_total = 0
 
     while True:
         attempts += 1
@@ -481,6 +597,51 @@ def execute(
             arrivals=arrivals,
         )
         jsonl_path.write_text(stdout, encoding="utf-8")
+        lines = stdout.splitlines()
+        parsed = parse_json_lines(lines)
+        # Generation time comes from when AIDW read each event, not from Pi (it
+        # timestamps nothing), so prefill and tool execution are excluded. One parse
+        # feeds both the total and the per-tool split; the total is the sum of the
+        # (already rounded) parts so ``runs show`` can never print parts that disagree.
+        generation = generation_seconds(zip(arrivals, lines))
+        breakdown = tool_breakdown(zip(arrivals, lines))
+        attempt_tool_seconds = round(sum(breakdown.values()), 3)
+        attempts_detail.append(
+            AttemptDetail(
+                attempt=attempts,
+                session_id=parsed.session_id,
+                exit_code=exit_code,
+                stop_reason=parsed.stop_reason,
+                usage=parsed.usage,
+                generation_seconds=generation,
+                tool_seconds=attempt_tool_seconds,
+            )
+        )
+        # Capture each attempt before a retry overwrites the transcript, so the stage
+        # record's usage/cost and timing are the sum of the attempts that ran.
+        _add_usage_total(usage_total, parsed.usage)
+        generation_total += generation
+        tool_total += attempt_tool_seconds
+        for name, seconds in breakdown.items():
+            breakdown_total[name] = round(breakdown_total.get(name, 0.0) + seconds, 3)
+        event_total += parsed.event_count
+        tool_calls_total += parsed.tool_calls
+        tool_errors_total += parsed.tool_errors
+
+        if (
+            retry_transient
+            and attempts < max_attempts
+            and retry_on_empty_final_message(parsed, exit_code, timed_out)
+        ):
+            # Visible in run.log as well as the meta: the roadmap asks for both attempts
+            # to be observable without reading a transcript.
+            logger.warn(
+                f"stage {stage_name}: no final message on attempt {attempts} "
+                f"(stop_reason {parsed.stop_reason or 'unknown'}); "
+                "retrying once in a fresh session"
+            )
+            argv = retry_argv(argv)
+            continue
 
         if (
             retry_transient
@@ -496,16 +657,16 @@ def execute(
         break
 
     duration = round(time.monotonic() - start, 3)
-    lines = stdout.splitlines()
-    parsed = parse_json_lines(lines)
-    # Generation time comes from when AIDW read each event, not from Pi (it timestamps
-    # nothing), so prefill and tool execution are excluded. ``arrivals`` belongs to the
-    # last attempt: a retry overwrites the transcript, which is accepted.
-    generation = generation_seconds(zip(arrivals, lines)) or None
-    # One parse feeds both the total and the per-tool split; the total is the sum of the
-    # (already rounded) parts so ``runs show`` can never print parts that disagree with it.
-    breakdown = tool_breakdown(zip(arrivals, lines))
-    tool_time = round(sum(breakdown.values()), 3) or None
+    # A measurable window of 0.0 stays ``None`` on the stage record (existing contract);
+    # the per-attempt values stay in ``attempts_detail`` either way.
+    generation = round(generation_total, 3) or None
+    tool_time = round(tool_total, 3) or None
+    breakdown = {
+        name: seconds
+        for name, seconds in sorted(
+            breakdown_total.items(), key=lambda item: item[1], reverse=True
+        )
+    }
     if parsed.final_message:
         out_path.write_text(parsed.final_message + "\n", encoding="utf-8")
         final_out: str | None = str(out_path)
@@ -521,19 +682,19 @@ def execute(
     else:
         logger.info(
             f"Pi finished in {duration}s "
-            f"({parsed.event_count} events, {parsed.tool_calls} tool calls, "
-            f"cost ${parsed.usage.cost_usd:.4f})"
+            f"({event_total} events, {tool_calls_total} tool calls, "
+            f"cost ${usage_total.cost_usd:.4f})"
         )
 
     return PiResult(
         exit_code=exit_code,
         session_id=parsed.session_id,
         final_message=parsed.final_message,
-        usage=parsed.usage,
+        usage=usage_total,
         duration_seconds=duration,
-        event_count=parsed.event_count,
-        tool_calls=parsed.tool_calls,
-        tool_errors=parsed.tool_errors,
+        event_count=event_total,
+        tool_calls=tool_calls_total,
+        tool_errors=tool_errors_total,
         stop_reason=parsed.stop_reason,
         stderr=stderr,
         timed_out=timed_out,
@@ -544,6 +705,7 @@ def execute(
         generation_seconds=generation,
         tool_seconds=tool_time,
         tool_breakdown=breakdown,
+        attempts_detail=attempts_detail,
     )
 
 
@@ -575,6 +737,7 @@ def write_meta(
         "session_id": result.session_id,
         "duration_seconds": result.duration_seconds,
         "attempts": result.attempts,
+        "attempts_detail": [asdict(attempt) for attempt in result.attempts_detail],
         "timed_out": result.timed_out,
         "stop_reason": result.stop_reason,
         "error_message": result.error_message,

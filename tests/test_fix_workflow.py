@@ -142,6 +142,9 @@ class _FakeStages:
             agent=spec.agent_id,
             model="test/model",
             status=SUCCEEDED,
+            # The empty code-review case below models H1.1's double-truncation result.
+            stop_reason="length" if spec.name.endswith("code-review") and not self.review_text else None,
+            attempts=2 if spec.name.endswith("code-review") and not self.review_text else None,
             artifacts={"out": str(out)},
         )
         kwargs["state"].record_stage(record)
@@ -194,6 +197,24 @@ def test_no_available_child_is_success(tmp_path: Path, monkeypatch) -> None:
     assert stages.repo_roots == [worktree]
     # The approve step must not succeed on the agent's exit code alone (design §10).
     assert callable(stages.specs[0].verify)
+
+
+def test_empty_code_review_names_both_truncated_attempts(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    control, _worktree = _fix_layout(tmp_path)
+    _patch(
+        monkeypatch,
+        select_impl=_select_seq([_select_ok(), _select_ok(), _select_none()]),
+    )
+    monkeypatch.setattr(fix_workflow, "run_stage", _FakeStages(""))
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 1
+
+    stderr = capsys.readouterr().err
+    assert "iter1-code-review: both attempts produced no final message" in stderr
+    assert "final stop_reason: length" in stderr
+    assert "both attempts were truncated" in stderr
 
 
 def test_clean_iteration_closes_child(tmp_path: Path, monkeypatch) -> None:

@@ -3951,6 +3951,11 @@ def test_l42_empty_review_exit_stays_gate_less(
             agent=spec.agent_id,
             model="test-model",
             status=SUCCEEDED,
+            # Model the real H1.1 result: both clean attempts were truncated and the
+            # final attempt reported ``length``. The workflow must not collapse this
+            # evidence back to the old bare message.
+            stop_reason="length" if spec.name != "task-prompt" else None,
+            attempts=2 if spec.name != "task-prompt" else 1,
             artifacts={"out": str(out)},
         )
         state.record_stage(record)
@@ -3967,7 +3972,9 @@ def test_l42_empty_review_exit_stays_gate_less(
     assert latest.status == state.FAILED
     assert not any(g.name == "approve-task-prompt" for g in latest.gates)
     log = _run_log(tmp_path, latest.run_id)
-    assert "produced no final message" in log
+    assert "task-review-1: both attempts produced no final message" in log
+    assert "final stop_reason: length" in log
+    assert "both attempts were truncated" in log
     assert "approved=" not in log
     assert "fixes_after_last_review" not in log
 

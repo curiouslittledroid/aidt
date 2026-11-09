@@ -166,7 +166,7 @@ evidence depends on it.
 
 ## Epic H1: A stage that returns nothing
 
-- [ ] **H1.1. Retry a stage whose final message never arrived** (Design 10, Design 14)
+- [x] **H1.1. Retry a stage whose final message never arrived** (Design 10, Design 14)
   A truncation is distinguishable from a refusal: the invocation exits 0, the transcript's last
   message is a `thinking` block with no text, and `stop_reason` says `length`. Today all three
   collapse into "produced no final message" and the run dies, even though the stage had already

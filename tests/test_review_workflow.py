@@ -101,6 +101,9 @@ class _FakeStages:
             model="test/model",
             status=status,
             error=error,
+            # The empty review case below models H1.1's double-truncation result.
+            stop_reason="length" if spec.name == "code-review" and not self.review_text else None,
+            attempts=2 if spec.name == "code-review" and not self.review_text else None,
             artifacts={"out": str(out)},
         )
         kwargs["state"].record_stage(record)
@@ -132,6 +135,25 @@ def _patch(
 def _no_run_state(repo: Path) -> None:
     runs_root = _runs_root(repo)
     assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- #
+# H1.1: a double-truncated review fails with attempt evidence
+# --------------------------------------------------------------------------- #
+
+
+def test_empty_review_names_both_truncated_attempts(
+    worktree_repo, monkeypatch, capsys
+) -> None:
+    _patch(monkeypatch)
+    monkeypatch.setattr(review_workflow, "run_stage", _FakeStages(""))
+
+    assert review_workflow.run(pr=7, **_roots(worktree_repo.control)) == 1
+
+    stderr = capsys.readouterr().err
+    assert "code-review: both attempts produced no final message" in stderr
+    assert "final stop_reason: length" in stderr
+    assert "both attempts were truncated" in stderr
 
 
 # --------------------------------------------------------------------------- #

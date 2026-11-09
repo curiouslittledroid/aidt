@@ -4,20 +4,27 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
 
 import pytest
 
+import aidw.pi as pi_module
+from aidw.log import RunLogger
 from aidw.pi import (
     PiResult,
     Usage,
     _invoke,
+    execute,
     generation_seconds,
     is_transient,
     parse_events,
     parse_json_lines,
+    retry_argv,
+    retry_on_empty_final_message,
+    retry_session_id,
     tool_breakdown,
     tool_breakdown_from_log,
     tool_execution_seconds,
@@ -578,3 +585,372 @@ def test_invoke_records_line_arrivals(tmp_path: Path) -> None:
     assert timed_out is False
     assert len(arrivals) == len(stdout.splitlines()) == 2
     assert arrivals[1] - arrivals[0] >= 0.1
+
+
+# ── H1.1: one fresh-session retry when no final message arrived ──────────── #
+#
+# The fake Pi echoes its own ``--session-id`` so every assertion about the retry's
+# session is read from what the child was actually invoked with, not from AIDW's plan.
+# Its tool call carries a deterministic ``durationMs`` (500ms base, 1000ms retry), which
+# makes the summed ``tool_seconds`` hand-checkable; its two message windows are real
+# monotonic 50ms sleeps, so generation time must be *summed*, not taken from one attempt.
+
+FAKE_PI = r'''
+import json, os, sys, time
+
+sys.stdin.read()
+args = sys.argv[1:]
+session = ""
+if "--session-id" in args:
+    index = args.index("--session-id")
+    if index + 1 < len(args):
+        session = args[index + 1]
+mode = os.environ.get("FAKE_PI_MODE", "answer")
+retried = session.endswith("-retry")
+
+
+def emit(event):
+    print(json.dumps(event), flush=True)
+
+
+emit({"type": "session", "id": session})
+
+if mode == "provider_error":
+    emit({"type": "message_end", "message": {
+        "role": "assistant",
+        "content": [],
+        "usage": {"input": 4, "output": 0, "totalTokens": 4,
+                  "cost": {"total": 0.0001}},
+        "stopReason": "error",
+        "errorMessage": "402: insufficient credits"}})
+    sys.exit(0)
+
+if mode == "nonzero":
+    print("fatal stage failure", file=sys.stderr, flush=True)
+    sys.exit(7)
+
+emit({"type": "tool_execution_end", "toolCallId": "t1", "toolName": "read",
+      "isError": False, "durationMs": 1000 if retried else 500})
+emit({"type": "message_update", "usage": {"output": 0}})
+time.sleep(0.05)
+
+if mode == "truncate" or (mode == "truncate_then_answer" and not retried):
+    emit({"type": "message_end", "message": {
+        "role": "assistant",
+        "content": [{"type": "thinking", "thinking": "cut off"}],
+        "usage": {"input": 10, "output": 7, "cacheRead": 2, "totalTokens": 19,
+                  "cost": {"total": 0.001}},
+        "stopReason": "length"}})
+elif mode == "whitespace":
+    emit({"type": "message_end", "message": {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "   "}],
+        "usage": {"input": 1, "output": 1, "cacheRead": 2, "totalTokens": 4,
+                  "cost": {"total": 0.0002}},
+        "stopReason": "stop"}})
+else:
+    emit({"type": "message_end", "message": {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "the answer"}],
+        "usage": {"input": 20, "output": 3, "cacheRead": 4, "totalTokens": 27,
+                  "cost": {"total": 0.002}},
+        "stopReason": "stop"}})
+'''
+
+
+def _execute_with_fake_pi(
+    tmp_path: Path,
+    mode: str,
+    *,
+    retry_transient: bool = True,
+    session: str = "aidw-run-implimenter",
+) -> tuple[PiResult, str]:
+    """Drive the real ``execute`` against a fake ``pi``; return the result and run.log."""
+    env = dict(os.environ)
+    env["FAKE_PI_MODE"] = mode
+    logger = RunLogger(tmp_path)
+    result = execute(
+        [sys.executable, "-c", FAKE_PI, "--session-id", session],
+        "the prompt",
+        env=env,
+        cwd=tmp_path,
+        timeout=30.0,
+        stage_dir=tmp_path / "stages",
+        stage_name="task-review-1",
+        logger=logger,
+        retry_transient=retry_transient,
+    )
+    return result, (tmp_path / "run.log").read_text(encoding="utf-8")
+
+
+def test_execute_retries_a_truncated_attempt_in_a_fresh_session(tmp_path: Path) -> None:
+    """Spec example: attempt 1 is `length`, attempt 2 answers; both costs are recorded."""
+    result, log = _execute_with_fake_pi(tmp_path, "truncate_then_answer")
+
+    assert result.attempts == 2
+    assert result.final_message == "the answer"
+    assert [a.session_id for a in result.attempts_detail] == [
+        "aidw-run-implimenter",
+        "aidw-run-implimenter-retry",
+    ]
+    assert [a.stop_reason for a in result.attempts_detail] == ["length", "stop"]
+    assert [a.exit_code for a in result.attempts_detail] == [0, 0]
+
+    # Hand-calculated sum of both attempts' counters.
+    assert result.usage.input_tokens == 30
+    assert result.usage.output_tokens == 10
+    assert result.usage.cache_read == 6
+    assert result.usage.total_tokens == 46
+    assert result.usage.cost_usd == pytest.approx(0.003)
+    # The final attempt's stop reason is the stage's.
+    assert result.stop_reason == "stop"
+    assert result.out_path is not None
+
+    # Tool time is the deterministic sum (0.5s base + 1.0s retry), not the last attempt.
+    assert result.tool_seconds == pytest.approx(1.5)
+    assert [a.tool_seconds for a in result.attempts_detail] == [0.5, 1.0]
+
+    # Generation time is summed across both measured windows.
+    first, second = result.attempts_detail
+    assert first.generation_seconds > 0 and second.generation_seconds > 0
+    assert result.generation_seconds == pytest.approx(
+        first.generation_seconds + second.generation_seconds
+    )
+    assert result.generation_seconds > max(
+        first.generation_seconds, second.generation_seconds
+    )
+    # Throughput pairs summed tokens with summed seconds.
+    assert result.output_tokens_per_second == round(
+        result.usage.output_tokens / result.generation_seconds, 1
+    )
+
+    retry_lines = [line for line in log.splitlines() if "retrying once in a fresh session" in line]
+    assert len(retry_lines) == 1
+    assert "task-review-1" in retry_lines[0]
+    assert "length" in retry_lines[0]
+
+
+def test_write_meta_records_one_entry_per_attempt(tmp_path: Path) -> None:
+    """`attempts_detail` travels from the PiResult into the stage meta (H1.1 req 4)."""
+    result, _log = _execute_with_fake_pi(tmp_path, "truncate_then_answer")
+    path = tmp_path / "task-review-1.meta.json"
+    write_meta(path, result, ["pi", "-p"], model="m", stage="task-review-1")
+
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    assert meta["attempts"] == 2
+    assert meta["stop_reason"] == "stop"
+    detail = meta["attempts_detail"]
+    assert len(detail) == 2
+    assert [entry["attempt"] for entry in detail] == [1, 2]
+    assert [entry["session_id"] for entry in detail] == [
+        "aidw-run-implimenter",
+        "aidw-run-implimenter-retry",
+    ]
+    assert [entry["exit_code"] for entry in detail] == [0, 0]
+    assert [entry["stop_reason"] for entry in detail] == ["length", "stop"]
+    assert [entry["usage"]["input_tokens"] for entry in detail] == [10, 20]
+    assert [entry["usage"]["output_tokens"] for entry in detail] == [7, 3]
+    assert [entry["generation_seconds"] for entry in detail] == [
+        result.attempts_detail[0].generation_seconds,
+        result.attempts_detail[1].generation_seconds,
+    ]
+
+
+def test_execute_fails_closed_on_two_truncated_attempts(tmp_path: Path) -> None:
+    """Both attempts empty: no out file, the final reason kept, both attempts recorded."""
+    result, log = _execute_with_fake_pi(tmp_path, "truncate")
+
+    assert result.attempts == 2
+    assert result.final_message == ""
+    assert result.stop_reason == "length"
+    assert result.out_path is None
+    assert not (tmp_path / "stages" / "task-review-1.out.txt").exists()
+    assert [a.stop_reason for a in result.attempts_detail] == ["length", "length"]
+    assert [a.usage.input_tokens for a in result.attempts_detail] == [10, 10]
+    # Both attempts' spend is summed, so the run total carries both.
+    assert result.usage.input_tokens == 20
+    assert result.usage.output_tokens == 14
+    assert "retrying once in a fresh session" in log
+
+
+def test_execute_never_retries_an_attempt_that_answered(tmp_path: Path) -> None:
+    result, log = _execute_with_fake_pi(tmp_path, "answer")
+
+    assert result.attempts == 1
+    assert result.final_message == "the answer"
+    assert [a.session_id for a in result.attempts_detail] == ["aidw-run-implimenter"]
+    assert "retrying once" not in log
+
+
+def test_execute_keeps_nonzero_exit_as_a_single_attempt(tmp_path: Path) -> None:
+    """The empty-text retry is only for a clean invocation, not process failures."""
+    result, log = _execute_with_fake_pi(tmp_path, "nonzero")
+
+    assert result.attempts == 1
+    assert result.exit_code == 7
+    assert result.failed is True
+    assert result.final_message == ""
+    assert result.attempts_detail[0].exit_code == 7
+    assert "retrying once" not in log
+
+
+def test_execute_keeps_the_existing_transient_retry_branch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A transient non-zero invocation still retries with the original argv."""
+    calls: list[list[str]] = []
+    answer = json.dumps(
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "recovered"}],
+                "stopReason": "stop",
+            },
+        }
+    )
+    outcomes = [
+        (1, "", "socket hang up", False),
+        (0, answer + "\n", "", False),
+    ]
+
+    def fake_invoke(argv, prompt, **kwargs):
+        calls.append(list(argv))
+        return outcomes.pop(0)
+
+    monkeypatch.setattr(pi_module, "_invoke", fake_invoke)
+    logger = RunLogger(tmp_path)
+    result = execute(
+        ["pi", "--session-id", "base"],
+        "prompt",
+        env=dict(os.environ),
+        cwd=tmp_path,
+        timeout=30.0,
+        stage_dir=tmp_path / "stages",
+        stage_name="stage",
+        logger=logger,
+    )
+
+    assert result.attempts == 2
+    assert result.final_message == "recovered"
+    assert calls == [["pi", "--session-id", "base"]] * 2
+    assert "transient Pi failure (exit 1); retrying once" in (
+        tmp_path / "run.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_execute_never_retries_a_provider_error(tmp_path: Path) -> None:
+    """A 402 is exit 0 + empty text; design §10 fails it instead of retrying (trap)."""
+    result, log = _execute_with_fake_pi(tmp_path, "provider_error")
+
+    assert result.exit_code == 0
+    assert result.final_message == ""
+    assert result.provider_error is True
+    assert result.stop_reason == "error"
+    assert result.attempts == 1
+    assert result.out_path is None
+    assert "retrying once" not in log
+
+
+def test_execute_treats_a_whitespace_only_answer_as_empty(tmp_path: Path) -> None:
+    """`parse_events` strips text, so spaces-only is empty and retries; twice still fails."""
+    result, _log = _execute_with_fake_pi(tmp_path, "whitespace")
+
+    assert result.attempts == 2
+    assert result.final_message == ""
+    assert result.out_path is None
+    assert [a.stop_reason for a in result.attempts_detail] == ["stop", "stop"]
+    assert all(a.usage.output_tokens == 1 for a in result.attempts_detail)
+
+
+def test_execute_does_not_retry_when_retry_transient_is_disabled(tmp_path: Path) -> None:
+    """`--no-retry-transient` disables the truncation retry exactly like the transient one."""
+    result, log = _execute_with_fake_pi(
+        tmp_path, "truncate_then_answer", retry_transient=False
+    )
+
+    assert result.attempts == 1
+    assert [a.session_id for a in result.attempts_detail] == ["aidw-run-implimenter"]
+    assert result.final_message == ""
+    assert result.out_path is None
+    assert "retrying once" not in log
+
+
+def test_retry_on_empty_final_message_requires_a_clean_empty_attempt() -> None:
+    """One predicate, hand-checked per path; a provider error always blocks the retry."""
+    empty = parse_events([{"type": "session", "id": "s"}])
+    answered = parse_events(
+        [
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "done"}],
+                    "stopReason": "stop",
+                },
+            }
+        ]
+    )
+    provider = parse_events(
+        [
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [],
+                    "stopReason": "error",
+                    "errorMessage": "402",
+                },
+            }
+        ]
+    )
+
+    assert retry_on_empty_final_message(empty, 0, False) is True
+    assert retry_on_empty_final_message(answered, 0, False) is False
+    assert retry_on_empty_final_message(empty, 1, False) is False
+    assert retry_on_empty_final_message(empty, 0, True) is False
+    assert retry_on_empty_final_message(provider, 0, False) is False
+
+
+#: Pinned seed/run count for the seeded property sweep below (this repo has no
+#: ``hypothesis`` dependency; AGENTS.md "Tests"): same seed + count = same cases.
+RETRY_PROPERTY_SEED = 3301
+RETRY_PROPERTY_RUNS = 40
+
+
+def test_retry_session_property() -> None:
+    """Seeded property: the retry argv is deterministic, distinct, and never mutated.
+
+    Invariants for every generated base id: the input list is untouched, every argument
+    other than the session id keeps its position and value, the retry id is exactly
+    ``base + "-retry"`` (so it can never equal the base and never resumes it), and
+    deriving it twice yields the same argv.
+    """
+    rng = random.Random(RETRY_PROPERTY_SEED)
+    alphabet = "abcXYZ019-_./"
+    for _ in range(RETRY_PROPERTY_RUNS):
+        base = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 24)))
+        assert retry_session_id(base) == f"{base}-retry"
+        assert retry_session_id(base) != base
+
+        argv = ["pi", "-p", "--mode", "json", "--session-id", base, "--model", "m"]
+        snapshot = list(argv)
+        retried = retry_argv(argv)
+
+        assert argv == snapshot, "retry_argv must not mutate the caller's argv"
+        session_index = snapshot.index("--session-id") + 1
+        assert retried[session_index] == f"{base}-retry"
+        assert retried[:session_index] == snapshot[:session_index]
+        assert retried[session_index + 1 :] == snapshot[session_index + 1 :]
+        assert retry_argv(argv) == retried
+        assert retried != snapshot
+
+
+def test_retry_argv_leaves_a_sessionless_invocation_unchanged() -> None:
+    """No ``--session-id`` means no context to resume, so nothing is invented."""
+    argv = ["pi", "-p", "--no-session"]
+
+    retried = retry_argv(argv)
+
+    assert retried == argv
+    assert retried is not argv

@@ -770,6 +770,12 @@ def run_stage(
 
     record.ended_at = utcnow_iso()
     record.exit_code = result.exit_code
+    # H1.1: the final attempt's reason and the attempt count, so a workflow that fails a
+    # stage for an empty final message can name them. The result's ``usage`` and timing
+    # are already summed over the attempts that ran (``aidw.pi.execute``), so the cost
+    # ceiling check below covers both attempts without a second check.
+    record.stop_reason = result.stop_reason
+    record.attempts = result.attempts
     record.duration_seconds = result.duration_seconds
     record.cost_usd = result.usage.cost_usd
     record.usage = asdict(result.usage)

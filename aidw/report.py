@@ -103,6 +103,28 @@ def cost_note(model: str, usage: dict[str, Any] | None) -> str | None:
     )
 
 
+def empty_final_message_error(record: StageRecord) -> str:
+    """Why a stage that exited cleanly with no final text fails the run (H1.1, §10).
+
+    One rule for the three workflows that check it. A retried stage names its final
+    attempt's ``stop_reason`` and states that **both** attempts were truncated, rather
+    than the bare ``produced no final message`` that used to hide the retry; a single
+    attempt says so, which is what ``--no-retry-transient`` produces. ``unknown`` stands
+    in for a record (or a fake in a test) that predates the additive fields.
+    """
+    reason = record.stop_reason or "unknown"
+    if record.attempts is not None and record.attempts > 1:
+        return (
+            f"{record.name}: both attempts produced no final message "
+            f"(final stop_reason: {reason}); both attempts were truncated"
+        )
+    return (
+        f"{record.name}: produced no final message "
+        f"(stop_reason: {reason}, attempts: "
+        f"{record.attempts if record.attempts is not None else 'unknown'})"
+    )
+
+
 def rel_to(base: Path | None, path: str | Path | None) -> str:
     """Render ``path`` relative to ``base`` when possible, else as-is."""
     if path is None:
