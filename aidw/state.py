@@ -3,18 +3,61 @@
 A run is one execution of a workflow. State lives under the per-repo state root
 (``<state root>/runs/<run_id>/state.json``) and records every stage and gate so a
 workflow can be inspected, logged, and resumed.
+
+**One state file, two writers** (H0.1, design §9.2). The workflow process writes the
+whole state through :func:`save`; the separate ``aidw gate run`` processes an agent
+spawns write gate outcomes through :func:`append_gate_outcomes`. Neither may drop the
+other's rows, so:
+
+* every write happens under a per-run cross-process lock beside the file it protects
+  (``<run_dir>/state.json.lock``, :func:`state_write_lock`) held around the whole
+  read-modify-write, and
+* every write is published with :func:`_write_atomic` — a temp file in the *same*
+  directory, fsynced, then ``os.replace``d — so an unlocked reader (``load``,
+  ``aidw runs show``, a concurrent citation) only ever sees a whole file.
+
+:func:`save` merges the ``gate_outcomes`` already on disk into what it publishes, which
+is what lets an outcome a stage's subprocess recorded survive the workflow's next
+``save()`` of a ``RunState`` it loaded before that subprocess ran. The gate-write path
+does not publish full state at all: it reloads under the lock and appends only, so a
+stage record the workflow wrote in between survives it. The dedup rule is "two distinct
+outcomes are two pieces of evidence": only byte-identical rows collapse (H0.1 Req 3).
+
+This lock is **not** :data:`aidw.runner._STATE_LOCK` (in-process, concurrent stages of
+one run) and **not** :func:`aidw.lock.acquire` (one run per worktree, held for the whole
+workflow). Design §9.1: the three must not be conflated — a worktree-keyed lock here
+would refuse every ``aidw gate run`` subprocess, because the workflow already holds it.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import re
+import tempfile
+import time
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+
+#: The state file, relative to the run directory (design §9.1).
+STATE_FILENAME = "state.json"
+
+#: Cross-process lock guarding the read-modify-write of ``state.json`` (H0.1 Req 4).
+#: Colocated with the file it protects — never under ``locks/``, never worktree-keyed.
+STATE_LOCK_FILENAME = "state.json.lock"
+
+#: How long a writer waits for a peer before failing closed, and how often it retries.
+#: The critical sections are a read plus an atomic rename, so contention is measured in
+#: milliseconds; the ceiling only exists so a wedged peer cannot hang a workflow for ever.
+STATE_LOCK_TIMEOUT_SECONDS = 60.0
+STATE_LOCK_POLL_SECONDS = 0.01
 
 RUNNING = "running"
 SUCCEEDED = "succeeded"
@@ -251,6 +294,179 @@ def run_dir(runs_root: Path, run_id: str) -> Path:
     return runs_root / run_id
 
 
+# --------------------------------------------------------------------------- #
+# Publication: one lock, atomic rename, merged gate outcomes (H0.1, design §9.2)
+# --------------------------------------------------------------------------- #
+
+
+def state_path(directory: Path) -> Path:
+    """``<run_dir>/state.json`` — the single state file for a run."""
+    return Path(directory) / STATE_FILENAME
+
+
+def state_lock_path(directory: Path) -> Path:
+    """``<run_dir>/state.json.lock`` — the state writer's cross-process mutex.
+
+    Deliberately colocated with ``state.json`` instead of ``<state root>/locks`` (H0.1
+    Req 4): the workflow holds the *worktree* run lock (``aidw.lock``) for its whole
+    lifetime, so a worktree-keyed state lock would refuse every ``aidw gate run``
+    subprocess the workflow itself spawned (design §9.1's non-conflation).
+    """
+    return Path(directory) / STATE_LOCK_FILENAME
+
+
+class StateLockTimeout(RuntimeError):
+    """A peer held the state write lock past :data:`STATE_LOCK_TIMEOUT_SECONDS`.
+
+    Fail closed rather than write unguarded: publishing without the lock is exactly the
+    lost-update this lock exists to prevent.
+    """
+
+
+@contextmanager
+def state_write_lock(
+    directory: Path, *, timeout: float = STATE_LOCK_TIMEOUT_SECONDS
+) -> Iterator[None]:
+    """Hold the run's state write lock across a full read-modify-write.
+
+    ``fcntl.flock(LOCK_EX | LOCK_NB)`` on ``<run_dir>/state.json.lock``, following
+    :mod:`aidw.lock`'s pattern: the descriptor is opened **fresh per acquire** (``flock``
+    is per open file description, so a cached fd would let two threads of one process
+    both "acquire") and the lock file is **never unlinked** (unlinking would race a
+    second acquirer onto a new inode while this one still holds the old one).
+
+    ``LOCK_NB`` plus a bounded retry loop, rather than a blocking ``LOCK_EX``: a peer
+    holding the lock must be *waited for* (two overlapping ``aidw gate run`` processes
+    both have evidence to record — H0.1 Req 3 forbids dropping either), but a wedged
+    holder must not hang the run for ever. Raises :class:`StateLockTimeout` when the
+    ceiling is reached.
+
+    Never nest calls: ``flock`` on a second descriptor of the same file does not
+    re-enter, so a nested acquire would wait for a lock the caller already holds.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = state_lock_path(directory)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise StateLockTimeout(
+                        f"another writer held {path} for more than {timeout:g}s"
+                    ) from None
+                time.sleep(STATE_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _write_atomic(
+    directory: Path, state: "RunState", outcomes: Sequence["GateOutcome"]
+) -> None:
+    """Publish ``state`` with ``outcomes`` through fsync + ``os.replace`` (H0.1 Req 2).
+
+    The temp file is created **in the run directory**, not ``/tmp``: ``os.replace`` is
+    only atomic within one filesystem, and a cross-device move reopens the torn-read
+    window this exists to close. Readers never take the lock, so this rename is the only
+    thing standing between them and a partially written file.
+    """
+    data = state.to_dict()
+    data["gate_outcomes"] = [asdict(outcome) for outcome in outcomes]
+    payload = json.dumps(data, indent=2) + "\n"
+    fd, temp_name = tempfile.mkstemp(
+        dir=directory, prefix=f".{STATE_FILENAME}.", suffix=".tmp"
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, state_path(directory))
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    _fsync_directory(directory)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort fsync of the directory entry the rename created.
+
+    Durability, not atomicity: the rename is already atomic for readers. A platform that
+    cannot fsync a directory handle (or refuses the open) must not fail the write, which
+    has completed.
+    """
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def outcome_identity(outcome: "GateOutcome") -> tuple[Any, ...]:
+    """A hashable identity for one outcome row — every recorded field, in order.
+
+    Used only to recognise the *same* row seen twice (the in-memory copy a ``save``
+    started from and the copy already on disk); it never merges two rows that differ in
+    any field, because two gate runs that both executed a command are two pieces of
+    evidence (H0.1 Req 3's dedup hazard).
+    """
+    return (
+        outcome.key,
+        tuple(outcome.command),
+        outcome.tree,
+        outcome.status,
+        outcome.stage,
+        outcome.at,
+        outcome.exit_code,
+        outcome.duration_seconds,
+        outcome.summary,
+        tuple(outcome.ignored),
+    )
+
+
+def merge_gate_outcomes(
+    base: Iterable["GateOutcome"], extra: Iterable["GateOutcome"]
+) -> list["GateOutcome"]:
+    """``base`` in order, then every ``extra`` row not already among them, in order.
+
+    Pure: neither argument is mutated and no I/O happens, so the merge is citable as a
+    rule rather than a side effect. ``extra`` is the *newer* side (in-memory on a
+    ``save``), but nothing is reordered or replaced: an outcome is evidence with the
+    origin it recorded, so "newest wins per key" would silently delete a run (H0.1
+    Req 3's trap).
+    """
+    merged = list(base)
+    seen = {outcome_identity(outcome) for outcome in merged}
+    for outcome in extra:
+        identity = outcome_identity(outcome)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(outcome)
+    return merged
+
+
+def _load_if_present(directory: Path) -> "RunState | None":
+    """The run on disk, or ``None`` when this is a run's first write."""
+    if not state_path(directory).is_file():
+        return None
+    return load(directory)
+
+
 def create_run(
     runs_root: Path,
     repo_root: Path,
@@ -283,14 +499,55 @@ def create_run(
 
 
 def save(directory: Path, state: RunState) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "state.json").write_text(
-        json.dumps(state.to_dict(), indent=2) + "\n", encoding="utf-8"
-    )
+    """Publish the whole run state, keeping every gate outcome already recorded.
+
+    The workflow's writer. It reloads the file **inside** the lock and merges its
+    ``gate_outcomes`` with the in-memory ones before publishing (H0.1 Req 3(i)): a
+    ``RunState`` loaded at ``create_run`` is stale by the time a stage finishes, and a
+    plain rewrite from it is what dropped every outcome an agent's ``aidw gate run``
+    subprocess had appended. Everything else in ``state`` (stages, status, totals, the
+    run's own fields) is the workflow's to write, so it is published as given.
+
+    The merged list is also folded back into ``state`` so a long-lived workflow handle
+    cites what its own agents recorded. A state file that cannot be read fails closed:
+    overwriting it would delete evidence nobody could parse.
+    """
+    directory = Path(directory)
+    with state_write_lock(directory):
+        disk = _load_if_present(directory)
+        merged = merge_gate_outcomes(
+            disk.gate_outcomes if disk is not None else [], state.gate_outcomes
+        )
+        _write_atomic(directory, state, merged)
+        state.gate_outcomes = merged
+
+
+def append_gate_outcomes(
+    directory: Path, outcomes: Sequence[GateOutcome]
+) -> RunState:
+    """Append gate outcomes to the run on disk without touching anything else.
+
+    The CLI's writer (``aidw gate run``, H0.1 Req 3(ii)). It reloads the run *inside* the
+    lock and changes only ``gate_outcomes``, so a stage record the workflow wrote between
+    this process's initial load and this write survives — a full-state save of a stale
+    ``RunState`` is exactly the other half of the symmetric loss. Rows are appended
+    unconditionally: this process ran the command, so its outcome is new evidence even if
+    an identical-looking row already exists.
+
+    Returns the state as published, so the caller can report without a second read.
+    """
+    directory = Path(directory)
+    with state_write_lock(directory):
+        state = load(directory)
+        for outcome in outcomes:
+            state.record_gate_outcome(outcome)
+        _write_atomic(directory, state, state.gate_outcomes)
+    return state
 
 
 def load(directory: Path) -> RunState:
-    data = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    """Read a run's state. Lock-free by design: writers publish atomically."""
+    data = json.loads(state_path(directory).read_text(encoding="utf-8"))
     version = data.get("schema_version")
     if version != SCHEMA_VERSION:
         raise ValueError(
@@ -305,7 +562,7 @@ def list_runs(runs_root: Path) -> list[RunState]:
         return []
     states: list[RunState] = []
     for directory in sorted(runs_root.iterdir()):
-        if not (directory / "state.json").is_file():
+        if not state_path(directory).is_file():
             continue
         try:
             states.append(load(directory))
@@ -316,7 +573,7 @@ def list_runs(runs_root: Path) -> list[RunState]:
 
 def find_run(runs_root: Path, run_id: str) -> RunState | None:
     directory = run_dir(runs_root, run_id)
-    if (directory / "state.json").is_file():
+    if state_path(directory).is_file():
         return load(directory)
     return None
 

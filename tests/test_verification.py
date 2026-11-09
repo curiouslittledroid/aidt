@@ -8,28 +8,60 @@ outcome, or a repo whose base branch will not resolve.
 Identity is content, so committing the verified change set must not invalidate it, while
 any content change must. These tests build real repositories so the git-side identity is
 exercised rather than mocked.
+
+The persistence contract (H0.1) is tested here too, because it is what makes a citation
+possible at all: an outcome recorded by a stage's own ``aidw gate run`` subprocess must
+still be in the file after the workflow's next ``save()``, the two writers must not drop
+each other's rows, and an unlocked reader must never observe a torn file. Those tests
+drive ``aidw/runner.py:run_stage`` against the real file (with a faked Pi result) instead
+of faking a stage by setting ``AIDW_STAGE`` alone, which is why the loss stayed green.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import random
 import subprocess
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
+from aidw import runner as runner_mod
 from aidw import verification
 from aidw.cli import EXIT_USAGE, app
-from aidw.paths import STATE_DIR_ENV_VAR, RUN_ID_ENV_VAR, STAGE_ENV_VAR, TargetRepo, WorkspacePaths
+from aidw.config import load_all
+from aidw.log import RunLogger
+from aidw.paths import (
+    STATE_DIR_ENV_VAR,
+    RUN_ID_ENV_VAR,
+    STAGE_ENV_VAR,
+    TargetRepo,
+    WorkspacePaths,
+    toolkit_root,
+)
+from aidw.pi import PiResult, Usage
+from aidw.runner import StageSpec, run_stage
 from aidw.state import (
     GATE_FAILED,
     PASSED,
     GateOutcome,
+    StageRecord,
+    append_gate_outcomes,
     create_run,
     load,
+    merge_gate_outcomes,
+    outcome_identity,
     run_dir,
     save,
+    state_lock_path,
+    state_write_lock,
 )
 
 cli = CliRunner()
@@ -905,3 +937,490 @@ def test_cli_runs_show_lists_gate_outcomes(
 
     assert result.exit_code == 0, result.output
     assert "gate suite: passed (tree t, stage test" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# Gate outcomes across stage boundaries (H0.1, design §9.2)
+#
+# Two processes write this file: the workflow (``state.save``) and the ``aidw gate run``
+# subprocess a stage's agent spawns (``state.append_gate_outcomes``). The contract is that
+# neither drop the other's rows and that no lock-free reader ever sees a torn file.
+# --------------------------------------------------------------------------- #
+
+
+def _outcome(
+    key: str,
+    *,
+    tree: str = "t",
+    stage: str = "cli",
+    at: str = "2026-01-01T00:00:00Z",
+) -> GateOutcome:
+    return GateOutcome(
+        key=key,
+        command=["true"],
+        tree=tree,
+        status=PASSED,
+        stage=stage,
+        at=at,
+        exit_code=0,
+        summary=f"{key} ok",
+    )
+
+
+def _pi_result() -> PiResult:
+    """A faked Pi result: the argv is built and passed, no model and no process."""
+    return PiResult(
+        exit_code=0,
+        session_id="s",
+        final_message="ok",
+        usage=Usage(cost_usd=0.0, total_tokens=0),
+        duration_seconds=0.1,
+        event_count=1,
+        tool_calls=0,
+        tool_errors=0,
+        stop_reason="end_turn",
+        stderr="",
+        timed_out=False,
+        attempts=1,
+        jsonl_path="",
+        out_path=None,
+    )
+
+
+def _run_workflow_stage(
+    state,
+    runs_root: Path,
+    target: Path,
+    monkeypatch,
+    *,
+    name: str = "record",
+) -> StageRecord:
+    """Drive the real ``runner.run_stage`` so the *workflow's* ``save()`` is exercised.
+
+    Faking a stage with ``AIDW_STAGE`` alone (what the earlier tests did) never runs the
+    workflow's own write, which is exactly why the loss was green.
+    """
+    agents, issues = load_all(toolkit_root(), target)
+    assert [issue for issue in issues if issue.level == "error"] == []
+    monkeypatch.setattr(runner_mod, "execute", lambda *args, **kwargs: _pi_result())
+    return run_stage(
+        StageSpec(
+            name=name,
+            agent_id="code-reviewer",
+            prompt=toolkit_root() / "prompts" / "test.md",
+            variables=[],
+        ),
+        repo_root=target,
+        toolkit_root=toolkit_root(),
+        state=state,
+        logger=RunLogger(run_dir(runs_root, state.run_id)),
+        agents=agents,
+        runs_root=runs_root,
+    )
+
+
+def test_a_cli_gate_outcome_survives_the_workflows_next_save(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement 3(i): the stale-handle round trip, not the write.
+
+    The workflow holds the ``RunState`` ``create_run`` returned. The agent's
+    ``aidw gate run`` lands its outcome on disk. The workflow then saves through that
+    pre-gate handle — no reload in between — and the outcome must still be there,
+    row for row.
+    """
+    state_root = _state_base(tmp_path, repo, monkeypatch)
+    runs_root = state_root / "runs"
+    state = create_run(runs_root, repo, "implement", label="round-trip", branch="task")
+    monkeypatch.setenv(RUN_ID_ENV_VAR, state.run_id)
+    monkeypatch.setenv(STAGE_ENV_VAR, "impliment-task")
+    directory = run_dir(runs_root, state.run_id)
+
+    gated = cli.invoke(app, ["gate", "run", "suite", "--", "sh", "-c", "echo 439 passed"])
+
+    assert gated.exit_code == 0, gated.output
+    before = load(directory).gate_outcomes
+    assert len(before) == 1
+    assert before[0].stage == "impliment-task"
+
+    _run_workflow_stage(state, runs_root, repo, monkeypatch)
+
+    after = load(directory)
+    assert [asdict(outcome) for outcome in after.gate_outcomes] == [asdict(before[0])]
+    assert after.gate_outcomes[0].summary == "439 passed"
+    assert [record.name for record in after.stages] == ["record"]
+
+
+def test_a_stage_record_written_while_a_cli_gate_runs_survives_its_write(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement 3(ii): the other direction of the symmetric loss.
+
+    The CLI holds the run copy it loaded *before* executing the gate command; the
+    workflow writes a stage record while that command is running. The CLI's publish must
+    not be a full-state save of its stale copy, or the stage record disappears.
+    """
+    state_root = _state_base(tmp_path, repo, monkeypatch)
+    runs_root = state_root / "runs"
+    state = create_run(runs_root, repo, "implement", label="overlap", branch="task")
+    monkeypatch.setenv(RUN_ID_ENV_VAR, state.run_id)
+    directory = run_dir(runs_root, state.run_id)
+    real_run_gate = verification.run_gate
+
+    def gate_between_two_writers(*args, **kwargs):
+        result = real_run_gate(*args, **kwargs)
+        _run_workflow_stage(state, runs_root, repo, monkeypatch)
+        return result
+
+    monkeypatch.setattr(verification, "run_gate", gate_between_two_writers)
+
+    result = cli.invoke(app, ["gate", "run", "suite", "--", "sh", "-c", "echo 439 passed"])
+
+    assert result.exit_code == 0, result.output
+    reloaded = load(directory)
+    assert [record.name for record in reloaded.stages] == ["record"]
+    assert [outcome.key for outcome in reloaded.gate_outcomes] == ["suite"]
+
+
+def test_two_overlapping_cli_gate_runs_both_record_an_outcome(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement 3/4: Pi runs tool calls in parallel; both outcomes must land.
+
+    ``runner._STATE_LOCK`` is in-process only, so this is what the per-run state lock
+    exists for. The command sleeps so the two invocations really do overlap.
+    """
+    state_root = _state_base(tmp_path, repo, monkeypatch)
+    runs_root = state_root / "runs"
+    state = create_run(runs_root, repo, "implement", label="parallel", branch="task")
+    monkeypatch.setenv(RUN_ID_ENV_VAR, state.run_id)
+    monkeypatch.setenv(STAGE_ENV_VAR, "impliment-task")
+
+    def gate(key: str):
+        # Typer's CliRunner swaps process-global stdout/stderr during isolation, so
+        # invoking two runners in threads races the test harness itself. Use two real
+        # aidw CLI processes here: this is the cross-process lock contract, and the
+        # sequential CliRunner tests above still cover the in-process CLI seam.
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from aidw.cli import main; main()",
+                "gate",
+                "run",
+                key,
+                "--",
+                "sh",
+                "-c",
+                "sleep 0.3; echo ok",
+            ],
+            cwd=repo,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(gate, key) for key in ("lint", "build")]
+        results = [future.result() for future in futures]
+
+    assert [result.returncode for result in results] == [0, 0]
+    recorded = load(run_dir(runs_root, state.run_id)).gate_outcomes
+    assert sorted(outcome.key for outcome in recorded) == ["build", "lint"]
+
+
+#: How many times each writer writes in the overlap-integrity test below.
+READER_WRITES = 30
+
+
+def test_no_unlocked_reader_observes_a_torn_or_stage_losing_state(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement 2: the atomic rename, not the lock, keeps an unlocked read whole.
+
+    Three threads: a reader that only ever ``load``s (no lock — a concurrent citation,
+    ``aidw runs show``), the CLI's append writer, and the workflow's full-state writer.
+    Every observed read must parse and still carry the stage record already on disk; the
+    both-rows-present assertion at the end is in addition to those observations.
+    """
+    state_root = _state_base(tmp_path, repo, monkeypatch)
+    runs_root = state_root / "runs"
+    state = create_run(runs_root, repo, "implement", label="reader", branch="task")
+    _run_workflow_stage(state, runs_root, repo, monkeypatch, name="impliment-task")
+    directory = run_dir(runs_root, state.run_id)
+    preexisting = {"impliment-task"}
+
+    failures: list[str] = []
+    reads = 0
+    stop = threading.Event()
+
+    def reader() -> None:
+        nonlocal reads
+        while not stop.is_set():
+            try:
+                observed = load(directory)
+            except Exception as exc:  # noqa: BLE001 - any read failure is the finding
+                failures.append(f"{type(exc).__name__}: {exc}")
+                return
+            names = {record.name for record in observed.stages}
+            if not preexisting <= names:
+                failures.append(f"stage record missing: {sorted(names)}")
+                return
+            reads += 1
+
+    def appender() -> None:
+        for index in range(READER_WRITES):
+            append_gate_outcomes(directory, [_outcome(f"g{index:02d}")])
+
+    def saver() -> None:
+        for index in range(READER_WRITES):
+            state.record_stage(
+                StageRecord(
+                    name=f"save-{index:02d}",
+                    agent="code-reviewer",
+                    model="<provider/model>",
+                )
+            )
+            save(directory, state)
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for future in (pool.submit(appender), pool.submit(saver)):
+                future.result()
+    finally:
+        stop.set()
+        thread.join()
+
+    assert failures == []
+    assert reads >= 10  # the overlap window was really observed, not skipped
+    final = load(directory)
+    assert [outcome.key for outcome in final.gate_outcomes] == [
+        f"g{index:02d}" for index in range(READER_WRITES)
+    ]
+    assert {record.name for record in final.stages} == preexisting | {
+        f"save-{index:02d}" for index in range(READER_WRITES)
+    }
+
+
+def test_one_test_gate_is_cited_by_record_and_by_pr(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The acceptance chain, with a counter outside the repository as the proof.
+
+    ``test`` gates tree ``T``; ``record`` and ``pr`` cite it, with a workflow save and a
+    document write (inside the declared scope) in between, and the command is executed
+    exactly once. The counter is outside the repo so counting cannot change the identity.
+    """
+    state_root = _state_base(tmp_path, repo, monkeypatch)
+    runs_root = state_root / "runs"
+    state = create_run(runs_root, repo, "implement", label="chain", branch="task")
+    monkeypatch.setenv(RUN_ID_ENV_VAR, state.run_id)
+    directory = run_dir(runs_root, state.run_id)
+
+    counter = tmp_path / "gate-counter.txt"
+    command = [
+        "sh",
+        "-c",
+        f'echo run >> "{counter}"; '
+        f'printf "%s\\n" "$(wc -l < "{counter}" | tr -d " ") checks passed"',
+    ]
+    scope = ["--ignore", "docs/implementation-results"]
+
+    def gate(stage: str):
+        monkeypatch.setenv(STAGE_ENV_VAR, stage)
+        result = cli.invoke(app, ["gate", "run", "suite", *scope, "--", *command])
+        assert result.exit_code == 0, result.output
+        return result
+
+    first = gate("test")
+    assert "passed: gate 'suite' passed" in first.output
+
+    # The record stage's own save, then its deliverable written inside the declared scope.
+    _run_workflow_stage(state, runs_root, repo, monkeypatch, name="record")
+    results = repo / "docs" / "implementation-results" / "chain"
+    results.mkdir(parents=True)
+    (results / "build-results.md").write_text("# results\n", encoding="utf-8")
+
+    cited_record = gate("record")
+    _run_workflow_stage(state, runs_root, repo, monkeypatch, name="pr")
+    cited_pr = gate("pr")
+
+    assert "reused: gate 'suite' passed" in cited_record.output
+    assert "reused: gate 'suite' passed" in cited_pr.output
+    assert "by stage 'test'" in cited_pr.output
+    assert len(counter.read_text(encoding="utf-8").splitlines()) == 1
+
+    reloaded = load(directory)
+    assert [outcome.stage for outcome in reloaded.gate_outcomes] == ["test"]
+    assert {record.name for record in reloaded.stages} == {"record", "pr"}
+
+
+def test_gate_list_and_runs_show_report_outcomes_after_the_process_exits(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement 5: the evidence outlives the run process, not just its memory."""
+    state_root = _state_base(tmp_path, repo, monkeypatch)
+    state = create_run(state_root / "runs", repo, "implement", label="exit", branch="task")
+    monkeypatch.setenv(RUN_ID_ENV_VAR, state.run_id)
+    monkeypatch.setenv(STAGE_ENV_VAR, "record")
+
+    def aidw_process(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from aidw.cli import main; main()",
+                *args,
+            ],
+            cwd=repo,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    for key in ("lint", "suite"):
+        result = aidw_process("gate", "run", key, "--", "sh", "-c", f"echo {key} ok")
+        assert result.returncode == 0, result.stderr + result.stdout
+
+    # Nothing in memory can supply these: the gate writer process has exited, the stage
+    # identity is gone, and the run is named explicitly, exactly as a later operator
+    # process would use it.
+    monkeypatch.delenv(RUN_ID_ENV_VAR, raising=False)
+    monkeypatch.delenv(STAGE_ENV_VAR, raising=False)
+
+    listed = aidw_process("gate", "list", "--run", state.run_id)
+    shown = aidw_process("runs", "show", state.run_id)
+
+    assert listed.returncode == 0, listed.stderr + listed.stdout
+    assert shown.returncode == 0, shown.stderr + shown.stdout
+    for key in ("lint", "suite"):
+        assert f"gate {key}: passed" in listed.stdout
+        assert f"gate {key}: passed" in shown.stdout
+
+
+def test_the_state_lock_excludes_a_second_holder_and_is_reusable(tmp_path: Path) -> None:
+    """The lock is a per-run mutex beside ``state.json``, never under ``locks/``."""
+    directory = tmp_path / "run"
+
+    with state_write_lock(directory):
+        fd = os.open(state_lock_path(directory), os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+    with state_write_lock(directory):  # released, so a peer's next write gets in
+        pass
+
+    assert state_lock_path(directory) == directory / "state.json.lock"
+    assert state_lock_path(directory).exists()  # never unlinked: that races a new inode
+
+
+def test_save_publishes_atomically_and_leaves_only_the_state_and_its_lock(
+    tmp_path: Path,
+) -> None:
+    """Requirement 2: the temp file lives in the run directory and is renamed away."""
+    state = create_run(tmp_path, tmp_path, "implement", label="atomic")
+    directory = run_dir(tmp_path, state.run_id)
+
+    save(directory, state)
+
+    assert sorted(path.name for path in directory.iterdir()) == [
+        "state.json",
+        "state.json.lock",
+    ]
+    assert json.loads((directory / "state.json").read_text(encoding="utf-8"))[
+        "schema_version"
+    ] == 1
+
+
+def test_a_state_file_that_cannot_be_read_is_never_overwritten(tmp_path: Path) -> None:
+    """Fail closed: an unparseable file holds evidence, so it is not replaced."""
+    state = create_run(tmp_path, tmp_path, "implement", label="corrupt")
+    directory = run_dir(tmp_path, state.run_id)
+    (directory / "state.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(json.JSONDecodeError):
+        save(directory, state)
+    with pytest.raises(json.JSONDecodeError):
+        append_gate_outcomes(directory, [_outcome("suite")])
+
+    assert (directory / "state.json").read_text(encoding="utf-8") == "{not json"
+    assert [path for path in directory.iterdir() if path.suffix == ".tmp"] == []
+
+
+def test_two_distinct_outcomes_for_one_key_are_both_kept() -> None:
+    """The dedup hazard (Requirement 3): two processes ran it, so both are evidence."""
+    first = _outcome("suite", at="2026-01-01T00:00:00Z")
+    second = _outcome("suite", at="2026-01-01T00:00:01Z")
+
+    assert merge_gate_outcomes([first], [second]) == [first, second]
+    # The same row seen twice (in-memory copy and disk copy) collapses; a distinct one
+    # never does.
+    assert merge_gate_outcomes([first], [first]) == [first]
+
+
+#: Pinned seed and run count for the merge property (AGENTS.md "Tests": pytest only, no
+#: hypothesis, so the sample is the generator and there is no shrinking).
+MERGE_PROPERTY_SEED = 9017
+MERGE_PROPERTY_RUNS = 64
+
+
+def test_merge_gate_outcomes_is_a_lossless_union_of_distinct_rows() -> None:
+    """Seeded property run (seed/runs pinned above): the merge drops and reorders nothing.
+
+    For every sampled pair of lists the merge is exactly ``base`` followed by the
+    ``extra`` rows whose identity is not already in ``base``. The expectation is computed
+    here from the identity rule, independently of the function under test, and the inputs
+    are asserted unchanged afterwards (the merge is pure: no mutation, no I/O).
+    """
+    rng = random.Random(MERGE_PROPERTY_SEED)
+    keys = ("suite", "lint", "build", "srd")
+    stages = ("test", "record", "pr", "cli")
+    statuses = (PASSED, GATE_FAILED)
+    scopes: tuple[tuple[str, ...], ...] = ((), ("docs/implementation-results",))
+    summaries = ("", "ok", "412 passed")
+
+    def row() -> GateOutcome:
+        return GateOutcome(
+            key=rng.choice(keys),
+            command=[rng.choice(("true", "false")), str(rng.randint(0, 3))],
+            tree=rng.choice(("t1", "t2")),
+            status=rng.choice(statuses),
+            stage=rng.choice(stages),
+            at=f"2026-01-0{rng.randint(1, 9)}T00:00:0{rng.randint(0, 9)}Z",
+            exit_code=rng.randint(0, 2),
+            duration_seconds=float(rng.randint(0, 5)),
+            summary=rng.choice(summaries),
+            ignored=list(rng.choice(scopes)),
+        )
+
+    for case in range(MERGE_PROPERTY_RUNS):
+        base = [row() for _ in range(rng.randint(0, 5))]
+        extra = [row() for _ in range(rng.randint(0, 5))]
+        base_before = [asdict(outcome) for outcome in base]
+        extra_before = [asdict(outcome) for outcome in extra]
+
+        expected = list(base)
+        seen = {outcome_identity(outcome) for outcome in base}
+        for candidate in extra:
+            identity = outcome_identity(candidate)
+            if identity not in seen:
+                seen.add(identity)
+                expected.append(candidate)
+
+        merged = merge_gate_outcomes(base, extra)
+
+        assert [asdict(outcome) for outcome in merged] == [
+            asdict(outcome) for outcome in expected
+        ], case
+        assert [asdict(outcome) for outcome in base] == base_before, case
+        assert [asdict(outcome) for outcome in extra] == extra_before, case
+        assert all(
+            any(outcome is source for source in (*base, *extra)) for outcome in merged
+        ), case

@@ -848,9 +848,13 @@ Run state lives in the **state root**, keyed by repo slug, never in a working tr
   only valid under the one-branch-one-worktree fact, and a detached-HEAD worktree has no branch
   at all. The lock is taken immediately before the run record is created and released on every
   exit path; a live peer in the same worktree is refused with exit 4 and writes no run state.
-- Two different serializations exist and must not be conflated: this lock is **one run per
-  worktree**, held for the whole workflow and cross-process, while `runner._STATE_LOCK`
-  serializes `state.json` writes between concurrent *stages inside one run* (`--parallel`).
+- Three different serializations exist and must not be conflated: this lock is **one run per
+  worktree**, held for the whole workflow and cross-process; `runner._STATE_LOCK` serializes
+  `state.json` writes between concurrent *stages inside one run* (`--parallel`) and is
+  in-process only; and `<run_dir>/state.json.lock` (§9.2) serializes the read-modify-write of
+  one run's file between the workflow process and every `aidw gate run` subprocess it spawns.
+  A worktree-keyed lock in that third position would refuse every gate subprocess, because the
+  workflow holds the worktree lock for its whole lifetime.
 
 ### 9.2 `state.json` (schema)
 
@@ -940,6 +944,22 @@ re-running it. The identity deliberately excludes `HEAD` (the PR stage commits t
 gated); anything unprovable — no resolvable base, no run to cite, a different command under the
 same key, a differently declared scope, a previous failure — means the gate executes. Human gate
 decisions live in `gates`; the two lists are different questions and are never merged.
+
+**Two writers, one file, one lock** (H0.1). `state.json` is written by two kinds of process:
+the workflow (`aidw/state.py:save` — the whole state) and each `aidw gate run` subprocess a
+stage's agent spawns (`aidw/state.py:append_gate_outcomes` — outcomes only). Both hold the
+per-run lock file **`<run_dir>/state.json.lock`** — `fcntl.flock(LOCK_EX|LOCK_NB)`, descriptor
+opened fresh per acquire, file never unlinked, colocated with `state.json` and deliberately
+*not* under `locks/` (§9.1's non-conflation) — around their whole read-modify-write, and both
+publish through a temp file created in the run directory, fsynced, then `os.replace`d. Readers
+therefore take no lock at all and never see a half-written file. Neither writer drops the
+other's rows: `save` reloads inside the lock and merges the `gate_outcomes` already on disk
+into the payload it publishes, and the gate path reloads and appends rather than rewriting the
+run, so a stage record written while a gate command was executing survives it. The merge
+collapses only byte-identical rows; two outcomes that differ in any field both survive, because
+two processes that both ran a command are two pieces of evidence (T1). An unreadable
+`state.json` is never overwritten — the write fails closed rather than deleting evidence nobody
+could parse.
 
 The per-stage throughput fields are stored, not aggregated: two stages of the same model in one
 run stay separate. `generation_seconds` is the time Pi spent generating assistant messages,
@@ -1302,6 +1322,8 @@ aidw gate      run <key> -- <command> [args...] | list
                same run cites the recorded outcome instead of re-running it (E4.8)
                [--run <run-id>] [--stage <name>] [--base <branch>] [--force]
                [--ignore <prefix>...] [--tail <lines>] [--timeout <seconds>] [--json]
+               `run` appends its outcome to `<run_dir>/state.json` under the per-run lock
+               `<run_dir>/state.json.lock` (§9.2); `list` reads that file without a lock
 
 # global
 --repo <path>   select the TARGET repo (never the toolkit); default cwd, then $AIDW_REPO
@@ -1310,6 +1332,14 @@ aidw gate      run <key> -- <command> [args...] | list
 --progress / --no-progress                 show '.' progress while Pi works
                                            (default: on when stderr is an interactive terminal)
 ```
+
+`gate run` is the second writer of `state.json` (H0.1, §9.2): it reloads the run inside the
+`<run_dir>/state.json.lock` critical section and appends the outcome, so a stage record the
+workflow wrote while the gate command was executing survives it, and the workflow's next
+`save()` merges what the subprocess recorded instead of overwriting it. That is what makes
+`gate list` and `runs show` report outcomes after the run process has exited, and what lets
+`record` and `pr` cite a `test` outcome in one uninterrupted chain. The cite-or-run rule itself
+is unchanged.
 
 Exit codes: `0` success/approved, `1` stage or gate failure, `2` usage/config error,
 `3` workflow blocked (needs human), `4` preflight/safety refusal.
@@ -1452,6 +1482,7 @@ implement them.
 | P1 | Every run's `state.json` records **what produced it** (E8.2, EXTRACTION.md §§3.11, 3.4; D9/D10): `toolkit_version` (always `aidw.__version__` — never a `git`/`uv` shell-out or a `pyproject.toml` parse, E1.6), `config_schema_version` (the **config** schema version that resolved, `None` for a repo with no `aidw/` folder, because §3.4 requires it *in* a config file and gives it no default), and `config_hash` (`sha256:<hex>` over `json.dumps(resolved.to_dict(), sort_keys=True)` — the same object `aidw config show --json` prints, so the fingerprint is reproducible from an operator-visible command). The three are **additive at the same `SCHEMA_VERSION`** on the throughput-fields precedent (§9.2), each defaulting `None` so a `state.json` written before them still loads. Two names are deliberate: the bare `schema_version` key is the **state** schema and `load` refuses a mismatch, so the config's is `config_schema_version`; and `config_hash` is the resolved **config**, never E4.8's `GateOutcome.tree` content-tree identity. Both config values come from one pure helper, `aidw.target_config.config_identity(resolved)` → `(config_schema_version, config_hash)`, called by the five workflows at their `create_run` site so they cannot drift; `aidw exec` records `toolkit_version` only and leaves both config fields `None`, because it resolves no target config and wiring the config preflight into it would change its failure surface. Hashing the *resolved* mapping rather than the raw file or the declared `TargetConfig` is what makes the value mean "the config this run used": each leaf carries its `source`, so a declared `max_revisions: 3` fingerprints differently from the default `3` — provenance is part of the resolved-config identity. (§9.2 carries the schema example now that E9.1 has rewritten it.) (EXTRACTION.md §§2 D9/D10, 3.4, 3.11; `aidw/state.py`, `aidw/target_config.py`, `aidw/workflows/*.py`, `aidw/cli.py`) |
 | S1 | The toolkit's prompt library is **14 neutral defaults** after the MF.2 cutover; EXTRACTION.md §4.2's 20 product prompts split into **17 moved** to the target repo's `aidw/prompts/` and **3 retained and neutralised** here (`task-prompt.md` = `P1`, `update-traceability.md` = `I3`, `update-architecture.md` = `I4`). MF.2's literal "none remains in the toolkit" is deliberately not followed: those three are invoked by the **default** `prompt` and `implement` chains, and `resolve_prompt` fails closed (§12.3 step 4), so deleting them would make `aidw prompt` and the default implement chain refuse for every repo without overrides — breaking §8.3's "a target repo with no `aidw/` folder runs with pure defaults". The 17 were reachable only through `aidw exec --prompt <name>` or through prose in another prompt, so removing them changes no stage: a repo that wants one supplies a same-named file under its own `aidw/prompts/` (D14 precedence 2). Two consequences are recorded rather than hidden. First, the three retained defaults were **rewritten as new neutral text**, and the product text lives on only in the target repo's copies, which is the point — Mythical Forge now owns it, and in exchange no longer receives toolkit fixes to those three (stated in its `aidw/prompts/README.md`). Second, a toolkit default names a **stage** (`/pr`, `/test`), never a prompt file path for a file it does not ship: the pre-extraction cross-references that pointed into the product repo's own `prompts/` tree were stale as soon as the toolkit moved, and the agent context files were cleaned up in the same change. `R` is skipped in this log — `R1`–`R18` are the extraction-era resolutions of EXTRACTION.md §6. (§7.1; `docs/migration/prompt-classification.md`; `tests/test_prompt_classification.py`, `tests/test_prompt_neutrality.py`) |
 | Q1 | `aidw --version` is an eager top-level flag that prints exactly what the `version` subcommand prints — `aidt {aidw.__version__}` — and exits 0 **before any target resolution**, so it works outside a repository (E8.3, the roadmap's "without a target repo"). Neither click's default `<prog>, version <v>` rendering nor a `git`/`uv`/`pyproject.toml` lookup is used: both would disagree with the one version source E1.6/P1 already chose. `aidw doctor` next reports `toolkit version` (`aidw.__version__`, informational and always OK) as an environment check beside `git version`, so it survives the target early return, and a distinct `compat status` check carries the D10 verdict. That verdict **moves out of** `target config` (E3.5) rather than being copied: `check_compatibility` is evaluated once, an incompatible `schema_version`/`requires_toolkit` is one FAIL on one named line, and `target config` keeps the loader's ERROR issues, `validate_paths` and the resolved schema-version line. (EXTRACTION.md §3.11 D10; `aidw/cli.py`, `aidw/doctor.py`) |
+| T1 | **Gate outcomes persist through a merge-on-write of `state.json` under a per-run file lock** (H0.1, the roadmap's mechanism (b); supersedes nothing, it makes E4.8's recording survive a stage boundary). Rejected mechanism (a), a separate append-only outcome log per run: it needs a second artifact every reader (`RunState.gate_outcome`, `gate list`, `runs show`) and every writer learns about, and it leaves the rest of `state.json` with the same unchecked read-modify-write — the loss H0.1 closes is symmetric, so it belongs to the file both writers already share. Both writers own their rows: `state.save` publishes the workflow's whole state but reloads under the lock and merges the `gate_outcomes` already on disk, and the CLI gate path (`state.append_gate_outcomes`) reloads and appends only, so it never rewrites a stage record it did not write. The lock is **`<run_dir>/state.json.lock`**, `fcntl.flock(LOCK_EX|LOCK_NB)` opened fresh per acquire and never unlinked (the `aidw/lock.py` pattern), held around each writer's whole read-modify-write — **not** `locks/` and **not** keyed by worktree path, because the workflow already holds the worktree run lock for its whole lifetime and a worktree-keyed state lock would refuse every `aidw gate run` subprocess (design §9.1's non-conflation). `LOCK_NB` plus a bounded 60s retry loop, not a blocking `LOCK_EX`: a peer must be waited for (two overlapping gate runs both have evidence, and H0.1's symmetric-merge rule forbids dropping either), while a wedged holder fails closed with `StateLockTimeout` instead of hanging the run. Publication is a temp file **in the run directory**, fsynced, then `os.replace`d, so lock-free readers (a concurrent citation, `runs show`) never see a torn file; a temp file in `/tmp` would be an `EXDEV` failure or a non-atomic cross-device move. Dedup is identity of the whole row, never "newest wins per key": two processes that both executed a command are two pieces of evidence, so only byte-identical rows collapse. `GateOutcome`'s field names and the `gate_outcomes` list stay in `state.json` at the same `schema_version` — no schema change — and the cite-or-run rule (same key, tree, command, declared scope and `passed`; anything else runs) is untouched. An unreadable `state.json` fails the write closed rather than being overwritten. (§9.2, §9.1, §14; `aidw/state.py`, `aidw/cli.py`; `tests/test_verification.py`) |
 
 ---
 
