@@ -107,7 +107,7 @@ stage's artifacts, specs, the roadmap, or architecture docs.
 ## Non-goals — do NOT do these
 
 - Do **not** modify implementation code, tests, traceability artifacts, specs, or the roadmap.
-- Do **not** commit, push, or open a PR (`aidt/prompts/pr.md` owns that).
+- Do **not** commit, push, or open a PR (the `/pr` stage owns that).
 - Do **not** write `player-actions.md` or `integration-tests.md` — the `show-updated-*` prompts own those.
 - Do **not** record a result you did not observe. If a gate fails, record the failure and stop;
   do not fix it here.

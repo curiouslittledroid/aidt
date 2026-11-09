@@ -592,7 +592,12 @@ fails under `--strict`).
 
 `prompts/` in the toolkit root is **AIDT's own** prompt and helper-script tree — the source of
 truth for every workflow. It is edited freely as the workflows evolve; it is not copied from,
-or compared with, any other directory. New instructions and new subcommands in the bundled
+or compared with, any other directory.
+
+It ships **neutral defaults only**. A product-specific prompt is not part of this library: the
+repo that owns it keeps it under its own `aidw/prompts/`, where it shadows the default of the same
+name, and a prompt the toolkit does not ship cannot be reached by name — `aidw exec --prompt
+<name>` reports it as missing rather than falling back to something close. New instructions and new subcommands in the bundled
 scripts (for example `review-followup approve`) are expected. A target repo overrides a
 prompt per stage under its own `aidw/prompts/` — see the `aidw/` note in
 [Repository, naming, and provenance](#repository-naming-and-provenance).

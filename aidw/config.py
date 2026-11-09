@@ -18,7 +18,7 @@ Path resolution (design §5.1):
 - ``agents_md``, ``system_prompt.file``, ``mcp_config`` and every entry of ``skills``,
   ``extensions`` and ``prompt_templates`` are relative to the **aidt root**
   (so ``../.mcp.json`` means ``<repo>/.mcp.json`` and ``prompts`` means
-  ``<repo>/aidt/prompts``).
+  ``<repo>/prompts``).
 - Absolute paths are used as-is.
 """
 

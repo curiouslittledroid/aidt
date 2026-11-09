@@ -9,7 +9,7 @@ preflight (PR exists; `gh` available)
 
 This extracts the approval step that ``aidw fix`` performs at its entry, so a human can
 apply the GitHub decision without starting the whole fix loop. The prompt itself is
-``aidt/prompts/approve-review-followups.md``; all GitHub writes are performed by the
+``prompts/approve-review-followups.md``; all GitHub writes are performed by the
 bundled ``review_followup.py`` script the prompt invokes (design §13).
 
 The run lock (``aidw.lock``, EXTRACTION.md §3.2/§3.10) is keyed on ``repo.root``. Unlike

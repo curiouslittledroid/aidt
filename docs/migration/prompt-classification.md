@@ -1,29 +1,27 @@
-# Prompt classification — EXTRACTION.md §4.2 (E7.1)
+# Prompt classification — EXTRACTION.md §4.2, after the MF.2 cutover
 
-Execution record for **E7.1 Classify and relocate**: every top-level prompt in the toolkit's
-`prompts/` directory carries one explicit **bucket**, one **action**, and one **destination**.
+Execution record for **E7.1 Classify and relocate** and **MF.2 Move the product prompts**.
 
-The inventory is fixed by the spec, not re-derived: EXTRACTION.md §4.2 names the members of all
-three buckets — 6 + 5 + 20 = 31 files. That section is the source of truth; this table echoes it.
-Do not re-bucket by grepping for product tokens: §4.2 deliberately keeps `git-update.md` and
-`review-findings-to-github.md` in bucket (i) despite their frozen marker strings, and keeps
-`task-prompt.md` in bucket (iii) even though it names `aidt/prompts`. Grep would misclassify all
-three, and the frozen markers are not allowed to move (D5, §3.9).
+EXTRACTION.md §4.2 fixed the inventory by naming three buckets over the toolkit's 31 top-level
+`prompts/*.md` files — 6 + 5 + 20. The cutover has now run: **17 of the 20 product prompts moved to
+Mythical Forge's `aidw/prompts/`** (where they shadow the toolkit default by filename, D14
+precedence 2), and **3 stayed here as neutral defaults**, because they are wired into the toolkit's
+default workflow chains and a target repo with no `aidw/` folder must still run (§8.3 acceptance).
 
-## Buckets and actions
+That deviation from MF.2's literal "none remains in the toolkit" is deliberate and recorded in
+`design.md` §17 (M4). The 3 kept files were rewritten to be product-free at cutover; the product
+text lives on in Mythical Forge's own copies, which is where it is maintained now.
 
-| Bucket | Meaning | Action | Owner |
-|---|---|---|---|
-| (i) | Generic — no product coupling | ship as-is | none |
-| (ii) | Mixed — path and tooling names, small edits | neutralise in E7.2 | E7.2 |
-| (iii) | Wholly Mythical Forge — product prompts | move at cutover in MF.2 | MF.2 |
+Membership stays **spec-fixed**, never re-derived by grepping for product tokens: §4.2 deliberately
+kept `git-update.md` and `review-findings-to-github.md` in bucket (i) despite their frozen marker
+strings, and `task-prompt.md` in bucket (iii) even though it named the toolkit's own directory.
+`tests/test_prompt_classification.py` asserts both halves of that partition — the 14 files present
+here and the 17 that must be absent — so a prompt that is deleted, re-added, or quietly re-bucketed
+fails there rather than after the next release.
 
-Until the cutover (§7, MF.2) every file stays exactly where it is. Bucket (iii) files are **marked
-only**: they carry their intended destination in YAML frontmatter and are otherwise untouched.
+## In the toolkit (14 files)
 
-## Classification
-
-| Prompt file | Bucket | Action | Destination |
+| Prompt file | Class | Action | Destination |
 |---|---|---|---|
 | `approve-review-followups.md` | (i) | ship as-is | toolkit `prompts/` |
 | `code-review.md` | (i) | ship as-is | toolkit `prompts/` |
@@ -31,74 +29,57 @@ only**: they carry their intended destination in YAML frontmatter and are otherw
 | `review-findings-to-github.md` | (i) | ship as-is | toolkit `prompts/` |
 | `task-review-fixes.md` | (i) | ship as-is | toolkit `prompts/` |
 | `task-review.md` | (i) | ship as-is | toolkit `prompts/` |
-| `fix-next-review-followup.md` | (ii) | neutralise in E7.2 | toolkit `prompts/` |
-| `impliment-task.md` | (ii) | neutralise in E7.2 | toolkit `prompts/` |
-| `pr.md` | (ii) | neutralise in E7.2 | toolkit `prompts/` |
-| `record-implementation-results.md` | (ii) | neutralise in E7.2 | toolkit `prompts/` |
-| `test.md` | (ii) | neutralise in E7.2 | toolkit `prompts/` |
-| `doc-lambdas.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `implement-srd-followup.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `integration-tests.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `manual-test-plan.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `show-updated-integration-tests.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `show-updated-player-actions.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `task-prompt.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-architecture.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-authentication-sequence-diagram.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-infrastructure-diagram.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-lambda-dataflow-diagram.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-player-ws-message-flow-diagram.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-rules-engine-diagram-combat.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-rules-engine-diagram-movement.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-rules-engine-diagram-progression.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-rules-engine-diagram-skills.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-rules-engine-diagram-spells.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-rules-engine-diagram-vision-world.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-rules-engine-diagram.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
-| `update-traceability.md` | (iii) | move at cutover in MF.2 | Mythical Forge `aidw/prompts/` |
+| `fix-next-review-followup.md` | (ii) | neutralised in E7.2 | toolkit `prompts/` |
+| `impliment-task.md` | (ii) | neutralised in E7.2 | toolkit `prompts/` |
+| `pr.md` | (ii) | neutralised in E7.2 | toolkit `prompts/` |
+| `record-implementation-results.md` | (ii) | neutralised in E7.2 | toolkit `prompts/` |
+| `test.md` | (ii) | neutralised in E7.2 | toolkit `prompts/` |
+| `task-prompt.md` | (iii) | retained and neutralised in MF.2 | toolkit `prompts/` |
+| `update-architecture.md` | (iii) | retained and neutralised in MF.2 | toolkit `prompts/` |
+| `update-traceability.md` | (iii) | retained and neutralised in MF.2 | toolkit `prompts/` |
 
-## Bucket (iii) marker contract
+The three retained files are the ones the default registry invokes: `task-prompt.md` is stage
+`P1` of the `prompt` workflow, and `update-traceability.md` / `update-architecture.md` are stages
+`I3` / `I4` of the default `implement` chain. Every other product prompt was reached only by
+`aidw exec --prompt <name>` or by prose in another prompt, so removing it changes no stage: a repo
+that wants one supplies a same-named file under its own `aidw/prompts/`.
 
-Each bucket (iii) file carries exactly one frontmatter field:
+## Moved to Mythical Forge at MF.2 (17 files)
 
-```yaml
-destination: mythical-forge/aidw/prompts/
-```
+- `doc-lambdas.md`
+- `implement-srd-followup.md`
+- `integration-tests.md`
+- `manual-test-plan.md`
+- `show-updated-integration-tests.md`
+- `show-updated-player-actions.md`
+- `update-authentication-sequence-diagram.md`
+- `update-infrastructure-diagram.md`
+- `update-lambda-dataflow-diagram.md`
+- `update-player-ws-message-flow-diagram.md`
+- `update-rules-engine-diagram.md`
+- `update-rules-engine-diagram-combat.md`
+- `update-rules-engine-diagram-movement.md`
+- `update-rules-engine-diagram-progression.md`
+- `update-rules-engine-diagram-skills.md`
+- `update-rules-engine-diagram-spells.md`
+- `update-rules-engine-diagram-vision-world.md`
 
-Three rules make the marker inert:
+They moved with their filenames unchanged, so they still resolve by name in the target repo, and
+the toolkit prompts that used to name them in prose now name the **stage** instead (`/test`,
+`/record-implementation-results`, `/pr`, …) — a toolkit default must not point at a file it does not
+ship. The `destination:` frontmatter marker E7.1 used to track the pending move is gone with them:
+no toolkit prompt carries it any more.
 
-1. **Frontmatter only.** `aidw/prompts.py:strip_frontmatter` removes the leading `---` block
-   before rendering, so the rendered prompt — the text Pi receives — is byte-identical to the
-   text before the marker was added. A note in the body would render into the agent message and
-   change behaviour.
-2. **A minimal block, not a replaced one.** `task-prompt.md`, `integration-tests.md` and
-   `manual-test-plan.md` had no frontmatter; each gained a `---` … `---` block carrying the
-   destination field and nothing else. The other 17 already had a block and kept every existing
-   field.
-3. **No foreign prefix.** The value must never contain `.pi/prompts`: `aidw/inventory.py`
-   (`FOREIGN_PREFIX`) rejects that reference from every file under `prompts/`, so
-   `aidw prompts check` and `tests/test_inventory.py::test_real_inventory_is_complete` would go
-   red. `mythical-forge/aidw/prompts/` is the new repo's own folder, not the old mirror.
+## What the guard asserts
 
-## What this table does *not* own
+`tests/test_prompt_classification.py` pins, in both directions:
 
-- **Bucket (ii) wording.** `test.md`, `pr.md`, `fix-next-review-followup.md`,
-  `record-implementation-results.md` and `impliment-task.md` are edited in E7.2. `pr.md` was
-  partly edited ahead of E7.2 (§4.2's (ii) table, R17) and is left exactly as found here. The
-  five keep toolkit `prompts/` as their destination; at MF.2 Mythical Forge additionally supplies
-  same-named overrides through `aidw/prompts/` (D14 precedence 2, §7 MF.2), which is a copy the
-  target repo owns, not a move of the toolkit default.
-- **The move itself.** MF.2 relocates the 20 files with their filenames unchanged, so stage
-  resolution stays by name. Nothing is moved, deleted or renamed here.
-- **`prompts/scripts/`.** The bundled streaming-review scripts (`REQUIRED_SCRIPTS` in
-  `aidw/inventory.py` — `scripts/review-followup/*.py`) are toolkit-owned helpers, not prompts,
-  and never appear in this table.
-- **Agents, configs and docs.** §4.3's inventory is E7.4's; §4.1's code inventory is not
-  revisited here.
-
-## Guard
-
-`tests/test_prompt_classification.py` is this document's executable half: the table's filename
-set equals the set of top-level `prompts/*.md` in **both** directions (no unclassified file, no
-stale row), the bucket membership equals §4.2's named lists, and the marker contract above is
-asserted against the real files through `strip_frontmatter`.
+- the 14 files present here are exactly the rows of the table above, and the 17 listed as moved are
+  absent from the toolkit;
+- the four sets partition §4.2's own named lists (6 / 5 / 3 / 17 = 31), read from
+  `docs/migration/EXTRACTION.md` rather than re-derived;
+- bucket (i) is byte-identical to the pre-E7.1 baseline revision, so "ship as-is" keeps meaning it;
+- the three retained defaults render at the positional arity their stages pass (`$1 $2 $3` for the
+  author stage, `$1` for traceability, `$1 $2` for architecture), and
+  `tests/test_prompt_neutrality.py` asserts their rendered text names no package manager, product
+  path or product doc.

@@ -1,18 +1,17 @@
 ---
-destination: mythical-forge/aidw/prompts/
-description: Update SRD traceability (catalog, vector matrix, report, roadmap checkbox) for the current branch
+description: Update the repo's traceability artefacts for a change and flip its roadmap entry
 argument-hint: "[branch]"
 ---
 
-# Update SRD traceability
+# Update traceability
 
 The implementation and its contract tests are complete on the current branch. This prompt owns
-**only the traceability artifacts** for the change: the SRD claim catalog, the vector matrix, the
-generated report, and the roadmap checkbox. It does not write or change implementation code, and
-it does not commit, push, or open a PR.
+**only** the repo's traceability artefacts for the change — whatever this repo uses to prove that a
+requirement is implemented and tested — plus the one roadmap checkbox for the task. It does not
+write or change implementation code, and it does not commit, push, or open a PR.
 
-This is a focused SDLC stage so it can run as its own agent. It is mechanical but gate-touching,
-so every edit must be validated against the conventions and the checkers — never papered over.
+This is a focused stage so it can run as its own agent. It is mechanical but gate-touching, so
+every edit must be validated against the repo's conventions and its checkers — never papered over.
 
 ## Variables
 
@@ -22,18 +21,22 @@ so every edit must be validated against the conventions and the checkers — nev
 
 | Artifact | What to update |
 |---|---|
-| `docs/rules-coverage/catalog.json` | Claim `status`, `implementation.integration[]`, `implementation.integrationTests[]`, `implementation.tests[]`, and `notes` for the claims this task implements |
-| `docs/rules-coverage/report.md` | Regenerate via `pnpm srd:report` — never hand-edit |
-| `tests/integration/src/vector-matrix/vectors.ts` | Add an independently hand-calculated row per new/changed Rules Engine API action or implemented claim in matrix scope; add/adjust `not_applicable` markers where a claim is out of scope |
-| `tests/integration/src/02.5-B/**` | Remove vector assertions superseded by a new matrix row |
-| `docs/tasks/<phase> - <name>.md` | Flip the one roadmap checkbox for the task id from `- [ ]` to `- [x]` |
+| The repo's traceability artefacts | The entries, statuses, references and generated views that cover the requirements this task implements — as its conventions define them |
+| `paths.roadmap_dir` | Flip the one checkbox for this task id from `- [ ]` to `- [x]` |
 
-Do **not** touch implementation code, unit/handler tests, integration suites under
-`tests/integration/src/<task-id>/`, specs, or `docs/implementation-results/**`.
+The artefact set is the **target repo's**, named by its `aidw/conventions.md` and its root
+`AGENTS.md`; it is not fixed here, and a repo with no traceability convention has nothing for this
+stage to update beyond the roadmap checkbox. Do not invent an artefact, a status vocabulary or a
+generated file to have something to change.
+
+Do **not** touch implementation code, unit tests, integration suites, specs, the build-results
+document (`paths.implementation_results_dir`), or the architecture documents.
 
 ## Instructions
 
-1. Read `docs/conventions/srd-traceability.md` in full, then `AGENTS.md` §6.
+1. Read the repo's root `AGENTS.md` and its optional `aidw/conventions.md`, and any traceability
+   convention document they cite. Those sources own the artefact list, the status vocabulary, the
+   checker commands and the evidence rules; this prompt does not restate them.
 2. Determine the branch and the change set:
    ```bash
    git branch --show-current
@@ -41,64 +44,54 @@ Do **not** touch implementation code, unit/handler tests, integration suites und
    git log --oneline main..HEAD
    git diff --stat main...HEAD
    ```
-3. Read the task prompt (`docs/task-prompts/<branch>-prompt.md`) and the implementation's
-   final response / diff to learn the exact symbols, actions, and tests the task added. The
-   catalog must cite real code and test names, resolved by `pnpm srd:check-tests` (which owns
-   `services/`/`packages/` refs; `tests/integration/…` refs need `--jest-json`).
-4. **Before changing any status or gate set**, verify the effect against the current repo:
-   ```bash
-   pnpm srd:matrix-check --statuses <set>
-   ```
-   If it reds on pre-existing entries, **stop and ask** — do not silently narrow the set or
-   widen the gate. Name the extra coverage the widening pulls in, or leave the set alone.
-5. Update `catalog.json`:
-   - Add/refresh `implementation.integration[]` (`{ file, symbol }`) and
-     `implementation.integrationTests[]` (`{ file, name }`) — these are **separate** fields; never
-     conflate code refs with test refs.
-   - Only change a claim's `status` when the evidence justifies it (`implemented` / `wired` /
-     `integrated` per the vocabulary in the convention). State the reason in `notes`.
-   - Edit the committed file **in place** (targeted edits, never a whole-file re-serialise) and
-     validate the JSON immediately after each edit.
-6. Update the vector matrix:
-   - For each new/changed API action or implemented claim in matrix scope, add an independently
-     hand-calculated row (seed only for seedable actions).
-   - Remove any superseded duplicate vector assertion from `02.5-B`.
-   - If the change is not eligible for matrix coverage, record the reason explicitly (in the
-     catalog `notes` and your final response) rather than silently omitting it.
-7. Regenerate the report: `pnpm srd:report`. Do not hand-edit `report.md`.
+3. Read the task prompt (`paths.task_prompts_dir`/`<branch>-prompt.md`) and the implementation's
+   final response and diff to learn the exact symbols, actions and tests the task added. Every
+   reference you record must resolve to something that exists — a real file, a real symbol, a real
+   test name. Never record a reference you did not verify.
+4. **Before changing any status or checked set, verify the effect against the current repo** with
+   the repo's own checker, run as the conventions name it. If it already fails on pre-existing
+   entries, **stop and ask** — do not silently narrow the requirement set or widen the checker.
+   Name the extra coverage a widening pulls in, or leave the set alone.
+5. Update the artefacts with **targeted, in-place edits**: preserve the file's existing formatting
+   and ordering, and re-validate a structured file immediately after each edit. A whole-file
+   re-serialise buries the real change in diff noise and is not acceptable.
+6. Only change a status when the evidence justifies it, and state the reason where the repo records
+   one. Recording a status the evidence does not support is the failure mode this stage exists to
+   prevent — it is never a way to make a checker pass.
+7. If this change is out of scope for an artefact the repo maintains, record that conclusion and
+   its reason rather than silently omitting the entry.
 8. Flip the roadmap checkbox for this task id (`- [ ]` → `- [x]`), and only that one. If the item
    is already checked or no unchecked entry matches the task id, leave the file alone and say so.
-9. Run the offline gates and report the real outcomes:
+9. Run the repo's traceability checks and report their real outcomes. Run each through
+   `aidw gate run <key> -- <command>`, with the gates named as `pr.md` names them and the same
+   `--ignore` scope `pr.md` declares, so the outcome is recorded against the tree it gated and
+   `/pr` can cite it instead of re-running it:
    ```bash
-   pnpm srd:validate
-   pnpm srd:check-references
-   pnpm srd:matrix-check
-   pnpm srd:report
+   aidw gate run <key> $SCOPE -- <the repo's traceability check command>
    ```
-   Run the matrix completeness test too. The deployed vector-matrix suite
-   (`pnpm integration -- --testPathPatterns=vector-matrix`) runs only when the deployed dev
-   prerequisites are available — if it cannot run, say so and do not treat the matrix as verified.
+   A check that needs credentials, a deployed environment or another unavailable prerequisite is
+   reported as not run — never as passing.
 
 ## Non-goals — do NOT do these
 
 - Do **not** write or modify implementation code, unit tests, or integration suites.
-- Do **not** commit, push, or open a PR (`aidt/prompts/pr.md` owns that).
-- Do **not** write `docs/implementation-results/**` (`record-implementation-results.md` owns that).
-- Do **not** edit specs, or any catalog field unrelated to this task's claims.
-- Do **not** change a claim's `status` to make a gate pass — that is the failure mode this
-  convention exists to prevent.
+- Do **not** commit, push, or open a PR (the `/pr` stage owns that).
+- Do **not** write the build-results document (`paths.implementation_results_dir`) — the
+  `/record-implementation-results` stage owns that.
+- Do **not** edit specs, or any artefact entry unrelated to this task's requirements.
+- Do **not** change a status to make a checker pass.
 
 ## Done when
 
-- Every claim this task implements cites real, resolvable `integration[]` / `integrationTests[]`
-  refs, or is explicitly documented as out of scope.
-- `pnpm srd:validate`, `pnpm srd:check-references`, `pnpm srd:matrix-check`, and the matrix
-  completeness test pass (or the reason they cannot run is stated).
-- The vector matrix has a row for every in-scope action/claim, and superseded duplicates are gone.
+- Every requirement this task implements cites real, resolvable evidence, or is explicitly
+  documented as out of scope with its reason.
+- The repo's traceability checks pass, or the reason they cannot run is stated.
+- Superseded or duplicated entries this change replaces are removed rather than left contradicting
+  the new ones.
 - The roadmap checkbox for this task id is flipped (or the reason it was not is stated).
-- No implementation, test, or results file was modified; no commit was made.
+- No implementation, test or results file was modified; no commit was made.
 
 ## Final response
 
-Return: the artifacts changed (paths), the exact gate commands and their real outcomes, the
-matrix-impact decision and its reason, and any claim left unverified with the reason.
+Return: the artefacts changed (paths), the exact commands and their real outcomes, the scope
+decision and its reason, and any requirement left unverified with the reason.

@@ -4,7 +4,7 @@ You run the repository's real verification gate and record exactly what happened
 
 ## Stage
 
-`/record-implementation-results` (`aidt/prompts/record-implementation-results.md`).
+`/record-implementation-results`.
 
 ## Hard rules
 

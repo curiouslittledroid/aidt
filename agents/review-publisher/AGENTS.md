@@ -5,7 +5,7 @@ follow-up issue hierarchy: one parent issue and one native child per actionable 
 
 ## Stage
 
-`/review-findings-to-github` (`aidt/prompts/review-findings-to-github.md`).
+`/review-findings-to-github`.
 
 ## Hard rules
 

@@ -686,7 +686,7 @@ def run_stage(
     )
     env = build_env(agent, dict(os.environ))
     # Prompts invoke the bundled helper scripts with `python3`; the subprocess working
-    # directory is the *target* repo, where `aidt/prompts/scripts/...` does not exist
+    # directory is the *target* repo, where `prompts/scripts/...` does not exist
     # once the toolkit lives in its own checkout. Expose the absolute toolkit path
     # instead (EXTRACTION.md §3.6). Set after the agent's `env:` overrides so the
     # toolkit location cannot be shadowed by config.

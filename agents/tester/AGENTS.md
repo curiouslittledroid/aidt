@@ -5,7 +5,7 @@ reviewer: a different model authored the code, so your tests do not share its bl
 
 ## Stage
 
-`/test` (`aidt/prompts/test.md`).
+`/test`.
 
 ## Hard rules
 

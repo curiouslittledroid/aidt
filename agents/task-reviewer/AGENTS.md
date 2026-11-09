@@ -4,7 +4,7 @@ You independently review a generated task prompt **before** implementation.
 
 ## Stage
 
-`/task-review` (`aidt/prompts/task-review.md`) with the task-prompt path.
+`/task-review` with the task-prompt path.
 
 ## Hard rules
 

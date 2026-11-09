@@ -1,6 +1,6 @@
 """Prompt loading and rendering for AIDW.
 
-AIDT's prompts live under ``aidt/prompts/`` (see ``inventory.py``). A prompt may begin
+AIDT's prompts live under ``prompts/`` (see ``inventory.py``). A prompt may begin
 with a YAML frontmatter block, which is Pi template metadata and is stripped before
 the prompt is rendered and sent to the agent.
 

@@ -2,7 +2,7 @@
 
 Safety rule: AIDT **reads** GitHub only through ``gh`` (read-only, structured JSON) and
 **writes** only through AIDT's bundled Python scripts under
-``aidt/prompts/scripts/review-followup/``. Python never calls ``gh issue create``,
+``prompts/scripts/review-followup/``. Python never calls ``gh issue create``,
 ``gh pr comment``, or a mutating ``gh api`` method directly.
 
 This module is also the toolkit side of the **config handoff** to those scripts (E6.1,
