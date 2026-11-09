@@ -519,7 +519,7 @@ def test_dry_run_argv_and_record_use_the_per_stage_model(
     assert record.model == record_model
     assert f"model={record_model}" in log
     # Purity: the loaded config another stage would use is untouched.
-    assert agents["code-reviewer"].model == "openrouter/meta/muse-spark-1.3"
+    assert agents["code-reviewer"].model == "openrouter/meta/muse-spark-1.3-contributor"
 
 
 def test_an_un_overridden_stage_keeps_the_toolkit_model(tmp_path: Path) -> None:
@@ -551,9 +551,9 @@ def test_an_un_overridden_stage_keeps_the_toolkit_model(tmp_path: Path) -> None:
 
     assert overridden.model == "openrouter/muse-spark-2.0"
     assert sibling.model == agents["code-reviewer"].qualified_model
-    assert sibling.model == "openrouter/meta/muse-spark-1.3"
+    assert sibling.model == "openrouter/meta/muse-spark-1.3-contributor"
     log = (tmp_path / run.run_id / "run.log").read_text()
-    assert "model=openrouter/meta/muse-spark-1.3" in log
+    assert "model=openrouter/meta/muse-spark-1.3-contributor" in log
 
 
 def test_stage_thinking_and_timeout_override_the_effective_agent(
@@ -593,7 +593,7 @@ def test_stage_thinking_and_timeout_override_the_effective_agent(
     assert argv[argv.index("--thinking") + 1] == "low"
     assert captured["timeout"] == 42.0
     # An un-overridden model still comes from the agent config.
-    assert record.model == "openrouter/meta/muse-spark-1.3"
+    assert record.model == "openrouter/meta/muse-spark-1.3-contributor"
 
 
 def test_state_meta_and_log_all_carry_the_effective_model(
@@ -733,7 +733,7 @@ def test_global_override_then_per_stage_model_precedence(tmp_path: Path) -> None
 
     assert global_layer.model == "openrouter/vendor/global-override"
     assert per_stage.model == "openrouter/vendor/stage-winner"
-    assert toolkit_layer.qualified_model == "openrouter/meta/muse-spark-1.3"
+    assert toolkit_layer.qualified_model == "openrouter/meta/muse-spark-1.3-contributor"
     log = (tmp_path / run.run_id / "run.log").read_text()
     assert "--model vendor/global-override" in log
     assert "--model vendor/stage-winner" in log
