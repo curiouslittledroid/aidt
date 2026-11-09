@@ -341,3 +341,67 @@ def test_the_gate_list_is_the_agents_md_set(release) -> None:
         ("prompts", "check"),
     ):
         assert ("uv", "run", "aidw", *tail) in release.GATES
+
+
+# ---------------------------------------------------------------------------
+# Every subcommand is reachable (the regression for the released `verify` crash)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "version"),
+    [("bump", "1.1.0"), ("tag", "1.1.0"), ("verify", "1.1.0")],
+)
+def test_every_subcommand_runs_its_preflight_without_an_unbound_name(
+    release, tree: Path, capsys, subcommand: str, version: str
+) -> None:
+    """No handler may raise a ``NameError`` — 1.1.0 shipped a `verify` that did.
+
+    ``cmd_verify`` was written against a ``root`` it never bound, and the suite only asserted
+    that the *subcommand existed*, so the first real use of ``verify`` in 1.1.0 was also its
+    first execution — after the tag was already published. This walks each handler's preflight
+    under ``--dry-run`` (exit 0, or exit 2 for the documented refusals) and fails on any
+    traceback. It is deliberately shallow: it checks reachability, not each rule, which the
+    tests above own one by one.
+    """
+    _git_repo(tree)
+
+    code = release.main(["--root", str(tree), subcommand, version, "--dry-run"])
+
+    captured = capsys.readouterr()
+    assert code in (0, 2), captured.err
+    assert "Traceback" not in captured.err
+    assert "NameError" not in captured.err
+    if code == 2:
+        assert "release refused:" in captured.err
+
+
+def test_verify_dry_run_prints_both_d9_install_forms(release, tree: Path, capsys) -> None:
+    """``verify`` names the exact tag and both documented forms before installing anything."""
+    _git_repo(tree)
+
+    code = release.main(["--root", str(tree), "verify", "1.1.0", "--dry-run"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "uv tool install git+https://github.com/curiouslittledroid/aidt@v1.1.0" in out
+    assert "uvx --from git+https://github.com/curiouslittledroid/aidt@v1.1.0 aidw --version" in out
+    assert "UV_TOOL_DIR" not in out  # the env is applied, not echoed as a command
+    assert "aidw doctor" in out  # the check it hands back to the operator
+
+
+def test_the_clean_venv_isolates_only_uvs_three_directories(release, tmp_path: Path) -> None:
+    """``HOME`` and ``PATH`` stay the operator's, and that is load-bearing.
+
+    ``verify`` installs from a **private** repository, so the clone authenticates with the
+    machine's git credentials. 1.1.0's ``verify`` overrode ``HOME`` as well and failed on the
+    first real run with ``could not read Username for 'https://github.com': terminal prompts
+    disabled`` — the credential helper lives in ``~/.gitconfig``. Only uv's three directories
+    are isolated, which is exactly what ``docs/releasing.md`` §3 prescribes.
+    """
+    env = release.clean_venv_env(tmp_path)
+
+    assert set(env) == {"UV_TOOL_DIR", "UV_TOOL_BIN_DIR", "UV_CACHE_DIR"}
+    assert env["UV_TOOL_DIR"] == str(tmp_path / "tools")
+    assert env["UV_TOOL_BIN_DIR"] == str(tmp_path / "bin")
+    assert env["UV_CACHE_DIR"] == str(tmp_path / "cache")
