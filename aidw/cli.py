@@ -298,6 +298,10 @@ def prompt(
     phase: str = typer.Argument(..., help="Zero-padded phase, e.g. 03."),
     epic: str = typer.Argument(..., help="Epic id, e.g. E2."),
     task: str = typer.Argument(..., help="Task id, e.g. E2.9."),
+    resume: bool = typer.Option(False, "--resume", help="Resume the latest run."),
+    from_stage: Optional[str] = typer.Option(
+        None, "--from", help="Re-run from this stage onward."
+    ),
     yes: bool = typer.Option(False, "--yes", help="Approve all gates."),
     skip_gates: list[str] = typer.Option(
         [], "--skip-gates", help="Gate name(s) to skip (repeatable)."
@@ -356,6 +360,8 @@ def prompt(
         no_fetch=no_fetch,
         allow_incomplete_prereqs=allow_incomplete_prereqs,
         max_revisions=max_revisions,
+        resume=resume,
+        from_stage=from_stage,
         stream=bool(_state["verbose"]),
     )
     raise typer.Exit(code)
@@ -1103,7 +1109,8 @@ def runs(
     if action == "resume":
         typer.echo(
             "`runs resume` is wired per-workflow; use the workflow's own --resume flag "
-            "(`aidw implement --resume`; `aidw fix` has no resume in v1).",
+            "(`aidw prompt --resume`, `aidw implement --resume`; `aidw fix` has no "
+            "resume in v1).",
             err=True,
         )
         raise typer.Exit(EXIT_USAGE)
