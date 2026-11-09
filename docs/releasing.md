@@ -43,7 +43,10 @@ uv run python scripts/release.py --root . verify 1.1.0          # D9 install for
   `origin` (§2). It never moves an existing tag.
 - **`verify`** installs the pushed tag into a throwaway tool venv and cache (`UV_TOOL_DIR`,
   `UV_TOOL_BIN_DIR`, `UV_CACHE_DIR`) with both D9 forms and checks `aidw --version` (§3). It prints
-  the `aidw doctor` line to run by hand, because that check needs a bootstrapped workspace.
+  the `aidw doctor` line to run by hand, because that check needs a bootstrapped workspace. Only
+  those three variables are isolated: the install clones a **private** repository with your git
+  credentials, so `HOME`/`PATH` stay yours — isolating `HOME` hides `~/.gitconfig` and the
+  credential helper, and the fetch fails with `could not read Username for 'https://github.com'`.
 
 `--root` is a top-level option, so it precedes the subcommand. `tests/test_release_script.py` pins
 the site patterns, the refusals and the gate list; it bumps throwaway fixtures, never this tree.

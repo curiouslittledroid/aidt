@@ -45,7 +45,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from packaging.version import InvalidVersion, Version
+from packaging.version import Version
 
 #: The three files that carry the version, and the one line in each. Each pattern captures
 #: exactly the version literal and is applied with ``count=1``, so a second copy is an error
@@ -209,9 +209,9 @@ class Runner:
     ) -> str:
         printable = " ".join(args)
         if self.dry_run:
-            print(f"  would run: {printable}")
+            print(f"  would run: {printable}", flush=True)
             return ""
-        print(f"  run: {printable}")
+        print(f"  run: {printable}", flush=True)
         completed = subprocess.run(
             list(args),
             cwd=self.cwd,
@@ -230,7 +230,7 @@ class Runner:
         commit, push or tag are suppressed. A dry run that skipped these would either refuse
         on empty strings or claim a clean tree it never looked at.
         """
-        print(f"  check: {' '.join(args)}")
+        print(f"  check: {' '.join(args)}", flush=True)
         completed = subprocess.run(
             list(args), cwd=self.cwd, check=False, text=True, capture_output=True
         )
@@ -239,7 +239,7 @@ class Runner:
     def run_ok(self, args: tuple[str, ...] | list[str], **kwargs: object) -> bool:
         """Whether the command succeeds — used for the checks that must fail *closed*."""
         if self.dry_run:
-            print(f"  would run: {' '.join(args)}")
+            print(f"  would run: {' '.join(args)}", flush=True)
             return False
         return (
             subprocess.run(
@@ -425,6 +425,7 @@ def cmd_tag(args: argparse.Namespace) -> int:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
+    root = Path(args.root).resolve()
     version = parse_version(args.version)
     tag = tag_name(version)
     runner = Runner(cwd=root, dry_run=args.dry_run)
@@ -437,13 +438,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     with tempfile.TemporaryDirectory(prefix="aidt-release-check-") as scratch:
         base = Path(scratch)
-        env = {
-            "UV_TOOL_DIR": str(base / "tools"),
-            "UV_TOOL_BIN_DIR": str(base / "bin"),
-            "UV_CACHE_DIR": str(base / "cache"),
-            "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin",
-            "HOME": str(base),
-        }
+        env = clean_venv_env(base)
         # A clean tool venv is the point: a cached build must not make an older install look
         # like the new tag (docs/releasing.md §3).
         runner.run(
@@ -467,8 +462,27 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def clean_venv_env(base: Path) -> dict[str, str]:
+    """The env overrides that make a *clean* tool venv: uv's three directories, nothing else.
+
+    Isolating ``UV_TOOL_DIR``/``UV_TOOL_BIN_DIR``/``UV_CACHE_DIR`` is what stops a cached build
+    making an older install look like the new tag (``docs/releasing.md`` §3).
+
+    ``HOME`` and ``PATH`` are deliberately **not** overridden. The install clones a *private*
+    repository, so it authenticates with the machine's git credentials; overriding ``HOME``
+    hides ``~/.gitconfig`` and its credential helper, and the fetch then fails with
+    ``could not read Username for 'https://github.com': terminal prompts disabled`` — which is
+    exactly how the first post-1.1.0 run of ``verify`` failed.
+    """
+    return {
+        "UV_TOOL_DIR": str(base / "tools"),
+        "UV_TOOL_BIN_DIR": str(base / "bin"),
+        "UV_CACHE_DIR": str(base / "cache"),
+    }
+
+
 def _merge_env(overrides: dict[str, str]) -> dict[str, str]:
-    """The current environment with the clean-venv overrides applied."""
+    """The operator's environment with the clean-venv overrides applied on top."""
     return {**os.environ, **overrides}
 
 
