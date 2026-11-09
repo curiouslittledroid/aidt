@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ from aidw.paths import (
     toolkit_root,
     repo_root,
 )
-from aidw.pi import PiResult, Usage
+from aidw.pi import AttemptDetail, PiResult, Usage
 from aidw import runner as runner_mod
 from aidw.runner import StageSpec, declared_stage_issues, resolve_prompt, run_stage
 from aidw.state import FAILED, SUCCEEDED, create_run
@@ -843,3 +844,164 @@ def test_stage_env_removes_a_stale_inherited_handoff_without_a_config(
 
     assert REVIEW_FOLLOWUP_CONFIG_ENV_VAR not in captured["env"]
     assert SCRIPTS_DIR_ENV_VAR in captured["env"]
+
+
+# --------------------------------------------------------------------------- #
+# H1.1: both attempts reach state.json + the stage meta; the final reason wins
+# --------------------------------------------------------------------------- #
+
+
+def _two_attempt_result() -> PiResult:
+    """A truncation retry that answered: summed usage/timing, per-attempt detail."""
+    first = AttemptDetail(
+        attempt=1,
+        session_id="aidw-run-base",
+        exit_code=0,
+        stop_reason="length",
+        usage=Usage(
+            input_tokens=10, output_tokens=7, cache_read=2, total_tokens=19, cost_usd=0.001
+        ),
+        generation_seconds=0.5,
+        tool_seconds=0.25,
+    )
+    second = AttemptDetail(
+        attempt=2,
+        session_id="aidw-run-base-retry",
+        exit_code=0,
+        stop_reason="stop",
+        usage=Usage(
+            input_tokens=20, output_tokens=3, cache_read=4, total_tokens=27, cost_usd=0.002
+        ),
+        generation_seconds=1.5,
+        tool_seconds=0.75,
+    )
+    return PiResult(
+        exit_code=0,
+        session_id="aidw-run-base-retry",
+        final_message="the answer",
+        usage=Usage(
+            input_tokens=30,
+            output_tokens=10,
+            cache_read=6,
+            total_tokens=46,
+            cost_usd=0.003,
+        ),
+        duration_seconds=4.0,
+        event_count=8,
+        tool_calls=2,
+        tool_errors=0,
+        stop_reason="stop",
+        stderr="",
+        timed_out=False,
+        attempts=2,
+        jsonl_path="stages/noop.jsonl",
+        out_path=None,
+        generation_seconds=2.0,
+        tool_seconds=1.0,
+        tool_breakdown={"read": 1.0},
+        attempts_detail=[first, second],
+    )
+
+
+def test_run_stage_records_the_final_stop_reason_and_attempt_count(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`StageRecord.stop_reason` is the *final* attempt's and usage is the summed total."""
+    record, _log = _run_with_result(tmp_path, monkeypatch, _two_attempt_result())
+
+    assert record.status == SUCCEEDED
+    assert record.attempts == 2
+    assert record.stop_reason == "stop"  # the last attempts_detail entry, not "length"
+    assert record.usage is not None
+    assert record.usage["input_tokens"] == 30
+    assert record.usage["output_tokens"] == 10
+    assert record.usage["cost_usd"] == pytest.approx(0.003)
+    assert record.cost_usd == pytest.approx(0.003)
+    assert record.generation_seconds == 2.0
+    assert record.tool_seconds == 1.0
+    assert record.output_tokens_per_second == 5.0
+
+
+def test_run_stage_meta_shows_one_entry_per_attempt(tmp_path: Path, monkeypatch) -> None:
+    """The stage `.meta.json` keeps both attempts alongside the `attempts` count."""
+    result = _two_attempt_result()
+    run = create_run(tmp_path, repo_root(), "stage", label="retry-meta")
+    agents, _ = load_all(toolkit_root(), repo_root())
+    monkeypatch.setattr(runner_mod, "execute", lambda *args, **kwargs: result)
+    logger = RunLogger(tmp_path / run.run_id)
+
+    run_stage(
+        StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
+        repo_root=repo_root(),
+        toolkit_root=toolkit_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        runs_root=tmp_path,
+    )
+
+    meta = json.loads(
+        (tmp_path / run.run_id / "stages" / "noop.meta.json").read_text(encoding="utf-8")
+    )
+    assert meta["attempts"] == 2
+    detail = meta["attempts_detail"]
+    assert len(detail) == 2
+    assert [entry["session_id"] for entry in detail] == [
+        "aidw-run-base",
+        "aidw-run-base-retry",
+    ]
+    assert [entry["exit_code"] for entry in detail] == [0, 0]
+    assert [entry["stop_reason"] for entry in detail] == ["length", "stop"]
+    assert [entry["usage"]["cost_usd"] for entry in detail] == [0.001, 0.002]
+
+
+def test_run_stage_cost_ceiling_sees_the_summed_two_attempt_cost(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Both attempts' spend lands in `usage`, so the one existing ceiling check covers it."""
+    agents, _ = load_all(toolkit_root(), repo_root())
+    # Each attempt alone is under the ceiling; only the summed 0.003 exceeds it.
+    agents["code-reviewer"].max_cost_usd = 0.0025
+    monkeypatch.setattr(runner_mod, "execute", lambda *args, **kwargs: _two_attempt_result())
+
+    run = create_run(tmp_path, repo_root(), "stage", label="retry-ceiling")
+    logger = RunLogger(tmp_path / run.run_id)
+    record = run_stage(
+        StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
+        repo_root=repo_root(),
+        toolkit_root=toolkit_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        runs_root=tmp_path,
+    )
+
+    assert record.status == FAILED
+    assert record.error is not None and record.error.startswith("cost_ceiling:")
+
+
+def test_run_stage_forwards_retry_transient_false(tmp_path: Path, monkeypatch) -> None:
+    """`--no-retry-transient` reaches `execute`, so neither retry branch can fire."""
+    captured: dict = {}
+
+    def _capture(argv, prompt, **kwargs):
+        captured.update(kwargs)
+        return _result(0.0)
+
+    monkeypatch.setattr(runner_mod, "execute", _capture)
+    agents, _ = load_all(toolkit_root(), repo_root())
+    run = create_run(tmp_path, repo_root(), "stage", label="no-retry")
+    logger = RunLogger(tmp_path / run.run_id)
+
+    run_stage(
+        StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
+        repo_root=repo_root(),
+        toolkit_root=toolkit_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        retry_transient=False,
+        runs_root=tmp_path,
+    )
+
+    assert captured["retry_transient"] is False

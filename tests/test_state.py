@@ -217,6 +217,29 @@ def test_old_state_without_throughput_still_loads(tmp_path: Path) -> None:
     assert loaded.stages[0].tool_seconds is None
     assert loaded.stages[0].tool_breakdown is None
     assert loaded.stages[0].output_tokens_per_second is None
+    # H1.1's fields are additive on the same precedent: an older record loads as None.
+    assert loaded.stages[0].stop_reason is None
+    assert loaded.stages[0].attempts is None
+
+
+def test_stage_retry_fields_round_trip_without_a_schema_bump(tmp_path: Path) -> None:
+    """`stop_reason`/`attempts` (H1.1) are additive at the same ``SCHEMA_VERSION``."""
+    run = create_run(tmp_path, tmp_path, "stage", label="t")
+    run.record_stage(
+        StageRecord(
+            name="s",
+            agent="a",
+            model="m",
+            stop_reason="length",
+            attempts=2,
+        )
+    )
+    save(tmp_path / run.run_id, run)
+
+    loaded = load(tmp_path / run.run_id)
+    assert loaded.schema_version == state.SCHEMA_VERSION
+    assert loaded.stages[0].stop_reason == "length"
+    assert loaded.stages[0].attempts == 2
 
 
 # ---------------------------------------------------------------------------

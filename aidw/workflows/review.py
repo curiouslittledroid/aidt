@@ -37,7 +37,7 @@ from aidw import git, github, lock, stage_registry
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
-from aidw.report import print_stage
+from aidw.report import empty_final_message_error, print_stage
 from aidw.runner import (
     StageSpec,
     declared_stage_issues,
@@ -440,7 +440,7 @@ def run(
 
         text = _read_out(rec1) or ""
         if not text.strip():
-            print(f"{R1} produced no final message; stopping.", file=sys.stderr)
+            print(f"{empty_final_message_error(rec1)}; stopping.", file=sys.stderr)
             state.status = FAILED
             save(directory, state)
             return 1

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from aidw.report import (
     cost_note,
+    empty_final_message_error,
     rel_to,
     short_count,
     stage_lines,
@@ -48,6 +49,33 @@ def test_short_count() -> None:
     assert short_count(1000) == "1.0k"
     assert short_count(50641) == "50.6k"
     assert short_count(2_000_000) == "2.0M"
+
+
+def test_empty_final_message_error_names_double_truncation() -> None:
+    """H1.1's workflow failure identifies the final reason and both attempts."""
+    message = empty_final_message_error(
+        _record(name="code-review", stop_reason="length", attempts=2)
+    )
+
+    assert message == (
+        "code-review: both attempts produced no final message "
+        "(final stop_reason: length); both attempts were truncated"
+    )
+    assert "produced no final message" in message
+    assert "length" in message
+    assert "both attempts were truncated" in message
+
+
+def test_empty_final_message_error_preserves_single_attempt_context() -> None:
+    """The no-retry path still reports its reason and attempt count."""
+    message = empty_final_message_error(
+        _record(name="task-review-1", stop_reason="stop", attempts=1)
+    )
+
+    assert message == (
+        "task-review-1: produced no final message "
+        "(stop_reason: stop, attempts: 1)"
+    )
 
 
 def test_usage_line_reports_every_counter() -> None:

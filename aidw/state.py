@@ -116,6 +116,14 @@ class StageRecord:
     started_at: str | None = None
     ended_at: str | None = None
     exit_code: int | None = None
+    #: The **final** Pi attempt's ``stopReason`` (H1.1). Additive at the same
+    #: ``SCHEMA_VERSION`` with a ``None`` default, so a record written before the field
+    #: still loads. Per-attempt reasons live in ``stages/<name>.meta.json``'s
+    #: ``attempts_detail``; this one exists so the workflow's failure path can name it.
+    stop_reason: str | None = None
+    #: Pi attempts this stage made: 1 normally, 2 when a retry ran. ``None`` for a
+    #: record written before the field existed.
+    attempts: int | None = None
     duration_seconds: float | None = None
     cost_usd: float | None = None
     #: Token/cost counters from the stage's ``.meta.json`` (``aidw.pi.Usage`` as a dict).

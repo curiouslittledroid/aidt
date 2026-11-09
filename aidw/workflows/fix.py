@@ -41,7 +41,7 @@ from aidw.config import ERROR, WARNING, Issue, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
-from aidw.report import print_stage
+from aidw.report import empty_final_message_error, print_stage
 from aidw.runner import StageSpec, declared_stage_issues, plan_stages, run_stage
 from aidw.state import (
     BLOCKED,
@@ -694,7 +694,7 @@ def run(
 
             review_text = _read_out(record) or ""
             if not review_text.strip():
-                print(f"{record.name} produced no final message; stopping.", file=sys.stderr)
+                print(f"{empty_final_message_error(record)}; stopping.", file=sys.stderr)
                 state.status = FAILED
                 save(directory, state)
                 return 1

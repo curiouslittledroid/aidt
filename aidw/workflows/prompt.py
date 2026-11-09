@@ -112,7 +112,7 @@ from aidw.gates import GateOutcome, decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.prompts import read_conventions_sources
-from aidw.report import print_stage
+from aidw.report import empty_final_message_error, print_stage
 from aidw.roadmap import DONE_RE, TASK_RE, RoadmapTask, find_task, load_tasks
 from aidw.runner import StageSpec, declared_stage_issues, plan_stages, run_stage
 # ``DEFAULT_MAX_REVISIONS`` lives in ``aidw.target_config``, its single home (design
@@ -1789,10 +1789,9 @@ def run(
 
             review_text = _read_out(rec) or ""
             if not review_text.strip():
-                logger.error(f"{rec.name} produced no final message")
-                print(
-                    f"{rec.name} produced no final message; stopping.", file=sys.stderr
-                )
+                message = empty_final_message_error(rec)
+                logger.error(message)
+                print(f"{message}; stopping.", file=sys.stderr)
                 state.status = FAILED
                 save(directory, state)
                 return 1
