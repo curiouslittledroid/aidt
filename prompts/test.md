@@ -18,9 +18,9 @@ Prove the behaviour that matters. A passing build or a source-code reading can s
 **Not owned — do not do these here:**
 
 - **Implementation code.** A real defect is reported as `Fail`, never silently fixed here — fixing the code would make the proof test its own fix and lose its independence. Hand it back to `/impliment-task` (or a review follow-up).
-- **Deployed integration tests.** `aidt/prompts/integration-tests.md` owns those; they require a deployed dev stack and live in whichever directory the repo's conventions reserve for them.
-- **Traceability** — the traceability stage's artifacts and the roadmap checkbox: `aidt/prompts/update-traceability.md`.
-- **The repo's full verification gate and the build-results document** (`paths.implementation_results_dir`) — `aidt/prompts/record-implementation-results.md`.
+- **Deployed integration tests.** The repo's own integration-test prompt owns those, when it supplies one (`aidw/prompts/` names it by filename); they require a deployed environment and live in whichever directory the repo's conventions reserve for them.
+- **Traceability** — the traceability stage's artifacts and the roadmap checkbox: the `/update-traceability` stage.
+- **The repo's full verification gate and the build-results document** (`paths.implementation_results_dir`) — the `/record-implementation-results` stage.
 
 ## Process
 

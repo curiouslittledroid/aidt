@@ -5,7 +5,7 @@ nothing else.
 
 ## Stage
 
-`/task-review-fixes` (`aidt/prompts/task-review-fixes.md`) with the task-prompt path.
+`/task-review-fixes` with the task-prompt path.
 
 A stage gives you either a single finding to fix, or one batch of the review's non-blocking
 (`could-fix`) findings to fix together.

@@ -4204,6 +4204,13 @@ def test_l43_unreadable_directory_config_refuses_before_dry_run(
 # `--dry-run`. `EXIT_REFUSED` (4) would split the two config refusals into different
 # codes; requirement 5 keeps `config show` display-only (pinned in `tests/test_cli.py`).
 
+#: A `requires_toolkit` floor no release can satisfy: one major above the running toolkit.
+#: It used to be the literal `">=1.0.0"`, which silently became **satisfiable** when the
+#: project version reached 1.0.0 — the version bump turned this refusal case into a
+#: no-op and reddened `main` (2026-11-08). Derived from `__version__` so the case stays
+#: unsatisfiable across bumps instead of needing a second edit.
+_UNSATISFIABLE_TOOLKIT = f">={int(__version__.split('.', 1)[0]) + 1}.0.0"
+
 
 @pytest.mark.parametrize(
     ("config_text", "expected_tokens"),
@@ -4214,8 +4221,8 @@ def test_l43_unreadable_directory_config_refuses_before_dry_run(
             id="newer-schema-version",
         ),
         pytest.param(
-            'schema_version: 1\nrequires_toolkit: ">=1.0.0"\n',
-            ("requires_toolkit", ">=1.0.0", __version__),
+            f'schema_version: 1\nrequires_toolkit: "{_UNSATISFIABLE_TOOLKIT}"\n',
+            ("requires_toolkit", _UNSATISFIABLE_TOOLKIT, __version__),
             id="unsatisfied-requires-toolkit",
         ),
         pytest.param(
@@ -4351,7 +4358,9 @@ def test_e33_both_refusals_are_reported(
     _patch_prompt_repo(
         tmp_path,
         monkeypatch,
-        config_text='schema_version: 2\nrequires_toolkit: ">=1.0.0"\n',
+        config_text=(
+            f'schema_version: 2\nrequires_toolkit: "{_UNSATISFIABLE_TOOLKIT}"\n'
+        ),
     )
     seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
     monkeypatch.setattr(prompt_workflow, "run_stage", fake)

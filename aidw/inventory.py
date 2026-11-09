@@ -71,7 +71,7 @@ FOREIGN_PREFIX = ".pi/prompts"
 #: Prompts that invoke a bundled helper script, mapped to the script they need. The
 #: invocation must locate the script through the runner-provided ``AIDW_SCRIPTS_DIR``
 #: (an absolute toolkit path). A path relative to the working directory — the old
-#: ``python3 aidt/prompts/scripts/...`` — resolves inside the *target* repository and
+#: ``python3 prompts/scripts/...`` — resolves inside the *target* repository and
 #: fails as soon as the toolkit is its own checkout (EXTRACTION.md §3.6).
 PROMPT_INVOKED_SCRIPTS = {
     "review-findings-to-github.md": "scripts/review-followup/publish_review_followups.py",
@@ -185,7 +185,7 @@ def check_defaults(toolkit_root: Path) -> list[Issue]:
             Issue(
                 WARNING,
                 LEGACY_MANIFEST,
-                "legacy mirror manifest; aidt/prompts is independent now — delete it",
+                "legacy mirror manifest; prompts is independent now — delete it",
             )
         )
 

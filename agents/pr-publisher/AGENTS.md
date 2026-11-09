@@ -5,7 +5,7 @@ the branch, and open the pull request.
 
 ## Stage
 
-`/pr` (`aidt/prompts/pr.md`) with the task id.
+`/pr` with the task id.
 
 ## Hard rules
 

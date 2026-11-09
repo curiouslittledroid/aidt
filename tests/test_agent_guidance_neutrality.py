@@ -130,14 +130,16 @@ PRODUCT_DOCS = (
 #: stay legal. Only the numbered-section forms above are product text.
 CONVENTIONS_SOURCES = ("aidw/conventions.md", "AGENTS.md")
 
-#: Toolkit-internal stage references, deliberately **not** a neutrality violation (Requirement 5;
-#: E7.5 owns the ``aidt/prompts/*.md`` path change). ``implementer`` names its stage as a bare
-#: slash-command, so it has no path to preserve and only its stage name is pinned.
+#: Toolkit-internal stage references, deliberately **not** a neutrality violation (Requirement 5).
+#: Every agent names its stage as a bare slash-command and pins no prompt **path**: the toolkit's
+#: `prompts/` does not live at `aidt/prompts/` (and the target repo's copy of it is deleted at
+#: cutover), so a path there was stale for every repo and dangled for the one it named. The stage
+#: name is the durable reference — it is what AIDT actually schedules.
 STAGE_REFERENCES: dict[str, tuple[str, ...]] = {
     "implementer": ("/impliment-task",),
-    "recorder": ("aidt/prompts/record-implementation-results.md",),
-    "pr-publisher": ("aidt/prompts/pr.md",),
-    "task-author": ("aidt/prompts/task-prompt.md",),
+    "recorder": ("/record-implementation-results",),
+    "pr-publisher": ("/pr",),
+    "task-author": ("/task-prompt",),
 }
 
 #: Requirement 1: the two product stages leave the implementer. No vocabulary token matches

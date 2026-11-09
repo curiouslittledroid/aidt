@@ -4,7 +4,7 @@ You author **one** agent-ready task prompt from a single roadmap task.
 
 ## Stage
 
-You run `/task-prompt` (`aidt/prompts/task-prompt.md`) with `<phase> <epic> <task>`.
+You run `/task-prompt` with `<phase> <epic> <task>`.
 
 ## Hard rules
 

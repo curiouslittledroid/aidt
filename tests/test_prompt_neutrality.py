@@ -1,4 +1,12 @@
-"""Neutrality contract for the five bucket (ii) prompts (E7.2, EXTRACTION.md §4.2/§3.4).
+"""Neutrality contract for the toolkit's neutralised defaults (E7.2 + MF.2).
+
+Two sets are covered: the five bucket (ii) prompts E7.2 neutralised (§4.2), and the three bucket
+(iii) prompts MF.2 **retained and neutralised** — `task-prompt.md`, `update-traceability.md` and
+`update-architecture.md`, the ones the default registry invokes, which had to become product-free
+to keep a target repo with no `aidw/` folder runnable (§8.3; `design.md` §17 M4). The vocabulary is
+the same for both: a toolkit default names no package manager, no product path and no product doc.
+
+Original E7.2 framing follows.
 
 Executable half of §6 E7.2: *the rendered prompt for each of the five names no package
 manager, no product path and no product doc — asserted against both a Mythical-Forge-shaped
@@ -69,23 +77,24 @@ VARIABLES: Mapping[str, tuple[str, ...]] = {
     "impliment-task.md": ("07-E9.9-prompt.md",),
 }
 
-#: Toolkit-internal stage references are deliberately not a neutrality violation (§6 E7.2);
-#: E7.5 owns changing them, so this task must preserve the existing references.
+#: Toolkit-internal stage references must survive, but by **stage name**. MF.2 moved seventeen
+#: product prompts out of the toolkit, so a toolkit default may no longer point at a prompt file
+#: it does not ship (``aidt/prompts/x.md`` was both stale and untruthful after the extraction);
+#: naming the stage is the durable form, because the stage is what actually exists.
 STAGE_REFERENCES: Mapping[str, tuple[str, ...]] = {
     "test.md": (
-        "aidt/prompts/integration-tests.md",
-        "aidt/prompts/update-traceability.md",
-        "aidt/prompts/record-implementation-results.md",
+        "the `/update-traceability` stage",
+        "the `/record-implementation-results` stage",
     ),
     "pr.md": (),
     "fix-next-review-followup.md": (),
-    "record-implementation-results.md": ("aidt/prompts/pr.md",),
+    "record-implementation-results.md": ("the `/pr` stage",),
     "impliment-task.md": (
-        "aidt/prompts/test.md",
-        "aidt/prompts/update-traceability.md",
-        "aidt/prompts/record-implementation-results.md",
-        "aidt/prompts/update-architecture.md",
-        "aidt/prompts/pr.md",
+        "the `/test` stage",
+        "the `/update-traceability` stage",
+        "the `/record-implementation-results` stage",
+        "the `/update-architecture` stage",
+        "the `/pr` stage",
     ),
 }
 
@@ -593,3 +602,64 @@ def test_the_recipe_guard_rejects_an_instructed_recipe() -> None:
         ("rm -rf", "rm -rf")
     ]
     assert _unguarded_recipe_mentions("Do not `rm -rf`; build into `$(mktemp -d)` instead.") == []
+
+
+# --------------------------------------------------------------------------- #
+# The three retained toolkit defaults (MF.2)
+# --------------------------------------------------------------------------- #
+
+#: The §4.2 bucket (iii) prompts MF.2 kept instead of moving them, with the positional variables
+#: their stages pass (`aidw/stage_registry.py`: P1 passes phase/epic/task, I3 the branch, I4 the
+#: branch and base branch). They are the ones the *default* chains invoke, which is exactly why
+#: the toolkit cannot hand them to the target repo.
+RETAINED_DEFAULTS: Mapping[str, tuple[str, ...]] = {
+    "task-prompt.md": ("02", "L5", "L5.2"),
+    "update-traceability.md": ("07-E9.9",),
+    "update-architecture.md": ("07-E9.9", "main"),
+}
+
+#: The config keys each retained default must name instead of a product literal (§3.4/D17).
+#: A prompt that named the literal would be wrong for every repo whose layout differs — which is
+#: precisely the failure these three were rewritten to remove.
+RETAINED_KEYS: Mapping[str, tuple[str, ...]] = {
+    "task-prompt.md": ("roadmap_dir", "task_prompts_dir"),
+    "update-traceability.md": (
+        "roadmap_dir",
+        "task_prompts_dir",
+        "implementation_results_dir",
+    ),
+    "update-architecture.md": ("architecture_dir",),
+}
+
+
+@pytest.mark.parametrize("name", sorted(RETAINED_DEFAULTS))
+def test_retained_defaults_name_no_package_manager_product_path_or_product_doc(
+    name: str,
+) -> None:
+    """The retained defaults are product-free, by the same vocabulary as bucket (ii).
+
+    They are the toolkit's defaults for `P1`/`I3`/`I4`, so a product token here would leak into
+    every repo that does not override them — the de-branding the extraction exists to finish.
+    """
+    hits = _forbidden_hits(render_prompt_file(_path(name), RETAINED_DEFAULTS[name]))
+
+    assert hits == [], f"{name}: forbidden token(s) in the rendered prompt: {hits}"
+
+
+@pytest.mark.parametrize("name", sorted(RETAINED_DEFAULTS))
+def test_retained_defaults_name_config_keys_that_resolve_under_both_configs(
+    name: str,
+) -> None:
+    """Every key they point the agent at is named *and* resolvable, in both configs.
+
+    The neutral leg is what stops the default layout from coming back in through wording: if a
+    retained default still said where Mythical Forge keeps its files, nothing here would notice.
+    """
+    rendered = render_prompt_file(_path(name), RETAINED_DEFAULTS[name])
+
+    for config in (_mythical_forge_shaped_config(), _neutral_config()):
+        for key in RETAINED_KEYS[name]:
+            assert key in rendered, f"{name}: does not name {key}"
+            resolved = config[f"paths.{key}"]
+            assert resolved.value is not None, (name, key)
+            assert resolved.source in (SOURCE_DEFAULT, SOURCE_CONFIG), (name, key)

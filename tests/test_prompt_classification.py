@@ -1,28 +1,30 @@
-"""Classification and destination-marker contract for the prompt library (E7.1).
+"""Prompt library inventory after the MF.2 cutover (EXTRACTION.md §4.2, E7.1 + MF.2).
 
-Executable half of ``docs/migration/prompt-classification.md``, which applies
-EXTRACTION.md §4.2's three buckets to the toolkit's 31 top-level ``prompts/*.md`` files:
+Executable half of ``docs/migration/prompt-classification.md``. §4.2 fixed the inventory by
+naming three buckets over the toolkit's 31 top-level ``prompts/*.md`` files:
 
 - **bucket (i)** generic, ship as-is (6 files);
 - **bucket (ii)** mixed, neutralised in E7.2 (5 files);
-- **bucket (iii)** wholly Mythical Forge, moved to ``aidw/prompts/`` at cutover, §7 MF.2
-  (20 files).
+- **bucket (iii)** wholly Mythical Forge (20 files).
 
-Membership is spec-fixed by §4.2's *named lists*, never re-derived by grepping for product
-tokens: §4.2 deliberately keeps ``git-update.md`` and ``review-findings-to-github.md`` in
-(i) despite their frozen marker strings and ``task-prompt.md`` in (iii) even though it names
-``aidt/prompts``. The table↔directory check is therefore bidirectional — a future prompt
-added without a classification row, or a stale row for a deleted prompt, fails here rather
-than at cutover.
+**The cutover split bucket (iii).** 17 of the 20 moved to Mythical Forge's ``aidw/prompts/``
+(MF.2), where they shadow the toolkit default by filename; the other 3 were **retained here and
+neutralised**, because the default registry invokes them — ``task-prompt.md`` is stage ``P1`` of
+the ``prompt`` workflow, and ``update-traceability.md`` / ``update-architecture.md`` are stages
+``I3`` / ``I4`` of the default ``implement`` chain. Deleting those three would make a target repo
+with no ``aidw/`` folder unable to run at all, which is §8.3's acceptance criterion, so MF.2's
+"none remains in the toolkit" is deviated from deliberately (`design.md` §17, M4).
 
-Until MF.2 nothing moves. Each bucket (iii) file carries its intended destination as a
-``destination:`` frontmatter field, and the marker is inert because
-``aidw/prompts.py:strip_frontmatter`` removes the leading ``---`` block before rendering —
-so the text Pi receives is byte-identical to the text before the marker existed. A marker
-placed in the *body* would render into the agent message, which is the trap these tests
-close. The marker also must never contain the foreign prefix ``.pi/prompts``: that sentinel
-(``aidw/inventory.py:FOREIGN_PREFIX``) turns ``aidw prompts check`` red for every file under
-``prompts/``.
+**Membership stays spec-fixed, never grepped.** §4.2 deliberately kept ``git-update.md`` and
+``review-findings-to-github.md`` in (i) despite their frozen marker strings, and ``task-prompt.md``
+in (iii) even though it named the toolkit's own prompt directory. The table↔directory check is
+bidirectional in both directions that matter now: a file present here with no row fails, and a file
+§4.2 assigns that is neither present nor listed as moved fails.
+
+**Two retired mechanisms are gone by design.** E7.1's ``destination:`` frontmatter marker travelled
+with the 17 files and no toolkit prompt carries it any more (asserted below, so it cannot creep
+back); and the "metadata-only edit changed no body" comparisons are now meaningful only for bucket
+(i), which is the one class whose contract is still "byte-identical".
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ from pathlib import Path
 import pytest
 
 from aidw.paths import toolkit_root
-from aidw.prompts import load_prompt_file, strip_frontmatter
+from aidw.prompts import PromptError, load_prompt_file, render
 
 DOC_REL = Path("docs") / "migration" / "prompt-classification.md"
 SPEC_REL = Path("docs") / "migration" / "EXTRACTION.md"
@@ -61,16 +63,23 @@ BUCKET_MIXED = (
     "test.md",
 )
 
-#: §4.2 (iii) "Wholly Mythical Forge — product prompts (20)".
-BUCKET_PRODUCT = (
+#: The three §4.2 bucket (iii) files that stayed: the default registry invokes them, so the
+#: toolkit needs a product-free default for each (MF.2 retention, `design.md` §17 M4).
+BUCKET_RETAINED = (
+    "task-prompt.md",
+    "update-architecture.md",
+    "update-traceability.md",
+)
+
+#: The seventeen §4.2 bucket (iii) files that moved to Mythical Forge's ``aidw/prompts/`` at
+#: MF.2. They must be absent from the toolkit, and their names are still the contract there.
+BUCKET_MOVED = (
     "doc-lambdas.md",
     "implement-srd-followup.md",
     "integration-tests.md",
     "manual-test-plan.md",
     "show-updated-integration-tests.md",
     "show-updated-player-actions.md",
-    "task-prompt.md",
-    "update-architecture.md",
     "update-authentication-sequence-diagram.md",
     "update-infrastructure-diagram.md",
     "update-lambda-dataflow-diagram.md",
@@ -82,49 +91,57 @@ BUCKET_PRODUCT = (
     "update-rules-engine-diagram-spells.md",
     "update-rules-engine-diagram-vision-world.md",
     "update-rules-engine-diagram.md",
-    "update-traceability.md",
 )
 
-EXPECTED_BUCKET: dict[str, str] = {
+#: §4.2 (iii) as the spec states it: 20 files, the union of the two tuples above.
+BUCKET_PRODUCT = (*BUCKET_RETAINED, *BUCKET_MOVED)
+
+#: Every prompt the toolkit ships, and the only files the table may list.
+TOOLKIT_PROMPTS = (*BUCKET_GENERIC, *BUCKET_MIXED, *BUCKET_RETAINED)
+
+EXPECTED_CLASS: dict[str, str] = {
     **{name: "i" for name in BUCKET_GENERIC},
     **{name: "ii" for name in BUCKET_MIXED},
-    **{name: "iii" for name in BUCKET_PRODUCT},
+    **{name: "iii" for name in BUCKET_RETAINED},
 }
 
-#: One action per bucket, as the classification table states it (owner in brackets).
-ACTION_BY_BUCKET = {
+#: One action per class, as the classification table states it (owner in brackets).
+ACTION_BY_CLASS = {
     "i": "ship as-is",
-    "ii": "neutralise in E7.2",
-    "iii": "move at cutover in MF.2",
+    "ii": "neutralised in E7.2",
+    "iii": "retained and neutralised in MF.2",
 }
 
-MARKER_FIELD = "destination:"
-MARKER_VALUE = "mythical-forge/aidw/prompts/"
-MARKER_LINE = f"{MARKER_FIELD} {MARKER_VALUE}"
+#: The destination cell for every class: all fourteen stay in the toolkit. The seventeen
+#: moved files are listed outside the table, so no row may name the target repo's folder.
+TOOLKIT_DESTINATION = "toolkit `prompts/`"
+TARGET_DESTINATION = "aidw/prompts/"
 
-#: The destination folder as the classification table names it (prose, not frontmatter).
-PRODUCT_DESTINATION = "aidw/prompts/"
+#: E7.1's pending-move marker. Retired at MF.2 (the move happened) — asserted absent so it
+#: cannot creep back into a prompt body, where it would render into the agent message.
+RETIRED_MARKER = "destination:"
 
-#: The three bucket (iii) files that had no frontmatter before E7.1 and therefore gained a
-#: minimal block carrying only the destination field.
-NO_FRONTMATTER = ("integration-tests.md", "manual-test-plan.md", "task-prompt.md")
+#: Bucket (i) alone is byte-frozen: it is the class whose action was "ship as-is". Buckets
+#: (ii)/(iii) were edited by E7.2 and MF.2 respectively, and their contracts are
+#: ``tests/test_prompt_neutrality.py``.
+BYTE_FROZEN = BUCKET_GENERIC
+
+#: The positional variables each retained default must declare, as its stage passes them
+#: (``aidw/stage_registry.py``): P1 passes phase/epic/task, I3 the branch, I4 branch+base.
+STAGE_ARITY: dict[str, tuple[str, ...]] = {
+    "task-prompt.md": ("02", "L5", "L5.2"),
+    "update-traceability.md": ("07-E9.9",),
+    "update-architecture.md": ("07-E9.9", "main"),
+}
 
 #: §4.2 spells six of the twenty as one brace expression rather than six names.
 BRACE_GROUP = (
     "update-rules-engine-diagram-{combat,movement,progression,skills,spells,vision-world}.md"
 )
 
-#: Bucket (i)/(ii) files keep their destination in the table only — no marker in the file.
-UNMARKED = (*BUCKET_GENERIC, *BUCKET_MIXED)
-
-#: Bucket (i) alone is byte-frozen against the pre-E7.1 baseline. Bucket (ii) is **edited**
-#: by E7.2, which is exactly why §5.4 excludes it from byte-frozen coverage — the E7.1
-#: oracle could only hold until the neutralisation landed.
-BYTE_FROZEN = BUCKET_GENERIC
-
-#: ``| `file.md` | bucket | action | destination |`` — the table's only row shape.
+#: ``| `file.md` | class | action | destination |`` — the table's only row shape.
 _TABLE_ROW = re.compile(r"^\|\s*`([^`]+\.md)`\s*\|(.+)\|\s*$")
-_FRONTMATTER_BLOCK = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.DOTALL)
+_POSITIONAL = re.compile(r"\$(\d+)")
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +162,7 @@ def _section_42() -> str:
 
 
 def _prompt_files() -> list[str]:
-    """The 31 top-level ``prompts/*.md`` files.
+    """The top-level ``prompts/*.md`` files the toolkit ships.
 
     ``aidw.inventory.list_files`` also returns ``scripts/review-followup/*.py`` (the bundled
     review helpers, ``REQUIRED_SCRIPTS``). Those are toolkit-owned code, not prompts, so the
@@ -156,7 +173,7 @@ def _prompt_files() -> list[str]:
 
 
 def _table_rows(text: str | None = None) -> dict[str, list[str]]:
-    """Every classification row, keyed by filename; values are bucket/action/destination."""
+    """Every classification row, keyed by filename; values are class/action/destination."""
     rows: dict[str, list[str]] = {}
     for line in (text if text is not None else _doc()).splitlines():
         match = _TABLE_ROW.match(line)
@@ -165,7 +182,7 @@ def _table_rows(text: str | None = None) -> dict[str, list[str]]:
         name = match.group(1)
         cells = [cell.strip() for cell in match.group(2).split("|")]
         assert len(cells) == 3, (
-            f"row for {name!r} must have bucket/action/destination columns, got {cells}"
+            f"row for {name!r} must have class/action/destination columns, got {cells}"
         )
         assert name not in rows, f"duplicate classification row for {name!r}"
         rows[name] = cells
@@ -180,19 +197,20 @@ def _raw(name: str) -> str:
 def _baseline_revision() -> str:
     """The pre-E7.1 revision: the first parent of the commit that introduced the marker.
 
-    ``git log -S`` (pickaxe) lists every commit that changed how often ``MARKER_LINE``
-    occurs under ``prompts/``; ``--reverse`` puts the introduction first, so that commit's
-    first parent is the tree the marker commit was applied to — the actual baseline the
-    no-body-edit contract is stated against.
+    ``git log -S`` (pickaxe) lists every commit that changed how often ``RETIRED_MARKER``+value
+    occurs under ``prompts/`` — the E7.1 commit that added the markers and the MF.2 commit that
+    removed them with the files. ``--reverse`` puts the introduction first, so that commit's first
+    parent is the tree the marker commit was applied to, which is what bucket (i)'s "unchanged"
+    claim is measured against. Resolving it from the marker rather than from ``HEAD`` keeps the
+    oracle armed after the cutover merge: ``merge-base HEAD origin/main`` collapses to ``HEAD`` on
+    ``main``, the compare-the-tree-to-itself tautology review follow-up #108 closed.
 
-    Resolving the baseline *from the marker* — rather than ``HEAD`` or ``merge-base`` —
-    keeps the oracle armed after this branch merges: ``merge-base HEAD origin/main``
-    collapses to ``HEAD`` on ``main``, the same compare-the-tree-to-itself tautology this
-    fix closes (review follow-up #108). Pickaxe needs only history, which CI already
-    fetches in full for the D5 freeze golden (``fetch-depth: 0``, .github/workflows/ci.yml).
+    Pickaxe needs only history, which CI already fetches in full for the D5 freeze golden
+    (``fetch-depth: 0``, ``.github/workflows/ci.yml``).
     """
+    marker_line = f"{RETIRED_MARKER} mythical-forge/aidw/prompts/"
     completed = subprocess.run(
-        ["git", "log", "--reverse", "--format=%H", f"-S{MARKER_LINE}", "--", "prompts"],
+        ["git", "log", "--reverse", "--format=%H", f"-S{marker_line}", "--", "prompts"],
         cwd=toolkit_root(),
         check=True,
         capture_output=True,
@@ -204,25 +222,16 @@ def _baseline_revision() -> str:
         # golden.py): a guard that quietly disarms is exactly the defect this oracle exists
         # to prevent.
         raise RuntimeError(
-            f"no commit in {toolkit_root()} history introduced '{MARKER_LINE}' under "
-            "prompts/ — the E7.1 no-body-edit oracle has no baseline; a shallow clone "
-            "needs `fetch-depth: 0` (.github/workflows/ci.yml) rather than a disarmed guard."
+            f"no commit in {toolkit_root()} history introduced '{marker_line}' under "
+            "prompts/ — the classification oracle has no baseline; a shallow clone needs "
+            "`fetch-depth: 0` (.github/workflows/ci.yml) rather than a disarmed guard."
         )
     return f"{shas[0]}^"
 
 
 @lru_cache(maxsize=1)
 def _parent_prompt_text() -> dict[str, str]:
-    """Load the pre-E7.1 prompt bytes as the no-body-edit oracle (review follow-up #108).
-
-    The marker commit adds metadata to files that are already tracked, so checking only
-    that the marker is absent from the current body would miss an accidental body edit. A
-    single archive of the baseline revision keeps this regression check independent of the
-    implementation's own classification constants and avoids one Git process per prompt.
-    The archive must never be ``HEAD``: on this branch HEAD already carries the E7.1
-    markers, which made both "parent revision" tests compare the tree to itself — a body
-    edit committed together with the marker change passed on a clean tree.
-    """
+    """The pre-E7.1 prompt bytes, as bucket (i)'s unchanged-content oracle."""
     completed = subprocess.run(
         ["git", "archive", "--format=tar", _baseline_revision(), "--", "prompts"],
         cwd=toolkit_root(),
@@ -239,75 +248,60 @@ def _parent_prompt_text() -> dict[str, str]:
         }
 
 
-def _frontmatter_block(raw: str) -> str:
-    """The leading ``---`` … ``---`` block including its delimiters, or ``""``."""
-    match = _FRONTMATTER_BLOCK.match(raw)
-    return match.group(0) if match is not None else ""
-
-
-def _marker_lines(block: str) -> list[str]:
-    return [line for line in block.splitlines() if line.startswith(MARKER_FIELD)]
-
-
 # ---------------------------------------------------------------------------
 # The inventory: table ↔ directory, in both directions
 # ---------------------------------------------------------------------------
 
 
-def test_table_classifies_exactly_the_prompt_files_that_exist():
+def test_table_lists_exactly_the_prompt_files_that_exist():
     """Bidirectional completeness: no unclassified file, no stale row.
 
-    A one-way "every row exists on disk" check silently passes when a future prompt is
-    added without a classification row, which is precisely the failure E7.1 must prevent.
+    A one-way "every row exists on disk" check silently passes when a future prompt is added
+    without a classification row, or when a moved prompt's row outlives the file.
     """
     rows = set(_table_rows())
     files = set(_prompt_files())
 
     assert rows - files == set(), f"rows for files that do not exist: {sorted(rows - files)}"
     assert files - rows == set(), f"prompts with no classification: {sorted(files - rows)}"
-    assert rows == files
+    assert rows == files == set(TOOLKIT_PROMPTS)
 
 
-def test_the_classification_covers_the_specs_31_files():
-    """§4.2 counts 6 + 5 + 20 = 31; a drift in any bucket changes this total."""
-    assert len(_prompt_files()) == 31
-    assert (len(BUCKET_GENERIC), len(BUCKET_MIXED), len(BUCKET_PRODUCT)) == (6, 5, 20)
-    assert set(EXPECTED_BUCKET) == set(_prompt_files())
-    assert (
-        set(BUCKET_GENERIC) | set(BUCKET_MIXED) | set(BUCKET_PRODUCT)
-    ) == set(_prompt_files())
-    # The three buckets partition the inventory: no file is in two, none in none.
-    assert set(BUCKET_GENERIC) & set(BUCKET_MIXED) == set()
-    assert set(BUCKET_GENERIC) & set(BUCKET_PRODUCT) == set()
-    assert set(BUCKET_MIXED) & set(BUCKET_PRODUCT) == set()
+def test_the_moved_prompts_are_gone_from_the_toolkit():
+    """MF.2 moved seventeen product prompts out; the toolkit must not ship them again.
 
-
-def test_table_bucket_membership_is_the_section_4_2_assignment():
-    """Each row's bucket cell is the spec's bucket for that file — 6/5/20 exactly.
-
-    A classification re-derived by grep (product tokens, package names, ``aidt/prompts``)
-    fails here: §4.2's frozen-marker files and ``task-prompt.md`` would land elsewhere.
+    Their names remain Mythical Forge's contract (it owns the files under ``aidw/prompts/``),
+    so re-adding one here would silently shadow the target's own copy with a stale one.
     """
-    rows = _table_rows()
+    present = set(_prompt_files())
+    reappeared = sorted(present & set(BUCKET_MOVED))
 
-    for name, cells in rows.items():
-        bucket = cells[0].strip("()")
-        assert bucket in ACTION_BY_BUCKET, f"{name}: unrecognised bucket {cells[0]!r}"
-        assert bucket == EXPECTED_BUCKET[name], (
-            f"{name}: classified as ({bucket}), §4.2 says ({EXPECTED_BUCKET[name]})"
-        )
+    assert reappeared == [], f"product prompts moved at MF.2 are back: {reappeared}"
 
-    assert sum(1 for cells in rows.values() if cells[0].strip("()") == "i") == 6
-    assert sum(1 for cells in rows.values() if cells[0].strip("()") == "ii") == 5
-    assert sum(1 for cells in rows.values() if cells[0].strip("()") == "iii") == 20
+
+def test_the_classification_partitions_the_specs_31_files():
+    """§4.2 counts 6 + 5 + 20 = 31; the cutover splits (iii) into 3 retained + 17 moved."""
+    assert (len(BUCKET_GENERIC), len(BUCKET_MIXED), len(BUCKET_PRODUCT)) == (6, 5, 20)
+    assert (len(BUCKET_RETAINED), len(BUCKET_MOVED)) == (3, 17)
+    assert len(set(BUCKET_PRODUCT)) == len(BUCKET_PRODUCT)
+    assert len(_prompt_files()) == 14
+
+    classes = (set(BUCKET_GENERIC), set(BUCKET_MIXED), set(BUCKET_PRODUCT))
+    # The three §4.2 buckets partition the inventory: no file is in two, none in none.
+    assert classes[0] & classes[1] == set()
+    assert classes[0] & classes[2] == set()
+    assert classes[1] & classes[2] == set()
+    assert set().union(*classes) == (
+        set(BUCKET_GENERIC) | set(BUCKET_MIXED) | set(BUCKET_RETAINED)
+    ) | set(BUCKET_MOVED)
+    assert set(EXPECTED_CLASS) == set(TOOLKIT_PROMPTS)
 
 
 def test_bucket_membership_matches_the_spec_s_named_lists():
     """§4.2 itself names every file this module classifies, in its stated bucket.
 
-    The doc is the source of truth, so the guard reads each bucket's subsection: an edit to
-    §4.2's lists that this table (and these constants) did not follow fails rather than
-    silently diverging. This intentionally does not classify by product-token grepping.
+    The spec is read directly, so an edit to §4.2's lists that this module did not follow fails
+    rather than silently diverging. It intentionally does not classify by product-token grepping.
     """
     section = _section_42()
     generic_start = section.index("**(i) Generic")
@@ -320,43 +314,37 @@ def test_bucket_membership_matches_the_spec_s_named_lists():
     assert all(f"`{name}`" in generic for name in BUCKET_GENERIC)
     assert all(f"`{name}`" in mixed for name in BUCKET_MIXED)
 
-    assert BRACE_GROUP in product
     prefix, rest = BRACE_GROUP.split("{", 1)
     stems = rest.removesuffix("}.md").split(",")
     expanded = {f"{prefix}{stem}.md" for stem in stems}
-    # Exactly the six child-diagram prompts, no more: the parent diagram is named
-    # separately in §4.2 and keeps its own row.
+    # Exactly the six child-diagram prompts, no more: the parent diagram is named separately
+    # in §4.2 and keeps its own entry.
     child_diagrams = {
-        name
-        for name in BUCKET_PRODUCT
-        if name.startswith("update-rules-engine-diagram-")
+        name for name in BUCKET_PRODUCT if name.startswith("update-rules-engine-diagram-")
     }
     assert expanded == child_diagrams
     assert "update-rules-engine-diagram.md" not in child_diagrams
-    assert all(
-        f"`{name}`" in product for name in set(BUCKET_PRODUCT) - expanded
-    )
+    assert all(f"`{name}`" in product for name in set(BUCKET_PRODUCT) - expanded)
 
 
-def test_each_row_states_its_bucket_s_action_and_destination():
-    """Action and destination follow the bucket; the table states one of each per row."""
-    rows = _table_rows()
+def test_each_row_states_its_class_action_and_destination():
+    """Action and destination follow the class; the table states one of each per row."""
+    for name, (class_cell, action, destination) in _table_rows().items():
+        expected_class = EXPECTED_CLASS[name]
+        (shown,) = re.findall(r"\((i{1,3})\)", class_cell) or [""]
 
-    for name, (bucket_cell, action, destination) in rows.items():
-        bucket = bucket_cell.strip("()")
-        assert action == ACTION_BY_BUCKET[bucket], (
-            f"{name}: ({bucket}) action must be {ACTION_BY_BUCKET[bucket]!r}, "
-            f"doc says {action!r}"
+        assert shown == expected_class, (
+            f"{name}: classified as ({shown}), the cutover says ({expected_class})"
         )
-        if bucket == "iii":
-            assert "Mythical Forge" in destination
-            assert PRODUCT_DESTINATION in destination
-        else:
-            assert "toolkit" in destination
-            # The remain-in-the-toolkit buckets never point at the new repo's folder. At
-            # MF.2 Mythical Forge supplies *overrides* for bucket (ii) (D14 pt 2); the
-            # toolkit default itself does not move.
-            assert PRODUCT_DESTINATION not in destination
+        assert action == ACTION_BY_CLASS[expected_class], (
+            f"{name}: ({expected_class}) action must be "
+            f"{ACTION_BY_CLASS[expected_class]!r}, doc says {action!r}"
+        )
+        assert destination == TOOLKIT_DESTINATION, (
+            f"{name}: every prompt the toolkit ships stays in {TOOLKIT_DESTINATION!r}, "
+            f"doc says {destination!r}"
+        )
+        assert TARGET_DESTINATION not in destination
 
 
 def test_the_table_parser_fails_closed_on_a_malformed_row():
@@ -374,133 +362,57 @@ def test_the_table_parser_fails_closed_on_a_malformed_row():
 
 
 # ---------------------------------------------------------------------------
-# The marker: present, frontmatter-only, inert
+# The retired marker and the surviving byte-frozen class
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", BUCKET_PRODUCT)
-def test_product_prompts_declare_their_destination_in_frontmatter(name: str) -> None:
-    """Bucket (iii) carries exactly one ``destination:`` field, in the leading block."""
-    raw = _raw(name)
-    block = _frontmatter_block(raw)
+@pytest.mark.parametrize("name", TOOLKIT_PROMPTS)
+def test_no_toolkit_prompt_carries_the_retired_destination_marker(name: str) -> None:
+    """The MF.2 pending-move marker is retired with the files that carried it.
 
-    assert block != "", f"{name}: no leading frontmatter block"
-    assert _marker_lines(block) == [MARKER_LINE], (
-        f"{name}: expected one `{MARKER_LINE}` field in the frontmatter block, "
-        f"found {_marker_lines(block)}"
-    )
-    # Exactly once in the whole file, so no stray copy can live in the body.
-    assert raw.count(MARKER_LINE) == 1
-
-
-@pytest.mark.parametrize("name", BUCKET_PRODUCT)
-def test_the_marker_never_reaches_the_rendered_prompt(name: str) -> None:
-    """The note is inert: frontmatter is stripped, so the rendered body carries no marker.
-
-    A body note would render into the agent message and change the prompt's behaviour;
-    ``aidw/prompts.py:strip_frontmatter`` only removes the leading block, which is why the
-    marker belongs there and nowhere else.
+    Asserted on the raw text, which is strictly stronger than asserting on the body: a marker
+    outside the leading frontmatter block would render into the agent message, and the move it
+    tracked has happened. Naming the target's override folder is still legitimate — a prompt may
+    tell the agent that a repo shadow lives under ``aidw/prompts/`` (§12.3) — so only the
+    ``destination:`` *field* is retired.
     """
-    raw = _raw(name)
-    block = _frontmatter_block(raw)
-    body = strip_frontmatter(raw)
-
-    assert MARKER_FIELD not in body
-    assert MARKER_VALUE not in body
-    # The file is exactly "block + body": nothing precedes the block and nothing else was
-    # added by the marker.
-    assert raw == block + body
-    # The loader Pi's message comes from returns that same body.
-    assert load_prompt_file(toolkit_root() / "prompts" / name) == body
-
-
-@pytest.mark.parametrize("name", BUCKET_PRODUCT)
-def test_the_parent_revision_oracle_predates_the_marker(name: str) -> None:
-    """The no-body-edit oracle is the pre-E7.1 baseline, never the current revision (#108).
-
-    The oracle once archived ``HEAD`` while HEAD already carried the E7.1 markers, so both
-    "parent revision" tests compared the tree to itself: a body edit committed together
-    with the marker change passed on a clean tree. Pin the baseline — the parent text must
-    predate the marker, so the oracle cannot silently collapse back onto the working tree
-    (or onto any post-marker revision) without this going red.
-    """
-    parent = _parent_prompt_text()[name]
-
-    # The baseline predates the marker; the current file carries it.
-    assert MARKER_LINE not in parent
-    assert MARKER_LINE in _raw(name)
-    # The three files that gained a minimal block had no frontmatter at the baseline.
-    if name in NO_FRONTMATTER:
-        assert _frontmatter_block(parent) == ""
-
-
-@pytest.mark.parametrize("name", BUCKET_PRODUCT)
-def test_product_prompt_rendering_matches_the_parent_revision(name: str) -> None:
-    """Adding the destination field does not change the prompt sent to Pi.
-
-    Compare the rendered current file with the parent revision (the pre-marker baseline,
-    see ``test_the_parent_revision_oracle_predates_the_marker``), rather than merely
-    checking that the current marker is in a frontmatter block. This catches an accidental
-    body edit in the same change, including edits to the three files that had no
-    frontmatter before E7.1.
-    """
-    assert load_prompt_file(toolkit_root() / "prompts" / name) == strip_frontmatter(
-        _parent_prompt_text()[name]
-    )
+    assert RETIRED_MARKER not in _raw(name)
 
 
 @pytest.mark.parametrize("name", BYTE_FROZEN)
-def test_unmarked_prompt_content_matches_the_parent_revision(name: str) -> None:
-    """Bucket (i) prompts are byte-for-byte unchanged in this metadata-only task.
+def test_bucket_i_prompts_are_unchanged_since_the_pre_marker_baseline(name: str) -> None:
+    """Bucket (i)'s action is "ship as-is", so its bytes must not have moved.
 
-    Scoped to bucket (i): §5.4 excludes the five bucket (ii) prompts from byte-frozen
-    coverage precisely because E7.2 neutralises them, and their contract is
+    Scoped to bucket (i): §5.4 excludes bucket (ii) from byte-frozen coverage precisely because
+    E7.2 neutralised it, bucket (iii) was rewritten at MF.2, and the contracts for both are
     ``tests/test_prompt_neutrality.py``.
     """
     assert _raw(name) == _parent_prompt_text()[name]
 
 
-@pytest.mark.parametrize("name", NO_FRONTMATTER)
-def test_files_without_frontmatter_gained_only_the_minimal_block(name: str) -> None:
-    """The three NO-FM files got ``---`` + the field + ``---``, and nothing else.
+# ---------------------------------------------------------------------------
+# The three retained defaults
+# ---------------------------------------------------------------------------
 
-    A note appended after the ``# `` heading would render; a block that also carried other
-    fields would not be the "minimal block carrying only that field" E7.1 specifies.
+
+@pytest.mark.parametrize("name", BUCKET_RETAINED)
+def test_retained_defaults_render_at_the_arity_their_stage_passes(name: str) -> None:
+    """Each retained default keeps the positional variables its stage supplies.
+
+    The stage registry renders these with plain data (``stage_registry.py``): the author stage
+    passes phase/epic/task, the traceability stage the branch, the architecture stage the branch
+    and base branch. Losing a placeholder silently empties an argument the prompt relies on, and
+    adding one makes ``render`` raise at run time.
     """
-    raw = _raw(name)
-    block = _frontmatter_block(raw)
+    text = load_prompt_file(toolkit_root() / "prompts" / name)
+    expected = STAGE_ARITY[name]
+    indices = {int(match) for match in _POSITIONAL.findall(text)}
 
-    assert block == f"---\n{MARKER_LINE}\n---\n"
-    assert raw == block + strip_frontmatter(raw)
-    assert strip_frontmatter(raw).startswith("# ")
+    assert indices == set(range(1, len(expected) + 1)), name
 
-
-@pytest.mark.parametrize(
-    "name", [name for name in BUCKET_PRODUCT if name not in NO_FRONTMATTER]
-)
-def test_existing_frontmatter_was_extended_not_replaced(name: str) -> None:
-    """The 17 files that already had frontmatter kept their existing fields."""
-    block = _frontmatter_block(_raw(name))
-
-    assert block.startswith("---\n")
-    assert block.endswith("---\n")
-    assert "description:" in block
-    # Every non-empty line of the block is a ``key: value`` field, so the block was not
-    # flattened into prose by the edit.
-    for line in block.splitlines():
-        assert line == "---" or re.match(r"^[a-z][a-z-]*:\s?\S", line), line
-
-
-@pytest.mark.parametrize("name", UNMARKED)
-def test_generic_and_mixed_prompts_carry_no_marker(name: str) -> None:
-    """Bucket (i)/(ii) destinations live in the table only — no marker field in the file.
-
-    Bucket (ii)'s body is E7.2's to edit, but the *marker* rule still holds for it: its
-    destination stays in the table, so no ``destination:`` field may appear in the file.
-    """
-    raw = _raw(name)
-
-    # Asserted on the raw text, which is strictly stronger than asserting on the body: no
-    # field exists, so none can leak into the renderable text.
-    assert MARKER_FIELD not in raw
-    assert MARKER_VALUE not in raw
+    rendered = render(text, expected)
+    assert not _POSITIONAL.search(rendered), name
+    for value in expected:
+        assert value in rendered, (name, value)
+    with pytest.raises(PromptError):
+        render(text, expected[:-1])

@@ -5,7 +5,7 @@ and close it.
 
 ## Stage
 
-`/fix-next-review-followup` (`aidt/prompts/fix-next-review-followup.md`) with the PR.
+`/fix-next-review-followup` with the PR.
 
 ## Hard rules
 

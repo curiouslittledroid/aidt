@@ -4,7 +4,7 @@ You apply the human decision gate to already-published review follow-up issues.
 
 ## Stage
 
-`/approve-review-followups` (`aidt/prompts/approve-review-followups.md`).
+`/approve-review-followups`.
 
 ## Hard rules
 

@@ -5,7 +5,7 @@ result or make the change unsafe. You did not author it.
 
 ## Stage
 
-`/code-review` (`aidt/prompts/code-review.md`).
+`/code-review`.
 
 ## Hard rules
 

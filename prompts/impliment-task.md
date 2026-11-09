@@ -13,11 +13,11 @@ can run as its own agent:
 | Activity | Owned by |
 |---|---|
 | Code + module contract/property tests | **this prompt** (`impliment-task.md`) |
-| Local proof against acceptance criteria, extra edge tests | `/test` prompt (workflow Step 3, `aidt/prompts/test.md`) |
-| Traceability: the traceability stage's artifacts and the roadmap checkbox | `aidt/prompts/update-traceability.md` |
-| Build-results doc + the full verification gate | `aidt/prompts/record-implementation-results.md` |
-| Architecture inventory + diagrams | `aidt/prompts/update-architecture.md` |
-| Commit, push, open the PR | `aidt/prompts/pr.md` |
+| Local proof against acceptance criteria, extra edge tests | the `/test` stage |
+| Traceability: the traceability stage's artifacts and the roadmap checkbox | the `/update-traceability` stage |
+| Build-results doc + the full verification gate | the `/record-implementation-results` stage |
+| Architecture inventory + diagrams | the `/update-architecture` stage |
+| Commit, push, open the PR | the `/pr` stage |
 
 Do **none** of those here. Leave your changes **uncommitted** in the working tree and do not
 open a PR. If a downstream activity seems necessary to finish the code, note it in your final
