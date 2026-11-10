@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import random
 import re
 import subprocess
@@ -6234,7 +6235,7 @@ def test_from_without_resume_starts_a_fresh_run(tmp_path: Path, monkeypatch) -> 
 
 
 # --------------------------------------------------------------------------- #
-# Blocked runs are not resume-able (H1.2 req 6)
+# Blocked runs: the scoped exit-3 refusal (H1.2 req 6, H1.3 req 1)
 # --------------------------------------------------------------------------- #
 
 
@@ -6252,30 +6253,6 @@ def _refuse_every_side_effect(monkeypatch) -> None:
     monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
     monkeypatch.setattr(git, "worktree_for_branch", _explode_locate)
     monkeypatch.setattr(prompt_workflow.lock, "acquire", _explode_lock)
-
-
-def test_blocked_resume_refuses_with_the_last_reviews_verdict(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    """A terminal `Request changes` is recorded in the last review's ``.out.txt``."""
-    _patch_prompt_repo(tmp_path, monkeypatch)
-    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
-    blocked = _blocked_run(tmp_path, monkeypatch, fake)
-    before = _state_text(tmp_path, blocked.run_id)
-
-    _refuse_every_side_effect(monkeypatch)
-
-    code = _run_prompt(tmp_path, resume=True)
-
-    assert code == 3
-    err = capsys.readouterr().err
-    assert blocked.run_id in err
-    assert "blocked, not failed" in err
-    assert "task-review-3" in err  # the last recorded review
-    assert "Request changes" in err
-    assert "3 findings (2 should-fix, 1 could-fix)" in err
-    assert "denied by the review loop" in err
-    assert _state_text(tmp_path, blocked.run_id) == before
 
 
 def test_blocked_resume_names_the_authors_recorded_block(
@@ -6383,13 +6360,53 @@ def test_dry_run_with_resume_plans_the_fresh_baseline_and_mints_a_new_run(
     assert len(run_ids) == 2 and failed.run_id in run_ids  # never a takeover
 
 
-def test_dry_run_with_resume_over_a_blocked_run_still_refuses(
+def test_dry_run_with_resume_over_a_review_loop_block_plans_fresh(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """H1.2 req 8: the blocked refusal is not dry-run-gated."""
+    """H1.2 req 8 + H1.3 req 7: a forward-path block is no dry-run refusal, no takeover.
+
+    A terminal-`Request changes` run is a continuation candidate now, so the dry run plans
+    the fresh baseline exactly as over a failed run — it never takes the blocked run over,
+    never prints its completed stages, copies nothing and leaves its record untouched. The
+    takeover-gated half of the route (the locate) is unreachable, so it is an assertion here
+    rather than a refused call.
+    """
     _patch_prompt_repo(tmp_path, monkeypatch)
     _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
     blocked = _blocked_run(tmp_path, monkeypatch, fake)
+    before = _state_text(tmp_path, blocked.run_id)
+
+    monkeypatch.setattr(git, "worktree_for_branch", _explode_locate)
+    monkeypatch.setattr(prompt_workflow, "_confirm_resume", _explode_lock)
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    code = _run_prompt(tmp_path, dry_run=True, resume=True, label="pytest-fresh")
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert _PLANNED_AUTHOR in out and _PLANNED_REVIEW in out
+    assert "completed stages:" not in out
+    assert f"resume: {blocked.run_id}" not in out
+    run_ids = {run.run_id for run in state.list_runs(_runs_root(tmp_path))}
+    assert len(run_ids) == 2 and blocked.run_id in run_ids  # never a takeover
+    blocked_after = next(
+        run
+        for run in state.list_runs(_runs_root(tmp_path))
+        if run.run_id == blocked.run_id
+    )
+    assert blocked_after.status == state.BLOCKED
+    assert _state_text(tmp_path, blocked.run_id) == before
+
+
+def test_dry_run_with_resume_over_an_author_blocked_run_still_refuses(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.3 req 7: the scoped-out refusal is not dry-run-gated and mints nothing."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _blocked_author_stages("blocked: cited Design 09 §5.2 is absent\n")
+    blocked = _blocked_run(tmp_path, monkeypatch, fake)
+    before = _state_text(tmp_path, blocked.run_id)
 
     _refuse_every_side_effect(monkeypatch)
 
@@ -6397,7 +6414,39 @@ def test_dry_run_with_resume_over_a_blocked_run_still_refuses(
 
     assert code == 3
     err = capsys.readouterr().err
-    assert blocked.run_id in err and "Request changes" in err
+    assert blocked.run_id in err
+    assert "blocked, not failed" in err
+    assert "cited Design 09 §5.2 is absent" in err
+    assert len(state.list_runs(_runs_root(tmp_path))) == 1
+    assert _state_text(tmp_path, blocked.run_id) == before
+
+
+def test_dry_run_with_resume_over_a_human_gate_denial_still_refuses(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.3 req 1/7: the review already approved, so a fix cycle is no forward path."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    assert (
+        _run_prompt(
+            tmp_path,
+            require_approval=True,
+            deny_gates=[prompt_workflow.GATE],
+        )
+        == 3
+    )
+    blocked = _only_run(tmp_path)
+    before = _state_text(tmp_path, blocked.run_id)
+
+    _refuse_every_side_effect(monkeypatch)
+
+    code = _run_prompt(tmp_path, dry_run=True, resume=True)
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert blocked.run_id in err and "denied by a human decision" in err
+    assert _state_text(tmp_path, blocked.run_id) == before
 
 
 def test_dry_run_over_a_running_record_still_plans_fresh(
@@ -6436,6 +6485,696 @@ def test_dry_run_validates_from_without_minting_a_run(
     assert state.list_runs(_runs_root(tmp_path)) == []
 
 
+def test_dry_run_from_prompt_plans_fresh_and_copies_nothing(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.3 req 7: `--dry-run --from-prompt` plans the fresh baseline, copying nothing.
+
+    The copy and the locate are takeover-gated, so a dry run neither writes the supplied
+    content onto the canonical path nor records its provenance on the blocked run.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake)
+    prompt = _blocked_prompt_path(tmp_path)
+    before_bytes = prompt.read_bytes()
+    supplied = _supplied_prompt(tmp_path)
+
+    monkeypatch.setattr(git, "worktree_for_branch", _explode_locate)
+    monkeypatch.setattr(prompt_workflow, "_confirm_resume", _explode_lock)
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    code = _run_prompt(
+        tmp_path, dry_run=True, from_prompt=supplied, label="pytest-fresh"
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert _PLANNED_AUTHOR in out and _PLANNED_REVIEW in out
+    assert "completed stages:" not in out
+    assert prompt.read_bytes() == before_bytes
+    run_ids = {run.run_id for run in state.list_runs(_runs_root(tmp_path))}
+    assert len(run_ids) == 2 and blocked.run_id in run_ids
+    blocked_after = next(
+        run
+        for run in state.list_runs(_runs_root(tmp_path))
+        if run.run_id == blocked.run_id
+    )
+    assert "from_prompt" not in blocked_after.task
+
+
+def test_dry_run_from_prompt_with_a_missing_file_is_a_usage_error(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.3 req 7: the missing-file check is not suppressed, and precedes any run record."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _refuse_every_side_effect(monkeypatch)
+
+    code = _run_prompt(
+        tmp_path, dry_run=True, from_prompt=tmp_path / "no-such-prompt.md"
+    )
+
+    assert code == 2
+    assert "no such file" in capsys.readouterr().err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+
+
+# --------------------------------------------------------------------------- #
+# Blocked-run continuation (H1.3, design §8.1/§9.2/§9.3/§9.4)
+# --------------------------------------------------------------------------- #
+
+#: The canonical prompt path inside the task worktree (what the author writes, the route
+#: copies `--from-prompt` content onto, and `_commit_reviewed_prompt` commits).
+PROMPT_REL = "docs/task-prompts/03-E4.1-prompt.md"
+
+
+def _blocked_prompt_path(tmp_path: Path) -> Path:
+    return _task_worktree(tmp_path) / PROMPT_REL
+
+
+def _supplied_prompt(tmp_path: Path, text: str = "supplied prompt body\n") -> Path:
+    """An operator-supplied prompt file outside the repo, as `--from-prompt` takes it."""
+    path = tmp_path.parent / f"{tmp_path.name}-supplied-prompt.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _clear_prompt_path(tmp_path: Path) -> Path:
+    """Clear a blocked run's own uncommitted prompt file, as an operator would.
+
+    The blocked run never commits (a block records no commit), so the file the author wrote
+    is untracked and dirty; `--from-prompt` refuses to copy over it (design §13), which is
+    why the "clean path" leg starts here.
+    """
+    prompt = _blocked_prompt_path(tmp_path)
+    if prompt.exists():
+        prompt.unlink()
+    return prompt
+
+
+def test_resume_continues_a_terminal_request_changes_block_with_one_extra_review(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.3 req 1/2/3/6: the same loop, the same run id, one added terminal review.
+
+    The blocked run recorded three reviews and two fix batches (the third review was
+    review-only). The continuation runs under `effective_max_revisions = 3 + 1 = 4`, so the
+    walk replays the recorded rounds, appends round 3's `FixBatch` — which the original run
+    never planned, because the terminal break skipped it — and its reconcile, then runs
+    `task-review-4`, which is terminal (L4.1).
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+    run_id = blocked.run_id
+    recorded = [stage.name for stage in blocked.stages]
+    assert recorded[-1] == "task-review-3"
+
+    seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=4)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, resume=True, approve_all=True)
+
+    assert code == 0
+    ran = [name for name, _variables, _extra in seen2]
+    assert ran == [
+        "task-review-fixes-3-1",
+        "task-review-fixes-3-2",
+        "task-review-fixes-3-3",
+        "task-review-reconcile-3",
+        "task-review-4",
+    ]
+    assert "task-prompt" not in ran
+    out = capsys.readouterr().out
+    assert "stage:  task-prompt [skipped]" in out
+    for skipped in ("task-review-1", "task-review-2", "task-review-3"):
+        assert f"stage:  {skipped} [skipped]" in out
+
+    continued = _only_run(tmp_path)  # one run id: no `create_run` fired
+    assert continued.run_id == run_id
+    assert continued.status == state.SUCCEEDED
+    assert continued.resume == {"next_stage": None}
+    assert continued.task["effective_max_revisions"] == 4
+    stage_names = [stage.name for stage in continued.stages]
+    # The prior records are kept in order and the continuation's stages are appended after
+    # them; the last stage is the added review, never a fix or a reconcile (L4.1).
+    assert stage_names[: len(recorded)] == recorded
+    assert stage_names[len(recorded) :] == ran
+    assert stage_names[-1] == "task-review-4"
+    # The reviewed prompt is committed on the task branch, once, at the same commit point a
+    # fresh run uses.
+    worktree = _task_worktree(tmp_path)
+    assert git.changed_files(worktree, "main") == [PROMPT_REL]
+    # H1.3 req 6: two gate records, distinguishable by their detail.
+    gates = continued.gates
+    assert len(gates) == 2
+    assert gates[0].decision == "denied" and gates[0].mechanism == "review-loop"
+    assert "max_revisions=3" in gates[0].detail
+    assert gates[1].decision == "approved"
+    assert gates[1].mechanism == "optional (default)"
+    assert "max_revisions=4" in gates[1].detail
+    assert "rounds=4" in gates[1].detail
+
+
+def test_a_second_resume_on_a_reblocked_run_gets_one_more_round(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.3 req 2: the budget guard checks the effective budget, not the resolved one.
+
+    The first continuation re-blocks at `task-review-4`, leaving three recorded fix rounds
+    while the resolved `max_revisions` is 3 — the shape H1.2's guard refuses as exit 2 when
+    it is left on the resolved value. Scoped to the continuation's effective budget
+    (4 + 1 = 5) it proceeds: round 4's fix batch and reconcile, then `task-review-5`.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+    assert _run_prompt(tmp_path, resume=True, approve_all=True) == 3
+
+    reblocked = _only_run(tmp_path)
+    assert reblocked.run_id == blocked.run_id
+    assert reblocked.status == state.BLOCKED
+    assert reblocked.task["effective_max_revisions"] == 4
+    assert prompt_workflow._recorded_fix_rounds(reblocked) == 3
+    assert prompt_workflow.effective_max_revisions(reblocked) == 5
+
+    seen3, fake3 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=5)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake3)
+
+    code = _run_prompt(tmp_path, resume=True, approve_all=True)
+
+    assert code == 0
+    assert [name for name, _variables, _extra in seen3] == [
+        "task-review-fixes-4-1",
+        "task-review-fixes-4-2",
+        "task-review-fixes-4-3",
+        "task-review-reconcile-4",
+        "task-review-5",
+    ]
+    again = _only_run(tmp_path)
+    assert again.run_id == blocked.run_id
+    assert again.task["effective_max_revisions"] == 5
+    assert [stage.name for stage in again.stages][-1] == "task-review-5"
+
+
+def test_a_continuation_that_still_requests_changes_blocks_with_a_review_last(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.3 req 3: a residual `Request changes` on the added review fails closed."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    code = _run_prompt(tmp_path, resume=True, approve_all=True)
+
+    assert code == 3
+    continued = _only_run(tmp_path)
+    assert continued.run_id == blocked.run_id
+    assert continued.status == state.BLOCKED
+    assert continued.resume == {}
+    assert continued.task["effective_max_revisions"] == 4
+    # L4.1 in the continuation: the last stage is a review; no fix ran after it.
+    assert [stage.name for stage in continued.stages][-1] == "task-review-4"
+    # Nothing was committed: the reviewed prompt is still uncommitted in the worktree.
+    assert git.status_short(_task_worktree(tmp_path), paths=[PROMPT_REL]) != ""
+    # Both gates are `review-loop` denials; the continuation's reports the extended budget.
+    assert [gate.mechanism for gate in continued.gates] == ["review-loop", "review-loop"]
+    assert "max_revisions=3" in continued.gates[0].detail
+    assert "max_revisions=4" in continued.gates[1].detail
+
+
+def test_a_blocked_continuation_releases_its_worktree_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.3 req 7: a re-blocked continuation cannot leave the worktree locked."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    assert _run_prompt(tmp_path, resume=True, approve_all=True) == 3
+
+    # The continuation exits through the blocked path inside the lock's try/finally. A
+    # second owner can acquire the same path only if that invocation released it.
+    worktree = _task_worktree(tmp_path)
+    acquired = prompt_workflow.lock.acquire(
+        _roots(tmp_path)["workspace"].state_root, worktree
+    )
+    try:
+        assert acquired is not None
+    finally:
+        acquired.release()
+    assert _only_run(tmp_path).run_id == blocked.run_id
+
+
+def test_a_continuation_approval_gate_is_asked_once_and_can_block(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.3 req 3/6: the post-loop gate is re-decided once, and records `decide`'s mechanism.
+
+    A review-loop block's recorded gate is `denied`, so `already_approved` is false and
+    `--require-approval` consults the human exactly once after the added review. Design §9.4
+    allows re-deciding a *denied* gate (only an approved one is never re-asked). A denial
+    here is the continuation's own blocked gate, with the mechanism `decide` returned — never
+    `review-loop`, because the review loop did not produce that decision.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+
+    decisions: list[object] = []
+    real_decide = prompt_workflow.decide
+
+    def counting_decide(*args, **kwargs):
+        outcome = real_decide(*args, **kwargs)
+        decisions.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(prompt_workflow, "decide", counting_decide)
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=4)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    code = _run_prompt(
+        tmp_path,
+        resume=True,
+        approve_all=True,
+        require_approval=True,
+        deny_gates=[prompt_workflow.GATE],
+    )
+
+    assert code == 3
+    assert len(decisions) == 1  # asked once, never skipped by the continuation
+    blocked_again = _only_run(tmp_path)
+    assert blocked_again.run_id == blocked.run_id
+    assert blocked_again.status == state.BLOCKED
+    assert blocked_again.resume == {}
+    assert git.status_short(_task_worktree(tmp_path), paths=[PROMPT_REL]) != ""
+    original, continuation = blocked_again.gates
+    assert original.decision == "denied" and original.mechanism == "review-loop"
+    assert continuation.decision == "denied"
+    assert continuation.mechanism == f"--deny-gates {prompt_workflow.GATE}"
+    assert continuation.mechanism != "review-loop"
+    assert "max_revisions=4" in continuation.detail
+    assert "rounds=4" in continuation.detail
+
+    # H1.3 req 1/3: the run now holds a human-gate denial, so a later `--resume` meets the
+    # scoped-out refusal instead of re-opening a loop whose review already approved.
+    before = _state_text(tmp_path, blocked.run_id)
+    _refuse_every_side_effect(monkeypatch)
+    assert _run_prompt(tmp_path, resume=True) == 3
+    err = capsys.readouterr().err
+    assert "denied by a human decision" in err
+    assert _state_text(tmp_path, blocked.run_id) == before
+
+
+def test_a_continuation_approval_gate_passes_once_with_yes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.3 req 3: `--yes` approves the continuation's gate, then commits and exits 0."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=4)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(
+        tmp_path, resume=True, approve_all=True, require_approval=True
+    )
+
+    assert code == 0
+    continued = _only_run(tmp_path)
+    assert continued.run_id == blocked.run_id
+    assert continued.status == state.SUCCEEDED
+    assert continued.gates[-1].decision == "approved"
+    assert continued.gates[-1].mechanism == "--yes"
+    assert "max_revisions=4" in continued.gates[-1].detail
+    assert git.changed_files(_task_worktree(tmp_path), "main") == [PROMPT_REL]
+
+
+def test_a_blocked_verdict_continuation_fixes_reconciles_and_reviews(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.3 req 1/2: a `Blocked`-verdict block is a fix-cycle shape too.
+
+    The recorded `Blocked` verdict already decided the original run; replaying it would
+    re-block with no forward path. The continuation therefore replays the round for its
+    fix batch only — reconcile, then the added review — and that review's own `Blocked`
+    verdict fails closed.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(
+        TASK_REVIEW_CHANGES, approve_review=None, blocked_review=1
+    )
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+    assert [stage.name for stage in blocked.stages][-1] == "task-review-1"
+    assert prompt_workflow.effective_max_revisions(blocked) == 2
+
+    seen2, fake2 = _fake_stages(
+        TASK_REVIEW_CHANGES, approve_review=None, blocked_review=2
+    )
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, resume=True, approve_all=True)
+
+    assert code == 3
+    assert [name for name, _variables, _extra in seen2] == [
+        "task-review-fixes-1-1",
+        "task-review-reconcile-1",
+        "task-review-2",
+    ]
+    continued = _only_run(tmp_path)
+    assert continued.run_id == blocked.run_id
+    assert continued.status == state.BLOCKED
+    assert continued.task["effective_max_revisions"] == 2
+    assert [stage.name for stage in continued.stages][-1] == "task-review-2"
+
+
+def test_from_prompt_applies_control_preflights_but_skips_run_scoped_preflights(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.3 req 4: takeover keeps tree checks but does not repeat fetch or prerequisites."""
+    roadmap = """# Phase 3: Test Phase
+
+## Epic E3: Earlier work
+
+- [ ] **E3.1. Incomplete predecessor** per Design 09..
+  - Done when: the predecessor remains unticked.
+
+## Epic E4: Defensive Combat
+
+- [ ] **E4.1. Implement Total Defense** per Design 09..
+  - Done when: applyTotalDefense returns the fixed effect.
+"""
+    _patch_prompt_repo(tmp_path, monkeypatch, roadmap=roadmap)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    assert _run_prompt(tmp_path, allow_incomplete_prereqs=True) == 3
+    capsys.readouterr()  # discard the initial run's expected predecessor warning
+    blocked = _only_run(tmp_path)
+    _clear_prompt_path(tmp_path)
+    supplied = _supplied_prompt(tmp_path)
+
+    def fail_if_run_scoped_preflight(*args, **kwargs):
+        raise AssertionError("a blocked takeover must not repeat the base-branch fetch check")
+
+    monkeypatch.setattr(prompt_workflow, "_verify_base_branch", fail_if_run_scoped_preflight)
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+
+    assert _run_prompt(tmp_path, from_prompt=supplied, approve_all=True) == 0
+    assert _only_run(tmp_path).run_id == blocked.run_id
+    assert "incomplete predecessor" not in capsys.readouterr().err
+
+
+def test_from_prompt_alone_continues_a_blocked_run_from_review_1(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.3 req 4: `--from-prompt` alone is a takeover that re-reviews new content.
+
+    No `--resume` is needed: the route locates, locks and reuses the same run id. The
+    supplied content is copied onto the canonical path (so `rel`, the evidence bundle and
+    the commit keep working), its provenance is recorded, the loop starts at
+    `task-review-1` under the resolved budget, and the author record is still reused.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+    prompt = _clear_prompt_path(tmp_path)
+    supplied = _supplied_prompt(tmp_path, "supplied prompt body\n")
+    supplied_bytes = supplied.read_bytes()
+
+    seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, from_prompt=supplied, approve_all=True)
+
+    assert code == 0
+    assert [name for name, _variables, _extra in seen2] == ["task-review-1"]
+    out = capsys.readouterr().out
+    assert "stage:  task-prompt [skipped]" in out
+    continued = _only_run(tmp_path)
+    assert continued.run_id == blocked.run_id
+    assert continued.status == state.SUCCEEDED
+    # Provenance: the supplied path and a sha256 over the bytes actually written.
+    assert continued.task["from_prompt"] == {
+        "path": str(supplied),
+        "hash": f"sha256:{hashlib.sha256(supplied_bytes).hexdigest()}",
+    }
+    # A `--from-prompt` continuation never claims the fix cycle's extension.
+    assert "effective_max_revisions" not in continued.task
+    # The re-run's review-1 record supersedes the blocked run's (one record, new verdict)
+    # and the rounds the new loop never reached keep their records as history.
+    assert len([stage for stage in continued.stages if stage.name == "task-review-1"]) == 1
+    replayed = continued.stage("task-review-1")
+    assert replayed is not None
+    assert "Approve" in (prompt_workflow._read_out(replayed) or "")
+    assert continued.stage("task-review-2") is not None
+    assert continued.stage("task-review-3") is not None
+    # The reviewed-and-committed prompt is the supplied content.
+    assert prompt.read_bytes() == supplied_bytes
+    assert git.changed_files(_task_worktree(tmp_path), "main") == [PROMPT_REL]
+    # H1.3 req 6: the gate reports the resolved budget it ran under and its own round count.
+    gate = continued.gates[-1]
+    assert gate.decision == "approved"
+    assert "max_revisions=3" in gate.detail
+    assert "rounds=1" in gate.detail
+
+
+def test_from_prompt_is_an_author_blocked_runs_forward_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.3 req 1/4: the supplied file is the forward path when no gate was recorded.
+
+    An author-`blocked:` run keeps H1.2's exit-3 `--resume` refusal (it holds no terminal
+    review whose findings a fix batch could take), so `--from-prompt` is its path. The
+    re-run must not re-read the author's old marker and re-block before reviewing the
+    supplied content.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen, fake = _blocked_author_stages("blocked: cited Design 09 §5.2 is absent\n")
+    blocked = _blocked_run(tmp_path, monkeypatch, fake)
+    assert not _blocked_prompt_path(tmp_path).exists()  # nothing on the canonical path
+    supplied = _supplied_prompt(tmp_path, "supplied prompt body\n")
+
+    seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, from_prompt=supplied, approve_all=True)
+
+    assert code == 0
+    assert [name for name, _variables, _extra in seen2] == ["task-review-1"]
+    continued = _only_run(tmp_path)
+    assert continued.run_id == blocked.run_id
+    assert continued.status == state.SUCCEEDED
+    assert continued.task["from_prompt"]["path"] == str(supplied)
+    assert _blocked_prompt_path(tmp_path).read_bytes() == supplied.read_bytes()
+
+
+def test_from_prompt_takes_precedence_over_the_resume_fix_cycle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.3 req 4: with both flags the supplied content wins; no fix cycle, no extension."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+    _clear_prompt_path(tmp_path)
+    supplied = _supplied_prompt(tmp_path)
+
+    seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, resume=True, from_prompt=supplied, approve_all=True)
+
+    assert code == 0
+    assert [name for name, _variables, _extra in seen2] == ["task-review-1"]
+    continued = _only_run(tmp_path)
+    assert continued.run_id == blocked.run_id
+    assert "from_prompt" in continued.task
+    assert "effective_max_revisions" not in continued.task
+
+
+def test_from_prompt_runs_at_the_resolved_budget_past_a_stale_effective_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H1.3 req 4/6: the guard counts no recorded round, and the gate claims no extension.
+
+    The re-blocked shape records three fix rounds while the resolved `max_revisions` is 3, so
+    H1.2's guard would refuse exit 2 — but a `--from-prompt` loop rebuilds none of those
+    rounds. It also runs under the resolved budget, so its gate reports `max_revisions=3`,
+    never the `effective_max_revisions=4` the earlier fix cycle left on the same run.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+    assert _run_prompt(tmp_path, resume=True, approve_all=True) == 3
+    reblocked = _only_run(tmp_path)
+    assert reblocked.task["effective_max_revisions"] == 4
+    assert prompt_workflow._recorded_fix_rounds(reblocked) == 3
+
+    _clear_prompt_path(tmp_path)
+    supplied = _supplied_prompt(tmp_path)
+    _seen3, fake3 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake3)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, from_prompt=supplied, approve_all=True)
+
+    assert code == 0
+    continued = _only_run(tmp_path)
+    assert continued.run_id == blocked.run_id
+    gate = continued.gates[-1]
+    assert gate.decision == "approved"
+    assert "max_revisions=3" in gate.detail
+    assert "max_revisions=4" not in gate.detail
+    assert "rounds=1" in gate.detail
+
+
+def test_from_prompt_refuses_a_dirty_canonical_path(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.3 req 4: the copy is a §13 discard, so a dirty path refuses exit 4 first.
+
+    A blocked run leaves its own uncommitted prompt edits exactly where the copy would go.
+    Overwriting them is the operator-work discard AIDT never performs, so the route refuses
+    with the run id, the untouched path and the clear commands, and records no stage.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+    prompt = _blocked_prompt_path(tmp_path)
+    dirty_bytes = prompt.read_bytes()
+    assert git.status_short(_task_worktree(tmp_path), paths=[PROMPT_REL]) != ""
+    stages_before = [stage.name for stage in blocked.stages]
+    before = _state_text(tmp_path, blocked.run_id)
+    supplied = _supplied_prompt(tmp_path)
+
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, from_prompt=supplied, approve_all=True)
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert "--from-prompt refused" in err
+    assert blocked.run_id in err
+    assert PROMPT_REL in err
+    assert "left untouched" in err
+    assert "aidw worktree remove 03-E4.1 --force" in err
+    assert "branch -D 03-E4.1" in err
+    assert prompt.read_bytes() == dirty_bytes  # nothing was overwritten
+    assert [stage.name for stage in _only_run(tmp_path).stages] == stages_before
+    assert _state_text(tmp_path, blocked.run_id) == before
+
+
+def test_a_blocked_continuation_without_its_worktree_refuses_and_never_re_authors(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.3 req 5: no worktree is exit 4 naming the run, the path and the re-author command.
+
+    Also the purity check for the route: reading the run's records (the block shape, the
+    recorded rounds) writes nothing — no `save`, no `create_run` — before the locate.
+    """
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+    before = _state_text(tmp_path, blocked.run_id)
+    worktree = _task_worktree(tmp_path)
+    assert git.remove_worktree(tmp_path, worktree, force=True)
+    assert git.worktree_for_branch(tmp_path, "03-E4.1") is None
+    supplied = _supplied_prompt(tmp_path)
+
+    saves: list[Path] = []
+    real_save = prompt_workflow.save
+
+    def recording_save(directory, run_state):
+        saves.append(Path(directory))
+        return real_save(directory, run_state)
+
+    monkeypatch.setattr(prompt_workflow, "save", recording_save)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    for kwargs in ({"resume": True}, {"from_prompt": supplied}):
+        code = _run_prompt(tmp_path, approve_all=True, **kwargs)
+        assert code == 4
+        err = capsys.readouterr().err
+        assert "continuation refused" in err
+        assert blocked.run_id in err
+        assert str(worktree) in err
+        assert "aidw prompt 03 E4 E4.1" in err
+        assert "worktree add" not in err  # never offered for a blocked continuation
+
+    assert saves == []  # routing read records only, before the locate
+    assert _state_text(tmp_path, blocked.run_id) == before
+    assert len(state.list_runs(_runs_root(tmp_path))) == 1
+
+
+def test_from_prompt_requires_a_blocked_run_and_rejects_from(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H1.3 req 4: a missing file, a `--from` combination and a non-blocked run are usage."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    real_locate = git.worktree_for_branch
+    real_acquire = prompt_workflow.lock.acquire
+    real_create = prompt_workflow.create_run
+    _refuse_every_side_effect(monkeypatch)
+
+    code = _run_prompt(tmp_path, from_prompt=tmp_path / "no-such-prompt.md")
+
+    assert code == 2
+    assert "no such file" in capsys.readouterr().err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+
+    supplied = _supplied_prompt(tmp_path)
+    code = _run_prompt(
+        tmp_path, from_prompt=supplied, from_stage="task-review-1"
+    )
+
+    assert code == 2
+    assert "cannot be combined" in capsys.readouterr().err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+
+    # A failed run is `--resume`/`--from`'s shape, never `--from-prompt`'s.
+    monkeypatch.setattr(git, "worktree_for_branch", real_locate)
+    monkeypatch.setattr(prompt_workflow.lock, "acquire", real_acquire)
+    monkeypatch.setattr(prompt_workflow, "create_run", real_create)
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(
+        prompt_workflow, "run_stage", _fail_stages(fake, FAIL_AT_REVIEW_2)
+    )
+    assert _run_prompt(tmp_path) == 1
+    failed = _only_run(tmp_path)
+    before = _state_text(tmp_path, failed.run_id)
+
+    _refuse_every_side_effect(monkeypatch)
+    code = _run_prompt(tmp_path, from_prompt=supplied, approve_all=True)
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert failed.run_id in err
+    assert "not `blocked`" in err
+    assert _state_text(tmp_path, failed.run_id) == before
+
+
 # --------------------------------------------------------------------------- #
 # CLI wiring (H1.2 req 1)
 # --------------------------------------------------------------------------- #
@@ -6469,6 +7208,35 @@ def test_prompt_cli_forwards_resume_and_from(tmp_path: Path, monkeypatch) -> Non
     assert result.exit_code == 0, result.output
     assert captured["resume"] is True
     assert captured["from_stage"] == "task-review-2"
+
+
+def test_prompt_cli_forwards_from_prompt(tmp_path: Path, monkeypatch) -> None:
+    """H1.3 req 4: `aidw prompt --from-prompt <path>` reaches the workflow as a Path."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    supplied = _supplied_prompt(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(prompt_workflow, "run", fake_run)
+    result = runner.invoke(
+        app,
+        [
+            "--repo",
+            str(tmp_path),
+            "prompt",
+            "03",
+            "E4",
+            "E4.1",
+            "--from-prompt",
+            str(supplied),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["from_prompt"] == supplied
 
 
 def test_runs_resume_hint_names_the_prompt_workflow(tmp_path: Path, monkeypatch) -> None:
@@ -6637,6 +7405,127 @@ def test_from_grammar_matches_the_prompt_loop_expansion_property() -> None:
                     [*fixes, "task-review-fixes-9-9"], fixes
                 )
                 is not None
+            )
+
+
+#: Pinned seed and run count for the H1.3 continuation property (AGENTS.md "Tests": pytest
+#: only, no ``hypothesis``, so a reproducible sample is the generator and there is no
+#: shrinking).
+CONTINUATION_PROPERTY_SEED = 7712
+CONTINUATION_PROPERTY_RUNS = 32
+
+
+def _recorded_run(reviews: int, *, gate: str) -> state.RunState:
+    """A recorded run with ``reviews`` review rounds and one ``approve-task-prompt`` gate.
+
+    The stage names are the loop's own: one review per round, and a fix batch plus its
+    reconcile for every round but the last (the terminal review runs none). ``gate`` is
+    ``"review-loop"``, a human mechanism, or ``"none"`` for no gate at all.
+    """
+    run = state.RunState(
+        run_id="20260101T000000Z-prop-prompt",
+        workflow="prompt",
+        created_at=state.utcnow_iso(),
+        repo_root=".",
+    )
+    run.record_stage(
+        state.StageRecord(
+            name="task-prompt",
+            agent="task-author",
+            model="test-model",
+            status=state.SUCCEEDED,
+        )
+    )
+    for index in range(1, reviews + 1):
+        run.record_stage(
+            state.StageRecord(
+                name=f"task-review-{index}",
+                agent="task-reviewer",
+                model="test-model",
+                status=state.SUCCEEDED,
+            )
+        )
+        if index == reviews:
+            continue
+        run.record_stage(
+            state.StageRecord(
+                name=f"task-review-fixes-{index}-1",
+                agent="task-fixer",
+                model="test-model",
+                status=state.SUCCEEDED,
+            )
+        )
+        run.record_stage(
+            state.StageRecord(
+                name=f"task-review-reconcile-{index}",
+                agent="task-fixer",
+                model="test-model",
+                status=state.SUCCEEDED,
+            )
+        )
+    if gate != "none":
+        run.record_gate(
+            state.GateRecord(
+                name=prompt_workflow.GATE,
+                decision="denied",
+                mechanism=gate,
+                at=state.utcnow_iso(),
+            )
+        )
+    return run
+
+
+def test_continuation_extension_is_exactly_one_review_property() -> None:
+    """Seeded property run (seed/runs pinned above): the continuation is one added review.
+
+    For every sampled recorded inventory (1–5 review rounds, a resolved budget of 1–5, and
+    a review-loop, human or absent gate), :func:`~aidw.workflows.prompt.effective_max_revisions`
+    is the recorded review count + 1 — never the resolved value, never a larger default — and
+    the loop's own expansion under that budget replays the recorded rounds' batches and ends
+    on `task-review-{N+1}`: a **review**, never a fix or a reconcile (L4.1), with the last
+    recorded round's fix batch and reconcile now planned. The extension is per-run, so the
+    `--from` grammar under the *resolved* budget still refuses that added review. The two
+    predicates are pinned pure (same answer twice, no state touched).
+    """
+    rng = random.Random(CONTINUATION_PROPERTY_SEED)
+
+    for _ in range(CONTINUATION_PROPERTY_RUNS):
+        reviews = rng.randint(1, 5)
+        resolved = rng.randint(1, 5)
+        gate = rng.choice(["review-loop", "human", "none"])
+        run = _recorded_run(reviews, gate=gate)
+
+        effective = prompt_workflow.effective_max_revisions(run)
+        assert effective == reviews + 1
+        assert prompt_workflow.effective_max_revisions(run) == effective
+        assert prompt_workflow.review_loop_block(run) is (gate == "review-loop")
+
+        batches = tuple(_synthesized_batch(rng) for _ in range(reviews))
+        names = [
+            stage.name
+            for stage in stage_registry.expand(
+                "prompt",
+                phase="03",
+                epic="E4",
+                task="E4.1",
+                rel=f"docs/task-prompts/{reviews}-prompt.md",
+                max_revisions=effective,
+                rounds=batches,
+            )
+        ]
+        # The added review is last and is a review, never a fix or a reconcile (L4.1).
+        assert names[-1] == f"task-review-{reviews + 1}"
+        assert prompt_workflow.prompt_stage_position(names[-1])[:2] == (reviews + 2, 0)
+        # The last recorded round's batch and reconcile are now reachable.
+        assert f"task-review-reconcile-{reviews}" in names
+        # The continuation's own plan is grammar-valid under the budget it runs under.
+        assert all(prompt_workflow.is_from_stage(name, effective) for name in names)
+        if reviews + 1 > resolved:
+            assert (
+                prompt_workflow.is_from_stage(
+                    f"task-review-{reviews + 1}", resolved
+                )
+                is False
             )
 
 

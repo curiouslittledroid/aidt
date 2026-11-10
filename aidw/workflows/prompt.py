@@ -61,14 +61,29 @@ Resumability (H1.2, design §9.4) mirrors ``aidw implement``: ``--resume`` reads
 **prompt** run for the derived branch, prints its completed stages and confirms before
 continuing; ``--from <stage>`` re-runs that stage and everything after it. A failed run
 stamps ``state.resume.next_stage`` at every ``return 1`` site and a run that succeeds clears
-it; a *blocked* run records none (design §9.3), so ``--resume`` on one refuses with exit 3
-naming the blocked shape's recorded reason instead of silently re-authoring. A resume keeps
+it; a *blocked* run records none (design §9.3). A resume keeps
 the run's single id and appends to the same ``state``: the loop's in-memory counters are
 reconstructed from the recorded stage records (``review_index``/``revisions`` from the stage
 names, each round's fix batch re-parsed from that round's recorded review ``.out.txt``), so
 no author or review stage is re-run to recover them and no ``FixBatch`` or baseline diff is
 fabricated. ``--dry-run`` always plans the fresh author + ``task-review-1`` baseline — never
 a resumed plan — exactly as ``implement.py`` layers the same flags.
+
+A **blocked** run's forward path is H1.3's, scoped by the shape of the block (design §9.4).
+A *review-loop* block — a blocked run holding the loop's own `denied`
+``approve-task-prompt`` gate (``mechanism == "review-loop"``: the terminal `Request
+changes`, a `Blocked` verdict, or M2's approve-with-blocking-findings) — continues with
+``--resume``: the same loop, in the same run id and worktree, under an *extended* budget of
+one added review round (``state.task["effective_max_revisions"]``), so the recorded round's
+findings finally get their fix batch and reconcile and the added review is terminal (L4.1).
+An author-``blocked:`` run and a human-gate denial hold no terminal review whose findings
+drive a fix batch, so ``--resume`` keeps H1.2's exit-3 refusal naming the recorded reason.
+``--from-prompt <path>`` is either shape's path: it copies the operator's content into the
+canonical prompt path (refusing exit 4 when the blocked run left uncommitted edits there,
+design §13), records its provenance in ``state.task["from_prompt"]``, and re-runs the review
+loop from ``task-review-1`` under the resolved ``max_revisions``. A blocked continuation whose
+task worktree is gone refuses exit 4 naming the run, the missing worktree and the re-author
+command; it never re-authors silently.
 Before any of that — and regardless of ``--dry-run`` — the target repo's
 ``<target>/aidw/config.yaml`` is loaded and resolved (E3.2): its ``max_revisions`` is the
 budget under the CLI flag, and a config carrying validation ERRORs refuses with
@@ -109,6 +124,7 @@ locates and creates no worktree, so it locks the control worktree it plans again
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -1549,6 +1565,121 @@ def _last_review_record(state: RunState):
     return None
 
 
+def _recorded_review_count(state: RunState) -> int:
+    """How many review rounds a recorded run ran, from its stage names (H1.3 req 2).
+
+    Pure read of ``state.stages``. The count is the run's *review* rounds, which is what the
+    revision budget counts (the ``max_revisions``-th review is review-only), so it is also
+    the budget the run actually consumed.
+    """
+    return sum(
+        1 for record in state.stages if _REVIEW_STAGE_RE.fullmatch(record.name)
+    )
+
+
+def effective_max_revisions(state: RunState) -> int:
+    """The budget a blocked-run continuation runs under: recorded reviews + 1 (H1.3 req 2).
+
+    Pure. The continuation grants exactly **one** added review round, never a larger default
+    budget (roadmap H1.3 Notes): with ``N`` recorded reviews the loop's own expansion then
+    plans the recorded rounds' fix batches (all recorded but the last, so they are skipped),
+    the last recorded round's ``FixBatch`` — which the original run never appended, because
+    ``terminal_last`` broke before it — its reconcile, and ``task-review-{N+1}``, which is
+    the ``max_revisions``-th review and therefore review-only (L4.1). Each further
+    ``--resume`` is its own explicit operator decision and adds one more round.
+    """
+    return _recorded_review_count(state) + 1
+
+
+def review_loop_block(state: RunState) -> bool:
+    """Whether a blocked run's latest review gate is the loop's own `denied` one (H1.3 req 1).
+
+    Pure. The marker is ``_record_review_outcome``'s ``mechanism == "review-loop"``: the
+    terminal `Request changes`, a `Blocked` verdict, and M2's approve-with-blocking-findings
+    exit. An author-``blocked:`` run recorded no gate, and a human-gate denial recorded
+    ``decide``'s own mechanism; neither has terminal findings that could drive a fix batch,
+    so neither is a fix-cycle continuation. Branching on the ``mechanism`` rather than on
+    ``status == BLOCKED`` alone is what keeps a human-gate-denied run (review already
+    approved) out of the fix cycle, which would re-commit an approved prompt.
+
+    The **latest** ``approve-task-prompt`` record decides, not "any": a continuation appends
+    its own gate after the block it continues, so a fix cycle re-blocked by a human denial
+    holds *both* a `review-loop` denial and that human one, and its next `--resume` must meet
+    the human-gate denial's refusal (req 1/3). The earlier records stay in ``state.gates`` as
+    history, which is what makes the original decision reviewable.
+    """
+    latest = None
+    for gate in state.gates:
+        if gate.name == GATE:
+            latest = gate
+    return (
+        latest is not None
+        and latest.decision == "denied"
+        and latest.mechanism == "review-loop"
+    )
+
+
+def _apply_from_prompt(
+    worktree: Path,
+    rel: str,
+    supplied: Path,
+    *,
+    run_id: str,
+    workspace: WorkspacePaths,
+    branch: str,
+    base_branch: str,
+) -> tuple[int | None, dict[str, str]]:
+    """Copy an operator-supplied prompt onto the canonical path (H1.3 req 4).
+
+    Returns ``(refusal, provenance)``: a design §14 exit code when the copy must not happen,
+    otherwise ``None`` plus the ``state.task["from_prompt"]`` mapping — the *supplied* path
+    and a ``sha256:<hex>`` over the very bytes written (design §9.2's ``config_hash``
+    convention, so the fingerprint can be reproduced with any sha256 tool).
+
+    The supplied file **is** the prompt being reviewed, but the review loop, the evidence
+    bundle and :func:`_commit_reviewed_prompt` all key off the worktree-relative canonical
+    ``docs/task-prompts/<phase>-<task>-prompt.md``; copying the content in keeps those three
+    working without inventing a second path, and the committed version stays in git history.
+
+    Design §13: a blocked run may itself have left uncommitted edits on that path — exactly
+    what :func:`_report_blocked_leftovers` reports and never repairs — so a dirty path
+    refuses (exit 4) before the copy rather than silently discarding the operator's work. A
+    clean path destroys nothing. The refusal prints the same two copy-pasteable clear
+    commands the fresh-path dirty-tree refusal does.
+    """
+    if git.status_short(worktree, paths=[rel]):
+        remove_command, branch_command = worktree_clear_commands(
+            workspace, branch, base_branch
+        )
+        print(
+            f"--from-prompt refused: run {run_id} left uncommitted changes on the "
+            f"canonical prompt path `{rel}` in {worktree}; copying the supplied file over "
+            "them would discard that work, which AIDT never does. The path was left "
+            "untouched. Commit or stash it, or clear the worktree and branch and start a "
+            "fresh run:",
+            file=sys.stderr,
+        )
+        print(f"  {remove_command}", file=sys.stderr)
+        print(f"  {branch_command}", file=sys.stderr)
+        return EXIT_REFUSED, {}
+    try:
+        content = supplied.read_bytes()
+    except OSError as exc:
+        print(f"--from-prompt: cannot read {supplied}: {exc}", file=sys.stderr)
+        return 2, {}
+    destination = worktree / rel
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+    except OSError as exc:
+        print(f"--from-prompt: cannot write {destination}: {exc}", file=sys.stderr)
+        return EXIT_REFUSED, {}
+    return None, {
+        "path": str(supplied),
+        "hash": f"sha256:{hashlib.sha256(content).hexdigest()}",
+    }
+
+
 def blocked_resume_reason(state: RunState) -> str:
     """A blocked run's recorded reason, re-read from its own records (H1.2 req 6).
 
@@ -1597,20 +1728,24 @@ def blocked_resume_reason(state: RunState) -> str:
 
 
 def _refuse_blocked_resume(state: RunState, branch: str) -> None:
-    """Print the exit-3 refusal for a blocked run (H1.2 req 6). Mutates nothing.
+    """Print the exit-3 refusal for a blocked run with no fix-cycle path (H1.2/H1.3).
 
-    A blocked run is not a failed one: design §9.3 sets ``resume.next_stage`` only when a
-    stage fails, so there is no stage to continue from, and re-authoring would discard the
-    reviewed prompt silently. Exit 3 is design §14's "workflow blocked (needs human)" —
-    not a usage error (2) and not a preflight refusal (4), which stay reserved for the
-    no-matching-run, still-running and worktree cases. The blocked-run continuation is
-    H1.3's.
+    Mutates nothing. A blocked run is not a failed one: design §9.3 sets
+    ``resume.next_stage`` only when a stage fails, so there is no stage to continue from,
+    and re-authoring would discard the reviewed prompt silently. H1.3 scopes the refusal to
+    the shapes a fix cycle cannot help — an author ``blocked:`` report (no recorded review)
+    and a human-gate denial (the review already approved) — because neither holds terminal
+    findings to batch; ``--from-prompt`` is their forward path. Exit 3 is design §14's
+    "workflow blocked (needs human)" — not a usage error (2) and not a preflight refusal
+    (4), which stay reserved for the no-matching-run, still-running and worktree cases.
     """
     print(
         f"resume refused: run {state.run_id} for `{branch}` is blocked, not failed — a "
         "blocked run records no `resume.next_stage` (design §9.3), so there is no stage "
-        f"to continue from. Recorded reason: {blocked_resume_reason(state)}. Fix the "
-        "cause and start a fresh run; a blocked-run continuation is not implemented.",
+        "to continue from, and this block shape has no terminal review whose findings a "
+        f"fix cycle could take. Recorded reason: {blocked_resume_reason(state)}. Fix the "
+        "cause and start a fresh run, or continue the review loop from a prompt file you "
+        "supply with `--from-prompt <path>`.",
         file=sys.stderr,
     )
 
@@ -1658,6 +1793,7 @@ def run(
     max_revisions: int | None = None,
     resume: bool = False,
     from_stage: str | None = None,
+    from_prompt: Path | None = None,
     stream: bool = False,
 ) -> int:
     skip = set(skip_gates or [])
@@ -1764,11 +1900,16 @@ def run(
     # rest of this function means by "this invocation resumes": `--dry-run` never takes a
     # run over (req 8) — it always plans the fresh author + task-review-1 baseline.
     existing = _latest_prompt_run(runs_root, branch_name)
-    takeover = resume and not dry_run
+    # H1.3 req 4/7: `--from-prompt` **alone** is a takeover — locate, lock and run-id reuse
+    # happen with or without `--resume` — so the H1.2 gate widens from `resume` to either
+    # flag, while `--dry-run` still never takes over any run (it plans the fresh baseline).
+    takeover = (resume or from_prompt is not None) and not dry_run
 
-    if existing is not None and existing.status == RUNNING and not resume:
+    if existing is not None and existing.status == RUNNING and not resume and not takeover:
         # Not `--dry-run`-gated: a dry run must not plan a second author over a run that a
-        # live-or-crashed process still owns. `--resume` takes the record over below.
+        # live-or-crashed process still owns. `--resume` (real or dry-run) takes the record
+        # over below, and a real `--from-prompt` takeover reaches its blocked-run-only
+        # usage error instead — a running record is not a blocked one.
         print(
             f"another prompt run for `{branch_name}` is still marked running: "
             f"{existing.run_id}. Use --resume or finish it.",
@@ -1776,16 +1917,60 @@ def run(
         )
         return EXIT_REFUSED
 
-    # H1.2 req 6: a blocked run is not a failed one — design §9.3 sets
-    # `resume.next_stage` only on a stage failure, so nothing can be continued from it.
-    # Refuse with the blocked shape's own recorded reason *before* the completed-stages
-    # print, the confirmation, the worktree locate and the lock: nothing is mutated. Exit
-    # 3 is design §14's "workflow blocked (needs human)", which keeps 2 (usage) and 4
-    # (preflight refusal) for the no-run, still-running and worktree cases. Deliberately
-    # not `--dry-run`-gated: a dry run never plans an author over a blocked run.
-    if resume and existing is not None and existing.status == BLOCKED:
-        _refuse_blocked_resume(existing, branch_name)
-        return 3
+    # --- `--from-prompt` validation (before any side effect, H1.3 req 4/7) ------- #
+    # Two usage errors, both before the confirmation, the base-branch preflights, the
+    # locate, the lock and any state write: a contradictory `--from` (the route fixes its
+    # own start stage at `task-review-1`, so a stage name there is not an ordering but a
+    # contradiction) and a supplied file that does not exist. Neither is `--dry-run`-gated
+    # — a dry run validates the flags exactly as it validates `--from`. Only the
+    # missing/non-blocked-run error below is suppressed under `--dry-run` (H1.2 req 8: a dry
+    # run over a missing run plans fresh).
+    if from_prompt is not None:
+        if from_stage is not None:
+            print(
+                "--from and --from-prompt cannot be combined: `--from-prompt` starts the "
+                "continuation's review loop at `task-review-1` over the supplied content, "
+                "so a `--from` stage name would contradict the route.",
+                file=sys.stderr,
+            )
+            return 2
+        if not from_prompt.is_file():
+            print(f"--from-prompt: no such file: {from_prompt}", file=sys.stderr)
+            return 2
+        if not dry_run and (existing is None or existing.status != BLOCKED):
+            detail = (
+                "no earlier prompt run exists for it"
+                if existing is None
+                else f"run {existing.run_id} is `{existing.status}`, not `blocked`"
+            )
+            print(
+                "--from-prompt continues a *blocked* prompt run for "
+                f"`{branch_name}`: {detail}. A failed run uses --resume/--from.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # H1.2 req 6 / H1.3 req 1: a blocked run's forward path is scoped by the shape of the
+    # block. A review-loop block (the loop recorded its own `denied` gate) continues, and
+    # `--from-prompt` continues either shape; an author-`blocked:` run and a human-gate
+    # denial keep the exit-3 refusal, naming the recorded reason, *before* the
+    # completed-stages print, the confirmation, the locate and the lock — nothing is
+    # mutated. Exit 3 is design §14's "workflow blocked (needs human)", keeping 2 (usage)
+    # and 4 (preflight refusal) for the no-run, still-running and worktree cases.
+    # Deliberately not `--dry-run`-gated: a dry run must not plan an author over a blocked
+    # run through a route that is no forward path for that shape.
+    block_continuation = False
+    if (
+        existing is not None
+        and existing.status == BLOCKED
+        and (resume or from_prompt is not None)
+    ):
+        if from_prompt is None and not review_loop_block(existing):
+            _refuse_blocked_resume(existing, branch_name)
+            return 3
+        # A dry run never takes the run over (req 7), so the located/copied part of the
+        # route is unreachable there and only the fresh plan runs.
+        block_continuation = not dry_run
 
     # H1.2 req 1: no run to resume is a usage error, matching implement. Suppressed under
     # `--dry-run` (implement's `resume and not dry_run` guard): no matching run simply
@@ -1806,6 +1991,20 @@ def run(
             _unknown_from_stage_message(from_stage, max_revisions), file=sys.stderr
         )
         return 2
+
+    # --- the budget this invocation's loop runs under (H1.3 req 2/4/6) ---------- #
+    # A `--resume` fix cycle continues the *existing* loop one round past the reviews the
+    # run recorded (`effective_max_revisions`), so the terminal review's findings finally
+    # get their fix batch and reconcile and the added review is itself terminal (L4.1).
+    # `--from-prompt` reviews new content, so it runs under a fresh budget — the resolved
+    # `max_revisions`, never a stale `effective_max_revisions` an earlier fix cycle left on
+    # the same run. `max_revisions` itself stays the resolved config value everywhere the
+    # grammar is consulted (`--from` validation above, the CLI/config precedence), because a
+    # per-run extension must never leak into the loop's bounded name grammar.
+    fix_cycle = block_continuation and from_prompt is None
+    loop_max_revisions = max_revisions
+    if fix_cycle and existing is not None:
+        loop_max_revisions = effective_max_revisions(existing)
 
     # R4: the control worktree is whichever worktree has `repo.base_branch` checked out;
     # never a fixed name. The literal "main" stays out of the code.
@@ -1914,14 +2113,22 @@ def run(
         # H1.2 req 4: the rebuilt batches are expanded under *this* invocation's budget,
         # and `_expand_prompt_loop` raises for more batches than it allows. Fail closed as
         # a usage/config error before the locate and the lock instead of crashing inside
-        # the loop; a resumed run keeps the budget it recorded (H1.3 owns recording it).
-        recorded_fix_rounds = _recorded_fix_rounds(existing)
-        if recorded_fix_rounds > max_revisions - 1:
+        # the loop. H1.3 req 2: the guard must consult the budget the loop will actually run
+        # under — `loop_max_revisions`, which is the *effective* value for a fix-cycle
+        # continuation and the resolved one for a failed-run resume — because a continuation
+        # legitimately recorded more fix rounds than the resolved budget allows (left on the
+        # resolved value it refuses the second `--resume` on a re-blocked run as exit 2,
+        # before the route is ever reached). A `--from-prompt` continuation rebuilds none of
+        # the recorded rounds, so it counts none (req 4).
+        recorded_fix_rounds = (
+            0 if from_prompt is not None else _recorded_fix_rounds(existing)
+        )
+        if recorded_fix_rounds > loop_max_revisions - 1:
             print(
                 f"cannot resume run {existing.run_id}: it recorded "
                 f"{recorded_fix_rounds} fix round(s), but max_revisions="
-                f"{max_revisions} allows at most {max_revisions - 1}. Re-run with a "
-                "budget at least as large as the run used, or start a fresh run.",
+                f"{loop_max_revisions} allows at most {loop_max_revisions - 1}. Re-run "
+                "with a budget at least as large as the run used, or start a fresh run.",
                 file=sys.stderr,
             )
             return 2
@@ -1968,6 +2175,21 @@ def run(
                 print(f"  {branch_command}", file=sys.stderr)
                 return EXIT_REFUSED
         elif takeover and existing is not None:
+            if block_continuation:
+                # H1.3 req 5: a blocked continuation continues in the run's own worktree and
+                # never silently re-creates it or re-authors the prompt. Name the run, the
+                # missing worktree and the re-author command; plain `git worktree add` is
+                # not offered because the branch's commits are not where the reviewed prompt
+                # was (a block commits nothing).
+                print(
+                    f"continuation refused: run {existing.run_id} has no worktree for "
+                    f"`{branch_name}` (missing: {planned_worktree}). A blocked-run "
+                    "continuation runs in the run's own worktree and never re-creates or "
+                    "re-authors it; re-author the task prompt with:",
+                    file=sys.stderr,
+                )
+                print(f"  aidw prompt {phase} {epic} {task}", file=sys.stderr)
+                return EXIT_REFUSED
             base_worktree = workspace.workspace_root / repo.base_branch
             print(
                 f"resume refused: run {existing.run_id} has no worktree for "
@@ -2043,6 +2265,29 @@ def run(
             state = existing
             directory = run_dir(runs_root, state.run_id)
             logger = RunLogger(directory, stream=stream)
+            if fix_cycle:
+                # H1.3 req 2/6: record the budget this continuation runs under, so the
+                # extension is visible in `state.json` rather than inferred from two gates.
+                # Additive in the free-form `task` dict (design §9.2), so a pre-H1.3
+                # `state.json` still loads and no schema field moves.
+                state.task["effective_max_revisions"] = loop_max_revisions
+            if from_prompt is not None:
+                # H1.3 req 4: copy the supplied content onto the canonical path and record
+                # its provenance. A dirty canonical path refuses exit 4 before the copy
+                # (design §13), so a blocked run's own uncommitted prompt edits are never
+                # discarded.
+                refusal, provenance = _apply_from_prompt(
+                    target.root,
+                    default_rel,
+                    from_prompt,
+                    run_id=state.run_id,
+                    workspace=workspace,
+                    branch=branch_name,
+                    base_branch=repo.base_branch,
+                )
+                if refusal is not None:
+                    return refusal
+                state.task["from_prompt"] = provenance
         else:
             # EXTRACTION.md §3.11 (E8.2): what produced this run. One helper so the five
             # workflows cannot record different values for one config.
@@ -2083,6 +2328,14 @@ def run(
                 resume_position = prompt_stage_position(next_stage)
                 if resume_position is not None:
                     logger.info(f"resume: continuing at {next_stage}")
+        if from_prompt is not None and not dry_run:
+            # H1.3 req 4: the route's own position bound, set by the route itself (the flag
+            # is refused alongside `--from`). Position 2 is `task-review-1`; `task-prompt`
+            # sorts before it, so the author record is still reused and the run never
+            # re-authors. A bound rather than skipping the old reviews is load-bearing: their
+            # recorded `succeeded` text would otherwise re-parse as stale findings.
+            forced_position = prompt_stage_position("task-review-1")
+            logger.info("--from-prompt: re-running the review loop from task-review-1")
 
         def note_from(name: str) -> None:
             """Apply the `--from` override when the loop reaches the named stage."""
@@ -2114,7 +2367,7 @@ def run(
             epic=epic,
             task=task,
             rel=default_rel,
-            max_revisions=max_revisions,
+            max_revisions=loop_max_revisions,
             rounds=[],
         )
         author = dry_specs["task-prompt"]
@@ -2179,7 +2432,13 @@ def run(
         # ``blocked:`` line would be silently ignored whenever the author also left a file.
         # The author stage stays ``succeeded`` (it exited 0 with a valid report); the *run* is
         # what is blocked, and no commit, review or fix stage follows.
-        blocked_reason = _parse_blocked(_read_out(rec1))
+        # H1.3 req 4: a `--from-prompt` continuation reviews the operator's content, so the
+        # author's recorded marker no longer governs the run — `--from-prompt` is exactly an
+        # author-``blocked:`` run's forward path, and re-reading the old line would re-block
+        # it before the supplied prompt was ever reviewed.
+        blocked_reason = (
+            None if from_prompt is not None else _parse_blocked(_read_out(rec1))
+        )
         if blocked_reason is not None:
             reason = blocked_reason or "no reason given"
             logger.error(f"task-prompt author reported blocked: {reason}")
@@ -2188,7 +2447,14 @@ def run(
             print(f"blocked: {reason}", file=sys.stderr)
             return 3
 
-        prompt_path = _resolve_prompt_path(target.root, rec1, default_rel)
+        # H1.3 req 4: a `--from-prompt` route wrote the supplied content onto the canonical
+        # path, so that is the file `rel`, the evidence bundle and `_commit_reviewed_prompt`
+        # are about; resolving it from the author's old output would review a stale path.
+        prompt_path = (
+            target.root / default_rel
+            if from_prompt is not None
+            else _resolve_prompt_path(target.root, rec1, default_rel)
+        )
         if prompt_path is None:
             print(
                 f"generated task prompt not found at {default_rel}",
@@ -2255,7 +2521,7 @@ def run(
                 epic=epic,
                 task=task,
                 rel=rel,
-                max_revisions=max_revisions,
+                max_revisions=loop_max_revisions,
                 rounds=fix_batches,
             )
             spec = specs[name]
@@ -2341,15 +2607,26 @@ def run(
             else:
                 print(f"verdict: {verdict or 'ambiguous'} — {findings_summary(findings)}")
 
+            # H1.3 req 2/3: a *fix-cycle* continuation re-opens the recorded rounds. Their
+            # verdicts already decided the blocked run — replaying an `Approve` (M2) or a
+            # `Blocked` here would re-block without a forward path, since the original run
+            # already recorded that decision. A replayed round therefore contributes only
+            # its re-parsed fix batch (and, for the last recorded round, the fix stages and
+            # reconcile the terminal break never let it plan); the continuation's own added
+            # review is what decides this invocation, and it is the `max_revisions`-th
+            # review under `loop_max_revisions`, so L4.1 holds in the continuation too.
+            replay_only = fix_cycle and not review_ran
+
             # H1.2 req 4: a *skipped* review is the record of what this run decided. If its
             # re-parsed verdict is now an exit (approve, Blocked, or the terminal budget)
             # while the run recorded later stages, the loop cannot be rebuilt from its
             # records — the toolkit's parsers changed between invocations. Fail closed
             # (exit 4, nothing written by this invocation) rather than "finishing" a run
-            # that still holds a failed stage.
-            if not review_ran and (
+            # that still holds a failed stage. A continuation replays deliberately, so the
+            # drift guard does not apply to it.
+            if not review_ran and not replay_only and (
                 verdict in (APPROVE, VERDICT_BLOCKED)
-                or revisions >= max_revisions - 1
+                or revisions >= loop_max_revisions - 1
             ):
                 later = _recorded_later_stage(
                     state, prompt_stage_position(name) or (0, 0, 0)
@@ -2365,7 +2642,7 @@ def run(
                     return EXIT_REFUSED
 
             blocking, could_fix = partition_findings(findings)
-            if verdict == APPROVE and blocking:
+            if verdict == APPROVE and blocking and not replay_only:
                 # M2: `Approve` while reporting must-fix/should-fix findings is a
                 # self-contradicting review — the mirror image of `review`'s "requires
                 # changes but no findings could be extracted" refusal. The evidence is not
@@ -2383,7 +2660,7 @@ def run(
                     logger,
                     verdict=verdict,
                     revisions=revisions,
-                    max_revisions=max_revisions,
+                    max_revisions=loop_max_revisions,
                     rounds=rounds,
                     decision="denied",
                     mechanism="review-loop",
@@ -2396,11 +2673,11 @@ def run(
                 )
                 print(review_text, file=sys.stderr)
                 return 3
-            if verdict == APPROVE:
+            if verdict == APPROVE and not replay_only:
                 # L4.2: an approving round ran no fix stage, so its fix count is 0.
                 _record_round(rounds, review_index, findings_count, 0)
                 break
-            if verdict == VERDICT_BLOCKED:
+            if verdict == VERDICT_BLOCKED and not replay_only:
                 # A `Blocked` verdict means a material ambiguity only a human can settle, so
                 # it short-circuits before any fix stage and before any ``approve_all`` path
                 # can reach the gate or :func:`_commit_reviewed_prompt` — the prompt stays
@@ -2414,7 +2691,7 @@ def run(
                     logger,
                     verdict=verdict,
                     revisions=revisions,
-                    max_revisions=max_revisions,
+                    max_revisions=loop_max_revisions,
                     rounds=rounds,
                     decision="denied",
                     mechanism="review-loop",
@@ -2426,7 +2703,7 @@ def run(
                 )
                 print(review_text, file=sys.stderr)
                 return 3
-            if revisions >= max_revisions - 1:
+            if not replay_only and revisions >= loop_max_revisions - 1:
                 # The fix budget is spent: the terminal review has now run. There is no further
                 # revision slot, so a residual `Request changes` fails closed rather than being
                 # applied unreviewed — the prompt is left uncommitted for a human to settle, with
@@ -2442,7 +2719,7 @@ def run(
                     logger,
                     verdict=verdict,
                     revisions=revisions,
-                    max_revisions=max_revisions,
+                    max_revisions=loop_max_revisions,
                     rounds=rounds,
                     decision="denied",
                     mechanism="review-loop",
@@ -2486,7 +2763,7 @@ def run(
                 epic=epic,
                 task=task,
                 rel=rel,
-                max_revisions=max_revisions,
+                max_revisions=loop_max_revisions,
                 rounds=fix_batches,
             )
             # This batch's stages: everything the expansion put after this round's review and
@@ -2700,12 +2977,16 @@ def run(
             # The prompt is verified by the reviewer above; the human gate is optional and
             # off by default. Record the auto-decision so state still shows what happened.
             outcome = GateOutcome(GATE, True, "optional (default)")
+        # H1.3 req 6: report the budget this loop actually ran under — the effective one
+        # for a `--resume` fix-cycle continuation, the resolved `max_revisions` for a fresh
+        # run and for `--from-prompt` (which never claims an extension it did not use), so a
+        # continuation's gate is distinguishable from the blocked run's by its `detail`.
         _record_review_outcome(
             state,
             logger,
             verdict=verdict,
             revisions=revisions,
-            max_revisions=max_revisions,
+            max_revisions=loop_max_revisions,
             rounds=rounds,
             decision=outcome.decision,
             mechanism=outcome.mechanism,
