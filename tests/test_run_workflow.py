@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from aidw import git as git_mod
+from aidw import roadmap as roadmap_mod
 from aidw import state as state_mod
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.workflows import run as run_workflow
@@ -614,3 +615,154 @@ def test_prompt_to_fix_still_runs_fix_when_followups_were_published(
     assert code == 0
     assert fixed["pr"] == 42
     assert fixed["skip_gates"] == [run_workflow.GATE_FOLLOWUPS]
+
+
+# --------------------------------------------------------------------------- #
+# Exactly one tick per chain (H3.3's Done-when)
+# --------------------------------------------------------------------------- #
+
+#: The roadmap file the default config reads (``docs/tasks`` / ``[0-9]* - *.md``), relative
+#: to the task worktree.
+ROADMAP_REL = "docs/tasks/03 - Stage resilience.md"
+ROADMAP_GLOB = "[0-9]* - *.md"
+
+
+def _write_roadmap(worktree: Path, *, done: bool = False) -> Path:
+    """One unchecked (or already ticked) roadmap entry for ``03``/``E4.1``."""
+    path = worktree / ROADMAP_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    box = "x" if done else " "
+    path.write_text(
+        "# Phase 03: Stage resilience\n\n"
+        "## Epic E4: Chains\n\n"
+        f"- [{box}] **E4.1. Tick it once** a task description.\n"
+        "  - Done when: the box is ticked once.\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _flip(path: Path, checkbox_id: str) -> str:
+    """Flip the entry the way a tick agent would, through the real postcondition helper."""
+    before = path.read_text(encoding="utf-8")
+    after = before.replace(f"- [ ] **{checkbox_id}.", f"- [x] **{checkbox_id}.")
+    assert (
+        roadmap_mod.verify_checkbox_flip(before, after, checkbox_id=checkbox_id)
+        == roadmap_mod.TICK_FLIPPED
+    )
+    path.write_text(after, encoding="utf-8")
+    return roadmap_mod.TICK_FLIPPED
+
+
+def _tick_already(path: Path, checkbox_id: str) -> str:
+    """The already-``[x]`` no-op: the file must stay byte-identical (H3.1's rule)."""
+    text = path.read_text(encoding="utf-8")
+    assert (
+        roadmap_mod.verify_checkbox_flip(text, text, checkbox_id=checkbox_id)
+        == roadmap_mod.TICK_ALREADY
+    )
+    return roadmap_mod.TICK_ALREADY
+
+
+def _entry_is_done(worktree: Path, *, phase: str = "03", task: str = "E4.1") -> bool:
+    """Re-parse the roadmap file and report whether the one matching entry is ticked."""
+    entry = roadmap_mod.tick_entry(
+        roadmap_mod.load_tasks(worktree / "docs" / "tasks", ROADMAP_GLOB),
+        phase=phase,
+        task=task,
+    )
+    return entry.done
+
+
+def _fake_chain(monkeypatch, *, order: list[str]) -> None:
+    """Fake the four workflows so the chain runs its real ordering logic only."""
+    monkeypatch.setattr(
+        run_workflow.prompt_workflow, "run", lambda **kwargs: order.append("prompt") or 0
+    )
+    monkeypatch.setattr(
+        run_workflow.implement_workflow,
+        "run",
+        lambda **kwargs: order.append("implement") or 0,
+    )
+    monkeypatch.setattr(
+        run_workflow.review_workflow, "run", lambda **kwargs: order.append("review") or 0
+    )
+    monkeypatch.setattr(
+        run_workflow.fix_workflow, "run", lambda **kwargs: order.append("fix") or 0
+    )
+
+
+def test_a_chain_that_ticks_in_implement_leaves_one_tick(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H3.3 Done-when: ``implement`` ticked, and ``fix``'s tick is the ``already`` no-op.
+
+    Asserted by **re-parsing the roadmap file**, not by counting stage records: the file
+    ends with the entry ticked, exactly one ``[x]`` and no second claim.
+    """
+    control, worktree, _prompt = _chain_layout(tmp_path)
+    path = _write_roadmap(worktree)
+    order: list[str] = []
+    _fake_chain(monkeypatch, order=order)
+    flipped: list[str] = []
+
+    def implement(**_kwargs):
+        order.append("implement")
+        flipped.append(_flip(path, "E4.1"))
+        return 0
+
+    def fix(**_kwargs):
+        order.append("fix")
+        # `fix` finds the box already ticked: a successful no-op, never a second write.
+        flipped.append(_tick_already(path, "E4.1"))
+        return 0
+
+    monkeypatch.setattr(run_workflow.implement_workflow, "run", implement)
+    monkeypatch.setattr(run_workflow.fix_workflow, "run", fix)
+
+    repo, aidt, workspace = _roots(control)
+    # The chain discovers the PR number from the implement run's recorded state (I1).
+    _record_pr(workspace, control, branch="03-E4.1", number=42)
+    code = run_workflow.prompt_to_fix(
+        phase="03", epic="E4", task="E4.1", repo=repo, aidt=aidt, workspace=workspace
+    )
+
+    assert code == 0
+    assert order == ["prompt", "implement", "review", "fix"]
+    assert flipped == ["flipped", "already"]
+    assert _entry_is_done(worktree) is True
+    text = path.read_text(encoding="utf-8")
+    assert text.count("[x]") == 1
+    assert "- [ ]" not in text
+    ticked = [line for line in text.splitlines() if "**E4.1." in line]
+    assert len(ticked) == 1
+
+
+def test_a_chain_that_ticks_only_in_fix_leaves_one_tick(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The other half: ``implement`` left the box open and ``fix`` ticked it, once."""
+    control, worktree, _prompt = _chain_layout(tmp_path)
+    path = _write_roadmap(worktree)
+    order: list[str] = []
+    _fake_chain(monkeypatch, order=order)
+
+    def fix(**_kwargs):
+        order.append("fix")
+        _flip(path, "E4.1")
+        return 0
+
+    monkeypatch.setattr(run_workflow.fix_workflow, "run", fix)
+
+    repo, aidt, workspace = _roots(control)
+    _record_pr(workspace, control, branch="03-E4.1", number=42)
+    code = run_workflow.prompt_to_fix(
+        phase="03", epic="E4", task="E4.1", repo=repo, aidt=aidt, workspace=workspace
+    )
+
+    assert code == 0
+    assert order == ["prompt", "implement", "review", "fix"]
+    assert _entry_is_done(worktree) is True
+    text = path.read_text(encoding="utf-8")
+    assert text.count("[x]") == 1
+    assert "- [ ]" not in text

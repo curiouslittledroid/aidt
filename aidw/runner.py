@@ -197,8 +197,9 @@ def declared_stage_issues(
     run record or worktree:
 
     * **the prompt resolves** — every declared entry's prompt is resolved exactly as
-      :func:`plan_stages` resolves it (a known id by its registry prompt-file name, a
-      repo-added id by its declared id) with the entry's ``prompt:`` as D14 level 1. This
+      :func:`plan_stages` resolves it (a known id — the static chain **or** the post-loop
+      half, H3.3 — by its registry prompt-file name, a repo-added id by its declared id)
+      with the entry's ``prompt:`` as D14 level 1. This
       is what keeps :func:`resolve_prompt`'s :class:`FileNotFoundError` out of ``run()``:
       deliberately *not* a ``try``/``except`` at a call site (the roadmap forbids local
       call-site catches), and not a wrapper around ``plan_stages`` either.
@@ -213,7 +214,12 @@ def declared_stage_issues(
     ``validate_stage_list`` site, where the agents dict does not exist yet.
     """
     definition = stage_registry.get_workflow(workflow)
-    static = {item.id: item for item in definition.stages}
+    # Known ids are the static chain **and** the post-loop half (H3.3 req 2): a repo's
+    # canonical `workflows.fix.stages: [A1, I7]` must resolve `I7` by its registry
+    # prompt-file/agent like any other known stage, or this preflight refuses it as
+    # repo-added ("a repo-added stage must declare `agent`") and exits 2 before any run
+    # record.
+    known = {item.id: item for item in (*definition.stages, *definition.post_loop)}
     source = f"workflows.{workflow}.stages"
     known_agents = ", ".join(sorted(agents)) or "(none configured)"
     issues: list[Issue] = []
@@ -225,7 +231,7 @@ def declared_stage_issues(
         if not isinstance(stage_id, str) or not stage_id:
             continue
         declared = _declared_prompt(entry)
-        definition_entry = static.get(stage_id)
+        definition_entry = known.get(stage_id)
         prompt_name = definition_entry.prompt_file if definition_entry else stage_id
         try:
             resolve_prompt(
@@ -308,6 +314,7 @@ def plan_stages(
     config: ResolvedConfig,
     toolkit_root: Path,
     target_root: Path,
+    include_post_loop: bool = False,
     **expand_fields: Any,
 ) -> list[StageSpec]:
     """The stages ``workflow`` runs, as runnable specs, from registry plus config (E4.3).
@@ -321,7 +328,8 @@ def plan_stages(
     per-workflow field set: ``implement`` (``prompt_rel``/``branch``/``task_id``/
     ``base_branch``), ``prompt`` (``phase``/``epic``/``task``/``rel``/``max_revisions``/
     ``rounds``), ``review`` (``pr``/``manifest_path``/``findings``), ``fix`` (``pr``/
-    ``round_index``/``iteration``/``manifest_path``) and ``approve`` (``pr``). Each expanded
+    ``round_index``/``iteration``/``manifest_path``, plus ``roadmap_file``/
+    ``checkbox_id`` when ``include_post_loop``) and ``approve`` (``pr``). Each expanded
     :class:`~aidw.stage_registry.PlannedStage` becomes one :class:`StageSpec`: its prompt is
     resolved through :func:`resolve_prompt` (D4/D14), ``variables`` is a fresh ``list``
     (the registry's tuples are frozen) and ``extra`` is carried byte for byte.
@@ -347,12 +355,23 @@ def plan_stages(
       ``name=`` the declared id (so ``<target>/aidw/prompts/<id>.md`` shadows) and the
       declared ``prompt:`` as level 1, ``variables == []``, ``extra == ""``.
 
-    The registry's **loop** portion is appended unchanged. Static and loop stages are split
-    **by stage id** — loop ids are ``stages_by_id(workflow)`` minus the static
-    ``definition.stages`` ids (E4.5a's formula), never a ``len(definition.stages)`` slice:
-    ``review``'s ``R2`` is ``when=findings``, so ``expand``'s static half is one or two
-    stages and a count slice would misclassify a loop stage. A declared loop id never
-    reaches the plan because :func:`validate_stage_list` refuses it.
+    The registry's **loop** portion is appended unchanged, and since H3.3 its
+    **post-loop** half is appended after that — but only when the caller asked for it
+    (``include_post_loop``), because ``fix``'s per-iteration expansion is the same call.
+    Static, loop and post-loop stages are split **three ways, by stage id** — loop ids are
+    ``stages_by_id(workflow)`` minus the static ``definition.stages`` ids **and** minus the
+    ``definition.post_loop`` ids (H3.3 req 2: the two-way formula would call ``fix``'s
+    ``I7`` a loop id), never a ``len(definition.stages)`` slice: ``review``'s ``R2`` is
+    ``when=findings``, so ``expand``'s static half is one or two stages and a count slice
+    would misclassify a loop stage. A declared loop id never reaches the plan because
+    :func:`validate_stage_list` refuses it.
+
+    A declared list covers the post-loop half too (H3.3 req 2): its static entries are
+    planned in declared order, then the loop unchanged, then its declared post-loop
+    entries in declared order — plan order is always static → loop → post-loop. A declared
+    post-loop id is withheld when the caller did not ask for the post-loop half (the
+    per-iteration expansion), exactly as a static stage ``expand`` withheld for this call
+    is.
 
     A declared list is validated here too: any ``ERROR`` from
     :func:`aidw.stage_registry.validate_stage_list` raises
@@ -376,7 +395,9 @@ def plan_stages(
     Performs no I/O beyond the prompt existence checks in :func:`resolve_prompt` and
     mutates neither ``config`` nor the registry defaults.
     """
-    planned = stage_registry.expand(workflow, **expand_fields)
+    planned = stage_registry.expand(
+        workflow, include_post_loop=include_post_loop, **expand_fields
+    )
     declared = _declared_stage_list(workflow, config)
     if declared is None:
         # No repo-declared list: the registry defaults plan unchanged, byte for byte.
@@ -397,15 +418,22 @@ def plan_stages(
 
     definition = stage_registry.get_workflow(workflow)
     static_ids = [item.id for item in definition.stages]
-    # The loop portion is the expansion's id set minus the static definitions (E4.5a's
-    # formula), never a slice of the expansion by length.
-    loop_ids = set(stage_registry.stages_by_id(workflow)) - set(static_ids)
+    post_loop_ids = [item.id for item in definition.post_loop]
+    # The loop portion is the expansion's id set minus the static definitions **and** the
+    # post-loop half (H3.3 req 2's three-way split), never a slice by length.
+    loop_ids = (
+        set(stage_registry.stages_by_id(workflow)) - set(static_ids) - set(post_loop_ids)
+    )
     rendered_static = {
         stage.id: stage for stage in planned if stage.id in static_ids
+    }
+    rendered_post_loop = {
+        stage.id: stage for stage in planned if stage.id in post_loop_ids
     }
     loop_stages = [stage for stage in planned if stage.id in loop_ids]
 
     specs: list[StageSpec] = []
+    post_loop_specs: list[StageSpec] = []
     for entry in declared:
         if not isinstance(entry, Mapping):
             # The loader already refused this entry; `validate_stage_list` skips it too.
@@ -418,23 +446,27 @@ def plan_stages(
             continue
         enabled = entry.get("enabled", True)
         rendered = rendered_static.get(stage_id)
+        is_post_loop = rendered is None and stage_id in rendered_post_loop
+        if is_post_loop:
+            rendered = rendered_post_loop[stage_id]
         if rendered is not None:
             if enabled is False:
                 # Repo-optional `enabled: false` is honoured by omission (a core id would
                 # have been refused above).
                 continue
-            specs.append(
-                _spec_from_planned(
-                    rendered,
-                    workflow,
-                    entry,
-                    toolkit_root,
-                    target_root,
-                )
+            spec = _spec_from_planned(
+                rendered,
+                workflow,
+                entry,
+                toolkit_root,
+                target_root,
             )
-        elif stage_id in static_ids:
-            # A static stage `expand` withheld for this call (`when=findings` with
-            # `findings=False`): the plan stays exactly as short as the expansion is.
+            # Declared post-loop entries render after the loop, in declared order.
+            (post_loop_specs if is_post_loop else specs).append(spec)
+        elif stage_id in static_ids or stage_id in post_loop_ids:
+            # A stage `expand` withheld for this call (`when=findings` with
+            # `findings=False`, or a post-loop id of a per-iteration expansion): the plan
+            # stays exactly as short as the expansion is.
             continue
         elif enabled is False:
             # `enabled: false` on a repo-added stage is the same as omitting it.
@@ -450,6 +482,7 @@ def plan_stages(
         _spec_from_planned(stage, workflow, None, toolkit_root, target_root)
         for stage in loop_stages
     )
+    specs.extend(post_loop_specs)
     return specs
 
 
@@ -589,7 +622,10 @@ def _warn_deferred_settings(
     ``thinking``/``timeout_seconds`` all take effect, so none of those is a reason any
     more.
     """
-    static_ids = {item.id for item in stage_registry.get_workflow(workflow).stages}
+    definition = stage_registry.get_workflow(workflow)
+    # The post-loop half is known too (H3.3 req 2): `fix` is name-keyed, so a declared,
+    # correctly-spelled `I7` must not be warned about as a repo-added deferred stage.
+    known_ids = {item.id for item in (*definition.stages, *definition.post_loop)}
     for entry in declared:
         if not isinstance(entry, Mapping):
             continue
@@ -597,7 +633,7 @@ def _warn_deferred_settings(
         if not isinstance(stage_id, str) or not stage_id:
             continue
         reasons: list[str] = []
-        if stage_id not in static_ids and workflow in _NAME_KEYED_WORKFLOWS:
+        if stage_id not in known_ids and workflow in _NAME_KEYED_WORKFLOWS:
             reasons.append(_REASON_REPO_ADDED)
         if reasons:
             print(
