@@ -6881,6 +6881,11 @@ def test_from_prompt_applies_control_preflights_but_skips_run_scoped_preflights(
 """
     _patch_prompt_repo(tmp_path, monkeypatch, roadmap=roadmap)
     _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    # The blocking baseline must be faked too: without this the first run reaches real Pi
+    # (design §15 — no test may invoke a model), which passed locally only because the
+    # live author happened to answer `blocked:` for this fixture's dangling `Design 09..`.
+    # CI has no model credential, so it exited 1 and the run stopped at the author.
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake1)
     assert _run_prompt(tmp_path, allow_incomplete_prereqs=True) == 3
     capsys.readouterr()  # discard the initial run's expected predecessor warning
     blocked = _only_run(tmp_path)
