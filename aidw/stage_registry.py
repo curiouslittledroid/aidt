@@ -45,7 +45,9 @@ Loops are not flat lists (design §8's ``⟳``/``if`` notation):
   ``terminal_last`` makes the final iteration head-only. That single boolean is H6/G2/L4.1
   ("the ``max_revisions``-th review is review-only; a review is always the last stage").
   ``unprimed_first`` is L2.3 ("round 1 is deliberately unprimed" — no delta brief).
-* :class:`StageDefinition.when` is the ``if`` of §8.3/§8.4 (``if findings: → R2``).
+* :class:`StageDefinition.when` is the ``if`` of §8.3/§8.4 (``if findings: → R2``), and
+  also :data:`WHEN_EVIDENCE_GREEN` (H3.2) — the one condition the expander cannot
+  resolve, so it is carried onto the planned stage and evaluated by the workflow.
 * :class:`FixBatch` carries one round's finding partition, so the ``prompt`` loop's
   per-finding / combined-could-fix / whole-review-fallback staging is *input*, not
   branching code inside the expander.
@@ -169,6 +171,17 @@ WHEN_BLOCKING = "blocking"
 WHEN_COULD_FIX = "could-fix"
 #: The single stage carrying the whole review when it does not parse into findings.
 WHEN_UNPARSEABLE = "unparseable"
+#: The stage runs only when the **workflow's own evidence is green** (H3.2, design §8.2).
+#: Unlike ``findings``/``blocking``/``could-fix``/``unparseable`` — which the expander
+#: resolves from data it already has — this condition is decided by the running workflow
+#: from state no expansion can see (the run's recorded gate outcomes), so the expander
+#: **carries it, never expands it away**: :func:`_expand_static` only omits on
+#: ``when=findings`` with ``findings is False``, and
+#: :func:`~aidw.runner._spec_from_planned` copies the value onto
+#: :attr:`aidw.runner.StageSpec.when`. The workflow evaluates the token (I7 in
+#: ``implement``; H3.3 reuses it for ``fix``) and records a ``skipped`` stage with its
+#: reason when the condition does not hold.
+WHEN_EVIDENCE_GREEN = "evidence-green"
 
 # Runtime-assembled ``extra`` kinds. The workflow owns the payload (prior review text, the
 # real ``git diff``); these helpers own the wording, so the text cannot drift.
@@ -575,6 +588,12 @@ _IMPLEMENT = WorkflowDefinition(
             "recorder",
             "update-roadmap.md",
             ("{roadmap_file}", "{checkbox_id}"),
+            # H3.2: the tick waits behind the run's own evidence. The condition is
+            # *carried* (the expander cannot see gate outcomes), so ``plan_stages``,
+            # ``build_plan`` and ``--dry-run`` still plan I7 unconditionally and the
+            # workflow decides at run time — before ``run_stage``, so an agent never
+            # gets the chance to tick a box the run has no green evidence for.
+            when=WHEN_EVIDENCE_GREEN,
         ),
         StageDefinition("I6", "pr", "pr-publisher", "pr.md", ("{task_id}",)),
     ),

@@ -66,6 +66,21 @@ BLOCKED = "blocked"
 ABORTED = "aborted"
 PLANNED = "planned"
 
+#: A stage the **workflow withheld before invoking Pi**, with a recorded reason (H3.2,
+#: design §9.3). Distinct from :data:`FAILED` (nothing went wrong — the run's own evidence
+#: decided the stage had nothing honest to do) and from a successful no-op (H3.1's
+#: already-``[x]`` tick, which *did* run and recording nothing was its own success): it says
+#: "this stage did not run, and here is why", which the resume skip's bare ``[skipped]``
+#: print (it leaves no record at all) cannot. Additive to the vocabulary above at the same
+#: ``SCHEMA_VERSION``: an older ``state.json`` never contains it and still loads.
+SKIPPED = "skipped"
+
+#: Key into ``StageRecord.artifacts`` carrying a skipped stage's human-readable reason
+#: (H3.2). ``error`` stays unset on a skip — it renders as a failure (design §9.3) — so the
+#: reason travels here, where the stage block and ``runs show`` can read it without a
+#: transcript.
+SKIP_REASON_KEY = "skip_reason"
+
 #: Verification gate outcome statuses (``GateOutcome``, E4.8). A gate is never
 #: "succeeded" — that word describes a *stage*; a gate passed or failed.
 PASSED = "passed"

@@ -314,7 +314,7 @@ evidence depends on it.
     artifacts the repo may not have. Rejected — a new agent id for a two-line mechanical edit. The
     split does not by itself make the tick honest; that is H3.2.
 
-- [ ] **H3.2. Tick only behind evidence, never against a red gate** (Design 8.2, Design 10, Design 14)
+- [x] **H3.2. Tick only behind evidence, never against a red gate** (Design 8.2, Design 10, Design 14)
   The run this epic exists for: `20261105T030527Z-00-E6.1-implement`. Its traceability stage
   flipped E6.1's box, then reverted it —
   > I flipped the E6.1 checkbox as instructed, then reverted it when the gate run came back red:

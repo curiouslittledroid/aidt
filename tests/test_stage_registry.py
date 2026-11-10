@@ -178,6 +178,90 @@ def test_implement_records_the_parallel_group_as_stage_names() -> None:
             assert member in names, f"{member} is not a stage name of `implement`"
 
 
+def test_i7_carries_the_evidence_green_condition() -> None:
+    """H3.2 req 1: the tick's condition is declared on the *definition*, not the workflow."""
+    i7 = registry.stage("implement", "I7")
+    assert i7.name == "update-roadmap"
+    assert i7.when == registry.WHEN_EVIDENCE_GREEN
+    # No other stage carries it: the condition is I7's, and H3.3 is what shares the token.
+    for workflow in ("implement", "prompt", "review", "approve", "fix"):
+        definition = registry.get_workflow(workflow)
+        carried = [
+            stage.name
+            for stage in definition.stages
+            if stage.when == registry.WHEN_EVIDENCE_GREEN
+        ]
+        expected = ["update-roadmap"] if workflow == "implement" else []
+        assert carried == expected
+
+
+def test_the_evidence_green_condition_is_carried_never_expanded_away() -> None:
+    """H3.2 req 1: ``expand`` still emits I7, with ``when`` carried onto the stage.
+
+    ``_expand_static`` omits only on ``when=findings`` with ``findings is False``; a
+    condition the expander cannot resolve (the run's gate outcomes do not exist yet) must
+    survive expansion, so ``plan_stages``, ``build_plan`` and ``--dry-run`` plan I7 in its
+    run position and the workflow decides at run time.
+    """
+    stages = expand(
+        "implement",
+        prompt_rel=PROMPT_REL,
+        branch=BRANCH,
+        task_id=TASK_ID,
+        base_branch="main",
+        roadmap_file=ROADMAP_FILE,
+        checkbox_id=CHECKBOX_ID,
+    )
+
+    assert [stage.id for stage in stages] == [
+        "I1", "I2", "I3", "I4", "I5", "I7", "I6",
+    ]
+    carried = {stage.id: stage.when for stage in stages}
+    assert carried["I7"] == registry.WHEN_EVIDENCE_GREEN
+    assert {key: value for key, value in carried.items() if key != "I7"} == {
+        "I1": "", "I2": "", "I3": "", "I4": "", "I5": "", "I6": "",
+    }
+    # A lowered ``findings`` field cannot drop it either — that switch is R2/F4's alone.
+    with_findings_flag = expand(
+        "implement",
+        prompt_rel=PROMPT_REL,
+        branch=BRANCH,
+        task_id=TASK_ID,
+        base_branch="main",
+        roadmap_file=ROADMAP_FILE,
+        checkbox_id=CHECKBOX_ID,
+        findings=False,
+    )
+    assert [stage.name for stage in with_findings_flag] == [
+        stage.name for stage in stages
+    ]
+
+
+def test_the_when_vocabulary_is_exported_and_distinct() -> None:
+    """H3.2 req 1: the token joins the ``when=`` vocabulary beside the other four."""
+    tokens = (
+        registry.WHEN_FINDINGS,
+        registry.WHEN_BLOCKING,
+        registry.WHEN_COULD_FIX,
+        registry.WHEN_UNPARSEABLE,
+        registry.WHEN_EVIDENCE_GREEN,
+    )
+
+    assert tokens == (
+        "findings", "blocking", "could-fix", "unparseable", "evidence-green"
+    )
+    assert len(set(tokens)) == len(tokens)
+    # Exported as module-level constants, beside the others (importable by name).
+    for name in (
+        "WHEN_FINDINGS",
+        "WHEN_BLOCKING",
+        "WHEN_COULD_FIX",
+        "WHEN_UNPARSEABLE",
+        "WHEN_EVIDENCE_GREEN",
+    ):
+        assert isinstance(getattr(registry, name), str)
+
+
 def test_retained_stage_ids_are_the_vocabulary() -> None:
     """R6: ids are retained. §3.4's `author`/`review`/`implement` example ids are not."""
     assert registry.STAGE_IDS == frozenset(
