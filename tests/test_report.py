@@ -15,7 +15,14 @@ from aidw.report import (
     tool_breakdown_line,
     usage_line,
 )
-from aidw.state import FAILED, PLANNED, SUCCEEDED, StageRecord
+from aidw.state import (
+    FAILED,
+    PLANNED,
+    SKIP_REASON_KEY,
+    SKIPPED,
+    SUCCEEDED,
+    StageRecord,
+)
 
 USAGE = {
     "input_tokens": 193,
@@ -119,6 +126,48 @@ def test_stage_lines_report_a_failure_instead_of_usage() -> None:
     )
     assert lines[1] == "        error: cost_ceiling: $0.5 > $0.1"
     assert not any(line.strip().startswith("usage:") for line in lines)
+
+
+def test_stage_lines_render_a_skipped_stage_with_its_reason() -> None:
+    """H3.2 req 4: ``[skipped]`` plus the reason, and never as a failure or a usage line."""
+    reason = "red gate for tree " + "a" * 64 + ": suite"
+    lines = stage_lines(
+        _record(
+            name="update-roadmap",
+            status=SKIPPED,
+            usage=None,
+            cost_usd=None,
+            duration_seconds=None,
+            artifacts={SKIP_REASON_KEY: reason},
+        ),
+        repo_root=Path("/repo"),
+        prefix="I7",
+    )
+
+    assert lines[0] == (
+        "stage:  I7 update-roadmap [skipped] model=openrouter/z-ai/glm-5.3"
+    )
+    assert lines[1] == f"        skipped: {reason}"
+    assert not any(line.strip().startswith("error:") for line in lines)
+    assert not any(line.strip().startswith("usage:") for line in lines)
+
+
+def test_stage_lines_report_a_missing_skip_reason_rather_than_nothing() -> None:
+    """A skip with no recorded reason is still observable — never a silent blank."""
+    lines = stage_lines(
+        _record(status=SKIPPED, usage=None, cost_usd=None, duration_seconds=None),
+        prefix="I7",
+    )
+
+    assert lines[1] == "        skipped: no reason recorded"
+
+
+def test_stage_lines_do_not_use_the_skip_line_for_a_failed_stage() -> None:
+    """The skip rendering is keyed on the status, so ``error:`` still carries a failure."""
+    lines = stage_lines(_record(status=FAILED, error="boom"))
+
+    assert not any("skipped:" in line for line in lines)
+    assert lines[1] == "        error: boom"
 
 
 UNPRICED_USAGE = {

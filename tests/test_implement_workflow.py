@@ -19,14 +19,18 @@ from pathlib import Path
 
 import pytest
 
-from aidw import git, lock, roadmap
+from aidw import git, lock, roadmap, verification
 from aidw.config import ERROR, Issue
 from aidw.gates import GateOutcome
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import (
     FAILED,
+    SKIP_REASON_KEY,
+    SKIPPED,
     SUCCEEDED,
+    GateOutcome as EvidenceOutcome,
     StageRecord,
+    append_gate_outcomes,
     create_run,
     run_dir,
     save,
@@ -222,8 +226,32 @@ class _Recorder:
         return record
 
 
+class _FakeAgent:
+    """The two fields a stage's agent resolution reads.
+
+    ``run_stage`` is faked in this module, but H3.2's withheld tick resolves the agent it
+    *would* have run through the same rule (``aidw.runner.stage_agent``), and
+    ``StageRecord.model`` is required — so the faked ``load_all`` has to hand back
+    something with ``id`` and ``qualified_model`` rather than a bare ``object()``.
+    """
+
+    def __init__(self, agent_id: str, model: str = "test/model") -> None:
+        self.id = agent_id
+        self.qualified_model = model
+
+
+#: Every agent id the registry's implement chain names, so a real-run stage (and the
+#: skipped tick) always resolves.
+_AGENTS: dict[str, _FakeAgent] = {
+    agent_id: _FakeAgent(agent_id)
+    for agent_id in ("implementer", "tester", "recorder", "pr-publisher")
+}
+
+
 def _patch(monkeypatch) -> None:
-    monkeypatch.setattr(implement_workflow, "load_all", lambda aidt, repo, **_kwargs: ({}, []))
+    monkeypatch.setattr(
+        implement_workflow, "load_all", lambda aidt, repo, **_kwargs: (dict(_AGENTS), [])
+    )
 
 
 def _write_config(control: Path, body: str) -> None:
@@ -231,6 +259,117 @@ def _write_config(control: Path, body: str) -> None:
     config = control / "aidw" / "config.yaml"
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text(body, encoding="utf-8")
+
+
+#: The four resolved document write-targets, hand-written from H3.2 req 3's prompt-fixed
+#: scope rather than read from the workflow: the fake evidence has to carry the *canonical*
+#: scope, so a workflow that resolved a different one matches nothing and the test fails
+#: instead of agreeing with itself.
+EVIDENCE_IGNORE = (
+    "docs/implementation-results",
+    "docs/architecture",
+    "docs/tasks",
+    "docs/task-prompts",
+)
+
+#: Every gate the E6.1 shape recorded: four green, one red `suite`.
+EVIDENCE_KEYS = ("build", "doctor", "agents", "prompts", "suite")
+
+
+def _evidence_tree(
+    worktree: Path,
+    *,
+    exclude: tuple[Path, ...] = (),
+    ignore: tuple[str, ...] = EVIDENCE_IGNORE,
+) -> str:
+    """The tree the gate CLI would have recorded for this fixture (H3.2).
+
+    Computed with ``aidw.verification.tree_identity``'s **default** base, which is what
+    every ``aidw gate run`` resolves when the prompts pass no ``--base``, and with the
+    hand-written :data:`EVIDENCE_IGNORE` scope — never the workflow's own helper, so a
+    workflow that resolved a different base or scope matches nothing and the test fails.
+    ``ignore`` widens for a fixture that relocated one of the four document dirs (the
+    prompts' scope is the *resolved* paths, so a custom ``roadmap_dir`` is declared too).
+    """
+    tree = verification.tree_identity(worktree, exclude=exclude, ignore=ignore)
+    assert tree is not None, "the fixture's change set has no identity"
+    return tree
+
+
+def _record_evidence(
+    state,
+    directory: Path,
+    *,
+    tree: str,
+    keys: tuple[str, ...] = EVIDENCE_KEYS,
+    failing: set[str] | frozenset[str] = frozenset(),
+    stage: str = "record-implementation-results",
+) -> None:
+    """Append a hand-calculated outcome set through the CLI's writer, then merge it.
+
+    ``aidw gate run`` appends to ``state.json`` from a subprocess (H0.1); the workflow's own
+    ``save`` is what folds those rows into the in-memory state a later stage reads. Both
+    halves are exercised here through the public writers rather than by poking the list, so
+    a fake cannot pass through a path a real run never takes.
+    """
+    append_gate_outcomes(
+        directory,
+        [
+            EvidenceOutcome(
+                key=key,
+                command=["uv", "run", "--frozen", "pytest"],
+                tree=tree,
+                status=FAILED if key in failing else "passed",
+                stage=stage,
+                at="2026-11-10T00:00:00Z",
+                exit_code=1 if key in failing else 0,
+                summary="1 failed" if key in failing else "1 passed",
+            )
+            for key in keys
+        ],
+    )
+    save(directory, state)
+
+
+class _GateEvidenceStages(_Recorder):
+    """A fake ``run_stage`` that leaves the run's gate evidence behind, as real agents do.
+
+    H3.2's condition is a read of the run's recorded ``gate_outcomes``; in a live run they
+    arrive through ``aidw gate run`` subprocesses appending to ``state.json`` (H0.1). This
+    fake appends through the same public writer at the ``record-implementation-results``
+    stage — the sync point where the run's gates have been recorded — and computes the tree
+    the way the gate CLI does.
+    """
+
+    def __init__(
+        self,
+        *,
+        failing: set[str] | None = None,
+        keys: tuple[str, ...] = EVIDENCE_KEYS,
+        tree: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.failing = failing or set()
+        self.keys = keys
+        self.tree = tree
+
+    def __call__(self, spec, **kwargs):
+        record = super().__call__(spec, **kwargs)
+        if spec.name != "record-implementation-results":
+            return record
+        state = kwargs["state"]
+        tree = self.tree or _evidence_tree(
+            Path(kwargs["repo_root"]),
+            exclude=(Path(kwargs["runs_root"]).parent,),
+        )
+        _record_evidence(
+            state,
+            run_dir(kwargs["runs_root"], state.run_id),
+            tree=tree,
+            keys=self.keys,
+            failing=self.failing,
+        )
+        return record
 
 
 #: The registry's implement order (I1..I7), the serial schedule.
@@ -407,6 +546,13 @@ def test_dry_run_plans_locate_and_all_seven_stages(
         str((control / ROADMAP_REL).resolve()),
         "E4.1",
     ]
+    # H3.2: the condition is carried onto the planned spec — `StageSpec.when` is what a
+    # workflow reads to decide at run time — and the dry run neither fails nor skips on
+    # the evidence, because it returns before the condition is ever evaluated.
+    assert tick.when == "evidence-green"
+    assert all(
+        spec.when == "" for spec in recorder.specs if spec.name != "update-roadmap"
+    )
     out = capsys.readouterr().out
     command = (
         f"git -C {tmp_path / 'main'} worktree add -b 03-E4.1 "
@@ -607,7 +753,7 @@ def test_agents_are_reloaded_against_the_located_worktree(
 
     def record_load(_aidt: Path, repo_root: Path, **_kwargs):
         load_roots.append(repo_root)
-        return {}, []
+        return dict(_AGENTS), []
 
     monkeypatch.setattr(implement_workflow, "load_all", record_load)
     recorder = _Recorder()
@@ -882,7 +1028,7 @@ def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
     state.status = FAILED
     save(directory, state)
 
-    recorder = _Recorder()
+    recorder = _GateEvidenceStages()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
@@ -1000,7 +1146,7 @@ def test_resume_declined_leaves_no_worktree(tmp_path: Path, monkeypatch, capsys)
 # --------------------------------------------------------------------------- #
 
 
-class _TrackingStages(_Recorder):
+class _TrackingStages(_GateEvidenceStages):
     """Recorder that tracks how many stages run at the same time.
 
     ``slow`` names the stages that park briefly so a group of them overlaps measurably;
@@ -1665,11 +1811,6 @@ def _write_repo_added_prompt(*roots: Path) -> None:
         path.write_text("# repo-added stage\n", encoding="utf-8")
 
 
-#: Stand-in agent configs: `load_all` is faked, so only the ids matter — a repo-added
-#: stage's declared `agent` is *existence*-checked against this dict (E4.5b req 4).
-_AGENTS = {"implementer": object(), "tester": object(), "recorder": object()}
-
-
 def _patch_with_agents(monkeypatch) -> None:
     """``_patch`` plus the agent configs a repo-added stage's declared ``agent`` needs."""
     _patch(monkeypatch)
@@ -1710,7 +1851,7 @@ def test_a_trailing_repo_added_stage_runs_after_i6(
     )
     _write_repo_added_prompt(control, worktree)
     _patch_with_agents(monkeypatch)
-    recorder = _Recorder()
+    recorder = _GateEvidenceStages()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
@@ -1775,7 +1916,7 @@ def test_a_repo_added_stage_before_i6_is_scheduled_in_declared_order(
     _write_config(control, _declared_stages(_stages_with_repo_added(2)))
     _write_repo_added_prompt(control, worktree)
     _patch_with_agents(monkeypatch)
-    recorder = _Recorder()
+    recorder = _GateEvidenceStages()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
@@ -1870,7 +2011,7 @@ def test_from_a_disabled_repo_optional_stage_keeps_the_run_coherent(
     control, _worktree, prompt = _located_layout(tmp_path)
     _write_config(control, _declared_implement_stages({"I3"}))
     _patch(monkeypatch)
-    recorder = _Recorder()
+    recorder = _GateEvidenceStages()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
@@ -1992,7 +2133,7 @@ def test_a_repo_added_stage_with_an_unknown_agent_is_refused(
 # --------------------------------------------------------------------------- #
 
 
-class _NoTickStages(_Recorder):
+class _NoTickStages(_GateEvidenceStages):
     """A fake stage that leaves the roadmap untouched — the "already `[x]`" agent."""
 
     def __call__(self, spec, **kwargs):
@@ -2018,7 +2159,7 @@ class _NoTickStages(_Recorder):
         return super().__call__(spec, **kwargs)
 
 
-class _NeighbourEditStages(_Recorder):
+class _NeighbourEditStages(_GateEvidenceStages):
     """A fake stage that flips the checkbox and edits another line too — a failed tick."""
 
     def __call__(self, spec, **kwargs):
@@ -2049,7 +2190,8 @@ def test_a_repo_with_no_traceability_catalog_still_ticks(
     _write_config(control, _declared_implement_stages({"I3"}))
     assert not (worktree / "docs" / "rules-coverage").exists()
     _patch(monkeypatch)
-    recorder = _Recorder()
+    # H3.2: the tick only runs behind green evidence, so the run has to have recorded some.
+    recorder = _GateEvidenceStages()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
@@ -2182,7 +2324,7 @@ def test_the_tick_resolves_the_located_worktree_not_the_control_root(
     control, worktree, prompt = _located_layout(tmp_path)
     _write_roadmap(control, "E4.1", checked=True)
     _patch(monkeypatch)
-    monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
+    monkeypatch.setattr(implement_workflow, "run_stage", _GateEvidenceStages())
 
     code = implement_workflow.run(
         task_prompt_path=prompt, **_roots(control), approve_all=True
@@ -2214,7 +2356,20 @@ def test_the_tick_uses_the_configured_roadmap_directory_and_glob(
         '  roadmap_glob: "[0-9]* - *.md"\n',
     )
     _patch(monkeypatch)
-    recorder = _Recorder()
+    # A relocated roadmap dir is a relocated *ignore* prefix: the evidence the prompts'
+    # gate runs recorded names the resolved directory, not ``docs/tasks``.
+    recorder = _GateEvidenceStages(
+        tree=_evidence_tree(
+            worktree,
+            exclude=(_runs_root(control).parent,),
+            ignore=(
+                "docs/implementation-results",
+                "docs/architecture",
+                "planning/roadmaps",
+                "docs/task-prompts",
+            ),
+        )
+    )
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
 
     code = implement_workflow.run(
@@ -2234,8 +2389,13 @@ def test_the_tick_uses_the_configured_roadmap_directory_and_glob(
 def test_from_update_roadmap_validates_against_the_plan(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """H3.1 req 8/F1: ``--from update-roadmap`` is a known name, so it re-runs from it."""
-    control, _worktree, prompt = _located_layout(tmp_path)
+    """H3.1 req 8/F1: ``--from update-roadmap`` is a known name, so it re-runs from it.
+
+    H3.2: the resumed run's evidence is what lets the forced tick run — the recorded
+    outcomes are read from the run state, which is the only place they come from.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    exclude = (_runs_root(control).parent,)
     _patch(monkeypatch)
     runs_dir = _runs_root(control)
     state = create_run(
@@ -2247,6 +2407,9 @@ def test_from_update_roadmap_validates_against_the_plan(
             StageRecord(name=name, agent="implementer", model="m", status=SUCCEEDED)
         )
     save(directory, state)
+    _record_evidence(
+        state, directory, tree=_evidence_tree(worktree, exclude=exclude), stage="record"
+    )
 
     recorder = _Recorder()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
@@ -2282,3 +2445,243 @@ def test_a_typoed_from_name_still_refuses_with_the_known_names(
     err = capsys.readouterr().err
     assert "unknown stage `update-roadmpa`" in err
     assert "update-roadmap" in err  # the known-names list
+
+
+# --------------------------------------------------------------------------- #
+# H3.2: the tick only behind the run's own green evidence
+# --------------------------------------------------------------------------- #
+
+
+def _tick_log(control: Path, state) -> str:
+    return (run_dir(_runs_root(control), state.run_id) / "run.log").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_the_e6_1_replay_withholds_the_tick_behind_a_red_suite(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Done-when: green build/doctor/agents/prompts + a red ``suite`` leaves the box alone.
+
+    The run that this epic exists for flipped E6.1's box and then reverted it, because the
+    decision was the agent's. Here the workflow decides before the agent is ever invoked:
+    the stage is recorded ``skipped`` naming ``suite``, the roadmap file is byte-identical,
+    and the run still exits 0 — the red gate already decided the run, not the tick.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    tree = _evidence_tree(worktree, exclude=(_runs_root(control).parent,))
+    before = (worktree / ROADMAP_REL).read_text(encoding="utf-8")
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages(failing={"suite"}, tree=tree)
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    # No agent was given the chance to claim the tick, and the file never moved.
+    assert "update-roadmap" not in recorder.names
+    assert (worktree / ROADMAP_REL).read_text(encoding="utf-8") == before
+    assert "- [x] **E4.1. A fixture task**" not in before
+
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-roadmap")
+    assert record.status == SKIPPED
+    assert record.agent == "recorder"
+    # The same agent resolution `run_stage` applies, recorded on the skip (req 4).
+    assert record.model == _AGENTS["recorder"].qualified_model
+    assert record.error is None
+    # Settle never ran either: no tick marker was stamped onto a stage that never ran.
+    assert "tick" not in record.artifacts
+    reason = record.artifacts[SKIP_REASON_KEY]
+    assert "suite" in reason
+    assert tree in reason
+    # The rest of the run is untouched: it succeeded, committed nothing, needs no resume.
+    assert state.status == SUCCEEDED
+    assert state.resume == {"next_stage": None}
+    assert "pr" in recorder.names
+    assert state.pr.get("number") == 42
+    assert "roadmap E4.1: already" not in _tick_log(control, state)
+    out = capsys.readouterr()
+    assert "I7 update-roadmap [skipped]" in out.out
+    assert "skipped: " in out.out
+    assert "stage update-roadmap failed" not in out.err
+
+
+def test_green_evidence_ticks_the_box_exactly_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The same replay with ``suite`` green flips the one checkbox, once."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages(failing=set())
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert recorder.names.count("update-roadmap") == 1
+    text = (worktree / ROADMAP_REL).read_text(encoding="utf-8")
+    assert text.count("- [x] **E4.1. A fixture task**") == 1
+    # Nothing else moved: the neighbour stays unticked.
+    assert "- [ ] **E9.9. A neighbour task**" in text
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-roadmap")
+    assert record.status == SUCCEEDED
+    assert record.artifacts.get("tick") == "flipped"
+    assert state.status == SUCCEEDED
+
+
+def test_a_run_with_no_recorded_gate_outcomes_skips_with_the_absence(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A run whose gates recorded nothing has nothing to cite — never "assume green"."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    before = (worktree / ROADMAP_REL).read_text(encoding="utf-8")
+    tree = _evidence_tree(worktree, exclude=(_runs_root(control).parent,))
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert (worktree / ROADMAP_REL).read_text(encoding="utf-8") == before
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-roadmap")
+    assert record.status == SKIPPED
+    reason = record.artifacts[SKIP_REASON_KEY]
+    assert "no evidence" in reason
+    assert "no gate outcome is recorded" in reason
+    assert tree in reason
+    assert state.gate_outcomes == []
+    assert "I7 update-roadmap [skipped]" in capsys.readouterr().out
+
+
+def test_a_parallel_group_member_naming_the_tick_is_withheld_without_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 4's trap: a repo-declared group may contain ``update-roadmap``.
+
+    Group members bypass ``execute()`` (they are submitted to the pool directly), so the
+    evidence check has to sit on the member path too — otherwise a group would tick with no
+    evidence at all.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    parallel_groups:\n"
+        "      - [test, update-roadmap]\n",
+    )
+    before = (worktree / ROADMAP_REL).read_text(encoding="utf-8")
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True, parallel=True
+    )
+
+    assert code == 0
+    assert "update-roadmap" not in recorder.names
+    assert "test" in recorder.names
+    assert (worktree / ROADMAP_REL).read_text(encoding="utf-8") == before
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-roadmap").status == SKIPPED
+
+
+def test_a_parallel_group_member_naming_the_tick_ticks_behind_green_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The member path's green branch: recorded evidence lets the grouped tick run."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    parallel_groups:\n"
+        "      - [update-roadmap, update-traceability]\n",
+    )
+    exclude = (_runs_root(control).parent,)
+    _patch(monkeypatch)
+    runs_dir = _runs_root(control)
+    state = create_run(
+        runs_dir, control, "implement", label="03-E4.1", branch="03-E4.1"
+    )
+    directory = run_dir(runs_dir, state.run_id)
+    save(directory, state)
+    _record_evidence(
+        state, directory, tree=_evidence_tree(worktree, exclude=exclude), stage="record"
+    )
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt,
+        **_roots(control),
+        resume=True,
+        approve_all=True,
+        parallel=True,
+    )
+
+    assert code == 0
+    assert "update-roadmap" in recorder.names
+    state = implement_workflow.list_runs(runs_dir)[-1]
+    assert _stage_record(state, "update-roadmap").artifacts.get("tick") == "flipped"
+    assert "- [x] **E4.1. A fixture task**" in (
+        worktree / ROADMAP_REL
+    ).read_text(encoding="utf-8")
+
+
+def test_a_second_green_run_on_an_already_ticked_box_is_a_no_op(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Green evidence twice: the first run flips, the second records ``tick: already``.
+
+    It also proves req 3's ``roadmap_dir`` scope: the first run's flip is *uncommitted*, so
+    the second run's tree contains it — and the evidence still matches, because the tick's
+    own edit is inside the ignored document write-target.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    monkeypatch.setattr(implement_workflow, "run_stage", _GateEvidenceStages())
+
+    assert (
+        implement_workflow.run(
+            task_prompt_path=prompt, **_roots(control), approve_all=True
+        )
+        == 0
+    )
+    after_first = (worktree / ROADMAP_REL).read_text(encoding="utf-8")
+    first = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(first, "update-roadmap").artifacts.get("tick") == "flipped"
+
+    monkeypatch.setattr(implement_workflow, "run_stage", _GateEvidenceStages())
+    assert (
+        implement_workflow.run(
+            task_prompt_path=prompt, **_roots(control), approve_all=True
+        )
+        == 0
+    )
+
+    # The run id is second-granular, so two runs this close share a run directory; the
+    # observable is the second run's record, which supersedes the first by stage name.
+    second = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert second.stage("update-roadmap") is not None
+    record = _stage_record(second, "update-roadmap")
+    assert record.status == SUCCEEDED
+    assert record.status != SKIPPED
+    assert record.artifacts.get("tick") == "already"
+    assert record.error is None
+    # Byte-identical: a no-op is a no-op, and the box was never ticked twice.
+    assert (worktree / ROADMAP_REL).read_text(encoding="utf-8") == after_first
+    assert after_first.count("- [x] **E4.1. A fixture task**") == 1

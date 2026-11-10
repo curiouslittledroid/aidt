@@ -33,6 +33,19 @@ line may flip `- [ ]` -> `- [x]`, every other byte must be unchanged, and an alr
 is a successful no-op recorded as `tick: already`. The edit stays uncommitted — I6 commits it,
 so the tick lands in the task's own PR.
 
+Since H3.2 the tick is also **conditional on the run's own evidence**: I7's registry entry
+carries `when=WHEN_EVIDENCE_GREEN`, and the workflow evaluates it itself, before
+`run_stage` is ever invoked and on both dispatch paths (serial and a `--parallel` group
+member). The condition is green iff the tree the tick edits has a content identity, at least
+one recorded `gate_outcomes` row is for exactly that tree, and every such row passed —
+computed with `aidw.verification.tree_identity`'s default base and with the four resolved
+document write-targets as its `--ignore` scope, exactly as `aidw gate run` computed the
+evidence it cites. Anything else (a red gate, no matching outcome, an identity that cannot
+be computed) withholds the stage: it is recorded `skipped` with a reason naming the failing
+gates or the absence, the roadmap file is never touched, the run's exit status is unchanged,
+and no agent ever got the chance to make the claim. An already-`[x]` entry under green
+evidence is still H3.1's successful no-op.
+
 The seven stages are not hardcoded here since E4.3: ``run()`` builds them with
 :func:`aidw.runner.plan_stages` over the ``aidw.stage_registry`` defaults, so the target
 repo's per-stage ``prompt:`` overlay applies and the prompts resolve against the located
@@ -67,23 +80,31 @@ import os
 import re
 import string
 import sys
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from aidw import __version__, git, lock, roadmap
+from aidw import __version__, git, lock, roadmap, verification
 from aidw import stage_registry
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
 from aidw.log import RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.runner import StageSpec, declared_stage_issues, plan_stages, run_stage
+from aidw.runner import (
+    StageSpec,
+    declared_stage_issues,
+    plan_stages,
+    record_skipped,
+    run_stage,
+)
 from aidw.state import (
     BLOCKED,
     FAILED,
     RUNNING,
     SUCCEEDED,
+    GateOutcome,
     GateRecord,
     RunState,
     StageRecord,
@@ -116,6 +137,29 @@ TICK_STAGE_NAME = "update-roadmap"
 
 #: ``StageRecord.artifacts`` key carrying the tick outcome (H3.1 req 7; additive).
 TICK_ARTIFACT_KEY = "tick"
+
+#: The resolved §3.4 **document write-targets** whose edits are never evidence about the
+#: tree the tick is judged against (H3.2 req 3). Every other stage of this workflow writes
+#: into one of them, and the tick's own edit lands in ``roadmap_dir`` — so a tree identity
+#: that included them would (a) differ from the ones ``aidw gate run`` recorded, because the
+#: prompts pass the same scope as ``--ignore``, and (b) make the tick's own edit part of the
+#: evidence checked against it. Prompt-fixed to the canonical scope ``prompts/pr.md`` and
+#: ``prompts/record-implementation-results.md`` declare.
+TICK_EVIDENCE_IGNORE_PATHS = (
+    "paths.implementation_results_dir",
+    "paths.architecture_dir",
+    "paths.roadmap_dir",
+    "paths.task_prompts_dir",
+)
+
+#: Why a tick is withheld when the change set has no tree identity. ``tree_identity``
+#: returns ``None`` for an unresolvable base branch or an over-budget change set, and
+#: "cannot prove" is never "green" (E4.8 is cite-or-run, never assume).
+TICK_NO_TREE_REASON = (
+    "no evidence: the change set has no tree identity (the base branch could not be "
+    "resolved, or the change set is over budget), so no recorded gate outcome can "
+    "cite it"
+)
 
 #: ``03-E4.1-prompt.md`` → phase ``03``, task ``E4.1``, branch ``03-E4.1``.
 _PROMPT_NAME = re.compile(
@@ -235,6 +279,131 @@ def derive_branch_name(pattern: str, *, phase: str, task: str) -> str | None:
         return pattern.format(phase=phase, task=task)
     except (KeyError, IndexError, ValueError):
         return None
+
+
+@dataclass(frozen=True)
+class TickEvidence:
+    """The verdict on I7's ``WHEN_EVIDENCE_GREEN`` condition (H3.2 req 3).
+
+    ``tree`` is the content-tree identity the condition was evaluated for, or ``None``
+    when it could not be computed. ``reason`` is the human-readable explanation carried by
+    a skipped stage; it is empty exactly when ``green`` is true, so a green verdict can
+    never be paired with a reason somebody might print as one.
+    """
+
+    green: bool
+    tree: str | None
+    reason: str
+
+
+def tick_evidence(
+    outcomes: Sequence[GateOutcome], tree: str | None
+) -> TickEvidence:
+    """**The rule**: is the tick's tree covered by green evidence? (H3.2, design §8.2).
+
+    Green iff (a) the tree has an identity, (b) at least one recorded gate outcome is for
+    exactly that tree, and (c) **every** such outcome passed. Anything else withholds the
+    tick, and the reason says which:
+
+    * ``tree is None`` — no identity, so no outcome can cite it (a ``None`` identity is
+      also what an unresolvable base branch and an over-budget change set produce);
+    * no matching outcome — "no evidence" is not "green" (E4.8 is cite-or-run, never
+      assume), and a run whose gates recorded nothing has nothing to cite;
+    * any non-``passed`` outcome — the red gate the roadmap's E6.1 incident exists for,
+      named per failing ``GateOutcome.key`` so one line says *which* gate said no.
+
+    Outcomes recorded for a **different** tree are ignored in both directions: another
+    tree's pass is not evidence for this one, and another tree's failure is not this run's
+    verdict (design §9.2 — the identity is the whole point of recording it).
+
+    Pure: no I/O, no mutation of ``outcomes``, and the returned value is a frozen value.
+    """
+    if tree is None:
+        return TickEvidence(False, None, TICK_NO_TREE_REASON)
+    matching = [outcome for outcome in outcomes if outcome.tree == tree]
+    if not matching:
+        return TickEvidence(
+            False,
+            tree,
+            f"no evidence for tree {tree}: no gate outcome is recorded for it "
+            "(cite-or-run, never assume)",
+        )
+    failing = [outcome for outcome in matching if not outcome.passed]
+    if failing:
+        # Every failing key, once, in recorded order: the operator must not have to guess
+        # which gate said no, and two failures of one key are still one key to fix.
+        keys = list(dict.fromkeys(outcome.key for outcome in failing))
+        label = "gate" if len(keys) == 1 else "gates"
+        return TickEvidence(
+            False, tree, f"red {label} for tree {tree}: {', '.join(keys)}"
+        )
+    return TickEvidence(True, tree, "")
+
+
+def tick_evidence_ignore(
+    resolved_config: ResolvedConfig, repo_root: Path
+) -> tuple[str, ...]:
+    """The four resolved document write-targets as ``--ignore`` prefixes (H3.2 req 3).
+
+    ``paths.*`` values are target-relative by default and may be absolute, while
+    ``tree_identity``'s ``ignore`` (and ``aidw gate run``'s ``--ignore``) take
+    **repo-relative** prefixes — so an absolute value inside the tree is re-based, and one
+    outside the tree is dropped (it cannot be a prefix of any path in the tree).
+    Canonicalisation is :func:`aidw.verification.normalise_ignore`, the same rule the gate
+    CLI applies, so the identity computed here matches the one the gate recorded instead
+    of a lookalike.
+    """
+    root = Path(repo_root).resolve()
+    prefixes: list[str] = []
+    for path in TICK_EVIDENCE_IGNORE_PATHS:
+        value = resolved_config[path].value
+        if not isinstance(value, str) or not value.strip():
+            continue
+        candidate = Path(value)
+        if candidate.is_absolute():
+            try:
+                relative = candidate.resolve().relative_to(root)
+            except ValueError:
+                continue
+            prefixes.append(relative.as_posix())
+            continue
+        text = os.path.normpath(value).replace(os.sep, "/")
+        # ``.``/``..`` would ignore the whole repository; ``normalise_ignore`` refuses them
+        # (that would make every tree identical), so a pathological config scope empties
+        # rather than crashing the run — and an emptied scope only ever *withholds* a tick.
+        if text in ("", ".", "..") or text.startswith("../"):
+            continue
+        prefixes.append(text)
+    return verification.normalise_ignore(prefixes)
+
+
+def roadmap_tick_evidence(
+    state: RunState,
+    *,
+    repo_root: Path,
+    exclude: Sequence[Path],
+    ignore: Sequence[str],
+) -> TickEvidence:
+    """I7's condition: this run's recorded outcomes against the **current** tree (H3.2).
+
+    The tree is recomputed the way ``aidw gate run`` computed the ones it recorded:
+    :func:`aidw.verification.tree_identity` with its **default** ``base``
+    (``verification.BASE_DEFAULT``). Never ``repo.base_branch``: the prompts pass no
+    ``--base`` to ``aidw gate run``, so every recorded outcome is measured against the
+    default, and a different base would match nothing and silently never tick.
+
+    ``exclude`` is the run's state root (the gate CLI's own exclusion — the run's logs are
+    not part of the change set) and ``ignore`` is :func:`tick_evidence_ignore`'s scope, so
+    the recomputed identity equals the one the gate recorded rather than a lookalike that
+    matches nothing.
+
+    Reads the **in-memory** run state, which is where H0.1's merge-on-write has already
+    folded in every outcome a stage's ``aidw gate run`` subprocess appended; a fresh
+    ``state.load`` or a ``run.log`` parse would re-introduce exactly the boundary loss H0.1
+    closed. I/O: one ``git`` change-set read plus the content hashes.
+    """
+    tree = verification.tree_identity(repo_root, exclude=exclude, ignore=ignore)
+    return tick_evidence(state.gate_outcomes, tree)
 
 
 def build_plan(
@@ -831,6 +1000,49 @@ def run(
             record = state.stage(name)
             return not (record is not None and record.status == SUCCEEDED)
 
+        def withhold_tick(entry: StageSpec) -> bool:
+            """H3.2: evaluate I7's ``WHEN_EVIDENCE_GREEN`` **before** ``run_stage`` does.
+
+            Called on **both** dispatch paths — the serial ``execute`` and the
+            ``--parallel`` member loop, which submits to the pool directly rather than
+            going through ``execute`` — because ``validate_parallel_groups`` only refuses
+            unknown or double-listed members, so a repo-declared group may legally contain
+            ``update-roadmap``. Evaluating here, before any Pi invocation, is what makes
+            the condition real: an agent that ran could tick a box the run has no green
+            evidence for, and routing the skip around ``settle_tick`` as well (it is only
+            called after a stage returns) keeps a ``tick: already`` stamp off a stage that
+            never ran.
+
+            Returns ``True`` when the stage was withheld and fully recorded — a skip is a
+            **success** on both paths: it never fails the run and never writes
+            ``state.status``/``state.resume``, because the red gate that caused it already
+            decided the run (design §8.2). Returns ``False`` for every other stage and for
+            a green verdict, which then runs exactly as H3.1 left it.
+            """
+            if (
+                entry.name != TICK_STAGE_NAME
+                or entry.when != stage_registry.WHEN_EVIDENCE_GREEN
+            ):
+                return False
+            evidence = roadmap_tick_evidence(
+                state,
+                repo_root=target.root,
+                exclude=(workspace.state_root,),
+                ignore=tick_evidence_ignore(resolved_config, target.root),
+            )
+            if evidence.green:
+                return False
+            record = record_skipped(
+                entry,
+                state=state,
+                directory=directory,
+                agents=agents,
+                reason=evidence.reason,
+            )
+            logger.info(f"stage {entry.name}: skipped — {evidence.reason}")
+            print_stage(record, repo_root=target.root, prefix=entry.id)
+            return True
+
         def settle_tick(entry: StageSpec, record: StageRecord) -> None:
             """Apply I7's postcondition on both the serial and the parallel schedule (H3.1).
 
@@ -855,6 +1067,8 @@ def run(
             """Run one stage unless it already succeeded; return its success."""
             if not should_run(index, entry.name):
                 print(f"stage:  {entry.id} {entry.name} [skipped]")
+                return True
+            if withhold_tick(entry):
                 return True
             record = run_stage(
                 entry,
@@ -929,8 +1143,15 @@ def run(
                         print(f"stage:  {member.id} {member.name} [skipped]")
                 if not active:
                     continue
+                # H3.2: a group is a dispatch path in its own right, so the evidence check
+                # runs per member here too — before anything is submitted to the pool.
+                runnable = [
+                    member for member in active if not withhold_tick(member)
+                ]
+                if not runnable:
+                    continue
                 failed: list[StageSpec] = []
-                with ThreadPoolExecutor(max_workers=len(active)) as pool:
+                with ThreadPoolExecutor(max_workers=len(runnable)) as pool:
                     futures = {
                         pool.submit(
                             run_stage,
@@ -942,7 +1163,7 @@ def run(
                             logger=logger,
                             agents=agents,
                         ): member
-                        for member in active
+                        for member in runnable
                     }
                     for future in as_completed(futures):
                         member = futures[future]

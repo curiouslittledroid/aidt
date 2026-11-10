@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from aidw.cost import is_unpriced, total_tokens
-from aidw.state import PLANNED, RUNNING, SUCCEEDED, StageRecord
+from aidw.state import (
+    PLANNED,
+    RUNNING,
+    SKIP_REASON_KEY,
+    SKIPPED,
+    SUCCEEDED,
+    StageRecord,
+)
 
 #: Field order for the one-line usage summary.
 _USAGE_FIELDS = (
@@ -162,7 +169,13 @@ def stage_lines(
 
     lines = [head]
 
-    if record.error:
+    if record.status == SKIPPED:
+        # H3.2: a withheld stage carries its reason in ``artifacts``, never in ``error``
+        # (which would render as a failure). The head already says ``[skipped]``, so the
+        # operator sees the decision *and* what decided it without a transcript.
+        reason = str(record.artifacts.get(SKIP_REASON_KEY) or "no reason recorded")
+        lines.append(f"        skipped: {reason}")
+    elif record.error:
         lines.append(f"        error: {record.error}")
     elif record.status in (SUCCEEDED, RUNNING) and usage_line(record.usage):
         lines.append(f"        usage: {usage_line(record.usage)}")

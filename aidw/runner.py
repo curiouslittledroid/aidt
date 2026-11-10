@@ -44,6 +44,8 @@ from aidw.state import (
     FAILED,
     PLANNED,
     RUNNING,
+    SKIP_REASON_KEY,
+    SKIPPED,
     SUCCEEDED,
     RunState,
     StageRecord,
@@ -92,6 +94,14 @@ class StageSpec:
     model: str | None = None
     thinking: str | None = None
     timeout_seconds: int | None = None
+    #: The registry's ``if`` condition, carried rather than expanded away (H3.2):
+    #: :func:`aidw.stage_registry.expand` plans a conditional stage and puts its
+    #: ``when`` here, so a **workflow** can read it and decide at run time
+    #: (``spec.when == stage_registry.WHEN_EVIDENCE_GREEN`` — I7's tick, and H3.3's
+    #: reuse for ``fix``). Empty for a stage with no condition, which is every stage
+    #: today except I7. Additive: the field defaults empty, so a spec a workflow builds
+    #: itself (``aidw exec``) keeps today's unconditional behaviour.
+    when: str = ""
 
 
 #: Retry a clearly transient Pi invocation error once (design E6, §10). ``aidw
@@ -524,6 +534,7 @@ def _spec_from_planned(
         model=model,
         thinking=thinking,
         timeout_seconds=timeout_seconds,
+        when=stage.when,
     )
 
 
@@ -637,16 +648,15 @@ def run_stage(
                 "agent config errors:\n" + "\n".join(str(i) for i in errors)
             )
 
-    agent = agents.get(spec.agent_id)
-    if agent is None:
-        raise ValueError(f"unknown agent: {spec.agent_id}")
     # E4.6: the stage's declared metadata applies for this invocation only. Build the
     # effective config **once, here**, before any consumer reads ``agent.model`` —
     # ``build_argv``, ``execute(timeout=…)``, ``StageRecord(model=…)``, ``write_meta``,
     # ``logger.info`` and ``progress.start`` all read it — so argv, run state and the
     # recorded cost (§9) can never disagree about which model ran. ``dataclasses.replace``
     # is what keeps the loaded config (and every other stage's) unchanged.
-    agent = _effective_agent(agent, spec)
+    # :func:`stage_agent` is the one resolution rule, shared with
+    # :func:`record_skipped` so a withheld stage records the agent it would have run.
+    agent = stage_agent(spec, agents)
 
     if not spec.prompt.is_file():
         raise FileNotFoundError(f"prompt not found: {spec.prompt}")
@@ -852,6 +862,61 @@ def run_stage(
         save(directory, state)
     if unpriced:
         logger.warn(f"stage {spec.name}: {unpriced}")
+    return record
+
+
+def stage_agent(spec: StageSpec, agents: Mapping[str, AgentConfig]) -> AgentConfig:
+    """The agent config one stage runs, or :class:`ValueError` for an unknown id.
+
+    The single resolution rule behind both ``run_stage``'s invocation and
+    :func:`record_skipped`'s record (H3.2 req 4): a stage withheld before Pi is invoked
+    must still name the agent and ``qualified_model`` it *would* have run, so the skip is
+    readable beside the stages that did run and cannot drift from them.
+    """
+    agent = agents.get(spec.agent_id)
+    if agent is None:
+        raise ValueError(f"unknown agent: {spec.agent_id}")
+    return _effective_agent(agent, spec)
+
+
+def record_skipped(
+    spec: StageSpec,
+    *,
+    state: RunState,
+    directory: Path,
+    agents: Mapping[str, AgentConfig],
+    reason: str,
+) -> StageRecord:
+    """Record a stage the workflow withheld before Pi was ever invoked (H3.2 req 4).
+
+    A skip is a *decision with a reason*, not a silent omission, so it gets a full
+    :class:`~aidw.state.StageRecord` published exactly the way ``run_stage`` publishes
+    its own — under :data:`_STATE_LOCK`, through ``state.record_stage`` and ``save`` — so
+    the observable evidence cannot depend on which dispatch path reached it.
+
+    ``status`` is :data:`aidw.state.SKIPPED` and ``error`` stays **unset**: ``error``
+    renders as a failure (design §9.3) and a skip is not one. The reason travels in
+    ``artifacts[SKIP_REASON_KEY]``, which the stage block prints and ``runs show``/a
+    reader of ``state.json`` can cite without a transcript. ``model`` is
+    :func:`stage_agent`'s ``qualified_model`` — the same agent resolution
+    ``run_stage`` applies — because ``StageRecord.model`` is a required field with no
+    default.
+
+    Nothing else is touched: no ``state.status`` stamp and no ``state.resume`` entry,
+    since the caller's workflow continues (a skip never fails a run; the red gate that
+    caused it already decided the run's outcome).
+    """
+    agent = stage_agent(spec, agents)
+    record = StageRecord(
+        name=spec.name,
+        agent=agent.id,
+        model=agent.qualified_model,
+        status=SKIPPED,
+        artifacts={SKIP_REASON_KEY: reason},
+    )
+    with _STATE_LOCK:
+        state.record_stage(record)
+        save(directory, state)
     return record
 
 

@@ -16,9 +16,18 @@ is their executable specification:
   and marks the stage ``failed`` when the postcondition does not hold. ``already`` stays
   ``succeeded``; ``skipped`` is H3.2's word for a tick withheld behind red gates.
 
+H3.2 adds the **evidence condition**: :func:`aidw.workflows.implement.tick_evidence` is the
+pure rule behind ``WHEN_EVIDENCE_GREEN`` — green iff the tick's tree has an identity, at least
+one recorded gate outcome is for exactly that tree, and every such outcome passed; anything
+else withholds the tick with a reason naming the failing gates or the absence. Its scope
+(:func:`aidw.workflows.implement.tick_evidence_ignore`) is the four resolved document
+write-targets, and :func:`...roadmap_tick_evidence` recomputes the tree with
+``tree_identity``'s **default** base, so the identity matches the one ``aidw gate run``
+recorded.
+
 No Pi model is involved (design §15): the pure helpers are called directly, and the
-workflow's own settlement helper is driven with a real ``RunState``/``RunLogger`` in a
-temporary run directory. The workflow-level exit codes and stage plan are pinned in
+workflow's own helpers are driven with a real ``RunState``/``RunLogger`` in a temporary run
+directory. The workflow-level exit codes and stage plan are pinned in
 ``tests/test_implement_workflow.py``.
 
 ``hypothesis`` is not a dependency (AGENTS.md "Tests": pytest only), so the sweep at the
@@ -28,15 +37,26 @@ bottom enumerates its input space deterministically with a pinned seed and run c
 from __future__ import annotations
 
 import builtins
+import itertools
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from aidw import roadmap
+from aidw import state as state_module
 from aidw.log import RunLogger
 from aidw.paths import toolkit_root
-from aidw.state import FAILED, SUCCEEDED, StageRecord, create_run, run_dir
+from aidw.state import (
+    FAILED,
+    PASSED,
+    SUCCEEDED,
+    GateOutcome,
+    StageRecord,
+    create_run,
+    run_dir,
+)
+from aidw.target_config import load_target_config, resolve_config
 from aidw.workflows import implement as implement_workflow
 
 CHECKBOX_ID = "H3.1"
@@ -420,6 +440,256 @@ def test_the_prompt_takes_the_roadmap_path_as_a_variable_and_names_no_directory(
 
 
 # --------------------------------------------------------------------------- #
+# WHEN_EVIDENCE_GREEN: the rule, its scope, and the tree it is computed for (H3.2)
+# --------------------------------------------------------------------------- #
+
+TREE = "a" * 64
+OTHER_TREE = "b" * 64
+
+
+def _outcome(
+    key: str = "suite", *, tree: str = TREE, status: str = PASSED
+) -> GateOutcome:
+    """One hand-calculated recorded gate outcome (``aidw/state.py:GateOutcome``)."""
+    return GateOutcome(
+        key=key,
+        command=["uv", "run", "--frozen", "pytest"],
+        tree=tree,
+        status=status,
+        stage="record-implementation-results",
+        at="2026-11-10T00:00:00Z",
+        exit_code=0 if status == PASSED else 1,
+        summary="1 passed" if status == PASSED else "1 failed",
+    )
+
+
+def test_evidence_is_green_when_every_outcome_for_the_tree_passed() -> None:
+    """The happy path: several recorded passes for exactly this tree."""
+    outcomes = [_outcome(key) for key in ("build", "doctor", "agents", "prompts", "suite")]
+
+    evidence = implement_workflow.tick_evidence(outcomes, TREE)
+
+    assert evidence.green is True
+    assert evidence.tree == TREE
+    # A green verdict never carries a reason somebody might print as one.
+    assert evidence.reason == ""
+
+
+def test_one_red_outcome_withholds_the_tick_and_names_every_failing_gate() -> None:
+    """The E6.1 shape: four green gates and a red ``suite`` withhold the tick."""
+    outcomes = [
+        _outcome("build"),
+        _outcome("doctor"),
+        _outcome("agents"),
+        _outcome("prompts"),
+        _outcome("suite", status=FAILED),
+    ]
+
+    evidence = implement_workflow.tick_evidence(outcomes, TREE)
+
+    assert evidence.green is False
+    assert evidence.tree == TREE
+    assert "suite" in evidence.reason
+    assert TREE in evidence.reason
+    # The passing gates are not blamed.
+    for key in ("build", "doctor", "agents", "prompts"):
+        assert key not in evidence.reason
+
+
+def test_every_failing_gate_is_named_once() -> None:
+    """Two failures of one key are still one key to fix; two keys are both named."""
+    outcomes = [
+        _outcome("suite", status=FAILED),
+        _outcome("suite", status=FAILED),
+        _outcome("build", status=FAILED),
+        _outcome("doctor"),
+    ]
+
+    reason = implement_workflow.tick_evidence(outcomes, TREE).reason
+
+    assert reason.count("suite") == 1
+    assert "build" in reason
+    assert "doctor" not in reason
+    assert reason.startswith("red gates for tree ")
+
+
+def test_zero_matching_outcomes_is_no_evidence_not_green() -> None:
+    """"No evidence" is not "green": a run whose gates recorded nothing never ticks."""
+    outcomes = [_outcome(tree=OTHER_TREE)]
+
+    evidence = implement_workflow.tick_evidence(outcomes, TREE)
+
+    assert evidence.green is False
+    assert evidence.tree == TREE
+    assert TREE in evidence.reason
+    assert "no evidence" in evidence.reason
+    assert "no gate outcome is recorded" in evidence.reason
+
+
+def test_an_unresolvable_tree_identity_is_no_evidence() -> None:
+    """``tree_identity`` returning ``None`` (unresolvable base / over budget) never greens."""
+    evidence = implement_workflow.tick_evidence([_outcome()], None)
+
+    assert evidence.green is False
+    assert evidence.tree is None
+    assert "no evidence" in evidence.reason
+    assert "no tree identity" in evidence.reason
+    assert evidence.reason == implement_workflow.TICK_NO_TREE_REASON
+
+
+def test_outcomes_for_another_tree_are_ignored_in_both_directions() -> None:
+    """A foreign pass is not evidence here, and a foreign failure is not this verdict."""
+    green = implement_workflow.tick_evidence(
+        [_outcome(tree=OTHER_TREE, status=FAILED), _outcome(tree=TREE)], TREE
+    )
+    red = implement_workflow.tick_evidence(
+        [_outcome(tree=OTHER_TREE), _outcome(tree=TREE, status=FAILED)], TREE
+    )
+
+    assert green.green is True
+    assert red.green is False
+    assert "suite" in red.reason
+
+
+def test_the_condition_is_pure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No I/O, and neither the outcome list nor its rows are mutated (design §15)."""
+    outcomes = [_outcome("build"), _outcome("suite", status=FAILED)]
+    before = [(row.key, row.tree, row.status) for row in outcomes]
+
+    def _explode(*args: object, **kwargs: object):
+        raise AssertionError("tick_evidence must not touch a file")
+
+    monkeypatch.setattr(builtins, "open", _explode)
+    monkeypatch.setattr(Path, "read_text", _explode)
+    monkeypatch.setattr(Path, "write_text", _explode)
+
+    implement_workflow.tick_evidence(outcomes, TREE)
+
+    assert [(row.key, row.tree, row.status) for row in outcomes] == before
+    assert len(outcomes) == 2
+
+
+def test_the_scope_is_the_four_resolved_document_write_targets(tmp_path: Path) -> None:
+    """Req 3: the four resolved dirs, canonicalised the way ``--ignore`` is."""
+    resolved = resolve_config(load_target_config(tmp_path / "aidw" / "config.yaml"))
+
+    assert implement_workflow.tick_evidence_ignore(resolved, tmp_path) == (
+        "docs/architecture",
+        "docs/implementation-results",
+        "docs/task-prompts",
+        "docs/tasks",
+    )
+
+
+def test_the_scope_follows_a_reconfigured_document_dir(tmp_path: Path) -> None:
+    """A relocated ``roadmap_dir`` is a relocated ignore prefix, not a hardcoded ``docs/tasks``."""
+    (tmp_path / "aidw").mkdir()
+    (tmp_path / "aidw" / "config.yaml").write_text(
+        "schema_version: 1\n"
+        "paths:\n"
+        "  roadmap_dir: ./planning/roadmaps/\n",
+        encoding="utf-8",
+    )
+    resolved = resolve_config(load_target_config(tmp_path / "aidw" / "config.yaml"))
+
+    scope = implement_workflow.tick_evidence_ignore(resolved, tmp_path)
+
+    assert "planning/roadmaps" in scope
+    assert "docs/tasks" not in scope
+    # Canonical form: no trailing slash, no ``./`` prefix (``normalise_ignore``'s rule).
+    assert all(not value.startswith("./") and not value.endswith("/") for value in scope)
+
+
+def test_the_scope_drops_a_document_dir_outside_the_repo(tmp_path: Path) -> None:
+    """An absolute write-target outside the tree cannot be a repo-relative prefix."""
+    outside = tmp_path.parent / "elsewhere-results"
+    (tmp_path / "aidw").mkdir()
+    (tmp_path / "aidw" / "config.yaml").write_text(
+        "schema_version: 1\n"
+        "paths:\n"
+        f"  implementation_results_dir: {outside}\n",
+        encoding="utf-8",
+    )
+    resolved = resolve_config(load_target_config(tmp_path / "aidw" / "config.yaml"))
+
+    scope = implement_workflow.tick_evidence_ignore(resolved, tmp_path)
+
+    assert "docs/implementation-results" not in scope
+    assert scope == ("docs/architecture", "docs/task-prompts", "docs/tasks")
+
+
+def test_the_tree_is_recomputed_with_the_gates_own_default_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Req 3's trap: the default base and the given scope, never ``repo.base_branch``.
+
+    ``aidw gate run`` records every outcome under ``verification.BASE_DEFAULT`` (the prompts
+    pass no ``--base``), so recomputing with the configured base would match nothing and
+    silently never tick. The in-memory ``state.gate_outcomes`` is the only source read.
+    """
+    seen: dict[str, object] = {}
+
+    def fake_tree_identity(repo_root: Path, **kwargs: object) -> str:
+        seen["repo_root"] = repo_root
+        seen.update(kwargs)
+        return TREE
+
+    monkeypatch.setattr(
+        implement_workflow.verification, "tree_identity", fake_tree_identity
+    )
+    directory, state = _run_directory(tmp_path)
+    state.record_gate_outcome(_outcome("suite"))
+
+    evidence = implement_workflow.roadmap_tick_evidence(
+        state,
+        repo_root=tmp_path,
+        exclude=(tmp_path / "state",),
+        ignore=("docs/tasks",),
+    )
+
+    assert evidence.green is True
+    assert seen == {
+        "repo_root": tmp_path,
+        "exclude": (tmp_path / "state",),
+        "ignore": ("docs/tasks",),
+    }
+    # ``base`` was never passed, so ``tree_identity`` used ``BASE_DEFAULT``.
+    assert "base" not in seen
+
+
+def test_the_in_memory_outcome_list_is_what_decides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Req 3's trap: the verdict reads the in-memory state, never a fresh ``state.load``.
+
+    A re-read would re-introduce exactly the boundary loss H0.1 closed. The fixture makes
+    the two disagree: the in-memory run holds the red ``suite``, the published
+    ``state.json`` holds none, and a reload is made fatal.
+    """
+    monkeypatch.setattr(
+        implement_workflow.verification, "tree_identity", lambda *a, **k: TREE
+    )
+    directory, state = _run_directory(tmp_path)
+    state.record_gate_outcome(_outcome("suite", status=FAILED))
+
+    def _explode(*args: object, **kwargs: object):
+        raise AssertionError("the condition must not re-read the run from disk")
+
+    monkeypatch.setattr(state_module, "load", _explode)
+    monkeypatch.setattr(state_module, "find_run", _explode)
+
+    evidence = implement_workflow.roadmap_tick_evidence(
+        state, repo_root=tmp_path, exclude=(), ignore=()
+    )
+
+    # The on-disk state (``create_run`` published an empty outcome list) would have said
+    # "no evidence"; the in-memory one says which gate is red.
+    assert evidence.green is False
+    assert "suite" in evidence.reason
+    assert directory.is_dir()  # the run directory exists; its state.json was not re-read
+
+
+# --------------------------------------------------------------------------- #
 # Property sweep (pytest only: no hypothesis, AGENTS.md "Tests")
 # --------------------------------------------------------------------------- #
 
@@ -461,3 +731,43 @@ def test_property_seed_and_run_count_are_pinned() -> None:
     """The seed is the whole sample, so the sweep cannot silently shrink."""
     assert NUM_RUNS == len(MUTATIONS) == 6
     assert len({name for name, _ in MUTATIONS}) == NUM_RUNS
+
+
+#: H3.2's property sample: every status combination over three gates (the green path, the
+#: red path and each mixed case), plus the two "cannot cite" rows. Pinned, deterministic —
+#: the enumeration *is* the generator (AGENTS.md "Tests": pytest only, no hypothesis).
+EVIDENCE_CASES: tuple[tuple[str, tuple[str, ...], str | None], ...] = tuple(
+    (f"statuses-{''.join(status[0] for status in statuses)}", statuses, TREE)
+    for statuses in itertools.product((PASSED, FAILED), repeat=3)
+) + (("no-outcomes", (), TREE), ("no-tree", (PASSED,), None))
+EVIDENCE_NUM_RUNS = len(EVIDENCE_CASES)
+
+
+def test_property_green_exactly_when_every_matching_outcome_passed() -> None:
+    """Property: the rule is an ``all(passed)`` over the matching rows, nothing else."""
+    assert EVIDENCE_NUM_RUNS == 10
+    for name, statuses, tree in EVIDENCE_CASES:
+        outcomes = [
+            _outcome(f"gate{index}", status=status)
+            for index, status in enumerate(statuses)
+        ]
+
+        evidence = implement_workflow.tick_evidence(outcomes, tree)
+
+        expected = bool(statuses) and tree is not None and all(
+            status == PASSED for status in statuses
+        )
+        assert evidence.green is expected, name
+        assert (evidence.reason == "") is expected, name
+        if not expected:
+            # Every withheld verdict says *why*, and names the tree whenever it has one.
+            assert evidence.reason, name
+            if tree is not None:
+                assert tree in evidence.reason, name
+
+
+def test_property_evidence_seed_and_run_count_are_pinned() -> None:
+    """The sample covers every 3-gate status combination plus both non-citable rows."""
+    assert EVIDENCE_NUM_RUNS == len(EVIDENCE_CASES) == 10
+    assert len({name for name, _, _ in EVIDENCE_CASES}) == EVIDENCE_NUM_RUNS
+    assert sum(1 for _, statuses, tree in EVIDENCE_CASES if tree is None) == 1
