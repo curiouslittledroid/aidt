@@ -1,6 +1,6 @@
 """The default stage registry: AIDT's workflow chains as data (EXTRACTION.md §3.5, E4.1).
 
-This module is the single declarative home of *which stage runs where*: the six-stage
+This module is the single declarative home of *which stage runs where*: the seven-stage
 ``implement`` chain (design §8.2), the post-phase-02 ``prompt`` review loop (§8.1), the
 ``review`` pair (§8.3), the ``fix`` iteration loop (§8.4) and the single ``approve`` stage
 (§8.5). It is **data plus pure helpers** (the expander and the ``parallel_groups``
@@ -32,7 +32,7 @@ Dependency direction (EXTRACTION.md §3.5, task E4.1's trap list):
   config.
 
 Stage-id vocabulary (R6 — ids are *retained*, never renamed to the semantic
-``author``/``review``/``implement`` of §3.4's illustrative YAML): ``I1``–``I6``, ``P1``,
+``author``/``review``/``implement`` of §3.4's illustrative YAML): ``I1``–``I7``, ``P1``,
 ``P2``, ``R1``, ``R2``, ``F1``–``F4``, ``A1`` (:data:`STAGE_IDS`). Two different fields are
 kept apart on purpose — ``id`` is the retained key (``"I1"``) and ``name`` is the runtime
 stage name (``"impliment-task"``), which is what ``state.json`` and the run artifacts key
@@ -131,6 +131,7 @@ STAGE_IDS = frozenset(
         "I4",
         "I5",
         "I6",
+        "I7",
         "P1",
         "P2",
         "R1",
@@ -562,6 +563,19 @@ _IMPLEMENT = WorkflowDefinition(
             "record-implementation-results.md",
             ("{branch}",),
         ),
+        # H3.1: the roadmap tick is its own **core** stage, after the record sync point
+        # and before the approval gate and I6, so the tick lands in the task's own PR
+        # (I6 is the single owner of the commit, design §8.2). Registry order is
+        # load-bearing: ``validate_stage_list``'s reorder rule compares the declared
+        # core subsequence to this order. ``checkbox_id`` is the entry's own task id
+        # (``H3.1``); ``{task_id}`` stays I6's branch form (``03-H3.1``).
+        StageDefinition(
+            "I7",
+            "update-roadmap",
+            "recorder",
+            "update-roadmap.md",
+            ("{roadmap_file}", "{checkbox_id}"),
+        ),
         StageDefinition("I6", "pr", "pr-publisher", "pr.md", ("{task_id}",)),
     ),
     # §3.4 ``parallel_groups`` / R11: the safe pair ``implement.py`` used to hardcode. I2
@@ -889,7 +903,7 @@ def validate_stage_list(
       membership: ``STAGE_IDS`` holds ``P2`` but not its fix/reconcile labels, which
       would make ``P2-fix-blocking`` look repo-added and be silently double-planned.
     * **core ids** — the static stage ids minus :data:`REPO_OPTIONAL_IDS` (``I1``, ``I2``,
-      ``I5``, ``I6`` for ``implement``; ``P1``; ``R1``/``R2``; ``A1``).
+      ``I5``, ``I7``, ``I6`` for ``implement``; ``P1``; ``R1``/``R2``; ``A1``).
     * **repo-optional ids** — :data:`REPO_OPTIONAL_IDS` (``I3``/``I4``).
     * anything else is a **repo-added** stage and is accepted here (its fields are
       E4.5b's contract, not this validator's).
@@ -1197,7 +1211,9 @@ def expand(workflow: str, /, **fields: Any) -> tuple[PlannedStage, ...]:
     ``fields``. Concrete inputs per workflow:
 
     * ``implement`` — ``prompt_rel``, ``branch``, ``task_id``, ``base_branch``
-      (default ``"main"``, matching ``build_plan``).
+      (default ``"main"``, matching ``build_plan``), ``roadmap_file`` and
+      ``checkbox_id`` (I7's ``$1``/``$2``: the entry's own absolute roadmap path and its
+      task id without the phase prefix, H3.1).
     * ``prompt`` — ``phase``, ``epic``, ``task``, ``rel``, ``max_revisions``, and ``rounds``
       (one :class:`FixBatch` per fixing round, in order).
     * ``review`` — ``pr``, ``manifest_path``, ``findings`` (``True``/``False``; ``False``

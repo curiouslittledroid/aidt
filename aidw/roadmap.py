@@ -22,6 +22,14 @@ reports the three malformations the format defines — a missing ``Done when``, 
 1-based line and rule. Validation is a separate, pure pass: the parser itself still never
 reports (roadmap-format.md §10), so ``parse_file``/``load_tasks`` and their callers are
 unchanged.
+
+Since H3.1 the module also owns the **one-checkbox tick** the ``I7 update-roadmap`` stage
+performs (design §8.2): :func:`tick_entry` resolves the stage's single target through the
+parsed list (a count, not ``find_task``'s first match, so a duplicate refuses instead of
+ticking the wrong entry), :func:`entry_path` names that entry's own file, and
+:func:`verify_checkbox_flip` is the workflow-owned postcondition — the agent's exit 0 is
+not evidence the edit happened (design §10, the O1 precedent). All three are pure, so the
+byte-exact rule lives here rather than inline in ``workflows/implement.py``.
 """
 
 from __future__ import annotations
@@ -268,3 +276,118 @@ def next_todo(tasks: list[RoadmapTask], phase: str | None = None) -> RoadmapTask
     for entry in filter_tasks(tasks, phase=phase, todo=True):
         return entry
     return None
+
+
+# --------------------------------------------------------------------------- #
+# The one-checkbox tick (H3.1, design §8.2)
+# --------------------------------------------------------------------------- #
+
+#: The two successful tick outcomes, recorded as ``StageRecord.artifacts["tick"]`` so the
+#: run is observable from ``state.json``/``run.log`` without reading a transcript (H3.1
+#: req 7). ``flipped`` is the real edit; ``already`` is the pinned no-op for an entry that
+#: was already ``[x]`` — a **success**, never ``skipped`` (H3.2 reserves that status for a
+#: tick withheld behind red gates).
+TICK_FLIPPED = "flipped"
+TICK_ALREADY = "already"
+
+
+class RoadmapTickError(ValueError):
+    """The tick cannot be resolved, or its postcondition does not hold (H3.1).
+
+    Every path raises rather than returning a partial answer: an unresolvable entry would
+    tick the wrong line, and a postcondition that cannot be checked must fail the stage
+    (design §10), never be reported as success.
+    """
+
+
+def tick_entry(
+    tasks: list[RoadmapTask], *, phase: str, task: str
+) -> RoadmapTask:
+    """The **one** entry matching ``(phase, task)``, or :class:`RoadmapTickError`.
+
+    Deliberately a count, not :func:`find_task`: ``find_task`` returns the first match, so
+    a duplicated ``(phase, task)`` would silently tick one of two entries (H3.1 req 5).
+    Zero matches and duplicates are both refusals, because a tick is a completion claim
+    and a wrong or ambiguous flip advances ``aidw tasks --next`` past open work.
+    """
+    matches = [
+        entry for entry in tasks if entry.phase == phase and entry.task == task
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise RoadmapTickError(
+            f"no roadmap entry matches {phase}-{task}; exactly one is required"
+        )
+    locations = ", ".join(f"{entry.file}:{entry.line}" for entry in matches)
+    raise RoadmapTickError(
+        f"{len(matches)} roadmap entries match {phase}-{task} ({locations}); "
+        "exactly one is required"
+    )
+
+
+def entry_path(root: Path, entry: RoadmapTask) -> Path:
+    """The absolute path of the roadmap file ``entry`` was parsed from.
+
+    ``entry.file`` is a basename (``parse_file`` records ``path.name``) and ``load_tasks``
+    only globs the caller's directory, so joining it to that directory reconstructs the one
+    file the stage may edit — the file the workflow hands the prompt as ``{roadmap_file}``
+    and the file whose bytes the postcondition re-reads (H3.1 req 6/req 7).
+    """
+    return (Path(root) / entry.file).resolve()
+
+
+def verify_checkbox_flip(
+    before: str, after: str, *, checkbox_id: str
+) -> str:
+    """The I7 postcondition: exactly one checkbox flipped, every other byte unchanged.
+
+    ``before`` is the roadmap file's text read before the stage ran, ``after`` the text
+    re-read from the **same** file afterwards; ``checkbox_id`` is the entry's own task id
+    without the phase prefix (``H3.1``, not the branch's ``03-H3.1``). Returns
+    :data:`TICK_FLIPPED` for the one legal edit or :data:`TICK_ALREADY` when the entry was
+    already ``[x]`` and the file is byte-identical, and raises :class:`RoadmapTickError` for
+    everything else.
+
+    The comparison is the whole line list, never a "this line now starts with ``[x]``"
+    check: that weaker shape would pass a reformat, an edited neighbour or a trailing
+    whitespace change, and a tick is a completion claim on a committed file (H3.1 traps).
+    Line endings are kept verbatim by ``splitlines(keepends=True)``, so a reflow fails.
+
+    Pure: no I/O, and neither input is mutated.
+    """
+    before_lines = before.splitlines(keepends=True)
+    after_lines = after.splitlines(keepends=True)
+    targets = [
+        (index, match)
+        for index, line in enumerate(before_lines)
+        if (match := TASK_RE.match(line)) is not None
+        and match.group(2) == checkbox_id
+    ]
+    if len(targets) != 1:
+        # The entry disappeared or was duplicated between resolution and the stage; both
+        # make the tick unverifiable, so the stage fails rather than claiming either.
+        raise RoadmapTickError(
+            f"expected exactly one `{checkbox_id}` entry before the tick, found "
+            f"{len(targets)}"
+        )
+    index, match = targets[0]
+    line = before_lines[index]
+    if match.group(1) in ("x", "X"):
+        if after_lines != before_lines:
+            raise RoadmapTickError(
+                f"`{checkbox_id}` was already `[x]`, so the file had to stay unchanged; "
+                f"line {index + 1} or a neighbour was edited"
+            )
+        return TICK_ALREADY
+
+    expected = list(before_lines)
+    expected[index] = (
+        line[: match.start(1)] + "x" + line[match.end(1) :]
+    )
+    if after_lines != expected:
+        raise RoadmapTickError(
+            f"the `{checkbox_id}` tick changed more than the `- [ ]` -> `- [x]` checkbox "
+            f"on line {index + 1}; every other byte must be unchanged"
+        )
+    return TICK_FLIPPED

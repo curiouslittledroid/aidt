@@ -9,6 +9,7 @@ I2 test                           agent tester      (fresh)
 I3 update-traceability            agent implementer (session shared)
 I4 update-architecture            agent implementer (session shared)
 I5 record-implementation-results  agent recorder    (fresh)  SYNC POINT
+I7 update-roadmap                 agent recorder    (fresh)  one checkbox, verified
 ◇  approve-implementation-pr
 I6 pr                             agent pr-publisher (fresh)
 …  any repo-added stages the repo declared before / after I6 (E4.5b)
@@ -23,7 +24,16 @@ which touch disjoint trees. Without ``--parallel``, or with a declared
 the preflight (§3.5: every member exists and is not ordered against another member); an
 invalid list is a config refusal (stderr + exit 2) before any run record or worktree.
 
-The six stages are not hardcoded here since E4.3: ``run()`` builds them with
+I7 (H3.1) is the roadmap tick: a **core** stage that resolves its one entry itself, from the
+configured ``paths.roadmap_dir``/``paths.roadmap_glob`` **after** the worktree locate (D15/D17;
+the control root is the wrong tree for a chain invocation, design K1), and renders the entry's
+own absolute file and its task id into the stage. A count other than exactly one refuses with
+exit 2 before the stage runs, and the workflow re-reads the file afterwards: exactly the target
+line may flip `- [ ]` -> `- [x]`, every other byte must be unchanged, and an already-`[x]` entry
+is a successful no-op recorded as `tick: already`. The edit stays uncommitted — I6 commits it,
+so the tick lands in the task's own PR.
+
+The seven stages are not hardcoded here since E4.3: ``run()`` builds them with
 :func:`aidw.runner.plan_stages` over the ``aidw.stage_registry`` defaults, so the target
 repo's per-stage ``prompt:`` overlay applies and the prompts resolve against the located
 worktree (EXTRACTION.md §3.5, D2/D14). The target config's two fail-closed preflight
@@ -61,7 +71,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
-from aidw import __version__, git, lock
+from aidw import __version__, git, lock, roadmap
 from aidw import stage_registry
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
@@ -76,6 +86,7 @@ from aidw.state import (
     SUCCEEDED,
     GateRecord,
     RunState,
+    StageRecord,
     create_run,
     list_runs,
     run_dir,
@@ -97,6 +108,14 @@ PARALLEL_GROUPS_PATH = "workflows.implement.parallel_groups"
 
 #: The resolved §3.4 path of the declared stage list (D12/D13, E4.5a).
 STAGES_PATH = "workflows.implement.stages"
+
+#: The roadmap-tick stage's registry **name** (H3.1). Located by name, not id: a declared
+#: stage list may carry repo-added stages, and the tick's postcondition attaches to this
+#: stage wherever it was declared.
+TICK_STAGE_NAME = "update-roadmap"
+
+#: ``StageRecord.artifacts`` key carrying the tick outcome (H3.1 req 7; additive).
+TICK_ARTIFACT_KEY = "tick"
 
 #: ``03-E4.1-prompt.md`` → phase ``03``, task ``E4.1``, branch ``03-E4.1``.
 _PROMPT_NAME = re.compile(
@@ -219,9 +238,16 @@ def derive_branch_name(pattern: str, *, phase: str, task: str) -> str | None:
 
 
 def build_plan(
-    *, aidt: Path, prompt_rel: str, branch: str, task_id: str, base_branch: str = "main"
+    *,
+    aidt: Path,
+    prompt_rel: str,
+    branch: str,
+    task_id: str,
+    base_branch: str = "main",
+    roadmap_file: str,
+    checkbox_id: str,
 ) -> list[stage_registry.PlannedStage]:
-    """The six stages, in order, exactly as the registry expands them (compat wrapper).
+    """The seven stages, in order, exactly as the registry expands them (compat wrapper).
 
     ``base_branch`` is I4's ``$2`` (``base_ref``): the architecture stage measures
     against the configured PR base, not a hardcoded ``main`` (EXTRACTION.md §3.4/R4).
@@ -234,6 +260,11 @@ def build_plan(
     prompts resolve against the target repo rather than the toolkit unconditionally.
     ``aidt`` is accepted and unused now that the plan carries prompt *names*: keeping it
     keeps every existing call site (and its ``aidt=`` argument) working.
+
+    ``roadmap_file``/``checkbox_id`` are I7's ``$1``/``$2`` (H3.1). ``expand`` renders every
+    stage from one field mapping, so a field the mapping lacks raises ``StageFieldError`` on
+    the first render; the pre-locate caller passes safe placeholders (see ``run``'s ``--from``
+    validation), because it reads only the stage names (H3.1 req 6).
     """
     return list(
         stage_registry.expand(
@@ -242,8 +273,63 @@ def build_plan(
             branch=branch,
             task_id=task_id,
             base_branch=base_branch,
+            roadmap_file=roadmap_file,
+            checkbox_id=checkbox_id,
         )
     )
+
+
+def _settle_roadmap_tick(
+    record: StageRecord,
+    *,
+    checkbox_id: str,
+    roadmap_file: Path,
+    before: str,
+    logger: RunLogger,
+    state: RunState,
+    directory: Path,
+) -> None:
+    """Verify I7's byte-exact postcondition and record which outcome happened (H3.1 req 7).
+
+    The agent's exit 0 is not evidence the write happened (design §10, the O1 precedent), so
+    the workflow re-reads the file the stage actually edited and applies
+    :func:`aidw.roadmap.verify_checkbox_flip` — exactly the target line ``- [ ]`` ->
+    ``- [x]``, every other byte unchanged; an already-``[x]`` file is a successful no-op.
+    Everything else (a neighbour edit, a reflow, a vanished or duplicated entry, an
+    unreadable file) marks the stage ``failed`` with the reason, which the caller's normal
+    failure path then reports and stops on.
+
+    The outcome is pinned observably without a transcript: ``artifacts["tick"]`` is
+    ``flipped``/``already`` on the record and one ``run.log`` line names the checkbox and the
+    outcome. ``already`` stays ``succeeded`` — ``skipped`` is H3.2's word for a tick
+    withheld behind red gates — and ``error`` stays unset on both successful paths. The
+    state is saved here because ``run_stage`` already published its own record before this
+    workflow-owned check runs. Mutates only ``record`` (and the run state it persists).
+    """
+    if record.exit_code not in (None, 0):
+        record.status = FAILED
+        record.error = (
+            "roadmap tick stage exited non-zero "
+            f"({record.exit_code}); postcondition cannot claim success"
+        )
+        logger.warn(f"stage {record.name}: {record.error}")
+        save(directory, state)
+        return
+
+    try:
+        after = roadmap_file.read_text(encoding="utf-8")
+        outcome = roadmap.verify_checkbox_flip(before, after, checkbox_id=checkbox_id)
+    except (OSError, roadmap.RoadmapTickError) as exc:
+        record.status = FAILED
+        record.error = f"roadmap tick postcondition not met: {exc}"
+        logger.warn(f"stage {record.name}: {record.error}")
+    else:
+        record.artifacts[TICK_ARTIFACT_KEY] = outcome
+        if outcome == roadmap.TICK_ALREADY:
+            logger.info(f"roadmap {checkbox_id}: already `[x]`, file unchanged")
+        else:
+            logger.info(f"roadmap {checkbox_id}: flipped `[ ]` -> `[x]`")
+    save(directory, state)
 
 
 def _read_out(record) -> str | None:
@@ -496,6 +582,11 @@ def run(
             branch=branch_name,
             task_id=task_id,
             base_branch=repo.base_branch,
+            # I7's fields cannot be resolved before the locate (the entry comes from the
+            # located tree), and this call reads only the stage *names* (H3.1 req 6): the
+            # same placeholder precedent as ``prompt_rel=""``.
+            roadmap_file="",
+            checkbox_id="",
         )
     ]
     from_index: int | None = None
@@ -521,7 +612,7 @@ def run(
             return 4
 
     # --- locate the task worktree (EXTRACTION.md §3.2, E2.6 req 1) ---------- #
-    # Inline Python, not a plan stage: I1..I6 stay the exact six stage ids (§3.5), and a
+    # Inline Python, not a plan stage: the stage ids stay the registry's own (§3.5), and a
     # refusal must leave no run state behind. ``aidw prompt`` (E2.5) created the worktree
     # and committed the task prompt inside it; implement only locates it. A missing
     # worktree is a preflight refusal (exit 4, design §14) in a real run; a dry run
@@ -544,7 +635,7 @@ def run(
             return 4
     else:
         # Re-resolve the target and agents against the worktree: agent.cwd was resolved
-        # against the control root and would silently keep I1..I6 in the wrong worktree.
+        # against the control root and would silently keep the stages in the wrong worktree.
         resolved = TargetRepo.resolve(worktree)
         target = replace(
             resolved,
@@ -584,13 +675,40 @@ def run(
             print(f"task prompt not found: {prompt_path}", file=sys.stderr)
             return 2
 
-    # The run-path plan: the registry's six stages mapped to specs through `resolve_prompt`,
-    # with the repo's `prompt:` overlay applied (E4.3). Prompts resolve against the tree the
-    # stages run in — the located worktree. A dry run with no worktree has no such tree yet,
-    # so it plans against the control root instead (the same fallback review/fix document):
-    # resolving against the planned-but-absent path would make every repo-declared `prompt:`
-    # fail closed in every dry run, a state the real run never sees.
+    # The tree every downstream read and stage uses: the located worktree, or — only for a
+    # dry run with no worktree — the control root. A dry run with no such tree yet plans
+    # against the control root (the same fallback review/fix document): resolving against the
+    # planned-but-absent path would make every repo-declared `prompt:` fail closed in every
+    # dry run, a state the real run never sees.
     plan_root = worktree_root if (worktree is not None or not dry_run) else repo.root
+
+    # --- roadmap tick target (H3.1 req 5/req 6; D15/D17) ------------------- #
+    # Resolved **after** the locate and from `plan_root`, so the entry comes from the tree
+    # the stage edits: the control root a chain invokes `implement` from is on the base
+    # branch and is the wrong tree (design K1). The two config values are the same ones
+    # `prompt.py` reads; they are joined here rather than hardcoded, so a repo that keeps
+    # its roadmap elsewhere still ticks (D15's "two readers, one source"). A count other
+    # than exactly one refuses before the stage runs: `find_task` returns the first match,
+    # so a duplicate would silently tick the wrong entry.
+    roadmap_root = (plan_root / str(resolved_config["paths.roadmap_dir"].value)).resolve()
+    try:
+        tick = roadmap.tick_entry(
+            roadmap.load_tasks(
+                roadmap_root, str(resolved_config["paths.roadmap_glob"].value)
+            ),
+            phase=phase,
+            task=task,
+        )
+    except roadmap.RoadmapTickError as exc:
+        print(f"roadmap tick refused: {exc}", file=sys.stderr)
+        return 2
+    roadmap_file = roadmap.entry_path(roadmap_root, tick)
+    # The bytes the post-stage check compares against; read before the stage runs, from the
+    # same file the stage is told to edit.
+    tick_before = roadmap_file.read_text(encoding="utf-8")
+
+    # The run-path plan: the registry's seven stages mapped to specs through `resolve_prompt`,
+    # with the repo's `prompt:` overlay applied (E4.3).
     plan = plan_stages(
         "implement",
         config=resolved_config,
@@ -600,6 +718,8 @@ def run(
         branch=branch_name,
         task_id=task_id,
         base_branch=repo.base_branch,
+        roadmap_file=str(roadmap_file),
+        checkbox_id=tick.task,
     )
     # I6 is the PR stage, located **by id** (E4.5b): a declared list may carry repo-added
     # stages before or after it, so a positional ``plan[:-1]``/``plan[-1]`` split would
@@ -711,7 +831,26 @@ def run(
             record = state.stage(name)
             return not (record is not None and record.status == SUCCEEDED)
 
-        # --- I1..I5 -------------------------------------------------------------- #
+        def settle_tick(entry: StageSpec, record: StageRecord) -> None:
+            """Apply I7's postcondition on both the serial and the parallel schedule (H3.1).
+
+            Only the tick stage has one, and only when the stage itself reported success: a
+            failed stage keeps its own error, and a ``--dry-run`` returned before either call
+            site, so no planned stage is ever verified as if it had run.
+            """
+            if entry.name != TICK_STAGE_NAME or record.status != SUCCEEDED:
+                return
+            _settle_roadmap_tick(
+                record,
+                checkbox_id=tick.task,
+                roadmap_file=roadmap_file,
+                before=tick_before,
+                logger=logger,
+                state=state,
+                directory=directory,
+            )
+
+        # --- I1..I5, I7 ----------------------------------------------------------- #
         def execute(entry: StageSpec, index: int) -> bool:
             """Run one stage unless it already succeeded; return its success."""
             if not should_run(index, entry.name):
@@ -727,6 +866,7 @@ def run(
                 agents=agents,
                 config=resolved_config,
             )
+            settle_tick(entry, record)
             print_stage(record, repo_root=target.root, prefix=entry.id)
             if record.status != SUCCEEDED:
                 print(f"stage {entry.name} failed: {record.error}", file=sys.stderr)
@@ -807,6 +947,7 @@ def run(
                     for future in as_completed(futures):
                         member = futures[future]
                         record = future.result()
+                        settle_tick(member, record)
                         print_stage(record, repo_root=target.root, prefix=member.id)
                         if record.status != SUCCEEDED:
                             print(
