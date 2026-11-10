@@ -302,6 +302,14 @@ def prompt(
     from_stage: Optional[str] = typer.Option(
         None, "--from", help="Re-run from this stage onward."
     ),
+    from_prompt: Optional[Path] = typer.Option(
+        None,
+        "--from-prompt",
+        help=(
+            "Continue a blocked run's review loop from task-review-1 with this prompt "
+            "file's content (copied over the run's canonical prompt path)."
+        ),
+    ),
     yes: bool = typer.Option(False, "--yes", help="Approve all gates."),
     skip_gates: list[str] = typer.Option(
         [], "--skip-gates", help="Gate name(s) to skip (repeatable)."
@@ -362,6 +370,7 @@ def prompt(
         max_revisions=max_revisions,
         resume=resume,
         from_stage=from_stage,
+        from_prompt=from_prompt,
         stream=bool(_state["verbose"]),
     )
     raise typer.Exit(code)

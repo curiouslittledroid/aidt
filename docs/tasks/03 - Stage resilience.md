@@ -214,7 +214,7 @@ evidence depends on it.
     check L1.1 and the predecessor check L1.2 belong to the run being resumed); the lock and the
     worktree identity are. Gates already recorded are not re-asked (design §9.3).
 
-- [ ] **H1.3. Give a blocked run a forward path** (Design 8.1, Design 9.2, Design 9.3)
+- [x] **H1.3. Give a blocked run a forward path** (Design 8.1, Design 9.2, Design 9.3)
   H1.2 recovers a *failed* run at the stage that failed. A *blocked* run is not a failure and has
   no such stage: design §9.2 sets `resume.next_stage` only when a stage fails, so a block records
   nothing to resume from. E4.3 stopped one round short with findings 5 → 4 → 2, and the reviewed
