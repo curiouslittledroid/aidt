@@ -96,13 +96,25 @@ BUCKET_MOVED = (
 #: §4.2 (iii) as the spec states it: 20 files, the union of the two tuples above.
 BUCKET_PRODUCT = (*BUCKET_RETAINED, *BUCKET_MOVED)
 
+#: Prompts added **after** the MF.2 cutover, so §4.2's 31-file inventory does not classify
+#: them. Class (iv) is their own row: `update-roadmap.md` is H3.1's core `I7` stage, a new
+#: toolkit default that is none of "ship as-is", "neutralised in E7.2" or "retained from
+#: (iii)" — back-dating it into one of those would misstate its provenance.
+POST_CUTOVER = ("update-roadmap.md",)
+
 #: Every prompt the toolkit ships, and the only files the table may list.
-TOOLKIT_PROMPTS = (*BUCKET_GENERIC, *BUCKET_MIXED, *BUCKET_RETAINED)
+TOOLKIT_PROMPTS = (
+    *BUCKET_GENERIC,
+    *BUCKET_MIXED,
+    *BUCKET_RETAINED,
+    *POST_CUTOVER,
+)
 
 EXPECTED_CLASS: dict[str, str] = {
     **{name: "i" for name in BUCKET_GENERIC},
     **{name: "ii" for name in BUCKET_MIXED},
     **{name: "iii" for name in BUCKET_RETAINED},
+    **{name: "iv" for name in POST_CUTOVER},
 }
 
 #: One action per class, as the classification table states it (owner in brackets).
@@ -110,6 +122,7 @@ ACTION_BY_CLASS = {
     "i": "ship as-is",
     "ii": "neutralised in E7.2",
     "iii": "retained and neutralised in MF.2",
+    "iv": "added after the cutover (H3.1)",
 }
 
 #: The destination cell for every class: all fourteen stay in the toolkit. The seventeen
@@ -284,7 +297,8 @@ def test_the_classification_partitions_the_specs_31_files():
     assert (len(BUCKET_GENERIC), len(BUCKET_MIXED), len(BUCKET_PRODUCT)) == (6, 5, 20)
     assert (len(BUCKET_RETAINED), len(BUCKET_MOVED)) == (3, 17)
     assert len(set(BUCKET_PRODUCT)) == len(BUCKET_PRODUCT)
-    assert len(_prompt_files()) == 14
+    # 14 files at the cutover plus H3.1's one post-cutover default.
+    assert len(_prompt_files()) == 14 + len(POST_CUTOVER) == 15
 
     classes = (set(BUCKET_GENERIC), set(BUCKET_MIXED), set(BUCKET_PRODUCT))
     # The three §4.2 buckets partition the inventory: no file is in two, none in none.
@@ -331,7 +345,7 @@ def test_each_row_states_its_class_action_and_destination():
     """Action and destination follow the class; the table states one of each per row."""
     for name, (class_cell, action, destination) in _table_rows().items():
         expected_class = EXPECTED_CLASS[name]
-        (shown,) = re.findall(r"\((i{1,3})\)", class_cell) or [""]
+        (shown,) = re.findall(r"\((iv|i{1,3})\)", class_cell) or [""]
 
         assert shown == expected_class, (
             f"{name}: classified as ({shown}), the cutover says ({expected_class})"

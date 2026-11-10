@@ -321,6 +321,7 @@ Current reality — the full inventory of stages, to be preserved exactly:
 | implement | I3 | update-traceability | implementer | update-traceability.md | **repo-specific** |
 | implement | I4 | update-architecture | implementer | update-architecture.md | **repo-specific** |
 | implement | I5 | record-implementation-results | recorder | record-implementation-results.md | mixed |
+| implement | I7 | update-roadmap | recorder | update-roadmap.md | yes (H3.1) |
 | implement | I6 | pr | pr-publisher | pr.md | mixed |
 | review | R1 | code-review | code-reviewer | code-review.md | yes |
 | review | R2 | review-findings-to-github | review-publisher | review-findings-to-github.md | yes (markers) |
@@ -332,6 +333,12 @@ Rules:
 
 - Keep the existing stage ids (`I1`…`I6`, `P1`, `R1`, `R2`) as defaults, for continuity in
   existing run artifacts and `state.json`.
+- **H3.1 amended this inventory:** `I7 update-roadmap` is a **core** stage added after `I5` and
+  before the approval gate and `I6`, on the `recorder` agent with `prompts/update-roadmap.md`. It
+  owns the one roadmap checkbox (`I3` keeps only its repo-specific artifacts and stays
+  repo-optional), so `STAGE_IDS` gains `I7` while `REPO_OPTIONAL_IDS` stays `{I3, I4}`. The
+  vocabulary decision and its prompt-fixed field names (`{roadmap_file}`/`{checkbox_id}`) are
+  recorded in `design.md` §17 (Y1).
 - Core mandatory stages (D13): implement, test, code-review, record, pr, plus Python-owned
   branch setup. The prompt workflow's author stage is core for that workflow.
 - Repo-optional stages (D13): traceability, architecture. Disabled with `enabled: false`;

@@ -12,8 +12,8 @@ fixture deliberately lacks Mythical Forge's default read-paths (``docs/tasks``,
 
 The behaviour→stage-id mapping is **prompt-fixed** (the roadmap names the behaviours, not
 their ids): ``implement`` is the only workflow with both repo-optional stages and a
-six-stage static chain, and a declared ``stages:`` list replaces the static half wholesale,
-so all six core ids are declared in registry order with I3 disabled by ``enabled: false``.
+seven-stage static chain, and a declared ``stages:`` list replaces the static half wholesale,
+so all seven core ids are declared in registry order with I3 disabled by ``enabled: false``.
 
 ============================ =================================================
 Behaviour                    Evidence in ``fixtures/target-repo``
@@ -89,6 +89,9 @@ WORKFLOW = "implement"
 PROMPT_REL = "docs/task-prompts/00-E4.7-prompt.md"
 BRANCH = "00-E4.7"
 TASK_ID = "00-E4.7"
+#: I7's two expansion fields (H3.1): the entry's own roadmap file and its task id.
+ROADMAP_FILE = "/repo/docs/tasks/03 - Extraction.md"
+CHECKBOX_ID = "E4.1"
 BASE_BRANCH = "main"
 
 
@@ -123,6 +126,8 @@ def _plan(
         branch=BRANCH,
         task_id=TASK_ID,
         base_branch=BASE_BRANCH,
+        roadmap_file=ROADMAP_FILE,
+        checkbox_id=CHECKBOX_ID,
     )
 
 
@@ -222,10 +227,10 @@ def _dry_run(
 
 
 def test_committed_config_loads_without_errors_and_plans_the_core_chain() -> None:
-    """Done-when: zero ERROR issues, and ``plan_stages`` returns I1–I6 minus I3, in order.
+    """Done-when: zero ERROR issues, and ``plan_stages`` returns I1–I7 minus I3, in order.
 
     A declared ``stages:`` list replaces the toolkit's static half wholesale (§3.4), so this
-    pins the *order* of the core half: the declaration lists all six core ids in registry
+    pins the *order* of the core half: the declaration lists all seven core ids in registry
     order and the plan keeps exactly that order minus the disabled I3. The repo-added
     stage's own presence and position are behaviour 6's check, not this one — a single
     assertion must not cover two behaviours.
@@ -260,7 +265,7 @@ def test_planning_does_not_mutate_the_resolved_config() -> None:
 
 
 def test_default_fallback_stages_resolve_to_the_toolkit_prompts() -> None:
-    """I1/I5/I6 declare no ``prompt:`` and have no shadow: they get ``<toolkit>/prompts``.
+    """I1/I5/I6/I7 declare no ``prompt:`` and have no shadow: they get ``<toolkit>/prompts``.
 
     Three ids, three literal filenames: fallback is a per-prompt rule, not one stage's
     accident (D4), and each one is asserted against its own toolkit file.
@@ -269,6 +274,7 @@ def test_default_fallback_stages_resolve_to_the_toolkit_prompts() -> None:
     expected = {
         "I1": ("impliment-task", "impliment-task.md"),
         "I5": ("record-implementation-results", "record-implementation-results.md"),
+        "I7": ("update-roadmap", "update-roadmap.md"),
         "I6": ("pr", "pr.md"),
     }
 

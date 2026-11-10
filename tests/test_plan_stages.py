@@ -60,6 +60,9 @@ BRANCH = "03-E4.1"
 TASK_ID = "03-E4.1"
 PR = 17
 MANIFEST = "artifacts/review-manifest.json"
+#: I7's two expansion fields (H3.1): the entry's own roadmap file and its task id.
+ROADMAP_FILE = "/repo/docs/tasks/03 - Extraction.md"
+CHECKBOX_ID = "E4.1"
 
 
 # --------------------------------------------------------------------------- #
@@ -103,6 +106,10 @@ def _plan(
     root: Path | None = None,
     **fields: object,
 ) -> list[StageSpec]:
+    """The run-path plan. Implement's two I7 expansion fields default here (H3.1)."""
+    if workflow == "implement":
+        fields.setdefault("roadmap_file", ROADMAP_FILE)
+        fields.setdefault("checkbox_id", CHECKBOX_ID)
     return plan_stages(
         workflow,
         config=config if config is not None else _defaults(),
@@ -167,7 +174,7 @@ def _config(workflow: str, entries: list[dict[str, object]]) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def test_implement_plan_is_the_six_registry_stages(tmp_path: Path) -> None:
+def test_implement_plan_is_the_seven_registry_stages(tmp_path: Path) -> None:
     root = _target(tmp_path)
     specs = _plan(
         "implement",
@@ -191,13 +198,15 @@ def test_implement_plan_is_the_six_registry_stages(tmp_path: Path) -> None:
          _toolkit_prompt("update-architecture.md"), [BRANCH, "develop"]),
         ("I5", "record-implementation-results", "recorder",
          _toolkit_prompt("record-implementation-results.md"), [BRANCH]),
+        ("I7", "update-roadmap", "recorder", _toolkit_prompt("update-roadmap.md"),
+         [ROADMAP_FILE, CHECKBOX_ID]),
         ("I6", "pr", "pr-publisher", _toolkit_prompt("pr.md"), [TASK_ID]),
     ]
     # The `extra` is part of the plan: I2's test context, rendered for these fields.
     assert specs[1].extra == stage_registry.TEST_CONTEXT_EXTRA.format(
         task_id=TASK_ID, branch=BRANCH, prompt_rel=PROMPT_REL
     )
-    assert [spec.extra for spec in specs if spec.id != "I2"] == [""] * 5
+    assert [spec.extra for spec in specs if spec.id != "I2"] == [""] * 6
     # A pure-defaults repo declares no overlay, so no stage carries an explicit path.
     assert all(spec.explicit_prompt is None for spec in specs)
     assert all(spec.workflow == "implement" for spec in specs)
@@ -373,7 +382,7 @@ def test_declared_prompt_sets_explicit_prompt_and_resolves_it(tmp_path: Path) ->
     assert by_id["I3"].explicit_prompt == OVERLAY_REL
     assert by_id["I3"].prompt == declared
     # Every other stage keeps the toolkit default and no explicit path.
-    for stage_id in ("I1", "I2", "I4", "I5", "I6"):
+    for stage_id in ("I1", "I2", "I4", "I5", "I7", "I6"):
         assert by_id[stage_id].explicit_prompt is None
         assert by_id[stage_id].prompt.parent == TOOLKIT.prompts_dir
 
@@ -519,8 +528,8 @@ def test_a_reordered_declared_list_raises_the_named_error(tmp_path: Path) -> Non
     assert message.startswith("error: workflows.implement.stages: ")
     assert "core stage cannot be reordered" in message
     # The declared core subsequence and the registry's core order, both named.
-    assert "declared [I2, I1, I5, I6]" in message
-    assert "registry order is [I1, I2, I5, I6]" in message
+    assert "declared [I2, I1, I5, I7, I6]" in message
+    assert "registry order is [I1, I2, I5, I7, I6]" in message
 
 
 def test_an_empty_declared_list_raises_the_named_error(tmp_path: Path) -> None:
@@ -593,7 +602,9 @@ def test_a_repo_added_stage_is_planned_in_declared_order_with_every_field(
     )
 
     # Declared order: the repo-added stage sits between I1 and I2, not appended.
-    assert [spec.id for spec in specs] == ["I1", "X9", "I2", "I3", "I4", "I5", "I6"]
+    assert [spec.id for spec in specs] == [
+        "I1", "X9", "I2", "I3", "I4", "I5", "I7", "I6"
+    ]
     added = specs[1]
     assert (added.id, added.name, added.agent_id) == ("X9", "X9", "implementer")
     # E4.6: the same three metadata fields apply to a repo-added stage, uniformly.
@@ -656,7 +667,7 @@ def test_a_repo_added_stage_shadows_by_its_declared_id(
         _config(
             "implement",
             _stage_entries(
-                "implement", added=[(6, {"id": "review-agent", "agent": "code-reviewer"})]
+                "implement", added=[(7, {"id": "review-agent", "agent": "code-reviewer"})]
             ),
         ),
     )
@@ -705,7 +716,7 @@ def test_a_disabled_repo_added_stage_is_omitted(tmp_path: Path) -> None:
         branch=BRANCH, task_id=TASK_ID,
     )
 
-    assert [spec.id for spec in specs] == ["I1", "I2", "I3", "I4", "I5", "I6"]
+    assert [spec.id for spec in specs] == ["I1", "I2", "I3", "I4", "I5", "I7", "I6"]
 
 
 def test_a_prompt_repo_added_static_stage_precedes_the_loop_portion(
@@ -839,7 +850,7 @@ def test_a_repo_optional_disabled_stage_is_omitted_with_no_warning(
         branch=BRANCH, task_id=TASK_ID,
     )
 
-    assert [spec.id for spec in specs] == ["I1", "I2", "I4", "I5", "I6"]
+    assert [spec.id for spec in specs] == ["I1", "I2", "I4", "I5", "I7", "I6"]
     assert capsys.readouterr().err == ""
 
 
@@ -969,7 +980,7 @@ def test_plan_stages_does_no_io_beyond_prompt_existence(
         "implement", prompt_rel=PROMPT_REL, branch=BRANCH, task_id=TASK_ID
     )
 
-    assert len(specs) == 6
+    assert len(specs) == 7
 
 
 def test_each_call_returns_fresh_objects(tmp_path: Path) -> None:
@@ -1005,6 +1016,8 @@ _FIELDS: dict[str, dict[str, object]] = {
         "prompt_rel": PROMPT_REL,
         "branch": BRANCH,
         "task_id": TASK_ID,
+        "roadmap_file": ROADMAP_FILE,
+        "checkbox_id": CHECKBOX_ID,
     },
     "prompt": {
         "phase": "03",

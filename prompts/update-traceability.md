@@ -1,5 +1,5 @@
 ---
-description: Update the repo's traceability artefacts for a change and flip its roadmap entry
+description: Update the repo's traceability artefacts for a change
 argument-hint: "[branch]"
 ---
 
@@ -7,8 +7,8 @@ argument-hint: "[branch]"
 
 The implementation and its contract tests are complete on the current branch. This prompt owns
 **only** the repo's traceability artefacts for the change — whatever this repo uses to prove that a
-requirement is implemented and tested — plus the one roadmap checkbox for the task. It does not
-write or change implementation code, and it does not commit, push, or open a PR.
+requirement is implemented and tested. This prompt does not write or change implementation code,
+and it does not commit, push, or open a PR.
 
 This is a focused stage so it can run as its own agent. It is mechanical but gate-touching, so
 every edit must be validated against the repo's conventions and its checkers — never papered over.
@@ -22,12 +22,11 @@ every edit must be validated against the repo's conventions and its checkers —
 | Artifact | What to update |
 |---|---|
 | The repo's traceability artefacts | The entries, statuses, references and generated views that cover the requirements this task implements — as its conventions define them |
-| `paths.roadmap_dir` | Flip the one checkbox for this task id from `- [ ]` to `- [x]` |
 
 The artefact set is the **target repo's**, named by its `aidw/conventions.md` and its root
 `AGENTS.md`; it is not fixed here, and a repo with no traceability convention has nothing for this
-stage to update beyond the roadmap checkbox. Do not invent an artefact, a status vocabulary or a
-generated file to have something to change.
+stage to update. Do not invent an artefact, a status vocabulary or a generated file to have
+something to change.
 
 Do **not** touch implementation code, unit tests, integration suites, specs, the build-results
 document (`paths.implementation_results_dir`), or the architecture documents.
@@ -60,9 +59,7 @@ document (`paths.implementation_results_dir`), or the architecture documents.
    prevent — it is never a way to make a checker pass.
 7. If this change is out of scope for an artefact the repo maintains, record that conclusion and
    its reason rather than silently omitting the entry.
-8. Flip the roadmap checkbox for this task id (`- [ ]` → `- [x]`), and only that one. If the item
-   is already checked or no unchecked entry matches the task id, leave the file alone and say so.
-9. Run the repo's traceability checks and report their real outcomes. Run each through
+8. Run the repo's traceability checks and report their real outcomes. Run each through
    `aidw gate run <key> -- <command>`, with the gates named as `pr.md` names them and the same
    `--ignore` scope `pr.md` declares, so the outcome is recorded against the tree it gated and
    `/pr` can cite it instead of re-running it:
@@ -88,7 +85,6 @@ document (`paths.implementation_results_dir`), or the architecture documents.
 - The repo's traceability checks pass, or the reason they cannot run is stated.
 - Superseded or duplicated entries this change replaces are removed rather than left contradicting
   the new ones.
-- The roadmap checkbox for this task id is flipped (or the reason it was not is stated).
 - No implementation, test or results file was modified; no commit was made.
 
 ## Final response

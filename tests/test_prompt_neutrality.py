@@ -623,8 +623,9 @@ RETAINED_DEFAULTS: Mapping[str, tuple[str, ...]] = {
 #: precisely the failure these three were rewritten to remove.
 RETAINED_KEYS: Mapping[str, tuple[str, ...]] = {
     "task-prompt.md": ("roadmap_dir", "task_prompts_dir"),
+    # H3.1 moved the roadmap checkbox to the core ``/update-roadmap`` stage, so I3 no
+    # longer names ``roadmap_dir`` at all.
     "update-traceability.md": (
-        "roadmap_dir",
         "task_prompts_dir",
         "implementation_results_dir",
     ),

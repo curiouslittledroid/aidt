@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from aidw import git, lock
+from aidw import git, lock, roadmap
 from aidw.config import ERROR, Issue
 from aidw.gates import GateOutcome
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
@@ -65,11 +65,51 @@ def _make_bare_with_control(tmp_path: Path) -> tuple[Path, Path]:
     return bare, control
 
 
+#: The roadmap file every fixture layout carries (H3.1: I7 resolves its entry from the
+#: configured ``paths.roadmap_dir``/``paths.roadmap_glob``, so a layout without one is a
+#: refusal, not a run).
+ROADMAP_REL = "docs/tasks/03 - Fixture.md"
+
+
+def _roadmap_text(task: str = "E4.1", *, checked: bool = False) -> str:
+    """A three-entry roadmap whose middle entry is ``task`` (hand-calculated fixture)."""
+    box = "x" if checked else " "
+    return (
+        "# Phase 03: Fixture phase\n"
+        "\n"
+        "## Epic E4: Fixture epic\n"
+        "\n"
+        f"- [{box}] **{task}. A fixture task** <details>\n"
+        "  Done when: the fixture task's checks pass.\n"
+        "\n"
+        "## Epic E9: Another epic\n"
+        "\n"
+        "- [ ] **E9.9. A neighbour task** <details>\n"
+        "  Done when: a neighbour changes for another task.\n"
+    )
+
+
+def _write_roadmap(
+    root: Path, task: str = "E4.1", *, checked: bool = False
+) -> Path:
+    path = root / ROADMAP_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_roadmap_text(task, checked=checked), encoding="utf-8")
+    return path
+
+
+def _task_from_prompt_name(name: str) -> str:
+    parsed = implement_workflow.parse_task_id(Path(name))
+    assert parsed is not None
+    return parsed[1]
+
+
 def _write_prompt(control: Path, name: str = "03-E4.1-prompt.md") -> Path:
     """Write the task prompt into the control worktree **uncommitted** (the real layout)."""
     prompt = control / "docs" / "task-prompts" / name
     prompt.parent.mkdir(parents=True, exist_ok=True)
     prompt.write_text("# Implement E4.1\n", encoding="utf-8")
+    _write_roadmap(control, _task_from_prompt_name(name))
     return prompt
 
 
@@ -95,6 +135,9 @@ def _make_task_worktree(
     prompt = worktree / "docs" / "task-prompts" / name
     prompt.parent.mkdir(parents=True, exist_ok=True)
     prompt.write_text("# Implement E4.1\n", encoding="utf-8")
+    # The roadmap is committed with the prompt: a real ``aidw prompt`` run commits the
+    # authored prompt in the task worktree, and I7 ticks the entry in that tree.
+    _write_roadmap(worktree, _task_from_prompt_name(name))
     _git_run(worktree, "add", ".")
     _git_run(worktree, "commit", "-qm", "task prompt")
     return worktree, prompt
@@ -137,10 +180,27 @@ class _Recorder:
         self.repo_roots: list[Path] = []
         self.fail = fail or set()
 
+    @staticmethod
+    def _flip_roadmap(spec) -> None:
+        """Do what the I7 agent is told to: flip ``$2``'s checkbox in ``$1`` (H3.1)."""
+        path = Path(spec.variables[0])
+        checkbox_id = spec.variables[1]
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            match = roadmap.TASK_RE.match(line)
+            if match and match.group(2) == checkbox_id:
+                lines[index] = line[: match.start(1)] + "x" + line[match.end(1) :]
+                break
+        path.write_text("".join(lines), encoding="utf-8")
+
     def __call__(self, spec, **kwargs):
         self.names.append(spec.name)
         self.specs.append(spec)
         self.repo_roots.append(kwargs["repo_root"])
+        if spec.name == "update-roadmap" and not kwargs.get("dry_run"):
+            # The workflow re-reads the file after the stage; a fake stage that did not
+            # edit it would (correctly) fail the postcondition.
+            self._flip_roadmap(spec)
         directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
@@ -173,13 +233,14 @@ def _write_config(control: Path, body: str) -> None:
     config.write_text(body, encoding="utf-8")
 
 
-#: The registry's implement order (I1..I6), the serial schedule.
+#: The registry's implement order (I1..I7), the serial schedule.
 DEFAULT_ORDER = [
     "impliment-task",
     "test",
     "update-traceability",
     "update-architecture",
     "record-implementation-results",
+    "update-roadmap",
     "pr",
 ]
 
@@ -230,6 +291,7 @@ def test_build_plan_order_and_agents() -> None:
     plan = implement_workflow.build_plan(
         aidt=Path("/aidt"), prompt_rel="docs/task-prompts/03-E4.1-prompt.md",
         branch="03-E4.1", task_id="03-E4.1",
+        roadmap_file="/repo/docs/tasks/03 - Extraction.md", checkbox_id="E4.1",
     )
     assert [(p.id, p.name) for p in plan] == [
         ("I1", "impliment-task"),
@@ -237,6 +299,7 @@ def test_build_plan_order_and_agents() -> None:
         ("I3", "update-traceability"),
         ("I4", "update-architecture"),
         ("I5", "record-implementation-results"),
+        ("I7", "update-roadmap"),
         ("I6", "pr"),
     ]
     assert [p.agent for p in plan] == [
@@ -244,6 +307,7 @@ def test_build_plan_order_and_agents() -> None:
         "tester",
         "implementer",
         "implementer",
+        "recorder",
         "recorder",
         "pr-publisher",
     ]
@@ -253,13 +317,15 @@ def test_build_plan_order_and_agents() -> None:
     assert plan[1].variables == () and plan[1].extra
     assert plan[2].variables == ("03-E4.1",)
     assert plan[3].variables == ("03-E4.1", "main")
-    assert plan[5].variables == ("03-E4.1",)
+    assert plan[5].variables == ("/repo/docs/tasks/03 - Extraction.md", "E4.1")
+    assert plan[6].variables == ("03-E4.1",)
 
 
 def test_build_plan_uses_the_configured_base_branch() -> None:
     plan = implement_workflow.build_plan(
         aidt=Path("/aidt"), prompt_rel="docs/task-prompts/03-E4.1-prompt.md",
         branch="03-E4.1", task_id="03-E4.1", base_branch="develop",
+        roadmap_file="/repo/docs/tasks/03 - Extraction.md", checkbox_id="E4.1",
     )
     assert plan[3].variables == ("03-E4.1", "develop")
 
@@ -319,7 +385,7 @@ def test_malformed_branch_pattern_is_usage_error_before_worktree(
 # --------------------------------------------------------------------------- #
 
 
-def test_dry_run_plans_locate_and_all_six_stages(
+def test_dry_run_plans_locate_and_all_seven_stages(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     control, prompt = _layout(tmp_path)
@@ -332,13 +398,14 @@ def test_dry_run_plans_locate_and_all_six_stages(
     )
 
     assert code == 0
-    assert recorder.names == [
-        "impliment-task",
-        "test",
-        "update-traceability",
-        "update-architecture",
-        "record-implementation-results",
-        "pr",
+    assert recorder.names == DEFAULT_ORDER
+    # H3.1 req 8: the tick stage is planned in its run position with both variables
+    # rendered from the configured roadmap — the entry's own file and its task id, not
+    # the branch form (``03-E4.1``).
+    tick = next(spec for spec in recorder.specs if spec.name == "update-roadmap")
+    assert tick.variables == [
+        str((control / ROADMAP_REL).resolve()),
+        "E4.1",
     ]
     out = capsys.readouterr().out
     command = (
@@ -362,6 +429,7 @@ def test_dry_run_plans_locate_and_all_six_stages(
         "I3 update-traceability [succeeded] (planned)",
         "I4 update-architecture [succeeded] (planned)",
         "I5 record-implementation-results [succeeded] (planned)",
+        "I7 update-roadmap [succeeded] (planned)",
         "I6 pr [succeeded] (planned)",
     ):
         assert line in out
@@ -388,6 +456,7 @@ def test_dry_run_renders_a_repo_declared_prompt_override(
         "        prompt: aidw/prompts/update-traceability.md\n"
         "      - id: I4\n"
         "      - id: I5\n"
+        "      - id: I7\n"
         "      - id: I6\n",
         encoding="utf-8",
     )
@@ -515,11 +584,12 @@ def test_base_branch_flows_through_the_whole_run(tmp_path: Path, monkeypatch) ->
     # configured base just as the PR record does, so it must not report g.txt.
     assert "g.txt" not in summaries[0]
     assert worktree == (tmp_path / "03-E4.1").resolve()
-    # The worktree branches from develop: only the committed prompt differs from develop.
-    assert git.changed_files(worktree, "develop") == [prompt_rel]
+    # The worktree branches from develop: the committed prompt and I7's uncommitted tick
+    # are the only differences (the tick stays uncommitted; I6 commits it in a real run).
+    assert git.changed_files(worktree, "develop") == [prompt_rel, ROADMAP_REL]
     # state.pr.changed_files and I4's base_ref both measure against develop.
     state = implement_workflow.list_runs(_runs_root(control))[-1]
-    assert state.pr.get("changed_files") == [prompt_rel]
+    assert state.pr.get("changed_files") == [prompt_rel, ROADMAP_REL]
     arch = next(s for s in recorder.specs if s.name == "update-architecture")
     assert arch.variables == ["03-E4.1", "develop"]
 
@@ -829,6 +899,7 @@ def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
         "update-traceability",
         "update-architecture",
         "record-implementation-results",
+        "update-roadmap",
         "pr",
     ]
 
@@ -998,6 +1069,7 @@ def test_parallel_runs_test_and_architecture_concurrently(
     assert recorder.names[3:] == [
         "update-traceability",
         "record-implementation-results",
+        "update-roadmap",
         "pr",
     ]
 
@@ -1062,7 +1134,12 @@ def test_parallel_runs_a_configured_group_instead_of_the_default_pair(
     }
     # The default pair's other member is no longer grouped: it keeps registry order and
     # runs on its own. Nothing hardcoded survived the replacement.
-    assert recorder.names[3:] == ["update-traceability", "update-architecture", "pr"]
+    assert recorder.names[3:] == [
+        "update-traceability",
+        "update-architecture",
+        "update-roadmap",
+        "pr",
+    ]
 
 
 def test_parallel_group_runs_at_its_earliest_member_not_its_first_listed(
@@ -1096,6 +1173,7 @@ def test_parallel_group_runs_at_its_earliest_member_not_its_first_listed(
     assert recorder.names[3:] == [
         "update-traceability",
         "record-implementation-results",
+        "update-roadmap",
         "pr",
     ]
 
@@ -1474,7 +1552,7 @@ def test_the_worktree_lock_is_released_on_every_exit_path(
 # --------------------------------------------------------------------------- #
 
 #: The registry's implement order (R6 ids, §3.5's inventory table).
-IMPLEMENT_STAGE_IDS = ("I1", "I2", "I3", "I4", "I5", "I6")
+IMPLEMENT_STAGE_IDS = ("I1", "I2", "I3", "I4", "I5", "I7", "I6")
 
 
 def _declared_implement_stages(disabled: set[str] | None = None) -> str:
@@ -1712,6 +1790,7 @@ def test_a_repo_added_stage_before_i6_is_scheduled_in_declared_order(
         "update-traceability",
         "update-architecture",
         "record-implementation-results",
+        "update-roadmap",
         "pr",
     ]
 
@@ -1742,6 +1821,7 @@ def test_a_repo_added_stage_before_i6_is_scheduled_in_parallel_mode(
         "X9",
         "update-traceability",
         "record-implementation-results",
+        "update-roadmap",
         "pr",
     ]
 
@@ -1905,3 +1985,300 @@ def test_a_repo_added_stage_with_an_unknown_agent_is_refused(
     assert "`X9`" in err
     assert "unknown agent `no-such-agent`" in err
     assert recorder.names == []
+
+
+# --------------------------------------------------------------------------- #
+# I7 update-roadmap: the tick stage (H3.1, design §8.2)
+# --------------------------------------------------------------------------- #
+
+
+class _NoTickStages(_Recorder):
+    """A fake stage that leaves the roadmap untouched — the "already `[x]`" agent."""
+
+    def __call__(self, spec, **kwargs):
+        if spec.name == "update-roadmap":
+            # Bypass the recorder's tick so the file stays byte-identical.
+            self.names.append(spec.name)
+            self.specs.append(spec)
+            self.repo_roots.append(kwargs["repo_root"])
+            directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
+            stages = directory / "stages"
+            stages.mkdir(parents=True, exist_ok=True)
+            out = stages / f"{spec.name}.out.txt"
+            out.write_text("ok\n", encoding="utf-8")
+            record = StageRecord(
+                name=spec.name,
+                agent=spec.agent_id,
+                model="test/model",
+                status=SUCCEEDED,
+                artifacts={"out": str(out)},
+            )
+            kwargs["state"].record_stage(record)
+            return record
+        return super().__call__(spec, **kwargs)
+
+
+class _NeighbourEditStages(_Recorder):
+    """A fake stage that flips the checkbox and edits another line too — a failed tick."""
+
+    def __call__(self, spec, **kwargs):
+        record = super().__call__(spec, **kwargs)
+        if spec.name == "update-roadmap":
+            path = Path(spec.variables[0])
+            path.write_text(
+                path.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+            )
+        return record
+
+
+def _stage_record(state, name: str) -> StageRecord:
+    record = state.stage(name)
+    assert record is not None, name
+    return record
+
+
+def test_a_repo_with_no_traceability_catalog_still_ticks(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Done-when: ``enabled: false`` on I3 no longer drops the tick (H3.1).
+
+    The fixture has no ``docs/rules-coverage/`` at all — the repo-optional traceability
+    stage is disabled — and the tick still plans, runs and lands in the roadmap.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_implement_stages({"I3"}))
+    assert not (worktree / "docs" / "rules-coverage").exists()
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-traceability" not in recorder.names
+    assert "update-roadmap" in recorder.names
+    text = (worktree / ROADMAP_REL).read_text(encoding="utf-8")
+    assert "- [x] **E4.1. A fixture task**" in text
+    # The tick's own record: succeeded (never skipped), the flipped marker, no error.
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-roadmap")
+    assert record.status == SUCCEEDED
+    assert record.artifacts.get("tick") == "flipped"
+    assert record.error is None
+    assert capsys.readouterr().err == ""
+
+
+def test_an_already_ticked_entry_is_a_successful_pinned_no_op(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H3.1 req 7: an already-``[x]`` entry is ``succeeded`` + ``tick: already``, not skipped.
+
+    Observable without a transcript: the stage record's status and its ``artifacts``
+    marker, plus one ``run.log`` line naming the checkbox and the outcome. ``skipped`` is
+    H3.2's word for a tick withheld behind red gates, so it must not appear here.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_roadmap(worktree, "E4.1", checked=True)
+    original = (worktree / ROADMAP_REL).read_text(encoding="utf-8")
+    _patch(monkeypatch)
+    monkeypatch.setattr(implement_workflow, "run_stage", _NoTickStages())
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert (worktree / ROADMAP_REL).read_text(encoding="utf-8") == original
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-roadmap")
+    assert record.status == SUCCEEDED
+    assert record.status != "skipped"
+    assert record.artifacts.get("tick") == "already"
+    assert record.error is None
+    log = (run_dir(_runs_root(control), state.run_id) / "run.log").read_text(
+        encoding="utf-8"
+    )
+    assert "roadmap E4.1: already `[x]`, file unchanged" in log
+
+
+def test_a_tick_that_edits_any_other_line_fails_the_stage(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The byte-exact postcondition is fail-closed: exit 0 from the agent is not evidence."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    monkeypatch.setattr(implement_workflow, "run_stage", _NeighbourEditStages())
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 1
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-roadmap")
+    assert record.status == FAILED
+    assert "postcondition not met" in (record.error or "")
+    assert "tick" not in record.artifacts
+    assert "pr" not in [
+        stage.name for stage in state.stages
+    ], "I6 must not run after a failed tick"
+    assert "stage update-roadmap failed" in capsys.readouterr().err
+
+
+def test_zero_matching_roadmap_entries_refuses_before_the_stage(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """H3.1 req 5: an unresolvable entry is stderr + exit 2 before any stage runs."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_roadmap(worktree, "E4.9")  # no E4.1 entry in the located tree
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(task_prompt_path=prompt, **_roots(control), approve_all=True)
+
+    assert code == 2
+    assert recorder.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    err = capsys.readouterr().err
+    assert "roadmap tick refused" in err
+    assert "no roadmap entry matches 03-E4.1" in err
+
+
+def test_a_duplicate_roadmap_entry_refuses_before_the_stage(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A duplicate must refuse, not tick the first match ``find_task`` would return."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    path = worktree / ROADMAP_REL
+    duplicate = _roadmap_text() + "- [ ] **E4.1. A duplicate** <details>\n"
+    path.write_text(duplicate, encoding="utf-8")
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(task_prompt_path=prompt, **_roots(control), approve_all=True)
+
+    assert code == 2
+    assert recorder.names == []
+    err = capsys.readouterr().err
+    assert "roadmap tick refused" in err
+    assert "2 roadmap entries match 03-E4.1" in err
+    # Nothing was ticked.
+    assert path.read_text(encoding="utf-8") == duplicate
+
+
+def test_the_tick_resolves_the_located_worktree_not_the_control_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Design K1/H3.1: the entry comes from the tree the stages run in.
+
+    The control root carries a *different* roadmap (its E4.1 already checked), so a stage
+    that read the control root would record ``already`` and leave the worktree untouched.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_roadmap(control, "E4.1", checked=True)
+    _patch(monkeypatch)
+    monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-roadmap")
+    assert record.artifacts.get("tick") == "flipped"
+    # The located worktree's file (the one the stage edited) was ticked.
+    assert "- [x] **E4.1. A fixture task**" in (
+        worktree / ROADMAP_REL
+    ).read_text(encoding="utf-8")
+
+
+def test_the_tick_uses_the_configured_roadmap_directory_and_glob(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """D15: custom roadmap paths are resolved in the located worktree, not hardcoded."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    custom = worktree / "planning" / "roadmaps" / "03 - Custom.md"
+    custom.parent.mkdir(parents=True)
+    custom.write_text(_roadmap_text(), encoding="utf-8")
+    _write_config(
+        control,
+        "schema_version: 1\n"
+        "paths:\n"
+        "  roadmap_dir: planning/roadmaps\n"
+        '  roadmap_glob: "[0-9]* - *.md"\n',
+    )
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    tick = next(spec for spec in recorder.specs if spec.name == "update-roadmap")
+    assert tick.variables == [str(custom.resolve()), "E4.1"]
+    assert "- [x] **E4.1. A fixture task**" in custom.read_text(encoding="utf-8")
+    # The default path remains untouched, proving the configured directory selected the file.
+    assert "- [ ] **E4.1. A fixture task**" in (
+        worktree / ROADMAP_REL
+    ).read_text(encoding="utf-8")
+
+
+def test_from_update_roadmap_validates_against_the_plan(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H3.1 req 8/F1: ``--from update-roadmap`` is a known name, so it re-runs from it."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    runs_dir = _runs_root(control)
+    state = create_run(
+        runs_dir, control, "implement", label="03-E4.1", branch="03-E4.1"
+    )
+    directory = run_dir(runs_dir, state.run_id)
+    for name in DEFAULT_ORDER[: DEFAULT_ORDER.index("update-roadmap")]:
+        state.record_stage(
+            StageRecord(name=name, agent="implementer", model="m", status=SUCCEEDED)
+        )
+    save(directory, state)
+
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt,
+        **_roots(control),
+        resume=True,
+        from_stage="update-roadmap",
+        approve_all=True,
+    )
+
+    assert code == 0
+    assert recorder.names[0] == "update-roadmap"
+    assert "impliment-task" not in recorder.names
+
+
+def test_a_typoed_from_name_still_refuses_with_the_known_names(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The placeholder rendering keeps the F1 refusal intact (`build_plan` threading)."""
+    control, prompt = _layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), from_stage="update-roadmpa"
+    )
+
+    assert code == 2
+    assert recorder.names == []
+    err = capsys.readouterr().err
+    assert "unknown stage `update-roadmpa`" in err
+    assert "update-roadmap" in err  # the known-names list

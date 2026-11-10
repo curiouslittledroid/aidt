@@ -271,7 +271,7 @@ evidence depends on it.
 
 ## Epic H3: One roadmap tick, one owner
 
-- [ ] **H3.1. Give the roadmap tick its own stage** (Design 8.2, EXTRACTION.md §3.5)
+- [x] **H3.1. Give the roadmap tick its own stage** (Design 8.2, EXTRACTION.md §3.5)
   I3 carries two jobs with different owners. Four of its owned artifacts —
   `docs/rules-coverage/catalog.json`, the generated `report.md`,
   `tests/integration/src/vector-matrix/vectors.ts` and `tests/integration/src/02.5-B/**` — exist

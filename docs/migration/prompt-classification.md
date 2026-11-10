@@ -16,6 +16,11 @@ Membership stays **spec-fixed**, never re-derived by grepping for product tokens
 kept `git-update.md` and `review-findings-to-github.md` in bucket (i) despite their frozen marker
 strings, and `task-prompt.md` in bucket (iii) even though it named the toolkit's own directory.
 `tests/test_prompt_classification.py` asserts both halves of that partition — the 14 files present
+Class `(iv)` is the one post-cutover addition: `update-roadmap.md`, the core `I7` stage H3.1
+added so the roadmap tick has an owner independent of the repo-optional traceability stage. It was
+not part of §4.2's 31-file inventory, so it carries its own class rather than being back-dated into
+one of the three buckets.
+
 here and the 17 that must be absent — so a prompt that is deleted, re-added, or quietly re-bucketed
 fails there rather than after the next release.
 
@@ -37,6 +42,7 @@ fails there rather than after the next release.
 | `task-prompt.md` | (iii) | retained and neutralised in MF.2 | toolkit `prompts/` |
 | `update-architecture.md` | (iii) | retained and neutralised in MF.2 | toolkit `prompts/` |
 | `update-traceability.md` | (iii) | retained and neutralised in MF.2 | toolkit `prompts/` |
+| `update-roadmap.md` | (iv) | added after the cutover (H3.1) | toolkit `prompts/` |
 
 The three retained files are the ones the default registry invokes: `task-prompt.md` is stage
 `P1` of the `prompt` workflow, and `update-traceability.md` / `update-architecture.md` are stages
