@@ -138,6 +138,16 @@ class StageRecord:
     output_tokens_per_second: float | None = None
     log: str | None = None
     rendered_prompt: str | None = None
+    #: Size of this stage's rendered prompt in **characters**, ``len(rendered)`` — the same
+    #: string written to ``prompts/<stage>.rendered.md`` (H2.1). Recorded for the ``prompt``
+    #: review loop's head stages only, on the real-run path; author/fix stages and the
+    #: ``--dry-run`` path leave it at its ``None`` default. Additive at the same
+    #: ``SCHEMA_VERSION`` (the ``stop_reason``/``attempts`` precedent above), so a
+    #: ``state.json`` written before the field still loads and a record that never set it
+    #: serialises ``rendered_chars: null``. It sits beside ``usage``'s ``input_tokens`` so
+    #: "how big was the prompt, and what did it cost in context?" is answerable from one
+    #: record.
+    rendered_chars: int | None = None
     artifacts: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
 

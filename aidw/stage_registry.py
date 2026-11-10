@@ -73,6 +73,13 @@ Deliberate, prompt-fixed choices (the task prompt left these to the implementer)
   data. ``extra`` here is the stage's *body* text; the workflow composes the pointer in
   front of it, exactly as :func:`aidw.workflows.prompt._with_evidence` does today.
 
+Since H2.1 :func:`render_delta_brief` also carries a **size contract**: its two halves are
+budgeted separately — the previous review by picking the smaller of the raw prose and the
+structured finding blocks (:func:`render_previous_review`), the diff by a hard cap
+(:data:`DELTA_BRIEF_DIFF_BUDGET_CHARS`, :func:`render_diff_section`). The contract and the
+values live here, not in ``workflows/prompt.py``, because ``_brief_diff`` also feeds
+:func:`render_reconcile`, which stays verbatim (H2.1 req 3).
+
 Since E4.4 ``implement.py`` schedules the target config's effective ``parallel_groups``
 (this default when the config does not declare the list) and runs
 :func:`validate_parallel_groups` over them in its preflight; a config's explicit ``[]``
@@ -100,6 +107,12 @@ from aidw.config import ERROR, Issue
 from aidw.findings import (
     MANIFEST_EXTRA,
     ParsedFinding,
+    # H2.1: the delta brief re-emits the previous review as the reviewer's own blocks,
+    # and ``_finding_text_block`` is that block. ``render_finding_block`` is *not* used:
+    # it wraps each block in the fixer's "Fix exactly this finding" instruction, the
+    # wrong voice for a reviewer that must resolve, not fix (H2.1 trap).
+    _finding_text_block,
+    parse_review_findings,
     render_could_fix_block,
     render_finding_block,
 )
@@ -342,6 +355,38 @@ DIFF_UNAVAILABLE = (
     "review the prompt file itself for its current state."
 )
 
+#: Hard cap on the **diff** half of a delta brief, in characters (H2.1 req 3).
+#:
+#: Measured with ``len(s)`` — the same metric as the previous-review half's
+#: smaller-representation rule — never UTF-8 bytes or lines: the roadmap counts the
+#: failure as 12,317 → 55,636 chars, and a byte count would differ for no gain.
+#: 4000 is anchored to round 1's ~12k prompt, so a budgeted brief keeps the diff a small
+#: fraction of what the reviewer already reads. The roadmap's second lever (a narrower
+#: ``--unified`` context) is deliberately **not** taken: the context width lives in the
+#: shared diff producer (``workflows/prompt.py:_brief_diff`` → ``_prompt_diff``), which also
+#: feeds the out-of-scope reconcile brief, so this registry-side cap is the diff's only
+#: lever in this task.
+DELTA_BRIEF_DIFF_BUDGET_CHARS = 4000
+
+#: Heading for the structured previous review (H2.1 req 2). ``_finding_text_block`` emits
+#: no heading of its own, so the delta brief supplies one; its exact text is unpinned, but
+#: it must not carry the fixer's voice (``render_finding_block``'s "Review finding N of M
+#: to address") — the reviewer must *resolve* findings, not fix them.
+DELTA_BRIEF_FINDINGS_LEAD = "#### Previous review findings, one block per finding"
+
+#: Note replacing an **over-budget** diff (H2.1 req 3), in :data:`DIFF_UNAVAILABLE`'s style.
+#:
+#: It is deliberately distinguishable from the could-not-produce case: it names the size
+#: as the reason, states the numeric budget and says the diff was elided, so a reviewer can
+#: tell "we could not produce it" from "we dropped it to fit" and cannot mistake it for an
+#: empty section. ``{size}`` is the diff's own ``len(s)``.
+DELTA_BRIEF_DIFF_ELIDED = (
+    "The prompt diff for this round was elided for size: the diff is {size} characters, "
+    f"over the {DELTA_BRIEF_DIFF_BUDGET_CHARS}-character delta-brief budget, so it is not "
+    "shown — neither whole nor shortened. Review the prompt file itself for its current "
+    "state and judge each finding's verdict from the file, not from an imagined diff."
+)
+
 #: Instruction prepended to the single reconcile stage after a fix batch (L3.4). E4.3
 #: deleted ``prompt.py``'s copy.
 RECONCILE_INSTRUCTION = """\
@@ -354,21 +399,103 @@ unaddressed. Do not review or re-litigate the findings; make the prompt internal
 consistent with the review."""
 
 
+#: The ``prompt`` review loop's head stage name prefix (``task-review-<n>``, H2.1 req 5).
+DELTA_BRIEF_REVIEW_STAGE_PREFIX = "task-review-"
+
+
+def is_review_stage(name: str) -> bool:
+    """True for the ``prompt`` loop's review-loop **head** stages, ``task-review-<n>`` (H2.1).
+
+    Called by :func:`aidw.runner.run_stage` to scope the ``rendered_chars`` record. It is a
+    deterministic name rule, so it lives here rather than inline at the call site: the head
+    is the only stage that carries a delta brief, and the fix/reconcile stages of the same
+    loop (``task-review-fixes-*``, ``task-review-reconcile-*``) must not match it. Derived
+    from the loop's own naming, not from a second stage list — the registry already owns
+    those names.
+    """
+    if not name.startswith(DELTA_BRIEF_REVIEW_STAGE_PREFIX):
+        return False
+    iteration = name[len(DELTA_BRIEF_REVIEW_STAGE_PREFIX) :]
+    # ``isascii`` keeps an exotic decimal (e.g. a superscript) from counting as an index.
+    return iteration.isascii() and iteration.isdigit()
+
+
+def render_previous_review(previous_review: str) -> str:
+    """The **previous-review** half of a delta brief: the smaller representation (H2.1 req 2).
+
+    The spec fixes the strategy, not a number: when the review parses cleanly into
+    findings, one :func:`aidw.findings._finding_text_block` per finding under
+    :data:`DELTA_BRIEF_FINDINGS_LEAD` is offered as a substitute for the raw prose, and it
+    is used **only when strictly smaller** — ``len(structured) < len(previous_review)``, the
+    same ``len(s)`` char metric as the diff cap (:data:`DELTA_BRIEF_DIFF_BUDGET_CHARS`),
+    never UTF-8 bytes or lines. On equality, as on any non-win, and on anything that does
+    not parse cleanly (any problem, or no findings at all), the prose is kept **verbatim** —
+    trailing whitespace included — because a review that did not parse into findings cannot
+    be re-emitted as blocks without losing text.
+
+    No finding is ever dropped: the structured rendering is built from every parsed finding,
+    and the substitution is all-or-nothing for exactly that reason. The review's non-finding
+    prose (its verdict, headings, commentary) is what the size win gives up; the verdict was
+    already consumed by the loop that routed on it, and the per-finding verdict instruction
+    (:data:`DELTA_BRIEF_INSTRUCTION`) survives in every rendering,
+    whichever representation the review itself is given in.
+
+    Pure: the caller's string is neither mutated nor written anywhere.
+    """
+    findings, problems = parse_review_findings(previous_review)
+    if problems or not findings:
+        return previous_review
+    structured = DELTA_BRIEF_FINDINGS_LEAD + "\n\n" + "\n\n".join(
+        _finding_text_block(finding) for finding in findings
+    )
+    return structured if len(structured) < len(previous_review) else previous_review
+
+
+def render_diff_section(diff: str | None) -> str:
+    """The **diff** half of a delta brief: unchanged, unavailable, or explicitly elided.
+
+    ``None`` means the workflow could not produce a diff → :data:`DIFF_UNAVAILABLE`. A diff
+    over :data:`DELTA_BRIEF_DIFF_BUDGET_CHARS` is replaced by
+    :data:`DELTA_BRIEF_DIFF_ELIDED`, never truncated to fit: a silently shortened diff reads
+    like a complete one, and a reviewer that cannot see a fix cannot verify it (H2.1 req 3).
+    An in-budget diff is returned byte-identically.
+    """
+    if diff is None:
+        return DIFF_UNAVAILABLE
+    if len(diff) > DELTA_BRIEF_DIFF_BUDGET_CHARS:
+        return DELTA_BRIEF_DIFF_ELIDED.format(size=len(diff))
+    return diff
+
+
 def render_delta_brief(*, previous_review: str, diff: str | None) -> str:
     """Assemble a later review round's ``extra`` (instruction, prior review, diff) (L2.3).
 
-    Pure: ``diff`` is the already-produced unified diff (or ``None``/unavailable, which
-    becomes :data:`DIFF_UNAVAILABLE`); producing it is the workflow's job, because only it
-    has the two prompt snapshots. Mirrors
-    :func:`aidw.workflows.prompt`'s pre-E4.3 ``_render_delta_brief`` after that function had
-    resolved its inputs, so the wording of a delta brief is unchanged by the move.
+    **Size contract (H2.1).** Both halves are budgeted *separately*, because they fail
+    differently and are fixed differently:
+
+    * **Previous review** — no hard cap. The smaller of two representations wins
+      (:func:`render_previous_review`): the reviewer's structured finding blocks when the
+      review parses cleanly into findings *and* those blocks are strictly fewer ``len(s)``
+      characters than the prose, else the prose verbatim. Every parsed finding survives
+      either way, and so does :data:`DELTA_BRIEF_INSTRUCTION`'s per-finding
+      `resolved`/`not resolved`/`newly contradicted` verdict instruction.
+    * **Diff** — a hard cap at :data:`DELTA_BRIEF_DIFF_BUDGET_CHARS` (4000) characters
+      (:func:`render_diff_section`). An over-budget diff is replaced by
+      :data:`DELTA_BRIEF_DIFF_ELIDED`, which names the size and the budget; an unavailable
+      one by :data:`DIFF_UNAVAILABLE`. Neither is ever an empty or shortened section.
+
+    Pure: no I/O, and neither input is mutated (design §15). ``diff`` is the
+    already-produced unified diff (or ``None``/unavailable); producing it is the workflow's
+    job, because only it has the two prompt snapshots. Round 1 never reaches this function —
+    the registry zeroes the ``unprimed_first`` round's brief (L2.3, H2.1 req 4) — so nothing
+    here can prime a first review. :func:`render_reconcile` is deliberately **not** budgeted:
+    it shares the workflow's diff producer and is the out-of-scope L3.4 brief.
     """
     return "\n\n".join(
         [
             DELTA_BRIEF_INSTRUCTION,
-            "### Previous review\n\n" + previous_review,
-            "### Prompt diff since that review\n\n"
-            + (diff if diff is not None else DIFF_UNAVAILABLE),
+            "### Previous review\n\n" + render_previous_review(previous_review),
+            "### Prompt diff since that review\n\n" + render_diff_section(diff),
         ]
     )
 

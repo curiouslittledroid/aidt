@@ -243,7 +243,7 @@ evidence depends on it.
 
 ## Epic H2: Bound the review context
 
-- [ ] **H2.1. Give the delta brief a size budget** (Design 8.1, Design 15)
+- [x] **H2.1. Give the delta brief a size budget** (Design 8.1, Design 15)
   L2.3's delta brief passes the previous review verbatim and the prompt diff after it, with no
   bound on either half; a six-finding round inflated the next review from 12,317 to
   55,636 chars and the stage then ended with `stop_reason: length`.

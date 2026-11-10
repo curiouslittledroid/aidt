@@ -706,6 +706,18 @@ def run_stage(
     else:
         env[REVIEW_FOLLOWUP_CONFIG_ENV_VAR] = serialize_github_config(config)
 
+    # H2.1 req 5: record the rendered prompt's size — ``len(rendered)``, the very string
+    # written to ``prompts/<stage>.rendered.md`` above — for the review loop's head stages
+    # only, and only on the real-run path. Scoped on purpose: ``run_stage`` renders and
+    # records *every* stage and also serves ``--dry-run``, so unscoped recording would put
+    # ``rendered_chars`` and its ``run.log`` line on author/fix stages and on the dry-run
+    # plan that E4.3's baseline keeps byte-identical. The field stays at its ``None``
+    # default everywhere else (an additive record serialises ``rendered_chars: null``).
+    rendered_chars = (
+        len(rendered)
+        if not dry_run and stage_registry.is_review_stage(spec.name)
+        else None
+    )
     record = StageRecord(
         name=spec.name,
         agent=agent.id,
@@ -714,6 +726,7 @@ def run_stage(
         session_id=sid,
         started_at=utcnow_iso(),
         rendered_prompt=str(rendered_path.relative_to(directory)),
+        rendered_chars=rendered_chars,
         artifacts={"prompt_source": str(spec.prompt)},
     )
     with _STATE_LOCK:
@@ -723,6 +736,10 @@ def run_stage(
     logger.section(f"stage {spec.name} ({agent.id})")
     logger.info(f"model={agent.qualified_model} session={sid}")
     logger.info(f"prompt={spec.prompt} vars={spec.variables}")
+    if rendered_chars is not None:
+        # One line, naming the stage and the size, so the operator can see a review
+        # round's prompt grow (or shrink) beside the stage's token usage (H2.1 req 5).
+        logger.info(f"stage {spec.name}: rendered prompt {rendered_chars} chars")
 
     if dry_run:
         logger.info("dry-run: not invoking Pi")
