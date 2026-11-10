@@ -220,6 +220,28 @@ def test_old_state_without_throughput_still_loads(tmp_path: Path) -> None:
     # H1.1's fields are additive on the same precedent: an older record loads as None.
     assert loaded.stages[0].stop_reason is None
     assert loaded.stages[0].attempts is None
+    # H2.1's additive field follows the same old-state contract.
+    assert loaded.stages[0].rendered_chars is None
+
+
+def test_rendered_chars_round_trips_without_a_schema_bump(tmp_path: Path) -> None:
+    """H2.1: the review prompt size is additive and survives state persistence."""
+    run = create_run(tmp_path, tmp_path, "prompt", label="rendered-chars")
+    run.record_stage(
+        StageRecord(
+            name="task-review-2",
+            agent="task-reviewer",
+            model="m",
+            rendered_chars=12345,
+            usage={"input_tokens": 193},
+        )
+    )
+    save(tmp_path / run.run_id, run)
+
+    loaded = load(tmp_path / run.run_id)
+    assert loaded.schema_version == state.SCHEMA_VERSION
+    assert loaded.stages[0].rendered_chars == 12345
+    assert loaded.stages[0].usage == {"input_tokens": 193}
 
 
 def test_stage_retry_fields_round_trip_without_a_schema_bump(tmp_path: Path) -> None:

@@ -1314,9 +1314,14 @@ def test_second_round_gets_delta_brief_with_previous_review_and_diff(
     extra = _extra_for(seen, "task-review-2")
     for token in ("`resolved`", "`not resolved`", "`newly contradicted`"):
         assert token in extra
-    # The previous review is passed verbatim, and only then does the diff follow.
+    # H2.1: the previous review is re-emitted as the reviewer's structured blocks, which
+    # is the smaller representation, so its *non-finding* prose (headings, verdict, and
+    # this fixture's round marker) is not carried. Every finding is, and only then does
+    # the diff follow.
     assert "The deliverable leaves a stale path reference." in extra
-    assert "<!-- review round 1 -->" in extra
+    assert stage_registry.DELTA_BRIEF_FINDINGS_LEAD in extra
+    assert "<!-- review round 1 -->" not in extra
+    assert "Fix exactly this finding" not in extra
     assert extra.index("## Delta brief") < extra.index("### Previous review")
     assert extra.index("### Previous review") < extra.index("### Prompt diff")
     # A genuine unified diff for the fix round-1 marker, under stable header paths and
@@ -1334,6 +1339,32 @@ def test_second_round_gets_delta_brief_with_previous_review_and_diff(
     assert "/tmp/" not in extra[extra.index("### Prompt diff") :]
 
 
+def test_over_budget_fix_diff_is_explicitly_elided_in_the_next_review(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H2.1: the real prompt-loop wiring names an over-budget diff instead of shortening it."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=2)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+    over = "diff --git a/baseline/prompt.md b/current/prompt.md\n" + "+" * 8000
+    monkeypatch.setattr(prompt_workflow, "_brief_diff", lambda **_kwargs: over)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    extra = _extra_for(seen, "task-review-2")
+    note = stage_registry.DELTA_BRIEF_DIFF_ELIDED.format(size=len(over))
+    assert note in extra
+    assert "elided" in extra and "for size" in extra
+    assert str(stage_registry.DELTA_BRIEF_DIFF_BUDGET_CHARS) in extra
+    assert over not in extra
+    assert "diff --git" not in extra
+    # The explicit replacement is materially smaller than carrying the same diff through.
+    assert len(extra) < len(extra.replace(note, over))
+
+
 def test_third_round_diff_reflects_only_the_previous_fix_batch(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1348,9 +1379,13 @@ def test_third_round_diff_reflects_only_the_previous_fix_batch(
 
     assert code == 0
     extra = _extra_for(seen, "task-review-3")
-    # Round 2's review, not round 1's.
-    assert "<!-- review round 2 -->" in extra
+    # Round attribution is proven by the diff, not by the review text: since H2.1 a
+    # parseable review renders as its structured finding blocks, and this fixture's two
+    # rounds produce identical findings, so the round-markers (non-finding prose) are not
+    # carried into the brief at all. The fix-batch diff below is round 2's net effect.
+    assert "<!-- review round 2 -->" not in extra
     assert "<!-- review round 1 -->" not in extra
+    assert stage_registry.DELTA_BRIEF_FINDINGS_LEAD in extra
     # Only the round-2 marker is an addition; round 1's marker is at most context.
     assert "+<!-- fix round 2 -->" in extra
     assert "+<!-- fix round 1 -->" not in extra
@@ -1381,18 +1416,25 @@ def test_delta_brief_temp_directories_are_removed(
 def test_delta_brief_preserves_previous_review_verbatim(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The prior review is carried byte-for-byte, including meaningful whitespace.
+    """The delta brief carries the previous review — through the *smaller* rendering.
 
-    Since E4.3 the wording is the registry's (``render_delta_brief``); this workflow only
-    produces the diff it embeds, so the two are exercised together here.
+    Re-baselined by H2.1 (the name is L2.3's old promise): the previous review is carried
+    byte-for-byte only when it does not parse into findings, or when its structured blocks
+    are not strictly smaller. When the parse is clean and the blocks win, the brief carries
+    the reviewer's own blocks instead — every finding survives, and the per-finding
+    resolution instruction is still there to be answered. Since E4.3 the wording is the
+    registry's (``render_delta_brief``); this workflow only produces the diff it embeds, so
+    the two are exercised together here.
     """
     baseline = "prompt\n"
     current = "prompt\n<!-- fix round 1 -->\n"
-    previous_review = "Review text with trailing spaces  \n"
-
     diff = prompt_workflow._prompt_diff(
         baseline, current, name="03-E4.1-prompt.md"
     )
+
+    # The old promise, which still holds for a review that does not parse into findings:
+    # the prose is carried with its meaningful trailing whitespace intact.
+    previous_review = "Review text with trailing spaces  \n"
     brief = stage_registry.render_delta_brief(
         previous_review=previous_review, diff=diff
     )
@@ -1401,6 +1443,24 @@ def test_delta_brief_preserves_previous_review_verbatim(
     assert "+<!-- fix round 1 -->" in brief
     assert "### Previous review" in brief
     assert "### Prompt diff since that review" in brief
+
+    # H2.1's substitute: a parseable, verbose review renders as one block per finding.
+    brief = stage_registry.render_delta_brief(
+        previous_review=TASK_REVIEW_CHANGES, diff=diff
+    )
+    assert stage_registry.DELTA_BRIEF_FINDINGS_LEAD in brief
+    assert TASK_REVIEW_CHANGES not in brief
+    for title in (
+        "The deliverable leaves a stale path reference.",
+        "The prompt is silent on matrix coverage.",
+        "The annotations contradict the import strategy.",
+    ):
+        assert title in brief
+    for token in ("`resolved`", "`not resolved`", "`newly contradicted`"):
+        assert token in brief
+    # The reviewer's voice, not the fixer's, and the diff still follows the review.
+    assert "Fix exactly this finding" not in brief
+    assert brief.index("### Previous review") < brief.index("### Prompt diff")
 
 
 def test_unparseable_previous_review_still_primes_the_next_round(

@@ -1005,3 +1005,111 @@ def test_run_stage_forwards_retry_transient_false(tmp_path: Path, monkeypatch) -
     )
 
     assert captured["retry_transient"] is False
+
+
+# --------------------------------------------------------------------------- #
+# The rendered prompt size on a review stage (H2.1 req 5)
+# --------------------------------------------------------------------------- #
+# ``run_stage`` renders and records *every* stage and also serves ``--dry-run``, so the
+# record is scoped explicitly: only the ``prompt`` review loop's head stages
+# (``task-review-<n>``, ``aidw.stage_registry.is_review_stage``) record ``rendered_chars``
+# and print the ``run.log`` line, and only on the real-run path.
+
+
+def _run_named_stage(tmp_path: Path, monkeypatch, name: str, *, dry_run: bool = False):
+    """Run one stage named ``name`` with a faked Pi invocation; return (record, state, log)."""
+    agents, _ = load_all(toolkit_root(), repo_root())
+    monkeypatch.setattr(
+        runner_mod,
+        "execute",
+        lambda *args, **kwargs: PiResult(
+            exit_code=0,
+            session_id="s",
+            final_message="ok",
+            usage=Usage(cost_usd=0.01, input_tokens=193, output_tokens=16),
+            duration_seconds=0.1,
+            event_count=1,
+            tool_calls=0,
+            tool_errors=0,
+            stop_reason="end_turn",
+            stderr="",
+            timed_out=False,
+            attempts=1,
+            jsonl_path="",
+            out_path=None,
+        ),
+    )
+    run = create_run(tmp_path, repo_root(), "prompt", label="rendered-chars")
+    logger = RunLogger(tmp_path / run.run_id)
+    record = run_stage(
+        StageSpec(
+            name=name,
+            agent_id="task-reviewer",
+            prompt=_noop_prompt(),
+            variables=[],
+            extra="## Delta brief\n\nsome brief text\n",
+        ),
+        repo_root=repo_root(),
+        toolkit_root=toolkit_root(),
+        state=run,
+        logger=logger,
+        agents=agents,
+        dry_run=dry_run,
+        runs_root=tmp_path,
+    )
+    directory = tmp_path / run.run_id
+    rendered = (directory / "prompts" / f"{name}.rendered.md").read_text(encoding="utf-8")
+    log = (directory / "run.log").read_text(encoding="utf-8")
+    saved = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+    return record, rendered, saved, log
+
+
+def test_a_review_stage_records_the_rendered_prompt_size(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H2.1 req 5: ``len(rendered)`` lands in the record beside ``usage.input_tokens``."""
+    record, rendered, saved, log = _run_named_stage(tmp_path, monkeypatch, "task-review-2")
+
+    assert record.rendered_chars == len(rendered)
+    assert record.rendered_chars is not None and record.rendered_chars > 0
+    # The state.json record carries the size and the tokens it should be read beside.
+    stage = next(item for item in saved["stages"] if item["name"] == "task-review-2")
+    assert stage["rendered_chars"] == len(rendered)
+    assert stage["usage"]["input_tokens"] == 193
+    # One run.log line, naming the stage and the size.
+    line = f"stage task-review-2: rendered prompt {len(rendered)} chars"
+    assert line in log
+    assert log.count("rendered prompt") == 1
+
+
+def test_author_and_fix_stages_do_not_record_the_rendered_size(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H2.1 req 5: only review-loop heads record; author and fix stages record neither."""
+    for name in ("task-prompt", "task-review-fixes-1-1", "task-review-reconcile-1"):
+        record, rendered, saved, log = _run_named_stage(tmp_path, monkeypatch, name)
+        assert rendered  # the stage really was rendered
+        assert record.rendered_chars is None, name
+        stage = next(item for item in saved["stages"] if item["name"] == name)
+        # The additive field serialises as null — not omitted, not a number.
+        assert stage["rendered_chars"] is None, name
+        assert "rendered prompt" not in log, name
+
+
+def test_the_dry_run_path_records_neither_the_size_nor_the_line(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H2.1 req 4/5: a dry run of a review stage leaves the field null and logs no line.
+
+    This is what keeps ``--dry-run`` output byte-identical to the pre-H2.1 plan: the
+    record still gains the additive key (null), and nothing is printed.
+    """
+    record, _rendered, saved, log = _run_named_stage(
+        tmp_path, monkeypatch, "task-review-1", dry_run=True
+    )
+
+    assert record.status == SUCCEEDED
+    assert record.rendered_chars is None
+    stage = next(item for item in saved["stages"] if item["name"] == "task-review-1")
+    assert stage["rendered_chars"] is None
+    assert "rendered prompt" not in log

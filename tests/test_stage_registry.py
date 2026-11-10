@@ -23,6 +23,7 @@ import ast
 import builtins
 import inspect
 import itertools
+import random
 from collections.abc import Collection, Sequence
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -31,7 +32,14 @@ import pytest
 
 from aidw import stage_registry as registry
 from aidw.config import ERROR
-from aidw.findings import MANIFEST_EXTRA, ParsedFinding
+# H2.1: the delta brief re-emits the reviewer's own block (``_finding_text_block``), never
+# ``render_finding_block`` whose "Fix exactly this finding" instruction is the fixer's voice.
+from aidw.findings import (
+    MANIFEST_EXTRA,
+    ParsedFinding,
+    _finding_text_block,
+    parse_review_findings,
+)
 from aidw.stage_registry import (
     BRIEF_DELTA,
     BRIEF_RECONCILE,
@@ -325,6 +333,395 @@ def test_delta_brief_degrades_to_the_unavailable_note() -> None:
     assert registry.DIFF_UNAVAILABLE in rendered
     assert "The prompt diff for this round is unavailable" in rendered
     assert "diff --git" not in rendered
+
+
+# --------------------------------------------------------------------------- #
+# The delta brief's size contract (H2.1, roadmap H2.1)
+# --------------------------------------------------------------------------- #
+#
+# The previous-review half has **no hard cap**: the smaller of two representations wins,
+# measured with ``len(s)`` on the exact strings compared (strictly smaller, so equality
+# keeps the prose). The diff half has a hard cap (``DELTA_BRIEF_DIFF_BUDGET_CHARS``) and an
+# over-budget diff becomes an explicit elision note. The sizes the roadmap counts are
+# **chars**, never bytes or lines, so every expectation below is a ``len`` of a string.
+
+#: The E4.5 failure run's round-1 prompt size and its inflated round-2 size (roadmap H2.1).
+ROUND_ONE_PROMPT_CHARS = 12_317
+FAILURE_RUN_ROUND_TWO_CHARS = 55_636
+
+#: The prompt-fixed round-2 acceptance bound (H2.1: the spec fixes no total number; 24,000
+#: clears the budgeted ceiling and sits under half the failure run's 55,636).
+ROUND_TWO_ACCEPTANCE_CHARS = 24_000
+
+#: Pinned property-test parameters: ``hypothesis`` is not a dependency (AGENTS.md, design
+#: §15), so the property run is a seeded sample and ``numRuns`` is an explicit constant.
+DELTA_BRIEF_PROPERTY_SEED = 41_210
+DELTA_BRIEF_PROPERTY_NUM_RUNS = 120
+
+
+#: A review shaped like a real one: headings, fenced finding blocks, a verdict section.
+MULTI_FINDING_REVIEW = """\
+## What I verified
+
+The prompt's assumptions hold.
+
+## Findings
+
+```text
+Priority: Should fix
+Confidence: 4
+What I found: The deliverable leaves a stale path reference.
+Why it matters: A reviewer lands on a missing file.
+Trigger and effect: After the rename the pointer is dead.
+Where: docs/task-prompts/00-E4.1-prompt.md, Deliverables.
+Suggested fix: Add the path update to the deliverables.
+```
+
+```text
+Priority: Should fix
+Confidence: 3
+What I found: The prompt is silent on matrix coverage.
+Why it matters: A convention-mandated check is skipped silently.
+Trigger and effect: The implementer omits the matrix review.
+Where: docs/task-prompts/00-E4.1-prompt.md, requirement 7.
+Suggested fix: Add one line recording the out-of-scope decision.
+```
+
+```text
+Priority: Could fix
+Confidence: 2
+What I found: The annotations contradict the import strategy.
+Why it matters: Minor compile churn or diff noise.
+Trigger and effect: The implementer picks either strategy.
+Where: docs/task-prompts/00-E4.1-prompt.md, Deliverables vs requirement 4.
+Suggested fix: Pick one consumer-import strategy and align them.
+```
+
+## Verdict
+
+Request changes — two should-fix items remain.
+"""
+
+
+#: A review that is *only* a fenced finding block: the structured rendering adds the lead
+#: line, so blocks are not strictly smaller and the prose must win.
+BARE_BLOCK_REVIEW = _finding_text_block(
+    ParsedFinding(
+        priority="should-fix",
+        confidence=4,
+        what_found="A stale path.",
+        why_it_matters="The reviewer lands nowhere.",
+        trigger_and_effect="After the rename.",
+        where="docs/x.md",
+        suggested_fix="Update the path.",
+    )
+)
+
+
+def _expected_blocks(review: str) -> str:
+    """The structured rendering the contract describes, built from the parsed findings."""
+    findings, problems = parse_review_findings(review)
+    assert problems == []
+    assert findings
+    return registry.DELTA_BRIEF_FINDINGS_LEAD + "\n\n" + "\n\n".join(
+        _finding_text_block(finding) for finding in findings
+    )
+
+
+def test_delta_brief_renders_structured_findings_when_strictly_smaller() -> None:
+    """H2.1 req 2: a parseable review whose blocks are smaller renders the blocks.
+
+    Every finding survives, the reviewer's voice is kept (no fixer instruction anywhere),
+    and the per-finding resolution instruction is still there to be answered.
+    """
+    expected = _expected_blocks(MULTI_FINDING_REVIEW)
+    # The premise of this fixture: the structured rendering is the smaller representation.
+    assert len(expected) < len(MULTI_FINDING_REVIEW)
+
+    rendered = registry.render_delta_brief(
+        previous_review=MULTI_FINDING_REVIEW, diff="diff --git a/x b/x\n"
+    )
+
+    assert expected in rendered
+    assert MULTI_FINDING_REVIEW not in rendered
+    # No finding is dropped by the substitution, and no fixer voice leaks in.
+    assert "Fix exactly this finding" not in rendered
+    assert "Review finding " not in rendered
+    for excerpt in (
+        "The deliverable leaves a stale path reference.",
+        "The prompt is silent on matrix coverage.",
+        "The annotations contradict the import strategy.",
+    ):
+        assert excerpt in rendered
+    for token in ("`resolved`", "`not resolved`", "`newly contradicted`"):
+        assert token in rendered
+    # The section heading is still the delta brief's, not the fixer's.
+    assert "### Previous review\n\n" + registry.DELTA_BRIEF_FINDINGS_LEAD in rendered
+
+
+def test_delta_brief_keeps_prose_verbatim_when_blocks_are_not_smaller() -> None:
+    """H2.1 req 2: a bare block review renders prose; the blocks would add characters."""
+    expected = _expected_blocks(BARE_BLOCK_REVIEW)
+    assert len(expected) >= len(BARE_BLOCK_REVIEW)
+
+    rendered = registry.render_delta_brief(previous_review=BARE_BLOCK_REVIEW, diff=None)
+
+    assert "### Previous review\n\n" + BARE_BLOCK_REVIEW in rendered
+    assert registry.DELTA_BRIEF_FINDINGS_LEAD not in rendered
+
+
+def test_delta_brief_keeps_prose_on_a_len_equal_tie() -> None:
+    """H2.1 req 2: the win is **strict**, so an exact ``len`` tie keeps the prose.
+
+    The fixture is the bare-block review (whose blocks are the *larger* representation),
+    padded with unparseable prose until the two lengths are exactly equal — the padding
+    cannot change the structured rendering, because it parses into no finding.
+    """
+    expected = _expected_blocks(BARE_BLOCK_REVIEW)
+    padding = len(expected) - len(BARE_BLOCK_REVIEW)
+    assert padding > 0
+    padded = BARE_BLOCK_REVIEW + "\n" + "x" * (padding - 1)
+    assert len(padded) == len(expected)
+    assert _expected_blocks(padded) == expected
+
+    rendered = registry.render_delta_brief(previous_review=padded, diff=None)
+
+    assert "### Previous review\n\n" + padded in rendered
+    assert registry.DELTA_BRIEF_FINDINGS_LEAD not in rendered
+
+
+def test_delta_brief_keeps_an_unparseable_review_verbatim_with_whitespace() -> None:
+    """H2.1 req 2: a review that does not parse into findings is never re-emitted.
+
+    Trailing whitespace is meaningful evidence of "this is the bytes we were given", so
+    the fallback is byte-for-byte, not stripped.
+    """
+    unparseable = "Priority: Urgent\nConfidence: 9\nWhat I found: broken  \n\n\n"
+    assert parse_review_findings(unparseable)[1]
+
+    rendered = registry.render_delta_brief(previous_review=unparseable, diff=None)
+
+    assert unparseable in rendered
+    assert registry.DELTA_BRIEF_FINDINGS_LEAD not in rendered
+
+
+def test_an_over_budget_diff_is_replaced_by_the_elision_note() -> None:
+    """H2.1 req 3: an over-budget diff is elided behind a named note, never truncated."""
+    over = "diff --git a/x b/x\n" + "+" * 8000
+    assert len(over) > registry.DELTA_BRIEF_DIFF_BUDGET_CHARS
+
+    rendered = registry.render_delta_brief(
+        previous_review=MULTI_FINDING_REVIEW, diff=over
+    )
+
+    # The pinned tokens: the word, the reason, and the numeric budget value.
+    assert "elided" in rendered
+    assert "for size" in rendered
+    assert str(registry.DELTA_BRIEF_DIFF_BUDGET_CHARS) in rendered
+    assert str(len(over)) in rendered
+    # Not the could-not-produce note, and no silently shortened diff.
+    assert registry.DIFF_UNAVAILABLE not in rendered
+    assert "diff --git" not in rendered
+    assert registry.DELTA_BRIEF_DIFF_ELIDED.format(size=len(over)) in rendered
+
+
+def test_an_in_budget_diff_renders_unchanged() -> None:
+    """H2.1 req 3: the cap is a ceiling, not a tightening — an in-budget diff is intact."""
+    at_cap = "diff --git a/x b/x\n" + "+" * (
+        registry.DELTA_BRIEF_DIFF_BUDGET_CHARS - len("diff --git a/x b/x\n")
+    )
+    assert len(at_cap) == registry.DELTA_BRIEF_DIFF_BUDGET_CHARS
+
+    rendered = registry.render_delta_brief(previous_review="r", diff=at_cap)
+
+    assert "### Prompt diff since that review\n\n" + at_cap in rendered
+    assert "elided" not in rendered
+
+
+def test_diff_budget_counts_characters_not_utf8_bytes() -> None:
+    """H2.1 req 3: the roadmap's cap is ``len(s)`` characters, not encoded bytes."""
+    at_cap = "é" * registry.DELTA_BRIEF_DIFF_BUDGET_CHARS
+    over_cap = at_cap + "é"
+
+    assert len(at_cap.encode("utf-8")) > registry.DELTA_BRIEF_DIFF_BUDGET_CHARS
+    assert registry.render_diff_section(at_cap) == at_cap
+    assert "elided" in registry.render_diff_section(over_cap)
+
+
+def test_the_delta_brief_helpers_are_pure_and_do_no_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H2.1 req 1/2/3: pure helpers — no I/O, no mutation of the caller's strings."""
+    monkeypatch.setattr(builtins, "open", _explode)
+    monkeypatch.setattr(Path, "read_text", _explode)
+    monkeypatch.setattr(Path, "write_text", _explode)
+
+    review = MULTI_FINDING_REVIEW
+    over = "diff --git a/x b/x\n" + "+" * 8000
+    before_review, before_diff = review, over
+
+    assert registry.render_previous_review(review) == _expected_blocks(review)
+    assert registry.render_diff_section(over) == registry.DELTA_BRIEF_DIFF_ELIDED.format(
+        size=len(over)
+    )
+    assert registry.render_diff_section(None) == registry.DIFF_UNAVAILABLE
+    assert registry.render_diff_section("diff --git a/x b/x\n") == "diff --git a/x b/x\n"
+    assert registry.render_delta_brief(previous_review=review, diff=over)
+
+    assert review == before_review
+    assert over == before_diff
+
+
+def test_is_review_stage_names_only_the_prompt_loops_review_heads() -> None:
+    """H2.1 req 5: the rendered-size record is scoped to ``task-review-<n>`` heads."""
+    for name in ("task-review-1", "task-review-2", "task-review-12"):
+        assert registry.is_review_stage(name)
+    for name in (
+        "task-prompt",
+        "task-review-fixes-1-1",
+        "task-review-fixes-2",
+        "task-review-reconcile-1",
+        "task-review-",
+        "task-review-1x",
+        "task-review-1-1",
+        "code-review",
+        "impliment-task",
+        "",
+    ):
+        assert not registry.is_review_stage(name), name
+
+
+def _e45_shape_review(count: int = 6) -> str:
+    """The E4.5 shape: ``count`` findings inside a realistically verbose review.
+
+    The narrative around the blocks is what makes the structured rendering the *smaller*
+    representation — the roadmap's premise that findings are cheaper than the prose the
+    reviewer wrapped them in (~2k of blocks against a much longer review).
+    """
+    blocks = []
+    for index in range(1, count + 1):
+        blocks.append(
+            "```text\n"
+            "Priority: Should fix\n"
+            "Confidence: 4\n"
+            f"What I found: Requirement {index} names a file the prompt never lists.\n"
+            "Why it matters: The stage stops or invents a path.\n"
+            f"Trigger and effect: A round reads requirement {index} alone.\n"
+            f"Where: docs/task-prompts/00-E4.5-prompt.md, req {index}.\n"
+            "Suggested fix: Name the file in the deliverables.\n"
+            "```"
+        )
+    return (
+        "## What I verified\n\n"
+        "I read the roadmap entry, the cited spec sections and the whole prompt, then re-read\n"
+        "every requirement against the phase's non-goals and the repository's gates. The\n"
+        "prompt's assumptions about the toolkit hold and every deliverable is reachable.\n\n"
+        f"I then walked the {count} findings below one at a time, in review order.\n\n"
+        "## Findings\n\n"
+        + "\n\n".join(blocks)
+        + "\n\n## Verdict\n\nRequest changes — six should-fix items remain.\n"
+    )
+
+
+def test_six_findings_plus_a_capped_diff_stay_under_the_round_two_bound() -> None:
+    """H2.1's hand-calculated size check on the E4.5 shape (six findings).
+
+    Round 1's 12,317-char prompt plus the budgeted brief must land under the prompt-fixed
+    24,000-char bound — the failure run's 55,636 is the "before" — and the six structured
+    blocks are ~2k, not the 40k+ the raw review prose carried.
+    """
+    review = _e45_shape_review()
+    assert len(parse_review_findings(review)[0]) == 6
+    blocks = _expected_blocks(review)
+    assert 1_500 < len(blocks) < 2_500, len(blocks)
+    # The structured rendering is the smaller representation for this shape, so the
+    # budgeted brief carries the blocks, not the verbose prose.
+    assert len(blocks) < len(review)
+
+    diff = "diff --git a/p b/p\n" + "+" * (
+        registry.DELTA_BRIEF_DIFF_BUDGET_CHARS - len("diff --git a/p b/p\n")
+    )
+    brief = registry.render_delta_brief(previous_review=review, diff=diff)
+    assert blocks in brief
+    assert review not in brief
+    round_two = "x" * ROUND_ONE_PROMPT_CHARS + brief
+
+    assert len(round_two) < ROUND_TWO_ACCEPTANCE_CHARS
+    assert len(round_two) < FAILURE_RUN_ROUND_TWO_CHARS
+    # And the elision is why a fix-batch-sized diff cannot blow the bound: the same
+    # fixture with the diff left uncapped is measurably larger.
+    uncapped = registry.DELTA_BRIEF_INSTRUCTION + "\n\n" + blocks + "\n\n" + (
+        "+" * 40_000
+    )
+    elided = registry.render_delta_brief(
+        previous_review=review, diff="+" * 40_000
+    )
+    assert len(elided) < len(uncapped)
+    assert len(elided) < len(brief) + registry.DELTA_BRIEF_DIFF_BUDGET_CHARS
+
+
+def test_delta_brief_size_property_holds_for_generated_reviews() -> None:
+    """Property (seeded, ``numRuns`` pinned above): the contract holds on every sample.
+
+    For each generated ``(review, diff)`` the rendering obeys exactly one of the two
+    previous-review promises — the structured blocks when they parse cleanly and are
+    strictly smaller, the prose verbatim otherwise — never drops a finding, always carries
+    the resolution instruction, and never emits an over-budget diff section. The sample is
+    the seed: same seed + same count => same cases on every machine.
+    """
+    rng = random.Random(DELTA_BRIEF_PROPERTY_SEED)
+    structured_used = verbatim_used = 0
+    for index in range(DELTA_BRIEF_PROPERTY_NUM_RUNS):
+        count = rng.randint(1, 8)
+        review = _e45_shape_review(count)
+        if rng.random() < 0.5:
+            # Strip the narrative, which flips the win to the *prose*: a review that is
+            # little more than its blocks is not re-emitted as (larger) blocks.
+            review = review[review.index("## Findings") :]
+        if rng.random() < 0.25:
+            review = review + "\n" + "noise " * rng.randint(0, 200)
+        if rng.random() < 0.25:
+            # A malformed finding makes the parse fail closed, so the prose must survive.
+            review = review.replace("Confidence: 4", "Confidence: 9", 1)
+        diff = (
+            None
+            if rng.random() < 0.15
+            else "d" * rng.choice([0, 1, registry.DELTA_BRIEF_DIFF_BUDGET_CHARS,
+                                   registry.DELTA_BRIEF_DIFF_BUDGET_CHARS + 1, 9_000])
+        )
+
+        findings, problems = parse_review_findings(review)
+        blocks = (
+            registry.DELTA_BRIEF_FINDINGS_LEAD
+            + "\n\n"
+            + "\n\n".join(_finding_text_block(f) for f in findings)
+            if findings and not problems
+            else None
+        )
+        rendered = registry.render_delta_brief(previous_review=review, diff=diff)
+
+        if blocks is not None and len(blocks) < len(review):
+            assert blocks in rendered, index
+            structured_used += 1
+        else:
+            assert "### Previous review\n\n" + review in rendered, index
+            verbatim_used += 1
+        for token in ("`resolved`", "`not resolved`", "`newly contradicted`"):
+            assert token in rendered, index
+        if diff is None:
+            assert registry.DIFF_UNAVAILABLE in rendered, index
+            assert "was elided for size" not in rendered, index
+        elif len(diff) > registry.DELTA_BRIEF_DIFF_BUDGET_CHARS:
+            assert registry.DELTA_BRIEF_DIFF_ELIDED.format(size=len(diff)) in rendered
+            assert diff not in rendered
+        else:
+            assert "### Prompt diff since that review\n\n" + diff in rendered, index
+        assert rendered == registry.render_delta_brief(
+            previous_review=review, diff=diff
+        ), index
+
+    # The sweep is only meaningful if both promises are actually exercised.
+    assert structured_used and verbatim_used, (structured_used, verbatim_used)
 
 
 def test_reconcile_brief_is_instruction_review_and_combined_diff() -> None:
