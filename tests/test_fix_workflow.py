@@ -986,6 +986,26 @@ def test_a_converged_run_ticks_the_box_once_and_records_true(
     assert "flipped `[ ]` -> `[x]`" in log
 
 
+def test_a_converged_fix_leaves_the_roadmap_edit_uncommitted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H3.3 req 6: the fix workflow never owns a commit, even after ticking."""
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    roadmap_file = _write_roadmap(worktree)
+    _git_run(worktree, "add", str(roadmap_file.relative_to(worktree)))
+    _git_run(worktree, "commit", "-qm", "roadmap baseline")
+    before_head = _git_run(worktree, "rev-parse", "HEAD").stdout.strip()
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    monkeypatch.setattr(fix_workflow, "run_stage", _FakeStages())
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
+
+    assert _git_run(worktree, "rev-parse", "HEAD").stdout.strip() == before_head
+    status = _git_run(worktree, "status", "--porcelain", "--", str(roadmap_file)).stdout
+    assert status.startswith(" M ")
+    assert roadmap_file.read_text(encoding="utf-8") == _roadmap_text(done=True)
+
+
 def test_a_tick_stage_that_does_not_flip_fails_closed(
     tmp_path: Path, monkeypatch
 ) -> None:

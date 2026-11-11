@@ -44,52 +44,52 @@
 
 ### Top-level verification
 
-Commands are this repo's own, taken from its root `AGENTS.md` ("Gates — run exactly these, and only these"). There is no `aidw/conventions.md` in this target repo and no lint/formatter/type-checker is configured (AGENTS.md "Tests"; design §15). Gate commands ran through `aidw gate run <key>` with the workflow's declared ignore scope `--ignore docs/implementation-results --ignore docs/architecture --ignore docs/tasks --ignore docs/task-prompts`.
+Commands are this repo's own, taken from its root `AGENTS.md` ("Gates — run exactly these, and only these"). There is no `aidw/conventions.md` in this target repo and no lint/formatter/type-checker is configured (AGENTS.md "Tests"; design §15). Gate commands ran through `aidw gate run <key>` with the workflow's declared ignore scope `--ignore docs/implementation-results --ignore docs/architecture --ignore docs/tasks --ignore docs/task-prompts`. All gates below were re-run against the committed tree by the review-follow-up fix for issue #151 (the record stage's original `suite` outcome was a stale red — see Deviations).
 
 | Step | Command | Result |
 |------|---------|--------|
-| Install | `uv sync --frozen` | ✅ Pass (`Checked 19 packages in 0.62ms`) |
+| Install | `uv sync --frozen` | ✅ Pass (`Checked 19 packages in 1ms`) |
 | Build | `uv build --out-dir <tmp>/dist` (gate `build`) | ✅ Pass — built `aidt-1.1.1.tar.gz` and `aidt-1.1.1-py3-none-any.whl` |
-| Test | `uv run --frozen pytest` (gate `suite`) | ❌ Fail (`1 failed, 2035 passed in 46.91s`; failing test `tests/test_fix_workflow.py::test_a_newest_implement_run_without_task_falls_back_to_the_branch_pattern`) |
-| Doctor | `uv run --frozen aidw doctor` (gate `doctor`) | ✅ Pass (`21 checks: 0 failed, 2 warning(s)`) |
+| Test | `uv run --frozen pytest` (gate `suite`) | ✅ Pass (`2036 passed in 42.18s`) |
+| Doctor | `uv run --frozen aidw doctor` (gate `doctor`) | ✅ Pass (`21 checks: 0 failed, 1 warning(s)`) |
 | Agents validate | `uv run --frozen aidw agents validate --strict` (gate `agents`) | ✅ Pass (`11 agent config(s): 0 error(s), 0 warning(s)`) |
 | Prompts check | `uv run --frozen aidw prompts check` (gate `prompts`) | ✅ Pass (`resolved repo prompts: 0 error(s), 0 warning(s)`) |
 | Whitespace | `git diff --check` | ✅ Pass (exit 0, no output) |
 | Lint | — | n/a — this repo configures no linter (AGENTS.md: "pytest is the only verification") |
 
-Gate origins for the rows above (recorded by this run, tree `40412cf9e573`, scope excludes `docs/architecture, docs/implementation-results, docs/task-prompts, docs/tasks`):
+Gate origins for the rows above (re-recorded by the review-follow-up fix for issue #151, tree `962a6da23ca0`, scope excludes `docs/architecture, docs/implementation-results, docs/task-prompts, docs/tasks`):
 
-- `build` — passed at `2026-11-10T22:44:08Z`, stage `record-implementation-results`.
-- `suite` — **failed** at `2026-11-10T22:44:58Z`, stage `record-implementation-results` (`1 failed, 2035 passed in 46.91s`).
-- `doctor` — passed at `2026-11-10T22:45:02Z`, stage `record-implementation-results`.
-- `agents` — passed at `2026-11-10T22:45:02Z`, stage `record-implementation-results`.
-- `prompts` — passed at `2026-11-10T22:45:03Z`, stage `record-implementation-results`.
+- `build` — passed at `2026-11-10T23:02:31Z`, stage `iter1-fix-next-review-followup`.
+- `suite` — passed at `2026-11-10T23:03:18Z`, stage `iter1-fix-next-review-followup` (`2036 passed in 42.18s`).
+- `doctor` — passed at `2026-11-10T23:03:24Z`, stage `iter1-fix-next-review-followup`.
+- `agents` — passed at `2026-11-10T23:03:24Z`, stage `iter1-fix-next-review-followup`.
+- `prompts` — passed at `2026-11-10T23:03:25Z`, stage `iter1-fix-next-review-followup`.
+- `smoke` — passed at `2026-11-10T23:03:38Z`, stage `iter1-fix-next-review-followup` (`tests/test_fix_workflow.py::test_a_newest_implement_run_without_task_falls_back_to_the_branch_pattern`: `1 passed in 8.06s`).
 
 ### `uv run --frozen pytest` (full suite)
 
-Rows are derived from the single full-gate invocation above; no second run was bought for this document.
+The full-suite row is derived from the single full-gate invocation above; no second suite run was bought for this document. The focused row cites the recorded `smoke` gate (a single-test invocation).
 
 | Test selection | Tests | Result |
 |----------------|-------|--------|
-| Full suite | 2036 | ❌ Fail (`1 failed, 2035 passed in 46.91s`) |
-| `tests/test_fix_workflow.py::test_a_newest_implement_run_without_task_falls_back_to_the_branch_pattern` | 1 | ❌ Fail — the newest `implement` run has `task={}`, but `resolve_roadmap_target` returned the older run's `H3.1` target (`roadmap_file=None`, reason "no roadmap entry matches 03-H3.1") instead of falling back to the `03-H3.3` branch and resolving the roadmap entry. |
+| Full suite | 2036 | ✅ Pass (`2036 passed in 42.18s`) |
+| `tests/test_fix_workflow.py::test_a_newest_implement_run_without_task_falls_back_to_the_branch_pattern` | 1 | ✅ Pass (`1 passed in 8.06s`, gate `smoke`) — the newest `implement` run has `task={}`, and `resolve_roadmap_target` falls back to the `03-H3.3` branch pattern and resolves the roadmap entry (`roadmap_file` set, `("03", "H3.3")`) instead of keeping the older run's `H3.1` task. |
 
 ### Task-specific verification gates
 
 | Gate | Status |
 |------|--------|
-| `tests/test_stage_registry.py`: `post_loop` exists, `expand("fix", …)` emits the shared `I7` only on request, shared object identity, `stage`/`stages_by_id` find the post-loop id, `validate_stage_list("fix", …)` classifies `I7` as core | ✅ Pass — no failures from this module appear in the single run's failure list (`2035 passed` overall) |
-| `tests/test_fix_workflow.py`: green tick once, `roadmap_ticked`, once-per-run records, stopped/empty runs skip with reasons, no-roadmap-entry exits 0, branch-pattern reversal on non-default and ambiguous patterns | ❌ Fail — one test (`test_a_newest_implement_run_without_task_falls_back_to_the_branch_pattern`) failed; the remaining tests in the module passed. |
+| `tests/test_stage_registry.py`: `post_loop` exists, `expand("fix", …)` emits the shared `I7` only on request, shared object identity, `stage`/`stages_by_id` find the post-loop id, `validate_stage_list("fix", …)` classifies `I7` as core | ✅ Pass — no failures from this module appear in the single run's failure list (`2036 passed` overall) |
+| `tests/test_fix_workflow.py`: green tick once, `roadmap_ticked`, once-per-run records, stopped/empty runs skip with reasons, no-roadmap-entry exits 0, branch-pattern reversal on non-default and ambiguous patterns | ✅ Pass — no failures from this module appear in the single run's failure list (`2036 passed` overall) |
 | `tests/test_plan_stages.py`: re-baselined fix plan, three-way split, declared `[A1, I7]` acceptance, missing/reordered `I7` refusal | ✅ Pass — no failures from this module appear in the single run's failure list |
 | `tests/test_run_workflow.py`: `prompt-to-fix` chain leaves the roadmap entry `[x]` exactly once | ✅ Pass — no failures from this module appear in the single run's failure list |
-| `aidw fix --pr <n> --dry-run` plans `update-roadmap` once in final position without evaluating evidence | ❌ **unverified** — no real PR/branch context and live `gh` workflow state were available in this recording session; the plan-level assertion is covered by the stage-registry/fix workflow tests, but the hand-run CLI check itself was not executed. |
+| `aidw fix --pr <n> --dry-run` plans `update-roadmap` once in final position without evaluating evidence | ✅ Pass — hand-run as `uv run --frozen aidw fix --pr 149 --dry-run` (exit 0) in a clean clone of the committed tree, because the active fix run holds this worktree's one-run lock: it resolved `branch: 03-H3.3`, planned the loop stages, printed `update-roadmap [succeeded] (planned) agent=recorder (after the loop, only when this run's evidence is green)` exactly once, in the final position, and ended `dry-run complete; Pi not invoked, no GitHub state written` — no evidence evaluated, no tick. |
 
 ---
 
 ## Deviations observed during recording
 
-- **The `suite` gate is red** — `uv run --frozen pytest` produced `1 failed, 2035 passed in 46.91s`. The failure is recorded here rather than fixed, because this stage does not change implementation code or tests. It is a real product gap in `fix`'s task-id fallback: when the newest `implement` run exists but has no usable `state.task`, the resolver kept the older run's task instead of reversing the branch pattern.
-- **`--dry-run` was not hand-run** — the check needs a real PR number and `gh` state, so it is marked unverified rather than simulated.
+- **The record stage's `suite` outcome was a stale red** — the original recording measured `uv run --frozen pytest` before the task-id fallback was corrected during development (`1 failed, 2035 passed`, tree `40412cf9e573`) and described a live product gap in `fix`'s task-id fallback. On the committed tree that gap does not exist: `_recorded_task_identity` falls through to the branch-pattern resolver when the newest `implement` run has no usable `state.task`, the named test passes, and the full suite is `2036 passed` (tree `962a6da23ca0`). Found in review (issue #151); every gate above was re-run against the committed tree and this document now records the real green outcomes.
 - **Roadmap entry remains `- [ ]`** — this recording stage only writes its results document; ticking the roadmap belongs to the update-roadmap stage.
 
 ---
