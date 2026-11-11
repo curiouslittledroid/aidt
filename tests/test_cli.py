@@ -180,6 +180,18 @@ def test_run_chain_rejects_unknown_name() -> None:
     assert "prompt-to-fix" in result.stderr
 
 
+def test_run_chain_accepts_allow_incomplete_prereqs() -> None:
+    """H13: the ordering override L1.2's refusal names must exist on `aidw run` too.
+
+    A chain runs `prompt` first, so its preflight's "re-run with
+    `--allow-incomplete-prereqs`" advice is only actionable if the chain accepts it.
+    """
+    result = runner.invoke(app, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--allow-incomplete-prereqs" in result.stdout
+
+
 def test_doctor_runs(fake_external_clis: None) -> None:  # noqa: ARG001
     result = runner.invoke(app, ["doctor"])
     # Unknown environment issues are warnings; doctor fails only on FAIL checks.

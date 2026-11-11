@@ -195,6 +195,7 @@ def task_to_pr(
     strict: bool = False,
     dry_run: bool = False,
     parallel: bool = False,
+    allow_incomplete_prereqs: bool = False,
     stream: bool = False,
 ) -> int:
     code = prompt_workflow.run(
@@ -210,6 +211,10 @@ def task_to_pr(
         gate_default=gate_default,
         strict=strict,
         dry_run=dry_run,
+        # L1.2's ordering gate belongs to the prompt stage, so the chain must forward the
+        # operator's override to it; without this, a chain that is told the preflight may
+        # be overridden still refuses with a message the chain's own CLI cannot satisfy.
+        allow_incomplete_prereqs=allow_incomplete_prereqs,
         stream=stream,
     )
     if code != 0:
@@ -327,6 +332,7 @@ def prompt_to_fix(
     parallel: bool = False,
     force_model: bool = False,
     max_iterations: int = fix_workflow.DEFAULT_MAX_ITERATIONS,
+    allow_incomplete_prereqs: bool = False,
     stream: bool = False,
 ) -> int:
     """Run the whole cycle: prompt → implement → review → approve-followups → fix.
@@ -353,6 +359,9 @@ def prompt_to_fix(
         gate_default=gate_default,
         strict=strict,
         dry_run=dry_run,
+        # See `task_to_pr`: L1.2's predecessor gate lives in the prompt stage, so the
+        # chain forwards the override instead of making the operator drop out of it.
+        allow_incomplete_prereqs=allow_incomplete_prereqs,
         stream=stream,
     )
     if code != 0:

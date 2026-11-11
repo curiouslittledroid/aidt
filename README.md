@@ -630,6 +630,7 @@ aidw run       task-to-pr <phase> <epic> <task> | prompt-to-fix <phase> <epic> <
               [--dry-run] [--yes] [--strict] [--parallel] [--force-model]
               [--max-iterations N] [--skip-gates ...]
               [--gate-default approve|deny] [--deny-gates ...]
+              [--allow-incomplete-prereqs]
 aidw tasks     [--todo] [--phase NN] [--epic X] [--next]
 aidw agents    list | show <id> | validate
 aidw runs      list | show <id> | resume <id>

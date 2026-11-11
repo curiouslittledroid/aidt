@@ -101,6 +101,78 @@ def test_task_to_pr_stops_when_prompt_fails(tmp_path: Path, monkeypatch) -> None
     assert called == []
 
 
+def test_task_to_pr_forwards_allow_incomplete_prereqs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H13: the chain must forward L1.2's ordering override to the prompt stage.
+
+    The refusal text the prompt preflight prints names `--allow-incomplete-prereqs`; if
+    the chain dropped it, `aidw run task-to-pr …` would offer a flag its own CLI rejects.
+    """
+    _init_repo(tmp_path)
+    forwarded: list[bool] = []
+    monkeypatch.setattr(
+        run_workflow.prompt_workflow,
+        "run",
+        lambda **kwargs: forwarded.append(kwargs["allow_incomplete_prereqs"]) or 1,
+    )
+    repo, aidt, workspace = _roots(tmp_path)
+    code = run_workflow.task_to_pr(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        repo=repo,
+        aidt=aidt,
+        workspace=workspace,
+        allow_incomplete_prereqs=True,
+    )
+    assert code == 1
+    assert forwarded == [True]
+
+
+def test_task_to_pr_does_not_authorise_out_of_order_by_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The chain forwards an *override*: the default stays `False`, so nothing widens."""
+    _init_repo(tmp_path)
+    forwarded: list[bool] = []
+    monkeypatch.setattr(
+        run_workflow.prompt_workflow,
+        "run",
+        lambda **kwargs: forwarded.append(kwargs["allow_incomplete_prereqs"]) or 1,
+    )
+    repo, aidt, workspace = _roots(tmp_path)
+    run_workflow.task_to_pr(
+        phase="03", epic="E4", task="E4.1", repo=repo, aidt=aidt, workspace=workspace
+    )
+    assert forwarded == [False]
+
+
+def test_prompt_to_fix_forwards_allow_incomplete_prereqs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """H13 for the full cycle: `prompt-to-fix` reaches `prompt` first, so it forwards it."""
+    _init_repo(tmp_path)
+    forwarded: list[bool] = []
+    monkeypatch.setattr(
+        run_workflow.prompt_workflow,
+        "run",
+        lambda **kwargs: forwarded.append(kwargs["allow_incomplete_prereqs"]) or 4,
+    )
+    repo, aidt, workspace = _roots(tmp_path)
+    code = run_workflow.prompt_to_fix(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        repo=repo,
+        aidt=aidt,
+        workspace=workspace,
+        allow_incomplete_prereqs=True,
+    )
+    assert code == 4
+    assert forwarded == [True]
+
+
 def test_task_to_pr_resolves_prompt_inside_the_located_worktree(
     tmp_path: Path, monkeypatch
 ) -> None:

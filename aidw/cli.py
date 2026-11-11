@@ -532,6 +532,14 @@ def run_chain(
         help="Accept the author==judge model warning in review/fix (review-and-fix, prompt-to-fix).",
     ),
     max_iterations: int = typer.Option(10, "--max-iterations"),
+    allow_incomplete_prereqs: bool = typer.Option(
+        False,
+        "--allow-incomplete-prereqs",
+        help=(
+            "task-to-pr/prompt-to-fix: forward to the prompt stage's own flag — author "
+            "even when earlier tasks in the same phase file are unticked."
+        ),
+    ),
 ) -> None:
     """Run a convenience chain of workflows.
 
@@ -560,6 +568,7 @@ def run_chain(
             strict=strict,
             dry_run=dry_run,
             parallel=parallel,
+            allow_incomplete_prereqs=allow_incomplete_prereqs,
             stream=bool(_state["verbose"]),
         )
     elif workflow == "prompt-to-fix":
@@ -583,6 +592,7 @@ def run_chain(
             parallel=parallel,
             force_model=force_model,
             max_iterations=max_iterations,
+            allow_incomplete_prereqs=allow_incomplete_prereqs,
             stream=bool(_state["verbose"]),
         )
     elif workflow == "review-and-fix":
