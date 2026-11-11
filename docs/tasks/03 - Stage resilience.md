@@ -11,6 +11,14 @@ roadmap tick. It does **not** change the loop's convergence rules (Phase 02), mo
 the shape of `prompt`/`review`/`approve`; `implement`'s chain becomes seven stages and `fix`
 gains one after its loop, both for the tick alone.
 
+Epic **H4** was appended after H0–H3 shipped. H2.1 made the delta brief small enough to fit the
+context; its structured previous-review rendering then made the brief's own dialect look like new
+findings to the loop's parser, and a correct `Approve` was read as a self-contradiction. It is a
+separate epic rather than `H2.2` because H2's subject is the brief's **size** and the defect is the
+brief's **dialect**: the convergence rules, the reviewer prompts and the verdict vocabulary are
+untouched, and only the report's machine-readable shape changes. Its two tasks split by what each
+must prove on its own — the format AIDW emits, and the strictness of the reader that consumes it.
+
 ## Evidence: the runs this phase is derived from
 
 Every E4 prompt run so far, each on its own branch worktree:
@@ -78,6 +86,50 @@ Its fifteen stages and $2.11 are unreachable by any supported path — although 
 this outcome (`Request changes` at the budget, exit 3) an intended one that will keep recurring —
 and the only recovery is a blind re-roll whose first stage re-authors the prompt file the review
 was about.
+
+### The mis-read approval, in detail
+
+`20261111T203253Z-03.1-B8-prompt` (Mythical Forge, 2026-11-11) is the first run this phase would
+have lost to a **correct** report. X1 had done its job — the round-2 prompt was 18,581 chars,
+well inside the 24,000-char acceptance bound — and the reviewer answered exactly what the delta
+brief asked: one `## Previous-review resolutions` entry per finding, each `resolved`, no new
+findings, `Verdict: Approve`.
+
+| | round 1 | round 2 |
+|---|---|---|
+| rendered prompt | 12,523 chars | 18,581 chars |
+| findings the loop parsed | 4 (3 should-fix, 1 could-fix) | **4 (3 should-fix, 1 could-fix)** |
+| malformed finding blocks reported | 0 | **20** |
+| verdict | `Request changes` | **`Approve`** |
+| outcome | one fix stage per finding + reconcile | **blocked: "approved but reported 3 blocking finding(s)"** |
+
+It reproduced the shape the brief had handed it:
+
+```text
+Priority: should-fix
+Confidence: 5
+What I found (previous): …
+Resolution verdict: resolved
+```
+
+`findings._collect_blocks` opens a new finding at **every** `Priority:` line in the message
+(`aidw/findings.py:119`), and `render_previous_review` (`aidw/stage_registry.py:454`) is what
+re-emitted those blocks into the brief — so the reviewer's echo of AIDW's own dialect became four
+"findings" whose required fields can never parse (`What I found (previous)` is not the
+`What I found` label). Three of them read as `should-fix`, and M2's guard
+(`workflows/prompt.py:2645`) fires **before** the `problems`/`unparseable` path at `:2749`, so the
+operator is told the reviewer contradicted itself while the truth is that the parser did.
+
+Re-parsing the saved artifacts reproduces both halves: `task-review-1.out.txt` →
+`findings=4, problems=0`; `task-review-2.out.txt` → `findings=4, problems=20`, all four blocks
+empty and all four from the resolutions section. The run is `blocked` with $0.54 of completed work
+and the reviewed prompt uncommitted — H1.3's forward path doing its job for a failure that never
+happened.
+
+Reach: `review` and `fix` already fail closed on `problems` *before* publishing a manifest
+(`workflows/review.py:488`, `workflows/fix.py:1237`), and `_finding_text_block` reaches a prompt
+only through `render_previous_review`, so the mis-read is confined to `prompt` rounds after the
+first and to a prompt run's `--resume` fix cycle, which re-parses the same review.
 
 ## Gate: do not start before these are known
 
@@ -390,6 +442,133 @@ evidence depends on it.
     iteration's cost, and the stage records its decision either way. Depends on H3.1 (the stage)
     and H3.2 (the condition).
 
+## Epic H4: A review AIDW mis-reads
+
+The loop's findings parser and the delta brief's finding rendering are two halves of one wire
+format, and X1 made them disagree: AIDW *emits* the parser's block dialect to the reviewer and asks
+for a verdict on each block, so a correct answer comes back wearing that dialect. Two tasks, split
+by what each one proves on its own. **H4.1** gives the brief's previous-review half a dialect that
+cannot be read back as findings, so the loop never sees the phantom. **H4.2** makes an incomplete
+block a problem instead of a finding and makes an approving review that did not parse say so, so the
+*next* dialect AIDW hands a reviewer cannot become a mis-read either. Neither depends on the other:
+H4.1's replay passes with the parser untouched, and H4.2's echo-shape assertions are driven from a
+hand-written review rather than from H4.1's rendering, so the two can ship in either order. The epic
+owns no convergence change: M2 still stops a genuine `Approve` that reports a `must-fix` or
+`should-fix` finding, L2.3's per-finding resolution requirement is preserved, and `review`/`fix` keep
+failing closed on `problems` before they publish anything.
+
+- [ ] **H4.1. A delta brief must never read back as findings** (Design 8.1, Design 15, Design 17)
+  `render_previous_review` (`stage_registry.py:454`) re-emits each prior finding through
+  `findings._finding_text_block` — the **reviewer's** block dialect, `Priority:` first — while
+  `DELTA_BRIEF_INSTRUCTION` asks for a per-finding verdict *on those blocks*. A reviewer that answers
+  per finding, as `20261111T203253Z-03.1-B8-prompt`'s round 2 did, therefore writes `Priority:` lines
+  back, and the loop reads four findings with empty bodies, three of them `should-fix`. H4.2 is the
+  task that turns that shape into a truthful failure; this one removes it.
+  - Deliverable: give the two halves distinct dialects. In `aidw/findings.py`, add a **delta-brief**
+    rendering of one prior finding — a stable per-finding id (`F1`, `F2`, … in review order) and
+    field lines that cannot open a block (no line the block-opening label accepts) — leaving
+    `_finding_text_block`/`render_finding_block` untouched for the fix stages that need the
+    reviewer's own format. In `aidw/stage_registry.py`, have `render_previous_review` emit that
+    rendering and `DELTA_BRIEF_INSTRUCTION` name the required answer form (`F<n>: resolved | not
+    resolved | newly contradicted`), so the three L2.3 verdict words and "before any new finding"
+    survive verbatim; X1's size contract is unchanged — structured still wins only when strictly
+    smaller — and round 1 stays unprimed. The parser and the approve path are **not** touched here.
+    Amend design §8.1's delta-brief paragraph to state which dialect each half uses, and record the
+    decision as **AA1** in §17.
+  - Done when: the structural invariant holds as a round trip — `parse_review_findings` over
+    `render_delta_brief`'s own previous-review half returns **no** findings and **no** problems, for
+    a review of any size, including one whose findings are shorter than the prose around them;
+    replaying the `03.1-B8` round-2 shape (four prior findings, one resolutions entry each,
+    `Verdict: Approve`, no new findings) approves the prompt, records `findings=0`, and commits it —
+    not `blocked`; every `F<n>` in a brief maps to exactly one prior finding, in review order, no
+    duplicates and none invented; the round-2 prompt for a six-finding review stays under the
+    24,000-char X1 bound with no finding dropped by the substitution; the prose-verbatim, `len` tie,
+    elision and round-1-unprimed behaviours are unchanged and `--dry-run` for `prompt` stays
+    byte-identical; `test_approve_with_blocking_findings_fails_closed` passes unmodified; and the
+    diff touches neither `aidw/findings.py:parse_review_findings` nor the approve path.
+  - Tests: `tests/test_stage_registry.py` — `_expected_blocks` re-pointed at the new renderer, the
+    round-trip invariant, and a pin that no line of the rendered previous-review half can open a
+    block, with the strictly-smaller/tie/verbatim/property tests carried over unchanged;
+    `tests/test_prompt_workflow.py` — the replayed round-2 shape (approve-and-commit), plus the
+    unmodified M2 test as the convergence pin.
+  - Notes: rejected — a target-repo `aidw/prompts/task-review.md` override that forbids the labels in
+    a resolutions section: it fixes one repo's wording, leaves the class for every other target, and
+    forks a generic contract that `aidw prompts check` resolves but never diffs against the default,
+    so the fork goes stale silently; the repo-side fix is a `requires_toolkit` floor once this
+    ships. Rejected — a section-boundary heuristic keyed on the reviewer's own headings ("stop
+    collecting at `## Previous-review resolutions`"): the heading is the model's prose, not a
+    contract, a renamed heading re-opens the hole, and the boundary must live in the format AIDW
+    emits (the phase's non-goals say the same). Rejected — drop the per-finding resolution
+    instruction (L2.3): it exists to stop re-litigation of resolved findings, and a brief whose
+    prior findings are un-answerable is H2.1's problem again. Rejected — quote the prior blocks
+    verbatim as a blockquote instead of rendering them differently: it sits one edit away from a
+    `Priority:` line again and re-inflates the brief X1 shrank. Not a defect: the reviewer's report
+    and its verdict were both correct.
+
+- [ ] **H4.2. An incomplete finding block is a problem, not a finding** (Design 8.1, Design 8.3, Design 10, Design 15, Design 17)
+  Two independent gates let an unparseable block reach the loop as evidence. `parse_review_findings`
+  appends every block it collected to `findings` while separately listing that block's missing
+  fields as `problems`, so `partition_findings` counts a block whose body never parsed but whose
+  `Priority:` line did; and the `prompt` approve path tests `blocking` (`workflows/prompt.py:2645`)
+  before `problems`/`unparseable` (`:2749`), so the run reports a self-contradiction the report never
+  contained. In `20261111T203253Z-03.1-B8-prompt`'s round 2, four empty blocks produced 20 problems
+  and the operator was told "approved but reported 3 blocking finding(s)" — while `review`/`fix` on
+  the same text would have refused to publish ("could not build a findings manifest"). H4.1 removes
+  today's trigger; this task makes the next one truthful instead of misleading.
+  - Deliverable: `aidw/findings.py` — yield a `ParsedFinding` **only** for a complete block: a valid
+    `priority`, a `confidence` in 0–5, and all five `STRING_FIELDS` non-empty. Anything else
+    contributes only a `problem`, keeping today's message wording and naming the block index (`F<n>`)
+    and the offending field; `findings_summary` therefore counts complete findings only. No
+    section-boundary heuristic is added (the phase's non-goals and H4.1's Notes carry the reason):
+    where a reviewer's findings end is prose, not a contract. `aidw/workflows/prompt.py` — an
+    `Approve` that arrives with `problems` fails closed **before** the blocking partition: exit 3,
+    the same `denied`/`review-loop` gate record, the reviewer's report on stderr, the prompt
+    uncommitted, and a message naming the unparseable blocks and their count — never a
+    blocking-finding count. The gate `detail` gains the parse-problem count beside the findings
+    count (additive text at the same `schema_version`; the existing `findings=<n>/<n>` field is
+    unchanged). A `Request changes` or `Blocked` verdict with `problems` keeps today's path — the
+    verdict already decided the round, and the whole-review fallback fix stage (`unparseable=True`)
+    is its rework. M2's contradictory-`Approve` branch is untouched for genuinely parsed blocking
+    findings. `review`/`fix` are not changed: they already fail closed on `problems` before
+    publishing (`review.py:488`, `fix.py:1237`), and completeness only narrows what a manifest can
+    contain. One interaction to state rather than discover: `render_previous_review`'s "parses
+    cleanly (no problems)" rule now falls back to prose for a review with one incomplete block,
+    which widens X1's safe fallback and narrows nothing. Amend design §8.1's M2 paragraph and §10's
+    findings-parsing row, and record the decision as **AB1** in §17.
+  - Done when: the `03.1-B8` echo shape (four `Priority:`/`Confidence:`/`What I found (previous)`
+    blocks) parses to `findings=0, problems=20`, exits 3, and its message names the unparseable
+    blocks and that count while printing "blocking finding(s)" nowhere; a review with one complete
+    `must-fix` and one incomplete block yields exactly one finding and one problem, and an `Approve`
+    over it still exits 3 — with the unparseable message, not the contradiction; an `Approve` whose
+    only findings are complete `could-fix` entries still approves, exactly as today; a `Request
+    changes` with an incomplete block still runs the whole-review fallback fix stage and records the
+    complete findings' count; a complete review produces the same findings, the same fix stages and
+    the same gate detail apart from the added parse count;
+    `test_approve_with_blocking_findings_fails_closed` and
+    `test_approve_with_only_could_fix_findings_is_still_an_approval` pass unmodified; and
+    `review`/`fix` publish byte-identical manifests for a complete review and still publish nothing
+    for an incomplete one.
+  - Tests: `tests/test_findings.py` — `test_missing_field_fails_closed` extended to assert the block
+    yields **no** `ParsedFinding` (today it asserts the problem *and* one finding), the
+    resolutions-echo fixture, one complete plus one incomplete block, and `findings_summary` over
+    complete findings only; `tests/test_prompt_workflow.py` — the echo-shape approve (the truthful
+    message and the gate detail), the mixed complete-plus-incomplete approve, and
+    `test_l42_partial_parse_fallback_keeps_findings_count` re-baselined from findings=3 to findings=2
+    — that test's docstring, "a malformed block among clean ones still counts as a finding", is the
+    old promise — with the same single fallback stage still asserted; M2's two existing tests
+    unmodified. `tests/test_review_workflow.py` and `tests/test_fix_workflow.py` — the
+    complete-review manifest unchanged, as the regression pin that this task narrows nothing.
+  - Notes: rejected — a section-boundary heuristic (see H4.1's Notes and the phase's non-goals).
+    Rejected — drop incomplete blocks silently, with no `problem`: the contract these workflows
+    already keep is that evidence is never dropped, and a silent drop would publish a partial
+    manifest. Rejected — treat `problems` on an `Approve` as non-blocking and continue: that approves
+    on evidence that did not parse, the mirror of `review`'s "requires changes but no findings could
+    be extracted" refusal and of M2's own principle. Rejected — fold this into H4.1: H4.1's fix is a
+    format a reviewer can still defeat with one stray label, and the strictness half must be
+    provable with H4.1 absent — its Done when is exercised on a hand-written echo — which is what
+    lets the two ship in either order. Not in scope: the verdict parser (M1/M3), the fixer's block
+    format, and any change to which stages gate.
+
 ## Explicit non-goals
 
 - Phase 02's convergence rules (finding sampling, fixer verification, the terminal review) are
@@ -403,3 +582,6 @@ evidence depends on it.
   is an explicit operator action on one recorded run, not a retry.
 - Moving the tick to the merge. AIDT still never merges (design §13), so H3 makes the tick
   evidence-based inside the run that produced the evidence; it does not make a merge the proof.
+- A findings-section heuristic that parses the reviewer's prose for a boundary. H4.1 makes the
+  dialect AIDW emits unambiguous; teaching the parser to guess where a model's findings end is a
+  second dialect, which `docs/roadmap-format.md` §1 rejects for the roadmap for the same reason.
