@@ -448,7 +448,7 @@ def build_plan(
     )
 
 
-def _settle_roadmap_tick(
+def settle_roadmap_tick(
     record: StageRecord,
     *,
     checkbox_id: str,
@@ -474,6 +474,10 @@ def _settle_roadmap_tick(
     withheld behind red gates — and ``error`` stays unset on both successful paths. The
     state is saved here because ``run_stage`` already published its own record before this
     workflow-owned check runs. Mutates only ``record`` (and the run state it persists).
+
+    Shared with ``fix`` since H3.3: ``fix``'s post-loop tick runs the same ``I7`` stage and
+    applies the same byte-exact rule, so the two workflows cannot disagree about what a
+    legal flip is. ``implement`` calls it ``settle_tick``; ``fix`` calls the same function.
     """
     if record.exit_code not in (None, 0):
         record.status = FAILED
@@ -499,6 +503,13 @@ def _settle_roadmap_tick(
         else:
             logger.info(f"roadmap {checkbox_id}: flipped `[ ]` -> `[x]`")
     save(directory, state)
+
+
+#: Pre-H3.3 spelling of :func:`settle_roadmap_tick`, kept as an alias because
+#: ``tests/test_roadmap_tick.py`` pins the helper under this (private) name. The function
+#: itself is public since H3.3 so ``fix`` imports the one flip rule instead of duplicating
+#: it — the tick's postcondition must not exist twice.
+_settle_roadmap_tick = settle_roadmap_tick
 
 
 def _read_out(record) -> str | None:
@@ -1052,7 +1063,7 @@ def run(
             """
             if entry.name != TICK_STAGE_NAME or record.status != SUCCEEDED:
                 return
-            _settle_roadmap_tick(
+            settle_roadmap_tick(
                 record,
                 checkbox_id=tick.task,
                 roadmap_file=roadmap_file,

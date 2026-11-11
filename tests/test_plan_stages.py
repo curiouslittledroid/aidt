@@ -49,7 +49,12 @@ from aidw import stage_registry
 from aidw.findings import MANIFEST_EXTRA, ParsedFinding
 from aidw.log import RunLogger
 from aidw.paths import ToolkitPaths
-from aidw.runner import StageSpec, plan_stages, run_stage
+from aidw.runner import (
+    StageSpec,
+    declared_stage_issues,
+    plan_stages,
+    run_stage,
+)
 from aidw.stage_registry import DEFAULTS, FixBatch
 from aidw.state import create_run, run_dir
 from aidw.target_config import ResolvedConfig, TargetConfig, load_target_config, resolve_config
@@ -104,10 +109,15 @@ def _plan(
     *,
     config: ResolvedConfig | None = None,
     root: Path | None = None,
+    include_post_loop: bool = False,
     **fields: object,
 ) -> list[StageSpec]:
-    """The run-path plan. Implement's two I7 expansion fields default here (H3.1)."""
-    if workflow == "implement":
+    """The run-path plan. I7's two expansion fields default here (H3.1/H3.3).
+
+    ``include_post_loop`` is the one request that emits the post-loop half; a per-iteration
+    ``fix`` plan (the default) never carries it (H3.3 req 1/req 7).
+    """
+    if workflow == "implement" or include_post_loop:
         fields.setdefault("roadmap_file", ROADMAP_FILE)
         fields.setdefault("checkbox_id", CHECKBOX_ID)
     return plan_stages(
@@ -115,6 +125,7 @@ def _plan(
         config=config if config is not None else _defaults(),
         toolkit_root=TOOLKIT.root,
         target_root=root if root is not None else Path("/nonexistent-target"),
+        include_post_loop=include_post_loop,
         **fields,
     )
 
@@ -135,6 +146,18 @@ def _static_ids(workflow: str) -> list[str]:
     return [item.id for item in stage_registry.get_workflow(workflow).stages]
 
 
+def _declarable_ids(workflow: str) -> list[str]:
+    """Every id a declared list must carry: the static core order, then the post-loop half.
+
+    Since H3.3 a declared list covers **both** halves (``fix``: ``[A1, I7]``), and the
+    registry's core order — the one the reorder rule compares against — is
+    static-then-post-loop (H3.3 req 2). For a workflow with no post-loop half this is
+    exactly :func:`_static_ids`.
+    """
+    definition = stage_registry.get_workflow(workflow)
+    return [item.id for item in (*definition.stages, *definition.post_loop)]
+
+
 def _stage_entries(
     workflow: str,
     *,
@@ -143,15 +166,16 @@ def _stage_entries(
 ) -> list[dict[str, object]]:
     """A full declared stage list, plus per-id overrides and repo-added entries.
 
-    A declared list **replaces** the toolkit's static half wholesale (§3.4), so E4.5a
-    refuses one that omits or reorders a core id: every static id (repo-optional ones
-    included, so the declared plan stays shape-identical) is named in registry order.
-    ``overrides`` adds keys to a declared static id's entry; ``added`` inserts repo-added
-    entries at declared positions (``0`` = before the first core stage).
+    A declared list **replaces** the toolkit's list wholesale (§3.4), so E4.5a refuses one
+    that omits or reorders a core id: every declarable id (repo-optional ones included, so
+    the declared plan stays shape-identical, and since H3.3 the post-loop ``I7`` last) is
+    named in registry order. ``overrides`` adds keys to a declared static id's entry;
+    ``added`` inserts repo-added entries at declared positions (``0`` = before the first
+    core stage).
     """
     entries: list[dict[str, object]] = [
         {"id": stage_id, **(overrides or {}).get(stage_id, {})}
-        for stage_id in _static_ids(workflow)
+        for stage_id in _declarable_ids(workflow)
     ]
     for position, entry in sorted(added or [], key=lambda item: item[0]):
         entries.insert(position, dict(entry))
@@ -264,6 +288,25 @@ def test_fix_plan_is_the_approval_plus_one_iteration(tmp_path: Path) -> None:
     assert [spec.variables for spec in specs] == [[str(PR)], [str(PR)], [], [], [str(PR)]]
     # The approval postcondition is workflow-side: the plan never carries one.
     assert all(spec.verify is None for spec in specs)
+
+    # H3.3 req 1/req 7: the post-loop half is planned **only on request**, and it lands
+    # after the iteration — the per-iteration plan above is what the loop expands.
+    post = _plan(
+        "fix",
+        root=root,
+        include_post_loop=True,
+        pr=PR,
+        round_index=1,
+        iteration=1,
+        manifest_path="artifacts/iter1-review-manifest.json",
+    )
+    assert [spec.id for spec in post] == ["A1", "F1", "F2", "F3", "F4", "I7"]
+    assert [spec.name for spec in post][-1] == "update-roadmap"
+    tick = post[-1]
+    assert (tick.agent_id, tick.prompt) == ("recorder", _toolkit_prompt("update-roadmap.md"))
+    assert tick.variables == [ROADMAP_FILE, CHECKBOX_ID]
+    # The shared definition carries the condition; the workflow evaluates it (H3.2/H3.3).
+    assert tick.when == stage_registry.WHEN_EVIDENCE_GREEN
 
 
 def test_approve_plan_is_the_single_a1_stage(tmp_path: Path) -> None:
@@ -1174,3 +1217,127 @@ def test_inserting_a_repo_added_stage_only_inserts(
         assert [spec.id for spec in plan[position + 1 :]] == [
             spec.id for spec in plain[position:]
         ]
+
+
+# --------------------------------------------------------------------------- #
+# The post-loop half in a declared fix list (H3.3 req 2)
+# --------------------------------------------------------------------------- #
+
+
+def _fix_declared(*ids: str) -> str:
+    """``aidw/config.yaml`` declaring exactly ``ids`` for ``fix``, in that order."""
+    return _config("fix", [{"id": stage_id} for stage_id in ids])
+
+
+def test_a_declared_fix_list_without_i7_is_refused(tmp_path: Path) -> None:
+    """H3.3 gate impact: I7 is core, so its absence is the removal rule's ``ERROR``."""
+    root = _target(tmp_path, _fix_declared("A1"))
+
+    with pytest.raises(stage_registry.StageListError) as excinfo:
+        _plan(
+            "fix",
+            config=_resolved(root),
+            root=root,
+            pr=PR,
+            round_index=1,
+            iteration=1,
+            manifest_path=MANIFEST,
+        )
+
+    message = str(excinfo.value)
+    assert "stage `I7`: core stage cannot be removed" in message
+    assert "core stage cannot be reordered: declared [A1] but the registry order is [A1, I7]" in message
+
+
+def test_a_declared_fix_list_with_i7_before_a1_is_refused(tmp_path: Path) -> None:
+    """The core order is static-then-post-loop, so ``I7`` first is a reorder."""
+    root = _target(tmp_path, _fix_declared("I7", "A1"))
+
+    with pytest.raises(stage_registry.StageListError) as excinfo:
+        _plan(
+            "fix",
+            config=_resolved(root),
+            root=root,
+            pr=PR,
+            round_index=1,
+            iteration=1,
+            manifest_path=MANIFEST,
+        )
+
+    message = str(excinfo.value)
+    assert "core stage cannot be reordered: declared [I7, A1]" in message
+    assert "the registry order is [A1, I7]" in message
+
+
+def test_the_canonical_fix_declaration_passes_preflight_and_plans_i7_last(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A declared ``[A1, I7]`` is the acceptance path (H3.3 req 2, trap list).
+
+    The plan preflight must treat ``I7`` as a known stage — resolving its registry
+    prompt-file/agent — and must **not** warn about it as a repo-added deferred stage just
+    because ``fix`` is name-keyed. Without that, the canonical declaration would be refused
+    (exit 2) or warned about, and the tick's prompt would never be found.
+    """
+    root = _target(tmp_path, _fix_declared("A1", "I7"))
+    config = _resolved(root)
+    agents = {"review-approver": object(), "recorder": object()}
+
+    assert (
+        stage_registry.validate_stage_list("fix", [{"id": "A1"}, {"id": "I7"}]) == []
+    )
+    assert (
+        declared_stage_issues(
+            "fix",
+            [{"id": "A1"}, {"id": "I7"}],
+            toolkit_root=TOOLKIT.root,
+            target_root=root,
+            agents=agents,
+        )
+        == []
+    )
+
+    specs = _plan(
+        "fix",
+        config=config,
+        root=root,
+        include_post_loop=True,
+        pr=PR,
+        round_index=1,
+        iteration=1,
+        manifest_path=MANIFEST,
+    )
+
+    assert [spec.id for spec in specs] == ["A1", "F1", "F2", "F3", "F4", "I7"]
+    assert specs[-1].prompt == _toolkit_prompt("update-roadmap.md")
+    assert specs[-1].variables == [ROADMAP_FILE, CHECKBOX_ID]
+    # No deferred-settings warning for a correctly declared known post-loop stage.
+    assert [line for line in capsys.readouterr().err.splitlines() if line.startswith("warning:")] == []
+
+
+def test_a_declared_i7_is_withheld_from_the_per_iteration_plan(tmp_path: Path) -> None:
+    """The per-iteration expansion never carries the tick, even when it is declared."""
+    root = _target(tmp_path, _fix_declared("A1", "I7"))
+
+    iteration = _plan(
+        "fix",
+        config=_resolved(root),
+        root=root,
+        pr=PR,
+        round_index=1,
+        iteration=1,
+        manifest_path=MANIFEST,
+    )
+    post = _plan(
+        "fix",
+        config=_resolved(root),
+        root=root,
+        include_post_loop=True,
+        pr=PR,
+        round_index=1,
+        iteration=1,
+        manifest_path=MANIFEST,
+    )
+
+    assert [spec.id for spec in iteration] == ["A1", "F1", "F2", "F3", "F4"]
+    assert [spec.id for spec in post][-1] == "I7"

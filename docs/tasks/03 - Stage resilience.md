@@ -352,7 +352,7 @@ evidence depends on it.
     own documents, and E4.8's gate scope belongs to I5. Depends on H0.1 (the evidence) and H3.1
     (the stage it gates).
 
-- [ ] **H3.3. Give `fix` the same tick, once its loop converges** (Design 8.4, Design 8.6, H3.1)
+- [x] **H3.3. Give `fix` the same tick, once its loop converges** (Design 8.4, Design 8.6, H3.1)
   `fix` is where a task the review found wanting actually finishes — every `prompt-to-fix` chain
   ends in it — and no stage of it has ever touched the roadmap. A `fix` run that closes a task's
   last approved follow-up leaves that task's box unticked, so `aidw tasks --next` keeps offering

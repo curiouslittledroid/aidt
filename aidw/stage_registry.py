@@ -7,6 +7,13 @@ This module is the single declarative home of *which stage runs where*: the seve
 validator): nothing here spawns a process, touches the filesystem, or imports a workflow
 module.
 
+Two stage definitions are **shared between workflows** so their behaviour cannot drift:
+``A1`` (``approve`` and ``fix``'s approval rounds, the pre-H3.3 precedent) and, since H3.3,
+``I7 update-roadmap`` — the roadmap tick that ``implement`` runs in its static chain and
+``fix`` runs from its :attr:`WorkflowDefinition.post_loop` half once its loop converges
+(§8.4). Both are module-level constants referenced from the workflow definitions, never
+copied.
+
 Dependency direction (EXTRACTION.md §3.5, task E4.1's trap list):
 
 * :mod:`aidw.workflows.implement` → this module is the direction E4.3 installed:
@@ -280,11 +287,21 @@ class LoopDefinition:
 
 @dataclass(frozen=True)
 class WorkflowDefinition:
-    """A workflow's static chain, optional loop, and parallel-safe stage-name pairs."""
+    """A workflow's static chain, optional loop, optional post-loop half, and groups.
+
+    ``post_loop`` (H3.3) is the stages that run **once per run, after the loop ends**: the
+    roadmap tick ``I7`` for ``fix``, shared with ``implement``'s static half. It is a
+    separate field from ``stages`` because ``expand("fix", …)`` *is* the per-iteration
+    expansion (``fix.py:_planned_iteration`` expands one iteration at a time), and a
+    stage riding it would be planned — and dry-run printed — once per iteration. The
+    expander therefore emits it **only on request** (``include_post_loop``), and it is
+    classified as core for declared-list validation like any static stage (req 2).
+    """
 
     name: str
     stages: tuple[StageDefinition, ...] = ()
     loop: LoopDefinition | None = None
+    post_loop: tuple[StageDefinition, ...] = ()
     #: R11/§3.4 ``parallel_groups``: stage *names*, not ids, because that is what
     #: ``implement.py``'s ``by_name`` lookup keys on. This default is what ``implement.py``
     #: schedules when a target repo does not declare the list (E4.4);
@@ -538,6 +555,29 @@ def render_whole_review_extra(review: str) -> str:
 # The defaults
 # --------------------------------------------------------------------------- #
 
+#: The roadmap tick is one logical stage (§3.5 ``I7``) that two workflows run: ``implement``
+#: in its static chain (H3.1/H3.2) and ``fix`` from its post-loop half once the loop
+#: converges (H3.3, design §8.4). One id, one prompt, one agent and one name in both — the
+#: ``A1`` precedent — so the two ticks cannot drift.
+#:
+#: ``checkbox_id`` is the entry's own task id (``H3.3``); ``{task_id}`` stays I6's branch
+#: form (``03-H3.3``). ``{roadmap_file}`` is the entry's own absolute roadmap path, so the
+#: prompt names no directory (D15).
+_ROADMAP_TICK_STAGE = StageDefinition(
+    "I7",
+    "update-roadmap",
+    "recorder",
+    "update-roadmap.md",
+    ("{roadmap_file}", "{checkbox_id}"),
+    # H3.2: the tick waits behind the run's own evidence. The condition is *carried* (the
+    # expander cannot see gate outcomes or iteration records), so ``plan_stages``,
+    # ``build_plan`` and ``--dry-run`` still plan I7 unconditionally and the workflow
+    # decides at run time — before ``run_stage``, so an agent never gets the chance to
+    # tick a box the run has no green evidence for. ``fix`` evaluates its own three-part
+    # rule (H3.3 req 4), never a copy of ``implement``'s gate-outcome rule.
+    when=WHEN_EVIDENCE_GREEN,
+)
+
 _IMPLEMENT = WorkflowDefinition(
     name="implement",
     stages=(
@@ -580,21 +620,8 @@ _IMPLEMENT = WorkflowDefinition(
         # and before the approval gate and I6, so the tick lands in the task's own PR
         # (I6 is the single owner of the commit, design §8.2). Registry order is
         # load-bearing: ``validate_stage_list``'s reorder rule compares the declared
-        # core subsequence to this order. ``checkbox_id`` is the entry's own task id
-        # (``H3.1``); ``{task_id}`` stays I6's branch form (``03-H3.1``).
-        StageDefinition(
-            "I7",
-            "update-roadmap",
-            "recorder",
-            "update-roadmap.md",
-            ("{roadmap_file}", "{checkbox_id}"),
-            # H3.2: the tick waits behind the run's own evidence. The condition is
-            # *carried* (the expander cannot see gate outcomes), so ``plan_stages``,
-            # ``build_plan`` and ``--dry-run`` still plan I7 unconditionally and the
-            # workflow decides at run time — before ``run_stage``, so an agent never
-            # gets the chance to tick a box the run has no green evidence for.
-            when=WHEN_EVIDENCE_GREEN,
-        ),
+        # core subsequence to this order.
+        _ROADMAP_TICK_STAGE,
         StageDefinition("I6", "pr", "pr-publisher", "pr.md", ("{task_id}",)),
     ),
     # §3.4 ``parallel_groups`` / R11: the safe pair ``implement.py`` used to hardcode. I2
@@ -747,6 +774,10 @@ _FIX = WorkflowDefinition(
         # iteration (`review_followup.py select`), so it expands one iteration at a time.
         terminal_last=False,
     ),
+    # H3.3: the shared roadmap tick, emitted **once per run** after the loop breaks on
+    # ``select`` exit ``EXIT_NONE_AVAILABLE`` — never on the per-iteration expansion
+    # (``include_post_loop``). Same definition object as ``implement``'s I7.
+    post_loop=(_ROADMAP_TICK_STAGE,),
 )
 
 #: The default registry, keyed by workflow name. Immutable: a caller cannot replace or
@@ -777,7 +808,8 @@ def stage(workflow: str, stage_id: str) -> StageDefinition:
     """The (unrendered) definition of ``stage_id`` in ``workflow``.
 
     Loop stages are searchable by their id too (``P2``, ``F1``–``F4``, and the loop-internal
-    ``P2-fix-*``/``P2-reconcile`` labels).
+    ``P2-fix-*``/``P2-reconcile`` labels), and since H3.3 so is the post-loop half
+    (``fix``'s shared ``I7``).
     """
     definition = get_workflow(workflow)
     candidates = list(definition.stages)
@@ -785,6 +817,7 @@ def stage(workflow: str, stage_id: str) -> StageDefinition:
         candidates.extend(definition.loop.head)
         candidates.extend(definition.loop.body)
         candidates.extend(definition.loop.tail)
+    candidates.extend(definition.post_loop)
     for candidate in candidates:
         if candidate.id == stage_id:
             return candidate
@@ -802,6 +835,8 @@ def stages_by_id(workflow: str) -> Mapping[str, StageDefinition]:
     if definition.loop is not None:
         for candidate in (*definition.loop.head, *definition.loop.body, *definition.loop.tail):
             found[candidate.id] = candidate
+    for candidate in definition.post_loop:
+        found[candidate.id] = candidate
     return MappingProxyType(found)
 
 
@@ -914,15 +949,22 @@ def validate_stage_list(
     stays with the caller: when the config did not declare the list the entry is absent
     and there is nothing to validate, because the registry's own list is all that runs.
 
-    Classification comes from the registry alone, with no third category:
+    Classification comes from the registry alone, with no other category:
 
-    * **loop ids** — every id :func:`stages_by_id` knows that the static
-      :attr:`WorkflowDefinition.stages` does not (``P2``, the ``P2-fix-*`` /
-      ``P2-reconcile`` loop labels, ``F1``–``F4``). Deliberately not ``STAGE_IDS``
-      membership: ``STAGE_IDS`` holds ``P2`` but not its fix/reconcile labels, which
-      would make ``P2-fix-blocking`` look repo-added and be silently double-planned.
-    * **core ids** — the static stage ids minus :data:`REPO_OPTIONAL_IDS` (``I1``, ``I2``,
-      ``I5``, ``I7``, ``I6`` for ``implement``; ``P1``; ``R1``/``R2``; ``A1``).
+    * **loop ids** — every id :func:`stages_by_id` knows that neither the static
+      :attr:`WorkflowDefinition.stages` nor the :attr:`WorkflowDefinition.post_loop` half
+      does (``P2``, the ``P2-fix-*`` / ``P2-reconcile`` loop labels, ``F1``–``F4``).
+      Deliberately not ``STAGE_IDS`` membership: ``STAGE_IDS`` holds ``P2`` but not its
+      fix/reconcile labels, which would make ``P2-fix-blocking`` look repo-added and be
+      silently double-planned. H3.3 req 2: the post-loop half is subtracted too, or
+      ``fix``'s ``I7`` would be misclassified as a loop id and refused as undeclarable
+      exactly where a repo wants to declare the canonical ``[A1, I7]``.
+    * **core ids** — the static stage ids **followed by the post-loop ids**, minus
+      :data:`REPO_OPTIONAL_IDS` (``I1``, ``I2``, ``I5``, ``I7``, ``I6`` for ``implement``;
+      ``A1``, ``I7`` for ``fix``; ``P1``; ``R1``/``R2``). One declared list covers both
+      halves (H3.3 req 2): the post-loop ids are declared **after** every static core id,
+      so there is one core order — static-then-post-loop — for the reorder rule, and a
+      missing ``I7`` in ``fix`` is the same removal ``ERROR`` as a missing ``A1``.
     * **repo-optional ids** — :data:`REPO_OPTIONAL_IDS` (``I3``/``I4``).
     * anything else is a **repo-added** stage and is accepted here (its fields are
       E4.5b's contract, not this validator's).
@@ -941,7 +983,8 @@ def validate_stage_list(
       per core stage instead of silently planning defaults the repo asked away;
     * **duplicate** — each core id declared more than once is one ``ERROR``;
     * **reorder** — the declared core-id subsequence (duplicates excluded) must equal the
-      registry's static core order. Repo-added and repo-optional stages may sit anywhere;
+      registry's static-then-post-loop core order. Repo-added and repo-optional stages
+      may sit anywhere;
       a mismatch is **one** ``ERROR`` for the list, naming the workflow and both orders.
       A removed core stage makes the subsequence shorter than the registry order too, so
       it reports removal *and* reorder — never one blended message.
@@ -951,10 +994,17 @@ def validate_stage_list(
     """
     definition = get_workflow(workflow)
     static_ids = [item.id for item in definition.stages]
-    static_set = set(static_ids)
-    # Loop stages are the ids the expansion can emit that are not flat stage entries.
-    loop_ids = set(stages_by_id(workflow)) - static_set
-    core_ids = [stage_id for stage_id in static_ids if stage_id not in REPO_OPTIONAL_IDS]
+    post_loop_ids = [item.id for item in definition.post_loop]
+    # Loop stages are the ids the expansion can emit that are neither flat stage entries
+    # nor the post-loop half (H3.3 req 2: a two-way split would call `fix`'s I7 a loop id).
+    loop_ids = (
+        set(stages_by_id(workflow)) - set(static_ids) - set(post_loop_ids)
+    )
+    core_ids = [
+        stage_id
+        for stage_id in (*static_ids, *post_loop_ids)
+        if stage_id not in REPO_OPTIONAL_IDS
+    ]
     core_set = set(core_ids)
     #: ``error: workflows.<name>.stages: …`` — the target-config loader's dotted-path
     #: shape, so ``format_issues`` output is uniform across every refusal.
@@ -1223,7 +1273,9 @@ def _expand_fix_loop(
         planned.append(_plan(item, local))
 
 
-def expand(workflow: str, /, **fields: Any) -> tuple[PlannedStage, ...]:
+def expand(
+    workflow: str, /, *, include_post_loop: bool = False, **fields: Any
+) -> tuple[PlannedStage, ...]:
     """The ordered stages ``workflow`` runs for these concrete inputs.
 
     Pure and deterministic: no process, no filesystem, no mutation of ``DEFAULTS`` or of
@@ -1237,8 +1289,19 @@ def expand(workflow: str, /, **fields: Any) -> tuple[PlannedStage, ...]:
       (one :class:`FixBatch` per fixing round, in order).
     * ``review`` — ``pr``, ``manifest_path``, ``findings`` (``True``/``False``; ``False``
       omits R2).
-    * ``fix`` — ``pr``, ``round_index``, ``iteration``, ``manifest_path``.
+    * ``fix`` — ``pr``, ``round_index``, ``iteration``, ``manifest_path``, plus
+      ``roadmap_file`` and ``checkbox_id`` **for the post-loop half only** (H3.3 req 1:
+      both are required exactly when ``include_post_loop`` is true, because the shared
+      ``I7`` is the only post-loop stage and it renders them).
     * ``approve`` — ``pr``.
+
+    ``include_post_loop`` (H3.3 req 1) appends :attr:`WorkflowDefinition.post_loop` after
+    the static and loop halves. It defaults to ``False`` because ``expand("fix", …)`` *is*
+    the per-iteration expansion (``fix.py:_planned_iteration`` calls it once per
+    iteration): emitting the tick unconditionally would plan — and dry-run print — the
+    roadmap tick once per iteration instead of once per run. ``fix`` asks for it in one
+    named post-loop planning call after the loop breaks. ``include_post_loop`` is
+    keyword-only so it can never collide with an expansion field.
 
     ``manifest_path`` is the findings manifest's **absolute** path in the run directory.
     It is rendered into the publisher stage's ``extra``, whose agent runs with the target
@@ -1264,4 +1327,8 @@ def expand(workflow: str, /, **fields: Any) -> tuple[PlannedStage, ...]:
                 f"workflow `{workflow}` declares unknown loop kind "
                 f"`{definition.loop.kind}`"
             )
+    # H3.3: the post-loop half, on request only (see the docstring). Ordered last so the
+    # plan is always static -> loop -> post-loop.
+    if include_post_loop:
+        planned.extend(_plan(item, local) for item in definition.post_loop)
     return tuple(planned)

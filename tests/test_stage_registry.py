@@ -923,6 +923,157 @@ def test_fix_expansion_reproduces_the_dry_run_plan() -> None:
         assert stage.when == ""
 
 
+# --------------------------------------------------------------------------- #
+# The post-loop half: one shared tick, once per run (H3.3 req 1/req 2)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_post_loop_field_exists_and_defaults_empty() -> None:
+    """``WorkflowDefinition.post_loop`` is additive: only ``fix`` carries one today."""
+    definition = registry.get_workflow("fix")
+    assert definition.post_loop == (registry.stage("fix", "I7"),)
+    for workflow in ("implement", "prompt", "review", "approve"):
+        assert registry.get_workflow(workflow).post_loop == (), workflow
+
+
+def test_the_shared_tick_is_one_definition_object() -> None:
+    """The ``A1`` precedent: one id, one prompt, one agent, one name — same object.
+
+    ``implement``'s static I7 and ``fix``'s post-loop I7 must be the *same*
+    ``StageDefinition``, or the two ticks could drift (H3.3's whole point).
+    """
+    implemented = registry.stage("implement", "I7")
+    fixed = registry.stage("fix", "I7")
+    assert implemented is fixed
+    assert fixed.id == "I7"
+    assert fixed.name == "update-roadmap"
+    assert fixed.agent == "recorder"
+    assert fixed.prompt_file == "update-roadmap.md"
+    assert fixed.variables == ("{roadmap_file}", "{checkbox_id}")
+    assert fixed.when == registry.WHEN_EVIDENCE_GREEN
+    assert fixed is registry.stages_by_id("fix")["I7"]
+    assert fixed is registry.stages_by_id("implement")["I7"]
+
+
+def test_expand_emits_the_post_loop_stage_only_on_request() -> None:
+    """Req 1: ``expand("fix", …)`` is the per-iteration expansion — never the tick.
+
+    The tick is emitted once, last, and only under ``include_post_loop`` (which is why the
+    flag exists: an unconditional emission would plan and dry-run print it per iteration).
+    """
+    iteration = expand("fix", pr=PR, round_index=1, iteration=1, manifest_path="m.json")
+    post = expand(
+        "fix",
+        pr=PR,
+        round_index=1,
+        iteration=1,
+        manifest_path="m.json",
+        include_post_loop=True,
+        roadmap_file=ROADMAP_FILE,
+        checkbox_id=CHECKBOX_ID,
+    )
+
+    assert [stage.id for stage in iteration] == ["A1", "F1", "F2", "F3", "F4"]
+    assert [stage.id for stage in post] == ["A1", "F1", "F2", "F3", "F4", "I7"]
+    assert post[: len(iteration)] == iteration
+    tick = post[-1]
+    assert (tick.name, tick.agent) == ("update-roadmap", "recorder")
+    assert tick.variables == (ROADMAP_FILE, CHECKBOX_ID)
+    # Carried, never expanded away (H3.2's rule for the shared condition).
+    assert tick.when == registry.WHEN_EVIDENCE_GREEN
+
+
+def test_the_post_loop_expansion_needs_its_two_fields() -> None:
+    """Fail closed: asking for the tick without its fields is a ``StageFieldError``."""
+    with pytest.raises(StageFieldError) as missing:
+        expand(
+            "fix",
+            pr=PR,
+            round_index=1,
+            iteration=1,
+            manifest_path="m.json",
+            include_post_loop=True,
+        )
+    assert "roadmap_file" in str(missing.value)
+
+
+def test_expand_never_emits_a_post_loop_stage_for_a_workflow_without_one() -> None:
+    """``include_post_loop`` on ``implement`` is a no-op: I7 is already in its static half."""
+    fields = dict(
+        prompt_rel=PROMPT_REL,
+        branch=BRANCH,
+        task_id=TASK_ID,
+        roadmap_file=ROADMAP_FILE,
+        checkbox_id=CHECKBOX_ID,
+    )
+    assert expand("implement", **fields) == expand(
+        "implement", include_post_loop=True, **fields
+    )
+
+
+def test_validate_stage_list_treats_the_fix_post_loop_i7_as_core() -> None:
+    """Req 2: removal, disable and reorder each report an ``ERROR`` for ``I7``."""
+    removal = registry.validate_stage_list("fix", [{"id": "A1"}])
+    assert any(
+        "I7" in issue.message and "core stage cannot be removed" in issue.message
+        for issue in removal
+    )
+
+    disabled = registry.validate_stage_list(
+        "fix", [{"id": "A1"}, {"id": "I7", "enabled": False}]
+    )
+    assert any(
+        "I7" in issue.message and "core stage cannot be disabled" in issue.message
+        for issue in disabled
+    )
+
+    reordered = registry.validate_stage_list("fix", [{"id": "I7"}, {"id": "A1"}])
+    assert any(
+        "core stage cannot be reordered" in issue.message
+        and "declared [I7, A1]" in issue.message
+        and "registry order is [A1, I7]" in issue.message
+        for issue in reordered
+    )
+
+    # And the canonical declaration is clean — I7 is not misclassified as a loop stage.
+    assert registry.validate_stage_list("fix", [{"id": "A1"}, {"id": "I7"}]) == []
+
+
+def test_the_post_loop_expansion_does_no_io(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Purity: asking for the tick reads and writes nothing, and mutates no default."""
+
+    def _explode(*args: object, **kwargs: object):
+        raise AssertionError("the registry must not touch the filesystem")
+
+    before = repr(DEFAULTS)
+    monkeypatch.setattr(builtins, "open", _explode)
+    monkeypatch.setattr(Path, "read_text", _explode)
+    monkeypatch.setattr(Path, "write_text", _explode)
+    monkeypatch.setattr(Path, "is_file", _explode)
+    monkeypatch.setattr(Path, "exists", _explode)
+
+    fields = dict(pr=PR, round_index=1, iteration=1, manifest_path="m.json")
+    first = expand(
+        "fix",
+        include_post_loop=True,
+        roadmap_file=ROADMAP_FILE,
+        checkbox_id=CHECKBOX_ID,
+        **fields,
+    )
+    second = expand(
+        "fix",
+        include_post_loop=True,
+        roadmap_file=ROADMAP_FILE,
+        checkbox_id=CHECKBOX_ID,
+        **fields,
+    )
+
+    assert first == second
+    assert first is not second
+    assert repr(DEFAULTS) == before
+    assert fields == dict(pr=PR, round_index=1, iteration=1, manifest_path="m.json")
+
+
 def test_fix_iteration_is_part_of_the_stage_names() -> None:
     stages = expand(
         "fix",
@@ -1291,11 +1442,15 @@ def test_repo_optional_ids_are_traceability_and_architecture() -> None:
 
 
 def test_validate_stage_list_accepts_every_workflow_s_own_static_list() -> None:
-    """The registry's list, written out as a declared list, is valid for all five."""
+    """The registry's list, written out as a declared list, is valid for all five.
+
+    Since H3.3 a declared list covers the post-loop half too, so ``fix``'s own list is
+    ``[A1, I7]`` — its static stage followed by the shared tick (req 2).
+    """
     for workflow in ("implement", "prompt", "review", "fix", "approve"):
+        definition = registry.get_workflow(workflow)
         declared = [
-            {"id": definition.id}
-            for definition in registry.get_workflow(workflow).stages
+            {"id": entry.id} for entry in (*definition.stages, *definition.post_loop)
         ]
         assert registry.validate_stage_list(workflow, declared) == [], workflow
 
@@ -1381,8 +1536,11 @@ def test_validate_stage_list_rejects_a_declared_loop_stage() -> None:
     assert "P2" in issues[0].message
     assert "core stage cannot be disabled" in issues[0].message
 
-    # The ``fix`` loop's F1–F4 are loop stages too (A1 is that workflow's core stage).
-    issues = registry.validate_stage_list("fix", [{"id": "A1"}, {"id": "F1"}])
+    # The ``fix`` loop's F1–F4 are loop stages too (A1 and the post-loop I7 are that
+    # workflow's core stages — H3.3 req 2 keeps I7 out of the loop classification).
+    issues = registry.validate_stage_list(
+        "fix", [{"id": "A1"}, {"id": "I7"}, {"id": "F1"}]
+    )
     assert len(issues) == 1
     assert "F1" in issues[0].message
     assert "loop stages are generated by `expand`, not declarable" in issues[0].message
