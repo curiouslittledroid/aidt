@@ -17,15 +17,19 @@ kept `git-update.md` and `review-findings-to-github.md` in bucket (i) despite th
 strings, and `task-prompt.md` in bucket (iii) even though it named the toolkit's own directory.
 `tests/test_prompt_classification.py` asserts both halves of that partition — the files present
 Class `(iv)` is the post-cutover additions: `update-roadmap.md`, the core `I7` stage H3.1 added so
-the roadmap tick has an owner independent of the repo-optional traceability stage, and
+the roadmap tick has an owner independent of the repo-optional traceability stage;
 `summarize-implementation-results.md`, the core `I8` stage X1.1 added so the build results are
-distilled into a human-readable summary. Neither was part of §4.2's 31-file inventory, so they
-carry their own class rather than being back-dated into one of the three buckets.
+distilled into a human-readable summary; and `write-integration-test-guide.md`, the core `I9`
+stage X1.2 added so a human has a hand-run procedure for the change. None was part of §4.2's
+31-file inventory, so they carry their own class rather than being back-dated into one of the
+three buckets. The last name is deliberately **not** `integration-tests.md`: that is a product
+prompt MF owns (listed under the moved files below), and a target repo's same-named file would
+shadow this stage's prompt by filename (D14).
 
 here and the 17 that must be absent — so a prompt that is deleted, re-added, or quietly re-bucketed
 fails there rather than after the next release.
 
-## In the toolkit (16 files)
+## In the toolkit (17 files)
 
 | Prompt file | Class | Action | Destination |
 |---|---|---|---|
@@ -45,6 +49,7 @@ fails there rather than after the next release.
 | `update-traceability.md` | (iii) | retained and neutralised in MF.2 | toolkit `prompts/` |
 | `update-roadmap.md` | (iv) | added after the cutover | toolkit `prompts/` |
 | `summarize-implementation-results.md` | (iv) | added after the cutover | toolkit `prompts/` |
+| `write-integration-test-guide.md` | (iv) | added after the cutover | toolkit `prompts/` |
 
 The three retained files are the ones the default registry invokes: `task-prompt.md` is stage
 `P1` of the `prompt` workflow, and `update-traceability.md` / `update-architecture.md` are stages

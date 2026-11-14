@@ -1,6 +1,6 @@
 """The default stage registry: AIDT's workflow chains as data (EXTRACTION.md §3.5, E4.1).
 
-This module is the single declarative home of *which stage runs where*: the eight-stage
+This module is the single declarative home of *which stage runs where*: the nine-stage
 ``implement`` chain (design §8.2), the post-phase-02 ``prompt`` review loop (§8.1), the
 ``review`` pair (§8.3), the ``fix`` iteration loop (§8.4) and the single ``approve`` stage
 (§8.5). It is **data plus pure helpers** (the expander and the ``parallel_groups``
@@ -39,7 +39,7 @@ Dependency direction (EXTRACTION.md §3.5, task E4.1's trap list):
   config.
 
 Stage-id vocabulary (R6 — ids are *retained*, never renamed to the semantic
-``author``/``review``/``implement`` of §3.4's illustrative YAML): ``I1``–``I8``, ``P1``,
+``author``/``review``/``implement`` of §3.4's illustrative YAML): ``I1``–``I9``, ``P1``,
 ``P2``, ``R1``, ``R2``, ``F1``–``F4``, ``A1`` (:data:`STAGE_IDS`). Two different fields are
 kept apart on purpose — ``id`` is the retained key (``"I1"``) and ``name`` is the runtime
 stage name (``"impliment-task"``), which is what ``state.json`` and the run artifacts key
@@ -142,6 +142,7 @@ STAGE_IDS = frozenset(
         "I6",
         "I7",
         "I8",
+        "I9",
         "P1",
         "P2",
         "R1",
@@ -632,6 +633,22 @@ _IMPLEMENT = WorkflowDefinition(
             "summarize-implementation-results.md",
             ("{branch}",),
         ),
+        # X1.2 (design §17 Z6): the integration-test guide is the **recipe** for a test AIDT
+        # never runs (§1.3's deployed-integration-tests non-goal holds — a human runs it).
+        # A separate **core** stage, like I8: generic, unconditional (no `when=`), and it
+        # reads the build results I5 just wrote, so it follows the summary and stays before
+        # the tick and I6 (uncommitted, in the task's own PR). Serially between I8 and I7 —
+        # never in a `parallel_group`. Position is load-bearing for
+        # `validate_stage_list`'s reorder rule, as I7's and I8's are. The prompt file is
+        # deliberately not `integration-tests.md`: that is a product prompt a target repo
+        # would shadow by filename (D14), silently swapping this stage's prompt.
+        StageDefinition(
+            "I9",
+            "write-integration-test-guide",
+            "recorder",
+            "write-integration-test-guide.md",
+            ("{branch}",),
+        ),
         # H3.1: the roadmap tick is its own **core** stage, after the record sync point
         # and before the approval gate and I6, so the tick lands in the task's own PR
         # (I6 is the single owner of the commit, design §8.2). Registry order is
@@ -976,7 +993,7 @@ def validate_stage_list(
       ``fix``'s ``I7`` would be misclassified as a loop id and refused as undeclarable
       exactly where a repo wants to declare the canonical ``[A1, I7]``.
     * **core ids** — the static stage ids **followed by the post-loop ids**, minus
-      :data:`REPO_OPTIONAL_IDS` (``I1``, ``I2``, ``I5``, ``I8``, ``I7``, ``I6`` for
+      :data:`REPO_OPTIONAL_IDS` (``I1``, ``I2``, ``I5``, ``I8``, ``I9``, ``I7``, ``I6`` for
       ``implement``; ``A1``, ``I7`` for ``fix``; ``P1``; ``R1``/``R2``). One declared list
       covers both halves (H3.3 req 2): the post-loop ids are declared **after** every
       static core id, so there is one core order — static-then-post-loop — for the

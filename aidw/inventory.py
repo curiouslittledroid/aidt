@@ -49,6 +49,7 @@ REQUIRED_PROMPTS = (
     "update-architecture.md",
     "record-implementation-results.md",
     "summarize-implementation-results.md",
+    "write-integration-test-guide.md",
     "update-roadmap.md",
     "pr.md",
     "code-review.md",

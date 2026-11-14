@@ -57,6 +57,7 @@ rendered with the run's fields.
 | `I6` | core | `implement` |
 | `I7` | core | `implement`, `fix` |
 | `I8` | core | `implement` |
+| `I9` | core | `implement` |
 | `R1` | core | `review` |
 | `R2` | core | `review` |
 | `F1` | loop-internal | `fix` |
@@ -188,6 +189,7 @@ preflight (target config, declared stage list, worktree located, no other run ac
   → I4 update-architecture            implementer   (shared)   repo-optional
   → I5 record-implementation-results  recorder      (fresh)    sync point
   → I8 summarize-implementation-results recorder    (fresh)
+  → I9 write-integration-test-guide   recorder      (fresh)    human-run guide, runs nothing
   → I7 update-roadmap                 recorder      (fresh)    if the run's evidence is green
   ◇  approve-implementation-pr
   → I6 pr                             pr-publisher  (fresh)
@@ -204,6 +206,7 @@ preflight (target config, declared stage list, worktree located, no other run ac
 | `I4` | `update-architecture` | `implementer` | `update-architecture.md` | `{branch}`, `{base_branch}` | — | — |
 | `I5` | `record-implementation-results` | `recorder` | `record-implementation-results.md` | `{branch}` | — | — |
 | `I8` | `summarize-implementation-results` | `recorder` | `summarize-implementation-results.md` | `{branch}` | — | — |
+| `I9` | `write-integration-test-guide` | `recorder` | `write-integration-test-guide.md` | `{branch}` | — | — |
 | `I7` | `update-roadmap` | `recorder` | `update-roadmap.md` | `{roadmap_file}`, `{checkbox_id}` | `evidence-green` | — |
 | `I6` | `pr` | `pr-publisher` | `pr.md` | `{task_id}` | — | — |
 
@@ -230,6 +233,16 @@ preflight (target config, declared stage list, worktree located, no other run ac
   command, edits nothing else and owns no commit. It is separate from `I5` because a summary has
   nothing to read until the record exists, and core because every repo has build results (unlike
   `I3`/`I4`).
+- **`I9` write-integration-test-guide** — the human-run **guide** for the change: it reads
+  `build-results.md`, the task prompt and the branch's changed files through read-only `git`,
+  and writes `integration-test-guide.md` beside them — a step-by-step procedure covering the
+  surfaces the change actually touches, with five fields per scenario (prerequisites, the exact
+  commands or steps, the expected observable result, how to tell pass from fail, and any
+  cost/permission/destructive warning) and the two closing sections (teardown, and what could
+  not be exercised in this environment). It is an instruction document, never an execution: it
+  runs no integration test, no gate and no cloud/browser/deployed-stack command, so design
+  §1.3's non-goal still holds. Core and unconditional like `I8`, and serial between `I8` and
+  `I7`.
 - **`I7` update-roadmap** — the roadmap tick: flips exactly one checkbox and changes nothing
   else. AIDT resolves the entry itself and refuses (exit 2, before the stage) unless exactly one
   `(phase, task)` entry matches, so a duplicate can never be ticked by accident. After the stage,
@@ -245,7 +258,7 @@ preflight (target config, declared stage list, worktree located, no other run ac
   the PR exists it replaces the build results' `not yet opened` pull-request line with the number
   it printed and commits that one line, so the delivered document names its own PR.
 
-Runtime shape: declared core order is `I1, I2, I5, I8, I7, I6` (`I3`/`I4` repo-optional, free to
+Runtime shape: declared core order is `I1, I2, I5, I8, I9, I7, I6` (`I3`/`I4` repo-optional, free to
 move), and the default `parallel_groups` is `[[test, update-architecture]]` — a `--parallel` flag
 turns it on; without it every stage runs serially.
 
@@ -506,6 +519,6 @@ registry.
   reads for its predecessor check.
 - [`../design.md`](../design.md) §8 — the authoritative workflow specifications (flow, gates,
   postconditions, artifacts), §5.4 the stage→agent role table, §17 the decision log (`I7`/`Z1`,
-  `fix`'s tick/`Z2`, `I8`/`Z3`, this document/`Z4`).
+  `fix`'s tick/`Z2`, `I8`/`Z3`, `I9`/`Z6`, this document/`Z4`).
 - [`../README.md`](../README.md) — the operator guide: how to run each workflow, and what a run
   prints.

@@ -372,8 +372,9 @@ class _GateEvidenceStages(_Recorder):
         return record
 
 
-#: The registry's implement order (I1..I8), the serial schedule. X1.1's I8
-#: (``summarize-implementation-results``) runs immediately after I5's record stage.
+#: The registry's implement order (I1..I9), the serial schedule. X1.1's I8
+#: (``summarize-implementation-results``) runs immediately after I5's record stage, and
+#: X1.2's I9 (``write-integration-test-guide``) immediately after the summary.
 DEFAULT_ORDER = [
     "impliment-task",
     "test",
@@ -381,6 +382,7 @@ DEFAULT_ORDER = [
     "update-architecture",
     "record-implementation-results",
     "summarize-implementation-results",
+    "write-integration-test-guide",
     "update-roadmap",
     "pr",
 ]
@@ -441,6 +443,7 @@ def test_build_plan_order_and_agents() -> None:
         ("I4", "update-architecture"),
         ("I5", "record-implementation-results"),
         ("I8", "summarize-implementation-results"),
+        ("I9", "write-integration-test-guide"),
         ("I7", "update-roadmap"),
         ("I6", "pr"),
     ]
@@ -449,6 +452,7 @@ def test_build_plan_order_and_agents() -> None:
         "tester",
         "implementer",
         "implementer",
+        "recorder",
         "recorder",
         "recorder",
         "recorder",
@@ -461,8 +465,9 @@ def test_build_plan_order_and_agents() -> None:
     assert plan[2].variables == ("03-E4.1",)
     assert plan[3].variables == ("03-E4.1", "main")
     assert plan[5].variables == ("03-E4.1",)
-    assert plan[6].variables == ("/repo/docs/tasks/03 - Extraction.md", "E4.1")
-    assert plan[7].variables == ("03-E4.1",)
+    assert plan[6].variables == ("03-E4.1",)
+    assert plan[7].variables == ("/repo/docs/tasks/03 - Extraction.md", "E4.1")
+    assert plan[8].variables == ("03-E4.1",)
 
 
 def test_build_plan_uses_the_configured_base_branch() -> None:
@@ -581,6 +586,7 @@ def test_dry_run_plans_locate_and_all_eight_stages(
         "I4 update-architecture [succeeded] (planned)",
         "I5 record-implementation-results [succeeded] (planned)",
         "I8 summarize-implementation-results [succeeded] (planned)",
+        "I9 write-integration-test-guide [succeeded] (planned)",
         "I7 update-roadmap [succeeded] (planned)",
         "I6 pr [succeeded] (planned)",
     ):
@@ -609,6 +615,7 @@ def test_dry_run_renders_a_repo_declared_prompt_override(
         "      - id: I4\n"
         "      - id: I5\n"
         "      - id: I8\n"
+        "      - id: I9\n"
         "      - id: I7\n"
         "      - id: I6\n",
         encoding="utf-8",
@@ -1024,6 +1031,48 @@ def test_full_run_dispatches_the_summary_stage_on_the_recorder_agent(
     assert spec.prompt.parent == ToolkitPaths.resolve().prompts_dir
 
 
+def test_full_run_dispatches_the_integration_test_guide_on_the_recorder_agent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """X1.2: I9 is planned and dispatched between I8 and the tick, on ``recorder``.
+
+    A fake-stage run with no Pi, exactly the X1.1 I8 test's shape: the plan comes from the
+    registry, so this pins the real dispatch — its position immediately after the summary,
+    before the tick / PR stage, its agent, its single ``{branch}`` variable, its resolved
+    prompt and the absence of a run-time condition (I9 is unconditional, unlike I7).
+    """
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert (
+        recorder.names.index("write-integration-test-guide")
+        == recorder.names.index("summarize-implementation-results") + 1
+    )
+    assert recorder.names.index("write-integration-test-guide") < recorder.names.index(
+        "pr"
+    )
+    spec = next(
+        item
+        for item in recorder.specs
+        if item.name == "write-integration-test-guide"
+    )
+    assert (spec.id, spec.agent_id, spec.variables, spec.when) == (
+        "I9",
+        "recorder",
+        ["03-E4.1"],
+        "",
+    )
+    assert spec.prompt.name == "write-integration-test-guide.md"
+    assert spec.prompt.parent == ToolkitPaths.resolve().prompts_dir
+
+
 def test_stage_failure_returns_one(tmp_path: Path, monkeypatch) -> None:
     control, _worktree, prompt = _located_layout(tmp_path)
     _patch(monkeypatch)
@@ -1097,6 +1146,7 @@ def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
         "update-architecture",
         "record-implementation-results",
         "summarize-implementation-results",
+        "write-integration-test-guide",
         "update-roadmap",
         "pr",
     ]
@@ -1268,6 +1318,7 @@ def test_parallel_runs_test_and_architecture_concurrently(
         "update-traceability",
         "record-implementation-results",
         "summarize-implementation-results",
+        "write-integration-test-guide",
         "update-roadmap",
         "pr",
     ]
@@ -1337,6 +1388,7 @@ def test_parallel_runs_a_configured_group_instead_of_the_default_pair(
         "update-traceability",
         "update-architecture",
         "summarize-implementation-results",
+        "write-integration-test-guide",
         "update-roadmap",
         "pr",
     ]
@@ -1374,6 +1426,7 @@ def test_parallel_group_runs_at_its_earliest_member_not_its_first_listed(
         "update-traceability",
         "record-implementation-results",
         "summarize-implementation-results",
+        "write-integration-test-guide",
         "update-roadmap",
         "pr",
     ]
@@ -1752,8 +1805,9 @@ def test_the_worktree_lock_is_released_on_every_exit_path(
 # core vs repo-optional preflight (E4.5a, D12/D13, EXTRACTION.md §3.5)
 # --------------------------------------------------------------------------- #
 
-#: The registry's implement order (R6 ids, §3.5's inventory table), including X1.1's I8.
-IMPLEMENT_STAGE_IDS = ("I1", "I2", "I3", "I4", "I5", "I8", "I7", "I6")
+#: The registry's implement order (R6 ids, §3.5's inventory table), including X1.1's I8 and
+#: X1.2's I9.
+IMPLEMENT_STAGE_IDS = ("I1", "I2", "I3", "I4", "I5", "I8", "I9", "I7", "I6")
 
 
 def _declared_implement_stages(disabled: set[str] | None = None) -> str:
@@ -1987,6 +2041,7 @@ def test_a_repo_added_stage_before_i6_is_scheduled_in_declared_order(
         "update-architecture",
         "record-implementation-results",
         "summarize-implementation-results",
+        "write-integration-test-guide",
         "update-roadmap",
         "pr",
     ]
@@ -2019,6 +2074,7 @@ def test_a_repo_added_stage_before_i6_is_scheduled_in_parallel_mode(
         "update-traceability",
         "record-implementation-results",
         "summarize-implementation-results",
+        "write-integration-test-guide",
         "update-roadmap",
         "pr",
     ]

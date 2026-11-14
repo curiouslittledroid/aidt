@@ -24,7 +24,8 @@ Pinned here, table by table:
 - every prompt file the tables name is in ``inventory.REQUIRED_PROMPTS``, so a prompt rename
   cannot leave a stale reference in the reference document;
 - ``README.md``'s ``aidw implement`` stage block lists exactly the registry's ``implement``
-  static chain in order — it had drifted by two stages (``I8``, ``I7``) before this test.
+  static chain in order — it had drifted by two stages (``I8``, ``I7``) before this test, and
+  the same check is what keeps X1.2's ``I9`` in its run position (between ``I8`` and ``I7``).
 
 Deliberately *not* tested: the prose ("what each stage does"), which is semantic and belongs to
 ``design.md`` §8 and the prompt files; the ASCII flow blocks, which are notation rather than
