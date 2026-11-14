@@ -92,6 +92,28 @@ Use `gh pr create --base main --head <branch>` (base is **always** `main`).
   - `## Verification` — the exact commands run and their outcomes (pass/fail, test counts), naming
     the origin (`tree`, `stage`, timestamp) of any outcome you cite from `aidw gate` rather than ran.
 
+## Record the PR number in the build results
+
+The build results name the pull request for this change at the very top of the document,
+immediately above their `## Summary` section — under the configured results directory
+(`paths.implementation_results_dir`), at `<branch>/build-results.md`. The record stage wrote that
+document *before* this one, so its line normally reads `not yet opened`. Now that the PR exists,
+replace that one line with the number (and URL) `gh pr create` printed, commit it on the branch,
+and push:
+
+```bash
+git add "<implementation_results_dir>/<branch>/build-results.md"
+git commit -m "docs(<scope>): record PR #<n> in the build results (<task-id>)"
+git push
+```
+
+- Change that one line and nothing else in the document, and use the number `gh pr create`
+  printed — never an invented or inferred one.
+- The document lives inside the results directory every stage declares in its `--ignore` scope, so
+  this edit cannot invalidate the gate outcomes above it. Re-run no gate to make it.
+- If the document does not exist, report it and continue: the record stage owns that file and this
+  stage does not create it.
+
 ## Do NOT merge
 
 Leave the PR open. Merging is driven by the CI/CD pipeline (PR → ephemeral dev → staging → prod) — never by a direct merge on the branch.

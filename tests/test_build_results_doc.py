@@ -128,3 +128,52 @@ def test_x1_1_record_matches_green_evidence_and_the_ticked_task() -> None:
     ).read_text(encoding="utf-8")
     assert "- [x] **X1.1." in roadmap
     assert "- [ ] **X1.1." not in roadmap
+
+
+# --------------------------------------------------------------------------- #
+# The pull-request contract (design §17 Z5)
+# --------------------------------------------------------------------------- #
+
+#: ``I5`` writes the build results *before* the PR exists (it records the gate ``I6``
+#: cites), so the number is stated by two stages in one direction: the record stage
+#: fills the line honestly, and the delivery stage replaces the absence with the real
+#: number. The template is the contract both read, so it is asserted, not grepped from
+#: a record: a template that drops the field silently drops the number from every task.
+TEMPLATE = toolkit_root() / "docs" / "implementation-results" / "TEMPLATE.md"
+
+
+def _flat(text: str) -> str:
+    """The text with runs of whitespace collapsed, for phrase assertions across wraps."""
+    return " ".join(text.split())
+
+
+def _prompt(name: str) -> str:
+    return _flat((toolkit_root() / "prompts" / name).read_text(encoding="utf-8"))
+
+
+def test_the_template_states_the_pull_request_just_above_the_summary() -> None:
+    """Z5: a mandatory ``**Pull request:**`` field, immediately above ``## Summary``."""
+    lines = TEMPLATE.read_text(encoding="utf-8").splitlines()
+
+    index = next(
+        number for number, line in enumerate(lines) if line.startswith("**Pull request:**")
+    )
+    assert "{{PULL_REQUEST}}" in lines[index]
+    assert lines[index + 1] == ""
+    assert lines[index + 2].startswith("## Summary")
+    assert any(line.startswith("**Spec:**") for line in lines[:index])
+
+
+def test_the_record_stage_writes_an_honest_value_and_pr_backfills_the_number() -> None:
+    """Z5: ``I5`` may not invent a number, and ``I6`` is the only stage that can know one."""
+    record = _prompt("record-implementation-results.md")
+
+    assert "gh pr view" in record
+    assert "not yet opened" in record
+    assert "invent no number" in record
+
+    pr = _prompt("pr.md")
+
+    assert "not yet opened" in pr
+    assert "record PR #" in pr
+    assert "`gh pr create` printed" in pr

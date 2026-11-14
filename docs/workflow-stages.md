@@ -222,7 +222,9 @@ preflight (target config, declared stage list, worktree located, no other run ac
   verification gates over the fully merged tree and writes
   `<implementation_results_dir>/<branch>/build-results.md` from the configured template,
   **failing closed** if the template is absent. Every later stage cites these gate outcomes
-  instead of buying the suite again.
+  instead of buying the suite again. The document names the pull request for the change at the
+  top, immediately above its `## Summary`: the number a read-only lookup resolves when one
+  already exists, otherwise `not yet opened`, because the PR does not exist until `I6`.
 - **`I8` summarize-implementation-results** — the read-only narrative summary of `I5`'s output:
   it reads `build-results.md` and writes `summary.md` beside it, runs no gate, re-runs no
   command, edits nothing else and owns no commit. It is separate from `I5` because a summary has
@@ -239,7 +241,9 @@ preflight (target config, declared stage list, worktree located, no other run ac
   `passed`. Anything else records a `skipped` stage naming the failing gates and leaves the
   roadmap byte-identical. "No evidence" is never green.
 - **`I6` pr** — commits the accumulated uncommitted change set, pushes, and opens the PR. This is
-  the **single owner of the commit** (design §13); no earlier stage of `implement` commits.
+  the **single owner of the commit** (design §13); no earlier stage of `implement` commits. After
+  the PR exists it replaces the build results' `not yet opened` pull-request line with the number
+  it printed and commits that one line, so the delivered document names its own PR.
 
 Runtime shape: declared core order is `I1, I2, I5, I8, I7, I6` (`I3`/`I4` repo-optional, free to
 move), and the default `parallel_groups` is `[[test, update-architecture]]` — a `--parallel` flag

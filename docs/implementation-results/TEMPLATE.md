@@ -3,6 +3,7 @@
 **Branch:** `{{BRANCH}}`
 **Date:** {{DATE}}
 **Spec:** {{SPEC_LIST}}
+**Pull request:** {{PULL_REQUEST}}
 
 ## Summary
 

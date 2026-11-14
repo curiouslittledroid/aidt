@@ -92,8 +92,28 @@ stage's artifacts, specs, the roadmap, or architecture docs.
    Avoid commands a non-interactive session refuses: do not `rm -rf` (build into `$(mktemp -d)`
    instead) and prefer the repo's existing fixtures over `git init` scratch demos. A blocked
    command costs a turn and produces no evidence.
-5. Populate `build-results.md` from the template:
+5. Resolve the pull request reference for this branch **before** writing the document. The build
+   results name it at the very top, immediately above their `## Summary` section. Ask GitHub
+   read-only, and treat "no pull request yet" as an answer rather than an error:
+   ```bash
+   # <branch> is `$1` when the workflow passed one, else the current branch (step 2)
+   gh pr view <branch> --json number,url \
+     --jq 'if .number then "#" + (.number|tostring) + " " + .url else empty end' 2>/dev/null || true
+   ```
+   - **A pull request already exists** — a re-run, a resume, or an implementation started with an
+     existing PR number: record it as `#<number>` with its URL beside it.
+   - **None exists yet — the normal case.** This stage records the gate the `/pr` stage cites, so
+     `/pr` opens the pull request *after* this document is written. Record exactly
+     `not yet opened — the /pr stage records it here once the PR exists`, and invent no number.
+     `/pr` replaces that note with the real number as part of delivering, so the finished document
+     always ends up naming the pull request that carries it.
+   - Never guess, derive or back-fill a number from a branch name, a task id, a run id or another
+     document. A wrong number is worse than an honest "not yet opened".
+
+6. Populate `build-results.md` from the template:
    - Fill `{{TASK_ID}}`, `{{TASK_TITLE}}`, `{{BRANCH}}`, `{{DATE}}`, `{{SPEC_LIST}}`.
+   - Fill the pull request line above `## Summary` with the reference resolved in step 5 — a real
+     `#<number>` with its URL, or the not-yet-opened note. Never a placeholder.
    - **Summary:** purpose, key design decisions, roadmap placement, and scope (including what the
      task deliberately stops short of).
    - **Files Changed:** every file touched, with action (Created/Modified) and a one-line description.
@@ -102,7 +122,7 @@ stage's artifacts, specs, the roadmap, or architecture docs.
      **unverified** with the reason — never as passing.
    - **Non-Goals (NOT implemented):** copied from the task prompt's explicit non-goals.
    - Delete optional template sections that do not apply; do not leave `{{placeholders}}` behind.
-6. Run `git diff --check` and review the final diff for stale or invented content.
+7. Run `git diff --check` and review the final diff for stale or invented content.
 
 ## Non-goals — do NOT do these
 
