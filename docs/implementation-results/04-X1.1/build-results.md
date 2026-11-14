@@ -49,19 +49,29 @@
 
 ### Top-level verification
 
-Commands are this repo's own, taken from its root `AGENTS.md` ("Gates — run exactly these, and only these"). There is no `aidw/conventions.md` in this target repo and no lint/formatter/type-checker is configured (AGENTS.md "Tests"; design §15), so the lint row is `n/a`. Gate commands ran through `aidw gate run <key>` with the workflow's declared ignore scope `--ignore docs/implementation-results --ignore docs/architecture --ignore docs/tasks --ignore docs/task-prompts`, recorded against tree `7f52a573a6b5` by stage `record-implementation-results`.
+Commands are this repo's own, taken from its root `AGENTS.md` ("Gates — run exactly these, and only these"). There is no `aidw/conventions.md` in this target repo and no lint/formatter/type-checker is configured (AGENTS.md "Tests"; design §15), so the lint row is `n/a`. Gate commands ran through `aidw gate run <key>` with the workflow's declared ignore scope `--ignore docs/implementation-results --ignore docs/architecture --ignore docs/tasks --ignore docs/task-prompts`. All gates below were re-run against the committed tree by the review-follow-up fix for issue #154: the record stage's original `suite` and `dry-run` outcomes were a stale red measured mid-run (tree `7f52a573a6b5`, stage `record-implementation-results`) — see Deviations.
 
 | Step | Command | Result |
 |------|---------|--------|
-| Install | `uv sync --frozen` | ✅ Pass (`Checked 19 packages in 0.87ms`) |
+| Install | `uv sync --frozen` | ✅ Pass (`Checked 19 packages in 1ms`) |
 | Lint | — | n/a — this repo configures no linter (AGENTS.md: "pytest is the only verification") |
-| Build | `uv build --out-dir <tmp>/dist` (gate `build`) | ✅ Pass — built `aidt-1.3.0.tar.gz` and `aidt-1.3.0-py3-none-any.whl` at `2026-11-13T23:56:47Z` |
-| Test | `uv run --frozen pytest` (gate `suite`) | ❌ Fail (`1 failed, 2060 passed in 42.79s`) at `2026-11-13T23:57:33Z` — `tests/test_design_doc.py::test_implement_chain_documentation_is_rebased_to_i8`: `assert 'I1–I8' in purpose` fails because `design.md` §1 still advertises the pre-summary vocabulary |
-| Doctor | `uv run --frozen aidw doctor` (gate `doctor`) | ✅ Pass (`21 checks: 0 failed, 2 warning(s)`) at `2026-11-13T23:57:37Z` — warnings are the dirty working tree and a missing `.mcp.json` |
-| Agents validate | `uv run --frozen aidw agents validate --strict` (gate `agents`) | ✅ Pass (`11 agent config(s): 0 error(s), 0 warning(s)`) at `2026-11-13T23:57:36Z` |
-| Prompts check | `uv run --frozen aidw prompts check` (gate `prompts`) | ✅ Pass (`resolved repo prompts: 0 error(s), 0 warning(s)`; `summarize-implementation-results.md` resolves to the toolkit default) at `2026-11-13T23:57:39Z` |
+| Build | `uv build --out-dir <tmp>/dist` (gate `build`) | ✅ Pass — built `aidt-1.3.0.tar.gz` and `aidt-1.3.0-py3-none-any.whl` |
+| Test | `uv run --frozen pytest` (gate `suite`) | ✅ Pass (`2061 passed in 44.38s`) |
+| Doctor | `uv run --frozen aidw doctor` (gate `doctor`) | ✅ Pass (`21 checks: 0 failed, 1 warning(s)`) — the warning is the missing `.mcp.json`; the working tree is clean |
+| Agents validate | `uv run --frozen aidw agents validate --strict` (gate `agents`) | ✅ Pass (`11 agent config(s): 0 error(s), 0 warning(s)`) |
+| Prompts check | `uv run --frozen aidw prompts check` (gate `prompts`) | ✅ Pass (`resolved repo prompts: 0 error(s), 0 warning(s)`; `summarize-implementation-results.md` resolves to the toolkit default) |
 | Whitespace | `git diff --check` | ✅ Pass (exit 0, no output) |
-| Task dry-run | `uv run aidw implement docs/task-prompts/04-X1.1-prompt.md --dry-run` (gate `dry-run`) | ❌ **unverified** — the command could not run: `another implement run for '04-X1.1' is still marked running: 20261113T233539Z-04-X1.1-implement. Use --resume or finish it.` (gate `dry-run` failed at `2026-11-13T23:57:42Z` with no plan output) |
+| Task dry-run | `uv run aidw implement docs/task-prompts/04-X1.1-prompt.md --dry-run` (gate `dry-run`) | ✅ Pass — hand-run in a clean clone of the committed tree (exit 0), because the active fix run holds this worktree's one-run lock: the plan prints `I8 summarize-implementation-results [succeeded] (planned) agent=recorder` between `I5 record-implementation-results` and `I7 update-roadmap` and ends `dry-run complete; Pi not invoked`. Not recorded through `aidw gate run`: a gate-wrapped invocation in this worktree would fail on the same one-run lock and record a spurious red against this exact tree |
+
+Gate origins for the rows above (re-recorded by the review-follow-up fix for issue #154, tree `4d5538f3abb5`, scope excludes `docs/architecture, docs/implementation-results, docs/task-prompts, docs/tasks`):
+
+- `build` — passed at `2026-11-14T00:28:15Z`, stage `iter1-fix-next-review-followup`.
+- `doctor` — passed at `2026-11-14T00:28:16Z`, stage `iter1-fix-next-review-followup` (`21 checks: 0 failed, 1 warning(s)`).
+- `agents` — passed at `2026-11-14T00:28:19Z`, stage `iter1-fix-next-review-followup` (`11 agent config(s): 0 error(s), 0 warning(s)`).
+- `prompts` — passed at `2026-11-14T00:28:19Z`, stage `iter1-fix-next-review-followup` (`resolved repo prompts: 0 error(s), 0 warning(s)`).
+- `smoke` — passed at `2026-11-14T00:28:20Z`, stage `iter1-fix-next-review-followup` (`tests/test_design_doc.py::test_implement_chain_documentation_is_rebased_to_i8`: `1 passed in 0.01s`).
+- `suite` — passed at `2026-11-14T00:29:10Z`, stage `iter1-fix-next-review-followup` (`2061 passed in 44.38s`).
+- `dry-run` — hand-run bare in a clean clone of the committed tree (exit 0); no recorded gate outcome, for the lock reason in the row above.
 
 ### `uv run --frozen pytest` (full suite)
 
@@ -69,8 +79,8 @@ The file-level rows are derived from the single full-gate invocation above; no s
 
 | Test selection | Tests | Result |
 |----------------|-------|--------|
-| Full suite | 2061 | ❌ Fail (`1 failed, 2060 passed in 42.79s`) |
-| `tests/test_design_doc.py` | — | ❌ `test_implement_chain_documentation_is_rebased_to_i8` failed; it is the only failure named in the run |
+| Full suite | 2061 | ✅ Pass (`2061 passed in 44.38s`) |
+| `tests/test_design_doc.py` | — | ✅ Pass — `test_implement_chain_documentation_is_rebased_to_i8` passes (`1 passed in 0.01s`, gate `smoke`): `design.md` §1 advertises the `I1`–`I8` vocabulary |
 | `tests/test_stage_registry.py`, `tests/test_plan_stages.py`, `tests/test_implement_workflow.py`, `tests/test_inventory.py`, `tests/test_summary_prompt.py` | — | ✅ No failures from these modules appear in the run's failure list |
 | `tests/test_prompt_classification.py` | — | ✅ No failures from this module appear in the run's failure list |
 
@@ -84,16 +94,16 @@ The file-level rows are derived from the single full-gate invocation above; no s
 | A fake-stage run plans and dispatches `I8` on the `recorder` agent in position (no real Pi) | ✅ Pass — covered by `tests/test_implement_workflow.py` |
 | `summarize-implementation-results.md` is in `REQUIRED_PROMPTS` and resolves from the toolkit | ✅ Pass — covered by `tests/test_inventory.py` and `aidw prompts check` |
 | The summary prompt owns only `<branch>/summary.md`, reads `build-results.md`, contains no gate instruction, and preserves failures/`unverified` rows | ✅ Pass — covered by `tests/test_summary_prompt.py` |
-| `uv run aidw implement docs/task-prompts/04-X1.1-prompt.md --dry-run` prints `I8 summarize-implementation-results` between `I5` and `I7` | ❌ **unverified** — blocked by the active run's lock, so no plan was produced |
-| `design.md` §1, §12.2 and §19 describe the eight-stage chain | ❌ Fail — `tests/test_design_doc.py::test_implement_chain_documentation_is_rebased_to_i8` fails on the `I1–I8` assertion for §1 |
+| `uv run aidw implement docs/task-prompts/04-X1.1-prompt.md --dry-run` prints `I8 summarize-implementation-results` between `I5` and `I7` | ✅ Pass — hand-run in a clean clone of the committed tree (exit 0): the plan prints `I8 summarize-implementation-results` between `I5 record-implementation-results` and `I7 update-roadmap` |
+| `design.md` §1, §12.2 and §19 describe the eight-stage chain | ✅ Pass — `tests/test_design_doc.py::test_implement_chain_documentation_is_rebased_to_i8` passes (gate `smoke`); §1 advertises `I1`–`I8` |
 
 ---
 
 ## Deviations observed during recording
 
-- **`design.md` was not fully rebased to `I1`–`I8`** — `tests/test_design_doc.py` expects §1, §12.2 and §19 to advertise the eight-stage vocabulary, but §1 still says `I1`–`I7` (and the test stops at its first assertion). `design.md` did receive the §1.3 reversal, §2, §5.4, §8.2 and §17 `Z3` edits, so the implementation is partially complete. This stage does not fix it; recorded as a real gate failure above.
-- **The task dry-run gate was blocked by this branch's own active run** — `aidw implement --dry-run` refuses to start while `20261113T233539Z-04-X1.1-implement` is still marked running. No plan output was produced, so the "prints `I8` between `I5` and `I7`" criterion is recorded as unverified rather than inferred from the registry tests.
-- **The `record` stage's gate run was itself blocked from reusing an earlier suite outcome** — tree `7f52a573a6b5` already carried a failed `suite` outcome from the run's `update-traceability` stage, so this stage re-ran the full suite rather than citing it. The two runs agree on the same single failure.
+- **The record stage's `suite` and `dry-run` outcomes were a stale red** — the original recording measured them mid-run, against tree `7f52a573a6b5`, before `design.md` §1/§12.2 were rebased to the `I1`–`I8` vocabulary and while `20261113T233539Z-04-X1.1-implement` still held this worktree's one-run lock: `uv run --frozen pytest` was `1 failed, 2060 passed` (`test_implement_chain_documentation_is_rebased_to_i8` failing the §1 `I1`–`I8` assertion) and the `dry-run` gate was refused with exit 4 ("still marked running"). On the committed tree neither holds: the named test passes bare (`1 passed in 0.01s`), the full suite is `2061 passed` (tree `4d5538f3abb5`), and the dry-run plans `I8` between `I5` and `I7`. Found in review (issue #154); every gate above was re-run against the committed tree and this document now records the real green outcomes.
+- **In the original record-stage session the suite could not reuse an earlier outcome** — tree `7f52a573a6b5` already carried a failed `suite` outcome from the run's `update-traceability` stage, so that stage re-ran the full suite rather than citing it; the two runs agreed on the same single failure. Historical note about the original session: the re-recorded gates above are this fix run's own invocations.
+- **The roadmap tick stays `[x]`, untouched by this fix** — the tick was hand-flipped during development while the workflow's own `update-roadmap` stage was skipped for red evidence (run `20261113T233539Z-04-X1.1-implement`: "red gates for tree `7f52a573a6b5`: suite, dry-run"). This fix does not hand-edit the tick (design §17 `Z1`: tick transitions belong to `settle_roadmap_tick`/skip logic); it makes the tick's evidence green instead — every gate this document now records for tree `4d5538f3abb5` passed, which is exactly the `WHEN_EVIDENCE_GREEN` condition the skipped stage evaluates.
 
 ---
 
