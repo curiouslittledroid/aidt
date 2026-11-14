@@ -244,7 +244,7 @@ def test_pyproject_identity_is_the_settled_name_version_and_script() -> None:
     project = _pyproject()["project"]
 
     assert project["name"] == "aidt"
-    assert project["version"] == "1.3.0"
+    assert project["version"] == "1.4.0"
     assert project["version"] == __version__
     assert project["scripts"] == {"aidw": "aidw.cli:main"}
     # The console script must name a real callable (E8.3 owns `aidw --version`, not this).
