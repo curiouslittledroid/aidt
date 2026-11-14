@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -180,16 +181,31 @@ def test_run_chain_rejects_unknown_name() -> None:
     assert "prompt-to-fix" in result.stderr
 
 
+#: Typer's highlighter splits a long option into several styled spans, so on a colour run
+#: (GitHub Actions sets `GITHUB_ACTIONS`, which forces Typer's terminal on) the raw help
+#: text contains `-` / `-allow` / `-incomplete-prereqs` separated by ANSI escapes rather
+#: than the contiguous option name. Below ~80 columns Rich also truncates the option
+#: column with `…`. Both are properties of the renderer, not of the CLI, so help-text
+#: assertions compare plain text at a pinned width (PR #152: this test only ever failed
+#: in CI, where the identical output is coloured).
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain_help(args: list[str], *, width: int = 120) -> str:
+    """`--help` for `args` as plain text at a fixed console width."""
+    result = runner.invoke(app, [*args, "--help"], env={"COLUMNS": str(width)})
+
+    assert result.exit_code == 0, result.output
+    return _ANSI.sub("", result.stdout)
+
+
 def test_run_chain_accepts_allow_incomplete_prereqs() -> None:
     """H13: the ordering override L1.2's refusal names must exist on `aidw run` too.
 
     A chain runs `prompt` first, so its preflight's "re-run with
     `--allow-incomplete-prereqs`" advice is only actionable if the chain accepts it.
     """
-    result = runner.invoke(app, ["run", "--help"])
-
-    assert result.exit_code == 0, result.output
-    assert "--allow-incomplete-prereqs" in result.stdout
+    assert "--allow-incomplete-prereqs" in _plain_help(["run"])
 
 
 def test_doctor_runs(fake_external_clis: None) -> None:  # noqa: ARG001

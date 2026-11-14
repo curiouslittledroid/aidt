@@ -13,11 +13,15 @@ from aidw.paths import toolkit_root
 
 
 def _record() -> str:
+    return _record_for("00-E9.1")
+
+
+def _record_for(branch: str) -> str:
     path = (
         toolkit_root()
         / "docs"
         / "implementation-results"
-        / "00-E9.1"
+        / branch
         / "build-results.md"
     )
     return path.read_text(encoding="utf-8")
@@ -76,3 +80,51 @@ def test_deviations_no_longer_claim_the_delivered_tree_is_red() -> None:
     deviations = record[record.index("## Deviations observed during recording") :]
 
     assert "not green as delivered" not in deviations
+
+
+def test_x1_1_record_matches_green_evidence_and_the_ticked_task() -> None:
+    """The X1.1 audit artifact must agree with its final tree and roadmap state.
+
+    Review follow-up #154 found the opposite state: the record retained a red suite
+    *and* an unverified dry-run from an intermediate tree while the roadmap already
+    said the task was complete. Checking the top-level outcome rows, the task-specific
+    assertions, the gate-origin tree, and the roadmap together prevents that split-brain
+    record from being accepted again while allowing the deviations section to preserve
+    the historical observation honestly.
+    """
+    record = _record_for("04-X1.1")
+    verification = _verification_section(record)
+
+    test_row = next(
+        line for line in verification.splitlines() if line.startswith("| Test |")
+    )
+    dry_run_row = next(
+        line
+        for line in verification.splitlines()
+        if line.startswith("| Task dry-run |")
+    )
+    assert "✅ Pass" in test_row
+    assert "❌ Fail" not in test_row
+    assert "✅ Pass" in dry_run_row
+    assert "unverified" not in dry_run_row.lower()
+
+    task_specific = verification[
+        verification.index("### Task-specific verification gates") :
+    ]
+    assert "❌" not in task_specific
+    assert (
+        "`uv run aidw implement docs/task-prompts/04-X1.1-prompt.md --dry-run` "
+        "prints `I8 summarize-implementation-results` between `I5` and `I7` | ✅ Pass"
+    ) in task_specific
+
+    gate_origins = verification[
+        verification.index("Gate origins for the rows above") :
+    ]
+    assert "`suite` — passed" in gate_origins
+    assert "tree `4d5538f3abb5`" in gate_origins
+
+    roadmap = (
+        toolkit_root() / "docs" / "tasks" / "04 - Enhancements.md"
+    ).read_text(encoding="utf-8")
+    assert "- [x] **X1.1." in roadmap
+    assert "- [ ] **X1.1." not in roadmap

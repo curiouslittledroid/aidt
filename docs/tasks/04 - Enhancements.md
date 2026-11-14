@@ -24,7 +24,7 @@ rows and non-goals. That is the audit artifact, but it is not something a human 
 understand *why* a change was made or what it actually did. Epic X1 adds a `recorder`-owned
 stage immediately after `I5` that distils the build results into a fixed narrative shape.
 
-- [ ] **X1.1. Summarise each task's build results in a human-readable summary.md**
+- [x] **X1.1. Summarise each task's build results in a human-readable summary.md**
   Add a `summarize-implementation-results` stage (new retained id `I8`) to the `implement`
   chain, immediately after `record-implementation-results` (`I5`) and before the roadmap tick
   (`I7`) / `pr` (`I6`). It is owned by the `recorder` agent, reads the just-written

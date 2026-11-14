@@ -48,6 +48,7 @@ REQUIRED_PROMPTS = (
     "update-traceability.md",
     "update-architecture.md",
     "record-implementation-results.md",
+    "summarize-implementation-results.md",
     "update-roadmap.md",
     "pr.md",
     "code-review.md",

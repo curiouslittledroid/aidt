@@ -122,6 +122,19 @@ def test_list_files_includes_known_prompts() -> None:
     assert "scripts/review-followup/review_followup.py" in files
 
 
+def test_required_prompts_include_the_summary_stage() -> None:
+    """X1.1: the `I8` stage's prompt is a required default, not an optional extra.
+
+    ``REQUIRED_PROMPTS`` is what makes a rename fail loudly instead of at Pi invocation
+    (AGENTS.md "Prompts and agent configs are the product contract"), so the stage the
+    registry schedules must be listed here beside ``record-implementation-results.md``.
+    """
+    assert "summarize-implementation-results.md" in inventory.REQUIRED_PROMPTS
+    # The real toolkit ships it, and the defaults half resolves it without issues.
+    assert "summarize-implementation-results.md" in inventory.list_files(toolkit_root())
+    assert _errors(_defaults(toolkit_root())) == []
+
+
 def test_missing_prompts_dir_is_error(tmp_path: Path) -> None:
     issues = inventory.check_defaults(tmp_path / "aidt")
     assert issues and issues[0].level == ERROR

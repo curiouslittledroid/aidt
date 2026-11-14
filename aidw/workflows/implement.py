@@ -9,6 +9,7 @@ I2 test                           agent tester      (fresh)
 I3 update-traceability            agent implementer (session shared)
 I4 update-architecture            agent implementer (session shared)
 I5 record-implementation-results  agent recorder    (fresh)  SYNC POINT
+I8 summarize-implementation-results agent recorder  (fresh)  read-only summary
 I7 update-roadmap                 agent recorder    (fresh)  one checkbox, verified
 ◇  approve-implementation-pr
 I6 pr                             agent pr-publisher (fresh)
@@ -46,7 +47,13 @@ gates or the absence, the roadmap file is never touched, the run's exit status i
 and no agent ever got the chance to make the claim. An already-`[x]` entry under green
 evidence is still H3.1's successful no-op.
 
-The seven stages are not hardcoded here since E4.3: ``run()`` builds them with
+X1.1 adds `I8` (design §8.2, §17 Z3): a read-only narration of what `I5` recorded. It runs
+no verification gate and re-runs no command — `I5` remains the single owner of the whole-repo
+gate, so a second run here would double the run's most expensive step for no new evidence —
+and it edits nothing but `<implementation_results_dir>/<branch>/summary.md`, uncommitted for
+`I6`. Its five-section narrative structure lives in the prompt, not in config.
+
+The eight stages are not hardcoded here since E4.3: ``run()`` builds them with
 :func:`aidw.runner.plan_stages` over the ``aidw.stage_registry`` defaults, so the target
 repo's per-stage ``prompt:`` overlay applies and the prompts resolve against the located
 worktree (EXTRACTION.md §3.5, D2/D14). The target config's two fail-closed preflight
@@ -416,7 +423,7 @@ def build_plan(
     roadmap_file: str,
     checkbox_id: str,
 ) -> list[stage_registry.PlannedStage]:
-    """The seven stages, in order, exactly as the registry expands them (compat wrapper).
+    """The eight stages, in order, exactly as the registry expands them (compat wrapper).
 
     ``base_branch`` is I4's ``$2`` (``base_ref``): the architecture stage measures
     against the configured PR base, not a hardcoded ``main`` (EXTRACTION.md §3.4/R4).
@@ -887,7 +894,7 @@ def run(
     # same file the stage is told to edit.
     tick_before = roadmap_file.read_text(encoding="utf-8")
 
-    # The run-path plan: the registry's seven stages mapped to specs through `resolve_prompt`,
+    # The run-path plan: the registry's eight stages mapped to specs through `resolve_prompt`,
     # with the repo's `prompt:` overlay applied (E4.3).
     plan = plan_stages(
         "implement",

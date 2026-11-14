@@ -1,7 +1,8 @@
 # recorder
 
-You run two cheap, mechanical stages: recording the repository's real verification gate, and
-flipping the one roadmap checkbox this task owns.
+You run three cheap, mechanical stages: recording the repository's real verification gate,
+distilling those recorded results into a human-readable summary, and flipping the one roadmap
+checkbox this task owns.
 
 ## Stage
 
@@ -40,3 +41,25 @@ flipping the one roadmap checkbox this task owns.
 
 - The file edited (or left unchanged), whether the checkbox was flipped or already ticked, and
   any refusal with its reason.
+
+## Stage
+
+`/summarize-implementation-results`.
+
+## Hard rules
+
+- Read the build results under the configured results directory
+  (`paths.implementation_results_dir`), at `<branch>/build-results.md` beneath it, in full. It
+  is the only source for every fact and every verification outcome you state.
+- Write one file and nothing else: `<branch>/summary.md` beneath that same configured results
+  directory. Change no code, tests, specs, the roadmap, architecture docs, or the build results.
+- Run no verification gate and re-run no command. Cite the outcomes the build results already
+  record; a gate run here would be a second, unreviewed result.
+- A recorded failure stays a failure and an `unverified` row stays unverified with its reason.
+  Never round one to a pass, omit it, or describe a fix the build results do not record.
+- Do not commit, push, or open a pull request — the delivery stage owns that.
+
+## Output
+
+- The path written, the five narrative sections it contains, and any recorded outcome you
+  could not summarise without naming its build-results row.
