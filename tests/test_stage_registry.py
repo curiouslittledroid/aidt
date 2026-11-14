@@ -134,7 +134,7 @@ def test_implement_default_reproduces_build_plan(base_branch: str) -> None:
         checkbox_id=CHECKBOX_ID,
     )
 
-    assert len(stages) == len(plan) == 8
+    assert len(stages) == len(plan) == 9
     for planned, expected in zip(stages, plan):
         assert planned.id == expected.id
         assert planned.name == expected.name
@@ -214,12 +214,13 @@ def test_the_evidence_green_condition_is_carried_never_expanded_away() -> None:
     )
 
     assert [stage.id for stage in stages] == [
-        "I1", "I2", "I3", "I4", "I5", "I8", "I7", "I6",
+        "I1", "I2", "I3", "I4", "I5", "I8", "I9", "I7", "I6",
     ]
     carried = {stage.id: stage.when for stage in stages}
     assert carried["I7"] == registry.WHEN_EVIDENCE_GREEN
     assert {key: value for key, value in carried.items() if key != "I7"} == {
-        "I1": "", "I2": "", "I3": "", "I4": "", "I5": "", "I8": "", "I6": "",
+        "I1": "", "I2": "", "I3": "", "I4": "", "I5": "", "I8": "",
+        "I9": "", "I6": "",
     }
     # A lowered ``findings`` field cannot drop it either — that switch is R2/F4's alone.
     with_findings_flag = expand(
@@ -265,8 +266,8 @@ def test_the_when_vocabulary_is_exported_and_distinct() -> None:
 def test_retained_stage_ids_are_the_vocabulary() -> None:
     """R6: ids are retained. §3.4's `author`/`review`/`implement` example ids are not."""
     assert registry.STAGE_IDS == frozenset(
-        {"I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "P1", "P2", "R1", "R2",
-         "F1", "F2", "F3", "F4", "A1"}
+        {"I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9", "P1", "P2",
+         "R1", "R2", "F1", "F2", "F3", "F4", "A1"}
     )
     for workflow in ("implement", "review", "approve"):
         for stage in registry.get_workflow(workflow).stages:
@@ -1101,8 +1102,9 @@ def test_unknown_workflow_and_stage_fail_closed() -> None:
     with pytest.raises(UnknownWorkflowError):
         expand("nope", pr=PR)
     with pytest.raises(UnknownStageError):
-        # I9 is the next free implement id after X1.1's I8; I1..I8 are all real stages.
-        registry.stage("implement", "I9")
+        # I10 is the next free implement id after X1.2's I9; I1..I9 are all real stages
+        # (I9 was this probe's id until X1.2 made it a stage).
+        registry.stage("implement", "I10")
 
 
 def test_missing_or_wrong_expansion_fields_fail_closed() -> None:
@@ -1144,7 +1146,7 @@ def test_expansion_does_no_io(monkeypatch: pytest.MonkeyPatch) -> None:
                 checkbox_id=CHECKBOX_ID,
             )
         )
-        == 8
+        == 9
     )
     assert registry.render_delta_brief(previous_review="r", diff=None)
     assert registry.render_reconcile(review="r", diff=None)
@@ -1416,12 +1418,13 @@ DIFF = "--- a/baseline/prompt.md\n+++ b/current/prompt.md\n@@ -1 +1 @@\n-a\n+b"
 
 #: The registry's static ``implement`` order, hand-copied from §3.5's inventory table so a
 #: registry reorder cannot silently redefine what "in order" means for these tests. I8
-#: (``summarize-implementation-results``, X1.1) sits between I5 and I7, and I7
-#: (``update-roadmap``, H3.1) between I8 and I6; both are core.
-IMPLEMENT_IDS = ("I1", "I2", "I3", "I4", "I5", "I8", "I7", "I6")
+#: (``summarize-implementation-results``, X1.1) sits between I5 and I7, I9
+#: (``write-integration-test-guide``, X1.2) between I8 and I7, and I7
+#: (``update-roadmap``, H3.1) between I9 and I6; all three are core.
+IMPLEMENT_IDS = ("I1", "I2", "I3", "I4", "I5", "I8", "I9", "I7", "I6")
 #: The same list minus the two repo-optional stages (D13) — the core subsequence the
 #: validator compares against.
-IMPLEMENT_CORE = ("I1", "I2", "I5", "I8", "I7", "I6")
+IMPLEMENT_CORE = ("I1", "I2", "I5", "I8", "I9", "I7", "I6")
 
 
 def _declared(
@@ -1462,11 +1465,12 @@ def test_validate_stage_list_accepts_a_disabled_removed_or_moved_repo_optional_s
     assert registry.validate_stage_list("implement", both) == []
     # Removing a repo-optional stage is not a removal of a core stage.
     assert registry.validate_stage_list(
-        "implement", _declared(("I1", "I2", "I5", "I8", "I7", "I6"))
+        "implement", _declared(("I1", "I2", "I5", "I8", "I9", "I7", "I6"))
     ) == []
     # I3/I4 are free to interleave anywhere in the list.
     assert registry.validate_stage_list(
-        "implement", _declared(("I4", "I1", "I2", "I3", "I5", "I8", "I7", "I6"))
+        "implement",
+        _declared(("I4", "I1", "I2", "I3", "I5", "I8", "I9", "I7", "I6")),
     ) == []
 
 
@@ -1496,7 +1500,7 @@ def test_validate_stage_list_rejects_disabling_a_core_stage() -> None:
 def test_validate_stage_list_names_i7_when_the_core_tick_is_omitted() -> None:
     """H3.1: a replacement list cannot silently remove the roadmap tick."""
     issues = registry.validate_stage_list(
-        "implement", _declared(("I1", "I2", "I3", "I4", "I5", "I8", "I6"))
+        "implement", _declared(("I1", "I2", "I3", "I4", "I5", "I8", "I9", "I6"))
     )
 
     removal = [issue for issue in issues if "core stage cannot be removed" in issue.message]
@@ -1512,7 +1516,7 @@ def test_validate_stage_list_names_i8_when_the_summary_stage_is_omitted() -> Non
     rule `I7` already carries, never a silent drop of the artifact the stage exists for.
     """
     issues = registry.validate_stage_list(
-        "implement", _declared(("I1", "I2", "I3", "I4", "I5", "I7", "I6"))
+        "implement", _declared(("I1", "I2", "I3", "I4", "I5", "I9", "I7", "I6"))
     )
 
     removal = [issue for issue in issues if "core stage cannot be removed" in issue.message]
@@ -1527,7 +1531,7 @@ def test_validate_stage_list_refuses_disabling_i8() -> None:
     issues = registry.validate_stage_list(
         "implement",
         _declared(
-            ("I1", "I2", "I3", "I4", "I5", "I8", "I7", "I6"),
+            ("I1", "I2", "I3", "I4", "I5", "I8", "I9", "I7", "I6"),
             disabled={"I8"},
         ),
     )
@@ -1543,14 +1547,98 @@ def test_validate_stage_list_refuses_i8_moved_past_the_tick() -> None:
     """X1.1: the registry's `I5 → I8 → I7` subsequence is load-bearing, like `I7`'s."""
     issues = registry.validate_stage_list(
         "implement",
-        _declared(("I1", "I2", "I3", "I4", "I5", "I7", "I8", "I6")),
+        _declared(("I1", "I2", "I3", "I4", "I5", "I9", "I7", "I8", "I6")),
     )
 
     assert len(issues) == 1
     assert issues[0].level == ERROR
     assert "core stage cannot be reordered" in issues[0].message
-    assert "I5, I7, I8" in issues[0].message
-    assert "I5, I8, I7, I6" in issues[0].message
+    assert "I5, I9, I7, I8" in issues[0].message
+    assert "I5, I8, I9, I7, I6" in issues[0].message
+
+
+def test_i9_is_a_core_implement_stage_between_the_summary_and_the_tick() -> None:
+    """X1.2 (design §17 Z6): `I9` is real, core, unconditional and in its run position.
+
+    The id joins the closed vocabulary, is **not** repo-optional (`I3`/`I4` remain the only
+    optional ids), and sits in `_IMPLEMENT.stages` immediately after `I8` and before the
+    `I7` tick. Its name/agent/prompt/variables resolve through the ordinary lookups, and it
+    carries no `when=` token — it runs unconditionally, like `I8`.
+    """
+    assert "I9" in registry.STAGE_IDS
+    assert "I9" not in registry.REPO_OPTIONAL_IDS
+    assert registry.REPO_OPTIONAL_IDS == frozenset({"I3", "I4"})
+
+    ids = [stage.id for stage in registry.get_workflow("implement").stages]
+    assert ids.index("I9") == ids.index("I8") + 1
+    assert ids.index("I9") < ids.index("I7")
+
+    definition = registry.stage("implement", "I9")
+    assert definition.name == "write-integration-test-guide"
+    assert definition.agent == "recorder"
+    assert definition.prompt_file == "write-integration-test-guide.md"
+    assert definition.variables == ("{branch}",)
+    assert definition.when == ""
+    assert registry.stages_by_id("implement")["I9"] == definition
+    # Never in a parallel group: it runs serially between I8 and I7 (Z6).
+    members = [member for group in registry.get_workflow("implement").parallel_groups
+               for member in group]
+    assert "write-integration-test-guide" not in members
+
+
+def test_expand_emits_i9_in_its_run_position() -> None:
+    """X1.2: `expand` emits `I9` between `I8` and `I7`, with the one `{branch}` variable."""
+    stages = expand(
+        "implement",
+        prompt_rel=PROMPT_REL,
+        branch=BRANCH,
+        task_id=TASK_ID,
+        base_branch="main",
+        roadmap_file=ROADMAP_FILE,
+        checkbox_id=CHECKBOX_ID,
+    )
+    by_id = {stage.id: stage for stage in stages}
+
+    assert [stage.id for stage in stages][-3:] == ["I9", "I7", "I6"]
+    assert by_id["I9"].name == "write-integration-test-guide"
+    assert by_id["I9"].agent == "recorder"
+    assert by_id["I9"].variables == (BRANCH,)
+
+
+def test_validate_stage_list_treats_i9_as_core_for_every_violation() -> None:
+    """X1.2: removal, disable and reorder of `I9` are each an `ERROR`, never a silent drop.
+
+    `I9` is core like `I8` (a generic artifact every repo has), so the same three rules
+    apply — the guide cannot be removed, disabled or moved out of the `I8 → I9 → I7`
+    subsequence by a repo-declared `workflows.implement.stages` list.
+    """
+    removed = registry.validate_stage_list(
+        "implement",
+        _declared(("I1", "I2", "I3", "I4", "I5", "I8", "I7", "I6")),
+    )
+    removal = [issue for issue in removed if "core stage cannot be removed" in issue.message]
+    assert [issue.message.split("`")[1] for issue in removal] == ["I9"]
+    assert all(issue.level == ERROR for issue in removed)
+
+    disabled = registry.validate_stage_list(
+        "implement",
+        _declared(IMPLEMENT_IDS, disabled={"I9"}),
+    )
+    assert any(
+        issue.level == ERROR
+        and "stage `I9`: core stage cannot be disabled" in issue.message
+        for issue in disabled
+    )
+
+    reordered = registry.validate_stage_list(
+        "implement",
+        _declared(("I1", "I2", "I3", "I4", "I5", "I8", "I7", "I9", "I6")),
+    )
+    assert len(reordered) == 1
+    assert reordered[0].level == ERROR
+    assert "core stage cannot be reordered" in reordered[0].message
+    assert "I8, I7, I9" in reordered[0].message
+    assert "I8, I9, I7, I6" in reordered[0].message
 
 
 def test_validate_stage_list_rejects_a_declared_loop_stage() -> None:
@@ -1599,7 +1687,8 @@ def test_validate_stage_list_rejects_a_declared_loop_stage() -> None:
 def test_validate_stage_list_rejects_a_reordered_core_list_once_for_the_list() -> None:
     """One ``ERROR`` per reordered list (the spec fixes the rule, the prompt the count)."""
     issues = registry.validate_stage_list(
-        "implement", _declared(("I2", "I1", "I3", "I4", "I5", "I8", "I7", "I6"))
+        "implement",
+        _declared(("I2", "I1", "I3", "I4", "I5", "I8", "I9", "I7", "I6")),
     )
     assert len(issues) == 1
     assert issues[0].level == ERROR
@@ -1607,7 +1696,7 @@ def test_validate_stage_list_rejects_a_reordered_core_list_once_for_the_list() -
     assert "implement" in issues[0].message
     # Both orders are named, so the message is actionable without re-reading the registry.
     assert "I2, I1" in issues[0].message
-    assert "I1, I2, I5, I8, I7, I6" in issues[0].message
+    assert "I1, I2, I5, I8, I9, I7, I6" in issues[0].message
     assert "core stage cannot be reordered" in issues[0].message
 
 
@@ -1616,9 +1705,11 @@ def test_validate_stage_list_does_not_blend_removal_into_reorder() -> None:
     issues = registry.validate_stage_list("implement", _declared(("I2", "I1")))
     removal = [issue for issue in issues if "cannot be removed" in issue.message]
     reorder = [issue for issue in issues if "cannot be reordered" in issue.message]
-    assert {issue.message.split("`")[1] for issue in removal} == {"I5", "I8", "I7", "I6"}
+    assert {issue.message.split("`")[1] for issue in removal} == {
+        "I5", "I8", "I9", "I7", "I6"
+    }
     assert len(reorder) == 1
-    assert len(issues) == len(removal) + len(reorder) == 5
+    assert len(issues) == len(removal) + len(reorder) == 6
 
 
 def test_validate_stage_list_reports_one_removal_per_core_stage_for_an_empty_list() -> None:
@@ -1636,7 +1727,7 @@ def test_validate_stage_list_reports_one_removal_per_core_stage_for_an_empty_lis
 def test_validate_stage_list_reports_one_duplicate_per_core_id() -> None:
     """A duplicated core id is one ``ERROR`` per id, not one per extra occurrence."""
     declared = _declared(
-        ("I1", "I1", "I2", "I3", "I4", "I5", "I5", "I5", "I8", "I7", "I6")
+        ("I1", "I1", "I2", "I3", "I4", "I5", "I5", "I5", "I8", "I9", "I7", "I6")
     )
     issues = registry.validate_stage_list("implement", declared)
     duplicates = [
@@ -1683,27 +1774,27 @@ def test_validate_stage_list_is_pure(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert repr(stages) == before
     assert all(issue.level == ERROR for issue in issues)
-    # I5/I8/I7/I6 removed, I1/I2 reordered, I1 disabled: six failures. The disabled
+    # I5/I8/I9/I7/I6 removed, I1/I2 reordered, I1 disabled: seven failures. The disabled
     # repo-optional I3, the repo-added entry and the non-mapping are accepted/skipped.
-    assert len(issues) == 6
+    assert len(issues) == 7
 
 
 def test_validate_stage_list_accepts_exactly_core_stages_in_registry_order() -> None:
     """Property sweep: no issues ⇔ the core subsequence equals the registry core order.
 
-    The pinned generator is ``itertools.permutations(IMPLEMENT_IDS)`` — all 40320 orderings
-    of the eight implement ids, ``seed = "I1..I8"`` — and ``numRuns = 40320``: the whole
-    input space for the reorder/removal rules with every id present exactly once and
-    nothing disabled. Hypothesis is not a dependency (AGENTS.md §15), so the enumeration
-    *is* the seed and the run count (the same convention as the ``parallel_groups`` sweep
-    above).
+    The pinned generator is ``itertools.permutations(IMPLEMENT_IDS)`` — all 362880
+    orderings of the nine implement ids, ``seed = "I1..I9"`` — and ``numRuns = 362880``:
+    the whole input space for the reorder/removal rules with every id present exactly once
+    and nothing disabled. Hypothesis is not a dependency (AGENTS.md §15), so the
+    enumeration *is* the seed and the run count (the same convention as the
+    ``parallel_groups`` sweep above).
 
-    Hand-checked expected count: the six core ids keep their registry order and the two
+    Hand-checked expected count: the seven core ids keep their registry order and the two
     repo-optional ids fill two of the remaining slots, so exactly
-    ``1 × C(8, 6) × 2! = 56`` of the 40320 permutations are accepted.
+    ``1 × C(9, 7) × 2! = 72`` of the 362880 permutations are accepted.
     """
     cases = list(itertools.permutations(IMPLEMENT_IDS))
-    assert len(cases) == 40320
+    assert len(cases) == 362880
     accepted = 0
     for order in cases:
         issues = registry.validate_stage_list("implement", _declared(order))
@@ -1714,7 +1805,7 @@ def test_validate_stage_list_accepts_exactly_core_stages_in_registry_order() -> 
         # A rejected all-present list carries exactly the one list-level reorder error.
         assert len(issues) == (0 if issues == [] else 1), order
         accepted += 1 if issues == [] else 0
-    assert accepted == 56
+    assert accepted == 72
 
     # Metamorphic half: a repo-added stage anywhere never changes any verdict.
     for order in cases:

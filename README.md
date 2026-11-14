@@ -263,7 +263,7 @@ The generated prompt lands in the target repo's task-prompts directory,
 ### `aidw implement` — implement a task prompt and open the PR
 
 Takes a generated task prompt, derives the task id and branch from its filename, and runs
-the eight focused stages serially, leaving the tree uncommitted until `/pr` owns delivery:
+the nine focused stages serially, leaving the tree uncommitted until `/pr` owns delivery:
 
 ```text
 I1 impliment-task                    implementer  (shared session)
@@ -272,13 +272,14 @@ I3 update-traceability               implementer  (shared)   repo-optional
 I4 update-architecture               implementer  (shared)   repo-optional
 I5 record-implementation-results     recorder     (fresh)    SYNC POINT
 I8 summarize-implementation-results  recorder     (fresh)
+I9 write-integration-test-guide      recorder     (fresh)    human-run guide, runs nothing
 I7 update-roadmap                    recorder     (fresh)    only if the gates are green
 ◇  approve-implementation-pr
 I6 pr                                pr-publisher (fresh)
 ```
 
 ```bash
-# plan only: prints I1–I8 with agents/models; no Pi, no git or GitHub writes
+# plan only: prints I1–I9 with agents/models; no Pi, no git or GitHub writes
 aidw implement docs/task-prompts/03-E4.1-prompt.md --dry-run
 
 # real run on branch 03-E4.1

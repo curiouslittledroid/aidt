@@ -97,11 +97,16 @@ BUCKET_MOVED = (
 BUCKET_PRODUCT = (*BUCKET_RETAINED, *BUCKET_MOVED)
 
 #: Prompts added **after** the MF.2 cutover, so §4.2's 31-file inventory does not classify
-#: them. Class (iv) is their own row: `update-roadmap.md` is H3.1's core `I7` stage and
-#: `summarize-implementation-results.md` is X1.1's core `I8` stage, both new toolkit defaults
+#: them. Class (iv) is their own row: `update-roadmap.md` is H3.1's core `I7` stage,
+#: `summarize-implementation-results.md` is X1.1's core `I8` stage and
+#: `write-integration-test-guide.md` is X1.2's core `I9` stage — all new toolkit defaults
 #: that are none of "ship as-is", "neutralised in E7.2" or "retained from (iii)" —
-#: back-dating either into one of those would misstate its provenance.
-POST_CUTOVER = ("update-roadmap.md", "summarize-implementation-results.md")
+#: back-dating any of them into one of those would misstate its provenance.
+POST_CUTOVER = (
+    "update-roadmap.md",
+    "summarize-implementation-results.md",
+    "write-integration-test-guide.md",
+)
 
 #: Every prompt the toolkit ships, and the only files the table may list.
 TOOLKIT_PROMPTS = (
@@ -298,8 +303,9 @@ def test_the_classification_partitions_the_specs_31_files():
     assert (len(BUCKET_GENERIC), len(BUCKET_MIXED), len(BUCKET_PRODUCT)) == (6, 5, 20)
     assert (len(BUCKET_RETAINED), len(BUCKET_MOVED)) == (3, 17)
     assert len(set(BUCKET_PRODUCT)) == len(BUCKET_PRODUCT)
-    # 14 files at the cutover plus the two post-cutover defaults (H3.1's `I7`, X1.1's `I8`).
-    assert len(_prompt_files()) == 14 + len(POST_CUTOVER) == 16
+    # 14 files at the cutover plus the three post-cutover defaults (H3.1's `I7`, X1.1's `I8`,
+    # X1.2's `I9`).
+    assert len(_prompt_files()) == 14 + len(POST_CUTOVER) == 17
 
     classes = (set(BUCKET_GENERIC), set(BUCKET_MIXED), set(BUCKET_PRODUCT))
     # The three §4.2 buckets partition the inventory: no file is in two, none in none.

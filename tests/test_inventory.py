@@ -135,6 +135,22 @@ def test_required_prompts_include_the_summary_stage() -> None:
     assert _errors(_defaults(toolkit_root())) == []
 
 
+def test_required_prompts_include_the_integration_guide_stage() -> None:
+    """X1.2: the `I9` stage's prompt is a required default, not an optional extra.
+
+    ``REQUIRED_PROMPTS`` is what makes a rename fail loudly instead of at Pi invocation
+    (AGENTS.md "Prompts and agent configs are the product contract"), so the stage the
+    registry schedules must be listed here beside its recorder siblings. The name matters:
+    it is deliberately not `integration-tests.md` (a product prompt a target repo would
+    shadow by filename, D14).
+    """
+    assert "write-integration-test-guide.md" in inventory.REQUIRED_PROMPTS
+    assert "integration-tests.md" not in inventory.REQUIRED_PROMPTS
+    # The real toolkit ships it, and the defaults half resolves it without issues.
+    assert "write-integration-test-guide.md" in inventory.list_files(toolkit_root())
+    assert _errors(_defaults(toolkit_root())) == []
+
+
 def test_missing_prompts_dir_is_error(tmp_path: Path) -> None:
     issues = inventory.check_defaults(tmp_path / "aidt")
     assert issues and issues[0].level == ERROR

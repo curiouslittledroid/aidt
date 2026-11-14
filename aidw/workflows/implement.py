@@ -1,7 +1,7 @@
 """``aidw implement`` — implement a task prompt and open the PR (design §8.2).
 
-Stage order follows ``docs/workflow.md`` (the focused stages run serially, leaving the
-working tree uncommitted; ``/pr`` is the single owner of the delivery step):
+Stage order follows the registry (``aidw/stage_registry.py``; the focused stages run serially,
+leaving the working tree uncommitted; ``/pr`` is the single owner of the delivery step):
 
 ```
 I1 impliment-task                 agent implementer (session shared)
@@ -10,6 +10,7 @@ I3 update-traceability            agent implementer (session shared)
 I4 update-architecture            agent implementer (session shared)
 I5 record-implementation-results  agent recorder    (fresh)  SYNC POINT
 I8 summarize-implementation-results agent recorder  (fresh)  read-only summary
+I9 write-integration-test-guide   agent recorder    (fresh)  human-run guide, runs nothing
 I7 update-roadmap                 agent recorder    (fresh)  one checkbox, verified
 ◇  approve-implementation-pr
 I6 pr                             agent pr-publisher (fresh)
@@ -53,7 +54,18 @@ gate, so a second run here would double the run's most expensive step for no new
 and it edits nothing but `<implementation_results_dir>/<branch>/summary.md`, uncommitted for
 `I6`. Its five-section narrative structure lives in the prompt, not in config.
 
-The eight stages are not hardcoded here since E4.3: ``run()`` builds them with
+X1.2 adds `I9` (design §8.2, §17 Z6): the integration-test **guide**, immediately after the
+summary and before the tick. It reads the build results, the task prompt and the branch's
+changed files through read-only `git`, and writes
+`<implementation_results_dir>/<branch>/integration-test-guide.md` — the step-by-step procedure
+a human follows to integration-test the change by hand. It **executes nothing**: no
+integration test, no gate, no cloud, browser or deployed-stack command, so §1.3's
+deployed-integration-tests non-goal still holds (AIDT writes the recipe, a human runs it).
+Core and unconditional like `I8` (no `when=` token), serial between `I8` and `I7`, never in a
+`parallel_group`, and its four-section structure and five per-scenario fields live in the
+prompt, not in config.
+
+The nine stages are not hardcoded here since E4.3: ``run()`` builds them with
 :func:`aidw.runner.plan_stages` over the ``aidw.stage_registry`` defaults, so the target
 repo's per-stage ``prompt:`` overlay applies and the prompts resolve against the located
 worktree (EXTRACTION.md §3.5, D2/D14). The target config's two fail-closed preflight

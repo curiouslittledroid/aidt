@@ -198,7 +198,7 @@ def _config(workflow: str, entries: list[dict[str, object]]) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def test_implement_plan_is_the_eight_registry_stages(tmp_path: Path) -> None:
+def test_implement_plan_is_the_nine_registry_stages(tmp_path: Path) -> None:
     root = _target(tmp_path)
     specs = _plan(
         "implement",
@@ -225,6 +225,9 @@ def test_implement_plan_is_the_eight_registry_stages(tmp_path: Path) -> None:
         # X1.1: the narrative summary of I5's own output is core and immediately after it.
         ("I8", "summarize-implementation-results", "recorder",
          _toolkit_prompt("summarize-implementation-results.md"), [BRANCH]),
+        # X1.2: the human-run guide is core, unconditional and immediately after the summary.
+        ("I9", "write-integration-test-guide", "recorder",
+         _toolkit_prompt("write-integration-test-guide.md"), [BRANCH]),
         ("I7", "update-roadmap", "recorder", _toolkit_prompt("update-roadmap.md"),
          [ROADMAP_FILE, CHECKBOX_ID]),
         ("I6", "pr", "pr-publisher", _toolkit_prompt("pr.md"), [TASK_ID]),
@@ -233,7 +236,7 @@ def test_implement_plan_is_the_eight_registry_stages(tmp_path: Path) -> None:
     assert specs[1].extra == stage_registry.TEST_CONTEXT_EXTRA.format(
         task_id=TASK_ID, branch=BRANCH, prompt_rel=PROMPT_REL
     )
-    assert [spec.extra for spec in specs if spec.id != "I2"] == [""] * 7
+    assert [spec.extra for spec in specs if spec.id != "I2"] == [""] * 8
     # A pure-defaults repo declares no overlay, so no stage carries an explicit path.
     assert all(spec.explicit_prompt is None for spec in specs)
     assert all(spec.workflow == "implement" for spec in specs)
@@ -428,7 +431,7 @@ def test_declared_prompt_sets_explicit_prompt_and_resolves_it(tmp_path: Path) ->
     assert by_id["I3"].explicit_prompt == OVERLAY_REL
     assert by_id["I3"].prompt == declared
     # Every other stage keeps the toolkit default and no explicit path.
-    for stage_id in ("I1", "I2", "I4", "I5", "I8", "I7", "I6"):
+    for stage_id in ("I1", "I2", "I4", "I5", "I8", "I9", "I7", "I6"):
         assert by_id[stage_id].explicit_prompt is None
         assert by_id[stage_id].prompt.parent == TOOLKIT.prompts_dir
 
@@ -574,8 +577,8 @@ def test_a_reordered_declared_list_raises_the_named_error(tmp_path: Path) -> Non
     assert message.startswith("error: workflows.implement.stages: ")
     assert "core stage cannot be reordered" in message
     # The declared core subsequence and the registry's core order, both named.
-    assert "declared [I2, I1, I5, I8, I7, I6]" in message
-    assert "registry order is [I1, I2, I5, I8, I7, I6]" in message
+    assert "declared [I2, I1, I5, I8, I9, I7, I6]" in message
+    assert "registry order is [I1, I2, I5, I8, I9, I7, I6]" in message
 
 
 def test_an_empty_declared_list_raises_the_named_error(tmp_path: Path) -> None:
@@ -589,7 +592,7 @@ def test_an_empty_declared_list_raises_the_named_error(tmp_path: Path) -> None:
         )
 
     message = str(raised.value)
-    for stage_id in ("I1", "I2", "I5", "I8", "I6"):
+    for stage_id in ("I1", "I2", "I5", "I8", "I9", "I6"):
         assert f"stage `{stage_id}`: core stage cannot be removed" in message
 
 
@@ -629,6 +632,53 @@ def test_a_declared_implementation_list_cannot_omit_i8(tmp_path: Path) -> None:
     assert "stage `I8`: core stage cannot be removed" in message
 
 
+def test_a_declared_implementation_list_cannot_omit_i9(tmp_path: Path) -> None:
+    """X1.2: a repo override missing the core integration-test-guide stage is refused.
+
+    `I9` is core like `I8` (`I3`/`I4` remain the only repo-optional ids), so dropping it
+    from a declared list is a named removal `ERROR` at planning time, never a silent
+    smaller plan.
+    """
+    entries = [
+        entry for entry in _stage_entries("implement") if entry["id"] != "I9"
+    ]
+    root = _target(tmp_path, _config("implement", entries))
+
+    with pytest.raises(stage_registry.StageListError) as raised:
+        _plan(
+            "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
+            branch=BRANCH, task_id=TASK_ID,
+        )
+
+    message = str(raised.value)
+    assert "stage `I9`: core stage cannot be removed" in message
+
+
+def test_a_declared_implementation_list_with_i9_between_i8_and_i7_passes(
+    tmp_path: Path,
+) -> None:
+    """X1.2: `I9` declared between `I8` and the `I7` tick is the one accepted position."""
+    root = _target(
+        tmp_path,
+        _config(
+            "implement",
+            [
+                {"id": stage_id}
+                for stage_id in ("I1", "I2", "I3", "I4", "I5", "I8", "I9", "I7", "I6")
+            ],
+        ),
+    )
+
+    specs = _plan(
+        "implement", config=_resolved(root), root=root, prompt_rel=PROMPT_REL,
+        branch=BRANCH, task_id=TASK_ID,
+    )
+
+    assert [spec.id for spec in specs] == [
+        "I1", "I2", "I3", "I4", "I5", "I8", "I9", "I7", "I6"
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Repo-added stages (E4.5b req 1/req 4, EXTRACTION.md §3.5/§3.6)
 # --------------------------------------------------------------------------- #
@@ -666,7 +716,7 @@ def test_a_repo_added_stage_is_planned_in_declared_order_with_every_field(
 
     # Declared order: the repo-added stage sits between I1 and I2, not appended.
     assert [spec.id for spec in specs] == [
-        "I1", "X9", "I2", "I3", "I4", "I5", "I8", "I7", "I6"
+        "I1", "X9", "I2", "I3", "I4", "I5", "I8", "I9", "I7", "I6"
     ]
     added = specs[1]
     assert (added.id, added.name, added.agent_id) == ("X9", "X9", "implementer")
@@ -730,7 +780,8 @@ def test_a_repo_added_stage_shadows_by_its_declared_id(
         _config(
             "implement",
             _stage_entries(
-                "implement", added=[(8, {"id": "review-agent", "agent": "code-reviewer"})]
+                # Appended after I6: nine ids are declarable since X1.2.
+                "implement", added=[(9, {"id": "review-agent", "agent": "code-reviewer"})]
             ),
         ),
     )
@@ -780,7 +831,7 @@ def test_a_disabled_repo_added_stage_is_omitted(tmp_path: Path) -> None:
     )
 
     assert [spec.id for spec in specs] == [
-        "I1", "I2", "I3", "I4", "I5", "I8", "I7", "I6"
+        "I1", "I2", "I3", "I4", "I5", "I8", "I9", "I7", "I6"
     ]
 
 
@@ -915,7 +966,9 @@ def test_a_repo_optional_disabled_stage_is_omitted_with_no_warning(
         branch=BRANCH, task_id=TASK_ID,
     )
 
-    assert [spec.id for spec in specs] == ["I1", "I2", "I4", "I5", "I8", "I7", "I6"]
+    assert [spec.id for spec in specs] == [
+        "I1", "I2", "I4", "I5", "I8", "I9", "I7", "I6"
+    ]
     assert capsys.readouterr().err == ""
 
 
@@ -1045,7 +1098,7 @@ def test_plan_stages_does_no_io_beyond_prompt_existence(
         "implement", prompt_rel=PROMPT_REL, branch=BRANCH, task_id=TASK_ID
     )
 
-    assert len(specs) == 8
+    assert len(specs) == 9
 
 
 def test_each_call_returns_fresh_objects(tmp_path: Path) -> None:
