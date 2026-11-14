@@ -175,6 +175,28 @@ def test_design_has_no_legacy_root_or_prompt_source_markers() -> None:
     assert not re.search(r"worktree", non_goals, re.IGNORECASE)
 
 
+def test_implement_chain_documentation_is_rebased_to_i8() -> None:
+    """X1.1: the current design must not advertise the pre-summary chain.
+
+    The implementation contract adds a retained core stage, so the high-level workflow
+    inventory, the stage-registry contract, and the acceptance section must all describe
+    the same eight-stage chain. Historical task prompts are intentionally out of scope;
+    these are the live sections operators use to understand the current toolkit.
+    """
+    design = _design_md()
+
+    purpose = _section(design, "## 1. Purpose and scope", "### 1.1 Two roots")
+    registry = _section(design, "### 12.2 Stage registry", "### 12.3 Prompt resolution")
+    acceptance = design[design.index("## 19. Acceptance criteria") :]
+
+    assert "I1–I8" in purpose
+    assert "I1–I7" not in purpose
+    assert "I1`–`I8" in registry
+    assert "I1`–`I6" not in registry
+    assert "I1–I8" in acceptance
+    assert "I1–I7" not in acceptance
+
+
 def test_section_3_uses_the_extracted_fixture_layout() -> None:
     """§3 must use the authoritative top-level fixture path from EXTRACTION §3.12."""
     design = _design_md()

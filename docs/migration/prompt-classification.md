@@ -15,16 +15,17 @@ text lives on in Mythical Forge's own copies, which is where it is maintained no
 Membership stays **spec-fixed**, never re-derived by grepping for product tokens: §4.2 deliberately
 kept `git-update.md` and `review-findings-to-github.md` in bucket (i) despite their frozen marker
 strings, and `task-prompt.md` in bucket (iii) even though it named the toolkit's own directory.
-`tests/test_prompt_classification.py` asserts both halves of that partition — the 14 files present
-Class `(iv)` is the one post-cutover addition: `update-roadmap.md`, the core `I7` stage H3.1
-added so the roadmap tick has an owner independent of the repo-optional traceability stage. It was
-not part of §4.2's 31-file inventory, so it carries its own class rather than being back-dated into
-one of the three buckets.
+`tests/test_prompt_classification.py` asserts both halves of that partition — the files present
+Class `(iv)` is the post-cutover additions: `update-roadmap.md`, the core `I7` stage H3.1 added so
+the roadmap tick has an owner independent of the repo-optional traceability stage, and
+`summarize-implementation-results.md`, the core `I8` stage X1.1 added so the build results are
+distilled into a human-readable summary. Neither was part of §4.2's 31-file inventory, so they
+carry their own class rather than being back-dated into one of the three buckets.
 
 here and the 17 that must be absent — so a prompt that is deleted, re-added, or quietly re-bucketed
 fails there rather than after the next release.
 
-## In the toolkit (14 files)
+## In the toolkit (16 files)
 
 | Prompt file | Class | Action | Destination |
 |---|---|---|---|
@@ -42,7 +43,8 @@ fails there rather than after the next release.
 | `task-prompt.md` | (iii) | retained and neutralised in MF.2 | toolkit `prompts/` |
 | `update-architecture.md` | (iii) | retained and neutralised in MF.2 | toolkit `prompts/` |
 | `update-traceability.md` | (iii) | retained and neutralised in MF.2 | toolkit `prompts/` |
-| `update-roadmap.md` | (iv) | added after the cutover (H3.1) | toolkit `prompts/` |
+| `update-roadmap.md` | (iv) | added after the cutover | toolkit `prompts/` |
+| `summarize-implementation-results.md` | (iv) | added after the cutover | toolkit `prompts/` |
 
 The three retained files are the ones the default registry invokes: `task-prompt.md` is stage
 `P1` of the `prompt` workflow, and `update-traceability.md` / `update-architecture.md` are stages
@@ -80,7 +82,7 @@ no toolkit prompt carries it any more.
 
 `tests/test_prompt_classification.py` pins, in both directions:
 
-- the 14 files present here are exactly the rows of the table above, and the 17 listed as moved are
+- the files present here are exactly the rows of the table above, and the 17 listed as moved are
   absent from the toolkit;
 - the four sets partition §4.2's own named lists (6 / 5 / 3 / 17 = 31), read from
   `docs/migration/EXTRACTION.md` rather than re-derived;

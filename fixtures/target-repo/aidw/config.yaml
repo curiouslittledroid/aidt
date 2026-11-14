@@ -16,7 +16,7 @@ paths:
 workflows:
   implement:
     # A declared `stages:` list replaces the toolkit's static half wholesale (§3.4), so all
-    # seven core ids I1–I7 are declared **in registry order** and the repo-optional I3 is
+    # eight core ids I1–I8 are declared **in registry order** and the repo-optional I3 is
     # disabled with `enabled: false` rather than omitted (D12/D13). An omitted or
     # reordered core id would be a `StageListError`, not a smaller plan.
     stages:
@@ -30,8 +30,11 @@ workflows:
       # I4 update-architecture — explicit path (D14 level 1).
       - id: I4
         prompt: aidw/prompts/architecture-explicit.md
-      # I5/I6/I7 — default fallback again: the sibling proof that fallback is not one stage.
+      # I5/I8/I6/I7 — default fallback again: the sibling proof that fallback is not one stage.
       - id: I5
+      # I8 summarize-implementation-results — core (X1.1): the narrative summary is not
+      # repo-optional.
+      - id: I8
       # I7 update-roadmap — core (H3.1): the roadmap tick is not repo-optional.
       - id: I7
       - id: I6
