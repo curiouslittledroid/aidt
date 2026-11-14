@@ -73,7 +73,9 @@ stages write), never for source, tests, config or lockfiles.
 | `README.md` | Operator guide. Sections still read pre-extraction in places; the naming/two-roots section is current. |
 | `EXPLICIT-RESOURCES.md` | **Planned future state** (not implemented). |
 | `docs/migration/EXTRACTION.md` | Plan of record for the extraction. |
-| `docs/target-repo-config.md`, `docs/schema/` | Placeholders owned by later tasks. |
+| `docs/target-repo-config.md` | The `<target>/aidw/config.yaml` contract. Drift-checked against `aidw/target_config.py` by `tests/test_target_repo_config_doc.py`. |
+| `docs/workflow-stages.md` | Every stage of every workflow (agent, prompt, arguments, condition, context), loops, gates. Drift-checked against `aidw/stage_registry.py` by `tests/test_workflow_stages_doc.py` — edit the tables when you change a stage. |
+| `docs/schema/` | Placeholder owned by later tasks. |
 
 ## Prompts and agent configs are the product contract
 

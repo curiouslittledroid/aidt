@@ -263,20 +263,22 @@ The generated prompt lands in the target repo's task-prompts directory,
 ### `aidw implement` — implement a task prompt and open the PR
 
 Takes a generated task prompt, derives the task id and branch from its filename, and runs
-the six focused stages serially, leaving the tree uncommitted until `/pr` owns delivery:
+the eight focused stages serially, leaving the tree uncommitted until `/pr` owns delivery:
 
 ```text
-I1 impliment-task                 implementer (shared session)
-I2 test                           tester     (fresh)
-I3 update-traceability            implementer (shared)
-I4 update-architecture            implementer (shared)
-I5 record-implementation-results  recorder   (fresh)   SYNC POINT
+I1 impliment-task                    implementer  (shared session)
+I2 test                              tester       (fresh)
+I3 update-traceability               implementer  (shared)   repo-optional
+I4 update-architecture               implementer  (shared)   repo-optional
+I5 record-implementation-results     recorder     (fresh)    SYNC POINT
+I8 summarize-implementation-results  recorder     (fresh)
+I7 update-roadmap                    recorder     (fresh)    only if the gates are green
 ◇  approve-implementation-pr
-I6 pr                             pr-publisher (fresh)
+I6 pr                                pr-publisher (fresh)
 ```
 
 ```bash
-# plan only: prints I1–I6 with agents/models; no Pi, no git or GitHub writes
+# plan only: prints I1–I8 with agents/models; no Pi, no git or GitHub writes
 aidw implement docs/task-prompts/03-E4.1-prompt.md --dry-run
 
 # real run on branch 03-E4.1
@@ -752,10 +754,13 @@ checkout resolves inside its own tree (design.md §9.1's warned case).
 
 ### Documentation
 
-Three shipped contracts are the reference for what AIDT reads around a target repo:
+Four shipped contracts are the reference for what AIDT reads around a target repo:
 
 - [`docs/target-repo-config.md`](./docs/target-repo-config.md) — the `<target>/aidw/config.yaml`
   contract: every field, its type, its default, its provenance and the worked examples.
+- [`docs/workflow-stages.md`](./docs/workflow-stages.md) — every stage of every workflow: its
+  agent, prompt, arguments, conditions and context, the loops, the gates, and how to declare
+  stages. Its tables are pinned to `aidw/stage_registry.py` by a test.
 - [`docs/roadmap-format.md`](./docs/roadmap-format.md) — the roadmap format AIDT owns, with the
   canonical worked example the parser tests read.
 - [`docs/releasing.md`](./docs/releasing.md) — the tag-based release process, the two install

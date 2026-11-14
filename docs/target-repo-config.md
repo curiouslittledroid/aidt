@@ -460,6 +460,10 @@ declared it).
 
 ## Related documents
 
+- [`workflow-stages.md`](./workflow-stages.md) — the companion reference: every stage of every
+  workflow (agent, prompt, arguments, conditions, context), the loops, the gates and how the
+  stage ids above bind to a declared `workflows.<name>.stages` list. Its tables are pinned to
+  `aidw/stage_registry.py`, as this document's field tables are pinned to the loader.
 - `docs/schema/aidw-config.schema.json` — the machine-readable shape of the config file (E3.1).
 - `docs/roadmap-format.md` — the roadmap format that `paths.roadmap_dir`/`paths.roadmap_glob`
   point at (E5.1).
