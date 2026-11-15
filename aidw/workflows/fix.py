@@ -919,6 +919,22 @@ def run(
             if not evidence.green:
                 withhold_tick(evidence.reason, target)
                 return 0
+            # The loop converged, so this run's own evidence is green — but the tick is a
+            # completion claim and must also agree with what the run recorded about the
+            # task's Done-when (design §8.2; the rule is shared with `implement` so the two
+            # ticks cannot drift, H3.3). Withheld, never failed: the recorded verdict is the
+            # thing to fix, and `fix` cannot repair a build-results document it did not write.
+            conclusion = roadmap.recorded_unmet_conclusion(
+                repo.root,
+                implementation_results_dir=(
+                    resolved_config["paths.implementation_results_dir"].value
+                ),
+                phase=target.phase,
+                task=target.task,
+            )
+            if conclusion is not None:
+                withhold_tick(roadmap.unmet_conclusion_reason(conclusion), target)
+                return 0
             spec = _tick_spec(
                 target=target,
                 pr=pr,

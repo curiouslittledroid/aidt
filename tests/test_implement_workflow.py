@@ -2622,6 +2622,52 @@ def test_the_e6_1_replay_withholds_the_tick_behind_a_red_suite(
     assert "stage update-roadmap failed" not in out.err
 
 
+def test_green_evidence_still_withholds_the_tick_against_a_recorded_unmet_verdict(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """PR #282: every gate green, and the task's own build results conclude unmet.
+
+    H3.2 asks whether the run's gates passed, which is not the same question as "does the
+    recorded proof agree the task is done". PR #282 had green gates *and* a build-results
+    document concluding the fixture's contract suite failed, so the tick was a completion
+    claim the run's own recording contradicted — and the stage has no legal repair (its
+    postcondition allows one checkbox and nothing else). The tick is withheld before any
+    agent is invoked, the document and line are named, and the run still exits 0.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    tree = _evidence_tree(worktree, exclude=(_runs_root(control).parent,))
+    results = worktree / "docs" / "implementation-results" / "03-E4.1"
+    results.mkdir(parents=True)
+    (results / "build-results.md").write_text(
+        '# Build Results\n\nConsequently the task\'s "Done when" is **not** met on this '
+        "tree: the fixture's contract suite does not pass.\n",
+        encoding="utf-8",
+    )
+    before = (worktree / ROADMAP_REL).read_text(encoding="utf-8")
+    _patch(monkeypatch)
+    # Green evidence: no gate key fails, so H3.2 alone would let the tick run.
+    recorder = _GateEvidenceStages(tree=tree)
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-roadmap" not in recorder.names
+    assert (worktree / ROADMAP_REL).read_text(encoding="utf-8") == before
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-roadmap")
+    assert record.status == SKIPPED
+    assert record.error is None
+    assert "tick" not in record.artifacts
+    reason = record.artifacts[SKIP_REASON_KEY]
+    assert "docs/implementation-results/03-E4.1/build-results.md:3" in reason
+    assert "Done-when is unmet" in reason
+    assert state.status == SUCCEEDED
+    assert "I7 update-roadmap [skipped]" in capsys.readouterr().out
+
+
 def test_green_evidence_ticks_the_box_exactly_once(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -1060,16 +1060,34 @@ def run(
                 exclude=(workspace.state_root,),
                 ignore=tick_evidence_ignore(resolved_config, target.root),
             )
+            reason = evidence.reason
             if evidence.green:
-                return False
+                # H3.2 asks whether this run's gates passed. The tick is a *completion*
+                # claim, so it also has to agree with what the run recorded about the
+                # task's Done-when: PR #282 had every gate green and a build-results
+                # document concluding the contract suite failed, and the tick was still
+                # attempted (design §8.2, the same rule the target repo's own completion
+                # check applies). A tick the recorded verdict contradicts is withheld, not
+                # failed — like a red gate, the run has already decided.
+                conclusion = roadmap.recorded_unmet_conclusion(
+                    target.root,
+                    implementation_results_dir=(
+                        resolved_config["paths.implementation_results_dir"].value
+                    ),
+                    phase=tick.phase,
+                    task=tick.task,
+                )
+                if conclusion is None:
+                    return False
+                reason = roadmap.unmet_conclusion_reason(conclusion)
             record = record_skipped(
                 entry,
                 state=state,
                 directory=directory,
                 agents=agents,
-                reason=evidence.reason,
+                reason=reason,
             )
-            logger.info(f"stage {entry.name}: skipped — {evidence.reason}")
+            logger.info(f"stage {entry.name}: skipped — {reason}")
             print_stage(record, repo_root=target.root, prefix=entry.id)
             return True
 
