@@ -391,3 +391,126 @@ def verify_checkbox_flip(
             f"on line {index + 1}; every other byte must be unchanged"
         )
     return TICK_FLIPPED
+
+
+# ── The recorded verdict on the task's Done-when (design §8.2) ──────────────────────
+#
+# I7 flips a completion claim. H3.2 gates that flip on the run's own green evidence; this
+# gates it on the *recorded* verdict too, because a run whose gates all passed can still
+# have written "the task's Done-when is not met" into its build results — which is exactly
+# what happened to PR #282: `04-A1.1` was ticked over a recorded contract-suite failure, and
+# the only thing that caught it was a check the target repo had grown itself. The stage
+# also has no way to express the repair: its postcondition allows one checkbox and nothing
+# else, so an agent told to tick a contradicted entry can only fail or go around it.
+
+#: A line naming the task's Done-when — the record stage's own vocabulary.
+DONE_WHEN_MENTION_RE = re.compile(r"done[- ]when", re.IGNORECASE)
+#: …asserting that it is unmet, with the negation adjacent to ``met`` — at most four words
+#: between them (``not met``, ``not yet met``, ``has not been met``, ``is **not** met``).
+#: Deliberately narrow in both directions: a gate row that merely *quotes* the Done-when
+#: command concludes nothing, and a distant ``not`` (``… is met; the earlier attempt was not
+#: reviewed …``) must not manufacture a conclusion either.
+DONE_WHEN_UNMET_RE = re.compile(
+    r"\bnot\b(?:\s+[^\s]+){0,4}\s+met\b", re.IGNORECASE
+)
+
+#: The build-results document the record stage writes per task (``I5``).
+BUILD_RESULTS_NAME = "build-results.md"
+
+
+@dataclass(frozen=True)
+class UnmetConclusion:
+    """A recorded build-results conclusion that the task's Done-when is unmet.
+
+    ``results_file`` is repo-relative so a skip reason names a path an operator can open;
+    ``line`` is 1-based and ``text`` the offending line, stripped.
+    """
+
+    results_file: str
+    line: int
+    text: str
+
+
+def _without_emphasis(line: str) -> str:
+    """``line`` with markdown emphasis and code-span marks removed before matching.
+
+    The record stage bolds its verdicts (``is **not** met``), and ``**`` between the
+    negation and ``met`` is markup, not a word: matching the raw line would read the one
+    sentence this rule exists for as no conclusion at all.
+    """
+    return line.replace("*", "").replace("_", "").replace("`", "")
+
+
+def find_unmet_conclusion(text: str) -> tuple[int, str] | None:
+    """Pure: the first line that both names the Done-when and asserts it is unmet.
+
+    Returns ``(1-based line, stripped text)`` or ``None``. One line is enough: the document
+    is a claim about one task, so any such line contradicts a tick, and reporting the first
+    keeps the skip reason short.
+    """
+    for index, line in enumerate(text.splitlines()):
+        plain = _without_emphasis(line)
+        if DONE_WHEN_MENTION_RE.search(plain) and DONE_WHEN_UNMET_RE.search(plain):
+            return index + 1, line.strip()
+    return None
+
+
+def task_results_candidates(phase: str, task: str) -> tuple[str, ...]:
+    """The ``<phase>-<task>`` directory names a build-results document may live under.
+
+    Padded first (``04-A1.1``), then the unpadded form older result trees use
+    (``4-A1.1``) — the same pair the layout accepts, so a tick is judged by the document the
+    run actually wrote rather than by one naming convention.
+    """
+    padded = f"{phase}-{task}"
+    unpadded = re.sub(r"(^|\.)0+(\d)", r"\1\2", padded)
+    return (padded,) if unpadded == padded else (padded, unpadded)
+
+
+def recorded_unmet_conclusion(
+    root: Path, *, implementation_results_dir: str, phase: str, task: str
+) -> UnmetConclusion | None:
+    """The task's **recorded** verdict, when it contradicts a tick (design §8.2).
+
+    ``implementation_results_dir`` is the resolved ``paths.implementation_results_dir``
+    value — target-relative by default, absolute allowed — so this module still carries no
+    product-specific directory (D15). A **missing** document is not a contradiction: a repo
+    without build results, or a task whose recording stage legitimately wrote none, keeps
+    the H3.2 behaviour unchanged. Only a document that exists and concludes unmet withholds.
+
+    Read-only: one file read, no mutation, and an unreadable file is treated as absent
+    rather than as a reason to fail — the tick's own postcondition is still the gate on
+    the edit itself.
+    """
+    base = Path(implementation_results_dir)
+    if not base.is_absolute():
+        base = Path(root) / base
+    for dirname in task_results_candidates(phase, task):
+        path = base / dirname / BUILD_RESULTS_NAME
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        found = find_unmet_conclusion(text)
+        if found is None:
+            continue
+        line, text_of_line = found
+        try:
+            shown = path.resolve().relative_to(Path(root).resolve()).as_posix()
+        except ValueError:  # results dir outside the tree: name what we read
+            shown = path.as_posix()
+        return UnmetConclusion(shown, line, text_of_line)
+    return None
+
+
+def unmet_conclusion_reason(conclusion: UnmetConclusion) -> str:
+    """The one-line skip reason a withheld tick carries.
+
+    Names the document and line first, because that is the thing to fix — the agents read
+    ``run.log``, and "the recorded verdict contradicts the tick" without a pointer is not
+    actionable.
+    """
+    return (
+        f"the recorded build results conclude the task's Done-when is unmet "
+        f"({conclusion.results_file}:{conclusion.line})"
+    )

@@ -771,3 +771,171 @@ def test_property_evidence_seed_and_run_count_are_pinned() -> None:
     assert EVIDENCE_NUM_RUNS == len(EVIDENCE_CASES) == 10
     assert len({name for name, _, _ in EVIDENCE_CASES}) == EVIDENCE_NUM_RUNS
     assert sum(1 for _, statuses, tree in EVIDENCE_CASES if tree is None) == 1
+
+
+# ── The recorded verdict rule (design §8.2) ─────────────────────────────────────────
+#
+# H3.2 withholds a tick behind a red gate. PR #282 showed the remaining gap: every gate was
+# green and the task's own build-results document concluded its Done-when was unmet, so the
+# tick was a completion claim the run's own recording contradicted. These pin the rule that
+# reads that document — narrow on purpose, because a gate row that merely *quotes* the
+# Done-when command must not withhold anything.
+
+#: The line the record stage actually wrote for `04-A1.1` (PR #282) — the incident.
+RECORDED_UNMET_LINE = (
+    "Consequently the task's \"Done when\" is **not** met on this tree: the fixture's "
+    "contract suite does not pass."
+)
+
+
+def test_find_unmet_conclusion_detects_the_recorded_verdict() -> None:
+    """The incident's own sentence is a conclusion: it names the Done-when and denies it."""
+    text = f"# Build Results\n\nSome prose.\n\n{RECORDED_UNMET_LINE}\n"
+
+    assert roadmap.find_unmet_conclusion(text) == (5, RECORDED_UNMET_LINE)
+
+
+def test_find_unmet_conclusion_reports_the_first_line_that_concludes() -> None:
+    """One line is the claim; a later duplicate must not change which one is reported."""
+    first = "At recording time the task's Done-when is not yet met."
+    text = f"{first}\n\nThe Done-when is not met either.\n"
+
+    assert roadmap.find_unmet_conclusion(text) == (1, first)
+
+
+def test_find_unmet_conclusion_ignores_a_gate_row_quoting_the_done_when() -> None:
+    """A verification row that runs the Done-when command concludes nothing."""
+    row = (
+        "| `pnpm docs:check-completions` (the task's Done-when check) | ✅ Pass — 288 "
+        "roadmap task(s) checked |"
+    )
+
+    assert roadmap.find_unmet_conclusion(row) is None
+
+
+def test_find_unmet_conclusion_ignores_a_met_verdict() -> None:
+    """A met verdict, a green gate row and a bare reference all stay silent."""
+    text = (
+        "**Verdict:** the Done-when recorded in the roadmap **is met** on this tree.\n"
+        "The Done-when: the contract suite passes.\n"
+    )
+
+    assert roadmap.find_unmet_conclusion(text) is None
+
+
+def test_find_unmet_conclusion_is_case_insensitive_and_accepts_the_hyphen() -> None:
+    """`Done-When`, `Done When` and `done-when` are the same claim."""
+    for line in (
+        "Done-When is not met on this tree.",
+        "Done When is not met on this tree.",
+        "done-when is not met on this tree.",
+    ):
+        assert roadmap.find_unmet_conclusion(line) == (1, line)
+
+
+def test_find_unmet_conclusion_requires_the_negation_to_be_near() -> None:
+    """A distant `not` cannot manufacture a conclusion out of an unrelated sentence."""
+    line = (
+        "The Done-when is met; note that the earlier attempt was not reviewed and the "
+        "fixture was met later."
+    )
+
+    assert roadmap.find_unmet_conclusion(line) is None
+
+
+def test_task_results_candidates_offers_padded_then_unpadded() -> None:
+    """Both layouts are where a recorded document has lived; the padded form comes first."""
+    assert roadmap.task_results_candidates("04", "A1.1") == ("04-A1.1", "4-A1.1")
+    assert roadmap.task_results_candidates("3", "D3") == ("3-D3",)
+    assert roadmap.task_results_candidates("03", "H3") == ("03-H3", "3-H3")
+
+
+def test_recorded_unmet_conclusion_reads_the_padded_directory(tmp_path: Path) -> None:
+    """The path in the reason is repo-relative, so an operator can open it."""
+    results = tmp_path / "docs" / "implementation-results" / "04-A1.1"
+    results.mkdir(parents=True)
+    (results / "build-results.md").write_text(
+        f"# Build Results\n\n{RECORDED_UNMET_LINE}\n", encoding="utf-8"
+    )
+
+    conclusion = roadmap.recorded_unmet_conclusion(
+        tmp_path,
+        implementation_results_dir="docs/implementation-results",
+        phase="04",
+        task="A1.1",
+    )
+
+    assert conclusion is not None
+    assert conclusion.results_file == "docs/implementation-results/04-A1.1/build-results.md"
+    assert conclusion.line == 3
+    assert conclusion.text == RECORDED_UNMET_LINE
+
+
+def test_recorded_unmet_conclusion_falls_back_to_the_unpadded_directory(
+    tmp_path: Path,
+) -> None:
+    """Older result trees drop the padding; the rule must still find the document."""
+    results = tmp_path / "docs" / "implementation-results" / "4-A1.1"
+    results.mkdir(parents=True)
+    (results / "build-results.md").write_text(
+        f"{RECORDED_UNMET_LINE}\n", encoding="utf-8"
+    )
+
+    conclusion = roadmap.recorded_unmet_conclusion(
+        tmp_path,
+        implementation_results_dir="docs/implementation-results",
+        phase="04",
+        task="A1.1",
+    )
+
+    assert conclusion is not None
+    assert conclusion.results_file == "docs/implementation-results/4-A1.1/build-results.md"
+
+
+def test_recorded_unmet_conclusion_withholds_nothing_without_a_document(
+    tmp_path: Path,
+) -> None:
+    """A repo with no build results keeps the H3.2 behaviour: absence is not a contradiction."""
+    assert (
+        roadmap.recorded_unmet_conclusion(
+            tmp_path,
+            implementation_results_dir="docs/implementation-results",
+            phase="04",
+            task="A1.1",
+        )
+        is None
+    )
+
+
+def test_recorded_unmet_conclusion_ignores_a_met_document(tmp_path: Path) -> None:
+    """A refreshed verdict that now concludes met no longer withholds the tick."""
+    results = tmp_path / "docs" / "implementation-results" / "03-H3"
+    results.mkdir(parents=True)
+    (results / "build-results.md").write_text(
+        "**Verdict:** the Done-when recorded in the roadmap **is met**.\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        roadmap.recorded_unmet_conclusion(
+            tmp_path,
+            implementation_results_dir="docs/implementation-results",
+            phase="03",
+            task="H3",
+        )
+        is None
+    )
+
+
+def test_unmet_conclusion_reason_names_the_document_and_line() -> None:
+    """The skip reason is the operator's pointer: file:line first, claim second."""
+    reason = roadmap.unmet_conclusion_reason(
+        roadmap.UnmetConclusion(
+            results_file="docs/implementation-results/04-A1.1/build-results.md",
+            line=103,
+            text="…",
+        )
+    )
+
+    assert "docs/implementation-results/04-A1.1/build-results.md:103" in reason
+    assert "Done-when is unmet" in reason
