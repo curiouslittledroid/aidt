@@ -216,3 +216,143 @@ def test_render_finding_block_reemits_the_reviewer_format() -> None:
     assert "What I found: The loop stops one element early." in block
     assert "Where: packages/shared/src/list.ts:42" in block
     assert "Suggested fix: Iterate with a `<`-bound to the array length." in block
+
+
+# ── Later-round per-finding verdicts (M4) ───────────────────────────────────────────
+#
+# The delta brief requires a `Verdict on this finding:` line per previous finding from
+# round 2 on. Those blocks are verdicts on *earlier* findings, so a `resolved` one must not
+# count as blocking — otherwise an approving review that resolved everything reads as
+# "Approve with N blocking findings" and M2 blocks the run. Observed on PR #282 / 04-A1.3
+# (2026-11-16): the review said "Approve — prior findings resolved, no new defects" and the
+# run was still blocked with `findings=2/2`.
+
+#: The shape that blocked the run: two previous findings, both resolved, both still
+#: carrying their original blocking priority.
+RESOLVED_ROUND = """\
+## Previous-review findings — per-finding verdicts
+
+Priority: Must fix
+Confidence: 5
+What I found: The Done when required a live 201 without A1.4's endpoints.
+Why it matters: The implementer would chase an impossible green.
+Trigger and effect: Every run of this task.
+Where: Previous prompt Done when.
+Suggested fix: Condition it on A1.4.
+Verdict on this finding: resolved. The current prompt conditions the `201` on A1.4.
+
+Priority: Should fix
+Confidence: 5
+What I found: Design 11 §3 was cited as a REST placement rule.
+Why it matters: The authority chain did not match the source text.
+Trigger and effect: A reader trusting the citation.
+Where: Previous prompt header citation block.
+Suggested fix: Correct the citation.
+Verdict on this finding: resolved. The header now attributes placement to A1.2.
+
+## New findings
+
+No new findings.
+
+Verdict: Approve — prior findings resolved, no new defects.
+"""
+
+
+def test_a_resolved_finding_keeps_its_priority_but_stops_blocking() -> None:
+    """The block still parses (the record keeps it); only its blocking status changes."""
+    parsed, problems = findings.parse_review_findings(RESOLVED_ROUND)
+
+    assert problems == []
+    assert [f.priority for f in parsed] == ["must-fix", "should-fix"]
+    assert [f.resolution for f in parsed] == [
+        findings.RESOLVED,
+        findings.RESOLVED,
+    ]
+    blocking, non_blocking = findings.partition_findings(parsed)
+    # Both are resolved, so neither needs a fix stage, and neither is fed to the
+    # could-fix batch (which would ask an agent to fix something already closed).
+    assert blocking == []
+    assert non_blocking == []
+    # The record keeps them: the manifest still publishes all findings.
+    assert len(findings.to_manifest(parsed)["findings"]) == 2
+
+
+def test_the_verdict_does_not_bleed_into_the_preceding_field() -> None:
+    """`Verdict on this finding` is its own field, not appended to `Where`."""
+    parsed, _ = findings.parse_review_findings(RESOLVED_ROUND)
+
+    assert parsed[0].where == "Previous prompt Done when."
+    assert "resolved" not in parsed[0].where
+
+
+def test_an_unresolved_verdict_still_blocks() -> None:
+    """`not resolved` and `newly contradicted` are live findings."""
+    for verdict, expected in (
+        ("not resolved. The prompt still owes A1.4.", findings.NOT_RESOLVED),
+        ("newly contradicted. The fix broke the trap.", findings.NEWLY_CONTRADICTED),
+    ):
+        text = RESOLVED_ROUND.replace(
+            "Verdict on this finding: resolved. The current prompt conditions the `201` on A1.4.",
+            f"Verdict on this finding: {verdict}",
+        )
+        parsed, problems = findings.parse_review_findings(text)
+
+        assert problems == [], verdict
+        assert parsed[0].resolution == expected, verdict
+        blocking, _ = findings.partition_findings(parsed)
+        assert [f.what_found for f in blocking] == [
+            "The Done when required a live 201 without A1.4's endpoints."
+        ], verdict
+
+
+def test_an_absent_verdict_still_blocks() -> None:
+    """Round 1 has no verdict line; nothing about that changes."""
+    parsed, problems = findings.parse_review_findings(REVIEW)
+
+    assert problems == []
+    assert [f.resolution for f in parsed] == ["", ""]
+    blocking, _ = findings.partition_findings(parsed)
+    assert len(blocking) == 1  # the should-fix one
+
+
+def test_an_unrecognised_verdict_fails_closed_as_blocking() -> None:
+    """A wording the parser does not know keeps the finding blocking, without a problem."""
+    text = RESOLVED_ROUND.replace(
+        "Verdict on this finding: resolved. The current prompt conditions the `201` on A1.4.",
+        "Verdict on this finding: partially addressed, see above.",
+    )
+    parsed, problems = findings.parse_review_findings(text)
+
+    assert problems == []
+    assert parsed[0].resolution == ""
+    blocking, non_blocking = findings.partition_findings(parsed)
+    # The unrecognised one blocks; the other is resolved, so it needs no stage.
+    assert [f.what_found for f in blocking] == [
+        "The Done when required a live 201 without A1.4's endpoints."
+    ]
+    assert non_blocking == []
+
+
+def test_a_resolved_could_fix_is_still_non_blocking() -> None:
+    """Priority decides non-blocking; the verdict only ever clears a blocking one."""
+    text = REVIEW.replace(
+        "Suggested fix: Extract one helper.",
+        "Suggested fix: Extract one helper.\nVerdict on this finding: not resolved.",
+    )
+    parsed, problems = findings.parse_review_findings(text)
+
+    assert problems == []
+    blocking, non_blocking = findings.partition_findings(parsed)
+    assert len(blocking) == 1
+    assert [f.priority for f in non_blocking] == ["could-fix"]
+
+
+def test_re_render_keeps_the_verdict_so_a_shrink_cannot_clear_it() -> None:
+    """`render_previous_review` shrinks the previous review; the verdict must survive it."""
+    parsed, _ = findings.parse_review_findings(RESOLVED_ROUND)
+
+    rendered = findings._finding_text_block(parsed[0])
+
+    assert "Verdict on this finding: resolved" in rendered
+    reparsed, _ = findings.parse_review_findings(rendered)
+    assert reparsed[0].resolution == findings.RESOLVED
