@@ -16,6 +16,14 @@ AIDT parses those blocks into the JSON manifest that the bundled publisher expec
 parser is strict and **fails closed**: an unknown priority, an out-of-range confidence, or
 an empty required field yields a problem rather than a guessed manifest. A manifest is
 only built when every finding parses cleanly.
+
+**Rounds after the first** add an optional ``Verdict on this finding:`` line (the delta
+brief requires one per previous finding: ``resolved`` / ``not resolved`` / ``newly
+contradicted``). Those blocks are *verdicts on earlier findings*, not new findings, so a
+``resolved`` block never counts as blocking — otherwise an approving review that resolved
+everything would contradict itself under M2 and block the run (observed on PR #282's
+`04-A1.3`, 2026-11-16). An absent or unrecognised verdict keeps the block blocking, which
+is the fail-closed direction: no finding is silently cleared.
 """
 
 from __future__ import annotations
@@ -50,6 +58,9 @@ _LABELS = {
     "trigger and effect": "triggerAndEffect",
     "where": "where",
     "suggested fix": "suggestedFix",
+    # Optional, later rounds only (the delta brief's per-finding verdict). Recognised as a
+    # label so it does not append itself to the preceding field's text.
+    "verdict on this finding": "resolution",
 }
 
 _LABEL_RE = re.compile(
@@ -61,6 +72,34 @@ _TITLE_CLEAN_RE = re.compile(r"[`*_#>]+")
 
 #: Markdown emphasis that can wrap a whole label line, e.g. ``**Priority: Must fix**``.
 _EMPHASIS_STRIP = "*`_ \t"
+
+
+#: The per-finding verdicts the delta brief asks for, normalised.
+RESOLVED = "resolved"
+NOT_RESOLVED = "not-resolved"
+NEWLY_CONTRADICTED = "newly-contradicted"
+
+#: Longer phrases first: ``not resolved`` must not be read as ``resolved``.
+_RESOLUTION_PREFIXES = (
+    ("not resolved", NOT_RESOLVED),
+    ("newly contradicted", NEWLY_CONTRADICTED),
+    ("resolved", RESOLVED),
+)
+
+
+def normalise_resolution(value: str) -> str:
+    """The canonical per-finding verdict, or ``""`` when absent or unrecognised.
+
+    Prefix-matched on the cleaned, lowercased text so prose after the token
+    (``resolved. The current prompt conditions …``) is tolerated. An unrecognised value is
+    deliberately **not** an error: the caller keeps the finding blocking, which is the
+    conservative reading, and a formatting quirk must not fail an otherwise valid review.
+    """
+    cleaned = _clean_scalar(value).rstrip(".").strip().lower()
+    for prefix, canonical in _RESOLUTION_PREFIXES:
+        if cleaned.startswith(prefix):
+            return canonical
+    return ""
 
 
 def _clean_scalar(value: str) -> str:
@@ -77,6 +116,8 @@ class ParsedFinding:
     trigger_and_effect: str
     where: str
     suggested_fix: str
+    #: Later rounds only: ``resolved`` / ``not-resolved`` / ``newly-contradicted``, else ``""``.
+    resolution: str = ""
 
     def to_manifest_entry(self, index: int) -> dict[str, Any]:
         return {
@@ -178,6 +219,7 @@ def parse_review_findings(text: str) -> tuple[list[ParsedFinding], list[str]]:
                 trigger_and_effect=values["triggerAndEffect"],
                 where=values["where"],
                 suggested_fix=values["suggestedFix"],
+                resolution=normalise_resolution(block.get("resolution", "")),
             )
         )
 
@@ -202,8 +244,21 @@ BLOCKING_PRIORITIES = ("must-fix", "should-fix")
 def partition_findings(
     findings: list[ParsedFinding],
 ) -> tuple[list[ParsedFinding], list[ParsedFinding]]:
-    """Split into ``(blocking, non_blocking)``, preserving review order in each."""
-    blocking = [f for f in findings if f.priority in BLOCKING_PRIORITIES]
+    """Split into ``(to_fix_one_at_a_time, could_fix_batch)``, preserving review order.
+
+    A blocking priority is necessary but not sufficient: a later round's per-finding verdict
+    can close the finding, and a closed finding needs no fix stage, so it appears in
+    **neither** list. ``resolved`` is the only verdict that clears one; ``not-resolved``,
+    ``newly-contradicted``, an absent verdict and an unrecognised one all stay blocking, so
+    the only thing that clears a finding is the reviewer saying so. The lengths therefore do
+    not have to add up to ``len(findings)`` — the review record keeps every finding either
+    way (``to_manifest`` still publishes them all).
+    """
+    blocking = [
+        f
+        for f in findings
+        if f.priority in BLOCKING_PRIORITIES and f.resolution != RESOLVED
+    ]
     non_blocking = [f for f in findings if f.priority not in BLOCKING_PRIORITIES]
     return blocking, non_blocking
 
@@ -238,7 +293,12 @@ def _finding_text_block(finding: ParsedFinding) -> str:
         f"Trigger and effect: {finding.trigger_and_effect}\n"
         f"Where: {finding.where}\n"
         f"Suggested fix: {finding.suggested_fix}\n"
-        "```"
+        + (
+            f"Verdict on this finding: {finding.resolution}\n"
+            if finding.resolution
+            else ""
+        )
+        + "```"
     )
 
 
