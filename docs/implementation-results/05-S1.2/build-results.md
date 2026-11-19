@@ -3,7 +3,7 @@
 **Branch:** `05-S1.2`
 **Date:** 2026-11-20
 **Spec:** `design.md` §8.2 (`aidw implement <task-prompt-path> [--pr <n>]`), §12.2 (stage registry and value overrides), §17 row `Z12`; roadmap entry S1.2 in `docs/tasks/05 - Pipeline efficiency.md`; `docs/task-prompts/05-S1.2-prompt.md`; `docs/workflow-stages.md`; `docs/target-repo-config.md`
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** #166 — https://github.com/curiouslittledroid/aidt/pull/166
 
 ## Summary
 
