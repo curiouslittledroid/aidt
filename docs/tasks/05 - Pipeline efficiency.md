@@ -55,7 +55,7 @@ still runs `I6 pr` and opens the PR; the reviewer then re-finds the same defects
 loop re-fixes them (one defect was found independently by the tester, the reviewer and the
 fixer in one task). This epic makes an in-scope tester `Fail` stop the run before the PR.
 
-- [ ] **Q1.1. Withhold the PR when the tester's in-scope verdict is `Fail`** (Design 8.2)
+- [x] **Q1.1. Withhold the PR when the tester's in-scope verdict is `Fail`** (Design 8.2)
   - Done when: `implement` does not run `I6 pr` (and opens no PR) when the `I2 test` stage's final message reports `Fail` for any in-scope acceptance criterion, and the run records a stop naming the failing criteria; `Unverified` criteria, out-of-scope criteria and pre-existing failures the tester already separated do not stop the run; the workflow (not the agent) parses the verdict and decides, the way §8.3 parses `R1`'s verdict; design §8.2 is updated and the decision recorded as Z10; and the five gates above are green.
   - Deliverable: `aidw/workflows/implement.py` (a verdict gate before `I6`), a machine-parseable verdict block in `prompts/test.md`, design.md §§8.2, 17 (row Z10), and the tests below.
   - Tests: `tests/test_implement_workflow.py`, `tests/test_design_doc.py`.

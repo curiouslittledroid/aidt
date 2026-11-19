@@ -59,6 +59,59 @@ def test_section_81_blocked_run_reports_leftovers() -> None:
     assert "branch that appeared during the run" in design
 
 
+def _section_82_block(design: str) -> str:
+    """The §8.2 ``aidw implement`` block: its heading up to the §8.3 heading."""
+    start = design.index("### 8.2 `aidw implement <task-prompt-path> [--pr <n>]`")
+    end = design.index("### 8.3 ", start)
+    return design[start:end]
+
+
+def test_section_82_withholds_i6_on_an_in_scope_test_fail() -> None:
+    """Q1.1: the I2 verdict gate is design, not an implementation detail.
+
+    The gate's whole point is that a `Fail` lives in I2's *message* while the stage stays
+    `SUCCEEDED`, so §8.2 must say so, name the tokens and the recorded state, and state the
+    resume rule — otherwise the next reader "fixes" the block away as a dead end.
+    """
+    # Whitespace-flattened: the bullets are hard-wrapped, and the pinned sentences span lines.
+    block = " ".join(_section_82_block(_design_md()).split())
+
+    assert "**`I2`'s verdict withholds `I6`**" in block
+    assert "Test verdict: Pass" in block
+    assert "Test verdict: Fail" in block
+    assert "Failing in-scope criteria:" in block
+    assert "_parse_test_verdict" in block
+    assert 'state.pr["test_verdict"] = "Fail"' in block
+    assert 'state.pr["test_failing_criteria"]' in block
+    assert "BLOCKED" in block and "exit 3" in block
+    # The Resume rule sentence: repeat-stop is correct, `--from test` re-tests.
+    assert "**Resume rule:**" in block
+    assert "repeats the stop identically while the verdict is unchanged" in block
+    assert "which is correct, not stuck" in block
+    assert "`--from test`" in block
+    assert "overrides §9.4's completed-stages-never-rerun rule" in block
+
+
+def test_section_17_has_one_z10_row_recording_the_test_verdict_gate() -> None:
+    """Q1.1: one §17 row records the gate, its fail-closed stop and its prompt-fixed choices."""
+    design = _design_md()
+    section = _section(design, "## 17. Resolved decisions", "## 18. Risks")
+
+    rows = [line for line in section.splitlines() if line.startswith("| Z10 |")]
+    assert len(rows) == 1, f"expected exactly one §17 Z10 row, found {len(rows)}"
+    z10 = rows[0]
+    # The behaviour the code implements: Fail → BLOCKED/exit 3, I6 withheld, criteria named.
+    assert "Fail" in z10
+    assert "BLOCKED" in z10 and "exit 3" in z10
+    assert "I6" in z10 and "withholds" in z10
+    assert "criteria" in z10
+    assert "test_verdict" in z10
+    # The prompt-fixed decisions travel with the row (Z2/Z9's precedent).
+    assert "Prompt-fixed decisions" in z10
+    for decision in ("(a)", "(b)", "(c)", "(d)"):
+        assert decision in z10, decision
+
+
 def _section_83_block(design: str) -> str:
     """The §8.3 ``aidw review`` block: its heading up to the §8.4 heading."""
     start = design.index("### 8.3 `aidw review --pr <n>`")
