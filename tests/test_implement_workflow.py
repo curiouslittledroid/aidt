@@ -3726,6 +3726,77 @@ def test_an_undeclared_when_paths_runs_i3_unconditionally(
     assert _stage_record(state, "update-traceability").status == SUCCEEDED
 
 
+def test_an_undeclared_when_paths_runs_i3_without_computing_the_change_set(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Done-when: the default run never pays the change set's git spawns (#165).
+
+    An undeclared ``when_paths`` is statically unconditional, so the pure decision
+    (:func:`paths_changed_reason` over an empty prefix set) is "run" for **every** change
+    set: computing one — three read-only ``git`` spawns — is I/O the answer never reads.
+    The exploding stub proves the workflow returns before :func:`change_set_paths` runs
+    (AGENTS.md: git spawns dominate runtime; none on the most common path).
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_implement_stages())
+    _patch(monkeypatch)
+
+    def _explode(*args, **kwargs):
+        raise AssertionError(
+            "an undeclared when_paths must not compute the change set"
+        )
+
+    monkeypatch.setattr(implement_workflow, "change_set_paths", _explode)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-traceability" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-traceability").status == SUCCEEDED
+
+
+def test_an_undeclared_when_paths_does_not_call_git_change_set_helpers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The unconditional default avoids both underlying change-set git reads (#165)."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_implement_stages())
+    _patch(monkeypatch)
+
+    def _explode(*args, **kwargs):
+        raise AssertionError(
+            "an undeclared when_paths must not call change-set git helpers"
+        )
+
+    monkeypatch.setattr(implement_workflow.git, "changed_paths", _explode)
+    monkeypatch.setattr(implement_workflow.git, "untracked_paths", _explode)
+    # Keep I7's independent evidence condition out of this I3 dispatch proof; otherwise
+    # its own tree-identity read would be the expected caller of ``changed_paths``.
+    monkeypatch.setattr(
+        implement_workflow,
+        "roadmap_tick_evidence",
+        lambda *args, **kwargs: implement_workflow.TickEvidence(
+            False, None, "test evidence withheld"
+        ),
+    )
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-traceability" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-traceability").status == SUCCEEDED
+
+
 def test_an_unresolvable_base_runs_i3_instead_of_skipping(
     tmp_path: Path, monkeypatch
 ) -> None:

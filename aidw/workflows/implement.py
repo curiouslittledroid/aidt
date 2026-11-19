@@ -1346,7 +1346,15 @@ def run(
             undeclared/empty ``when_paths`` and a change set that cannot be computed both
             make :func:`paths_changed_reason` return ``None``, i.e. the stage runs: dropping
             a stage that may be needed is never the fail-closed direction.
+
+            The **pure** decision comes first (#165): the declared prefixes are evaluated
+            with no I/O, and an empty (or unusable) set returns before the change set is ever
+            computed. The toolkit default — no declared paths — is statically unconditional,
+            so the three read-only ``git`` spawns :func:`change_set_paths` would perform are
+            pure waste on the most common path (AGENTS.md: git spawns dominate runtime).
             """
+            if not _declared_prefixes(entry.when_paths):
+                return False
             reason = paths_changed_reason(
                 change_set_paths(target.root, exclude=(workspace.state_root,)),
                 entry.when_paths,
