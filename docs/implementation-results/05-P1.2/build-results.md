@@ -3,7 +3,7 @@
 **Branch:** `05-P1.2`
 **Date:** 2026-11-19
 **Spec:** `design.md` §8.4 (`aidw fix --pr <n>`), §7.2 (frozen GitHub contracts, D5), §17 row `Z9`; roadmap entry P1.2 in `docs/tasks/05 - Pipeline efficiency.md`; `docs/task-prompts/05-P1.2-prompt.md`
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** #159 — https://github.com/curiouslittledroid/aidt/pull/159
 
 ## Summary
 
