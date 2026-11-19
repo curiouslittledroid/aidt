@@ -3,7 +3,7 @@
 **Branch:** `05-P1.1`
 **Date:** 2026-11-19
 **Spec:** `design.md` §8.4 (`aidw fix --pr <n>`), §13 (Git and GitHub safety), §17 (`Z9`), §18 (risk table); roadmap entry P1.1 in `docs/tasks/05 - Pipeline efficiency.md`; `docs/task-prompts/05-P1.1-prompt.md`; `docs/workflow-stages.md`
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** #158 — https://github.com/curiouslittledroid/aidt/pull/158
 
 ## Summary
 
