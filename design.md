@@ -939,12 +939,19 @@ preflight (PR exists, branch exists, its worktree is located, no other run activ
     successful no-op: no empty commit, no push); clean with ≥ 1 closed → **fail closed**
     (issues were closed and there is nothing to push, exactly the untruthful state this
     change removes; P1.2's close-after-push ordering makes it unrepresentable later);
+  - a **new commit must exist** before "the push landed" means anything: the workflow
+    captures `HEAD` before the stage and requires it to have moved afterwards. The tree is
+    dirty by construction on this path, so a real `git commit` always moves it, while a stage
+    that stashes or cleans the change set instead of committing it leaves the pre-existing
+    SHAs in place — and would otherwise satisfy the comparison and the clean-tree check below
+    while losing the fixes (the PR #158 review finding);
   - the pushed proof is pinned without a fetch: after the stage the workflow compares
     `git.rev_parse(worktree, "HEAD")` with `git.rev_parse(worktree, "origin/<branch>")` — a
     successful `git push` updates the remote-tracking ref — and an unequal or unresolvable
-    pair, a non-`SUCCEEDED` stage record, a tree still dirty afterwards, or the fourth case
-    above each fail the run (exit 1) with a message naming the PR and the branch, never a
-    silent success (the O1 precedent: an agent's exit 0 is not evidence the write happened).
+    pair, a `HEAD` that did not move, a non-`SUCCEEDED` stage record, a tree still dirty
+    afterwards, or the fourth case above each fail the run (exit 1) with a message naming the
+    PR and the branch, never a silent success (the O1 precedent: an agent's exit 0 is not
+    evidence the write happened).
     `state.pr["head_sha"]` is the **verified remote** SHA, written only when that comparison
     holds; a skip writes `state.pr["commit_skip_reason"]` instead. There is no separate
     "committed"/"pushed" flag — `head_sha`'s presence is the boolean;
@@ -1855,7 +1862,7 @@ implement them.
 | The author may name the task-prompt file differently than the assumed convention | **Resolved (Phase 3 live validation)** | The reviewer is pointed at the path the author actually reported, not a hard-coded filename. |
 | Findings extraction into `findings.json` depends on the code-review output format | **Resolved (Phase 5)** | Strict labelled-block parser (`findings.py`): unknown priority, out-of-range confidence, or an empty required field records a problem and the workflow fails closed without publishing. `title` is derived from the finding body (the review format has no title). |
 | Two reviewer models may not be available in the configured provider set | `--strict` independence checks would always fail | Ship placeholder configs with distinct models; document the minimum viable rule (`/code-review` ≠ `/impliment-task`) and allow `--strict` to be omitted. `aidw fix` additionally warns (strict: fails) when no reviewer model differs from the fixer model. |
-| The fix-loop prompts leave their changes uncommitted | **Resolved (05-P1.1, Z9)** | The boundary was wrong where it mattered: `F1` closed each issue as `Status: fixed` while the fix (and the `I7` tick) never left the PR-head worktree. `F5 commit-and-push` (§8.4) now publishes a converged run's change set — but only what the run owns: a dirty tree with nothing closed is a recorded *skip*, and Python never commits or pushes (the `pr-publisher` agent does). A stage that cannot commit or push, a push that did not land and a clean tree with closed issues all fail the run naming the PR and branch, so "issue closed" is never ahead of "fix pushed" (P1.2 moves the close behind that push). |
+| The fix-loop prompts leave their changes uncommitted | **Resolved (05-P1.1, Z9)** | The boundary was wrong where it mattered: `F1` closed each issue as `Status: fixed` while the fix (and the `I7` tick) never left the PR-head worktree. `F5 commit-and-push` (§8.4) now publishes a converged run's change set — but only what the run owns: a dirty tree with nothing closed is a recorded *skip*, and Python never commits or pushes (the `pr-publisher` agent does). A stage that cannot commit or push, a stage that discards the change set instead of committing it (proved by requiring `HEAD` to have moved), a push that did not land and a clean tree with closed issues all fail the run naming the PR and branch, so "issue closed" is never ahead of "fix pushed" (P1.2 moves the close behind that push). |
 | Prompts and helper scripts evolve, but their contract is strings the scripts compare | Prompt/script contract drift (labels, exact comments, markers) | Expected and intentional: the prompts and `constants.py` are edited together, and `aidw prompts check` verifies presence, provenance and self-containment, not semantic agreement. The D5 freeze (§7.2) is the part that must not drift, and it has its own golden test. |
 | A target repo's `aidw/prompts/` override can reintroduce environment assumptions | A repo override drifts from the toolkit's neutral default | `aidw prompts check` sweeps the target's own overrides with the same sentinels (§12.3), so a shadowed prompt is checked as strictly as a default. |
 | The state root can land inside a working tree in a single-checkout repo | `git worktree remove`/a clean could discard run state | `aidw doctor` and `aidw/layout.py` warn on that layout and refuse the clone-of-a-worktree layout outright (§9.1). |

@@ -384,9 +384,10 @@ by the bundled prompts/scripts (the fixer and approver agents); AIDT only reads
 A converged run **publishes its own work**: `F5 commit-and-push` commits the change set the run
 accumulated — the fixes plus the `I7` roadmap tick when it flipped — and pushes the PR-head
 branch, then AIDT records the verified remote head as `state.pr["head_sha"]`. Nothing about that
-is silent: a stage that cannot commit or push, a push whose remote head does not match `HEAD`, a
-tree left dirty, or a run that closed an issue with nothing to push fails the run (exit non-zero)
-with a message naming the PR and the branch. A run that closed no issue publishes nothing — it
+is silent: a stage that cannot commit or push, a stage that discards the change set instead of
+committing it (`HEAD` never moved), a push whose remote head does not match `HEAD`, a tree left
+dirty, or a run that closed an issue with nothing to push fails the run (exit non-zero) with a
+message naming the PR and the branch. A run that closed no issue publishes nothing — it
 records `state.pr["commit_skip_reason"]` and exits 0 rather than committing a stranger's dirt or
 an empty commit. `F5` never force-pushes, never merges, and refuses outright when the resolved PR
 head is the base branch; `commit`/`push` remain the `pr-publisher` agent's, never Python's.

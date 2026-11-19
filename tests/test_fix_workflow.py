@@ -144,8 +144,9 @@ class _FakeStages:
     untouched tree would be D3's fourth case, and the commit case would have nothing to
     commit), and ``F5 commit-and-push`` performs a real ``git add -A`` + ``git commit`` plus
     a real ``git update-ref`` for the remote-tracking ref a successful ``git push`` moves — no
-    network, no fake git. ``push=False``, ``commit=False`` and ``leave_dirty=True`` model
-    the failure modes without inventing a signal the workflow does not read.
+    network, no fake git. ``push=False``, ``commit=False``, ``leave_dirty=True`` and
+    ``discard=True`` model the failure modes without inventing a signal the workflow does
+    not read.
     """
 
     def __init__(
@@ -156,6 +157,7 @@ class _FakeStages:
         push: bool = True,
         commit: bool = True,
         leave_dirty: bool = False,
+        discard: bool = False,
     ) -> None:
         self.names: list[str] = []
         self.specs: list = []
@@ -165,6 +167,7 @@ class _FakeStages:
         self.push = push
         self.commit = commit
         self.leave_dirty = leave_dirty
+        self.discard = discard
 
     @staticmethod
     def _apply_fix_edit(spec, repo_root: Path) -> None:
@@ -175,6 +178,14 @@ class _FakeStages:
 
     def _apply_commit(self, repo_root: Path) -> None:
         """Play ``F5``'s part: commit the change set and move ``origin/<branch>`` to it."""
+        if self.discard:
+            # The PR #158 review finding's failure mode: the change set is stashed away
+            # instead of committed, so `HEAD`, `origin/<branch>` and a clean tree all still
+            # describe the *pre-existing* SHAs and only a HEAD-movement proof can tell.
+            _git_run(repo_root, "stash", "push", "--include-untracked", "--quiet")
+            branch = git.current_branch(repo_root)
+            _git_run(repo_root, "update-ref", f"refs/remotes/origin/{branch}", "HEAD")
+            return
         if self.commit:
             _git_run(repo_root, "add", "-A")
             _git_run(repo_root, "commit", "-qm", "fix: land the accumulated change set")
@@ -1705,6 +1716,41 @@ def test_a_push_that_did_not_land_fails_the_run(
     state = _state_of(control)
     assert PR_HEAD_SHA not in state.pr
     assert state.status == FAILED
+
+
+def test_a_stage_that_discards_the_change_set_fails_the_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """PR #158 review finding: a clean tree at the *old* HEAD is not proof of a push.
+
+    A stage that discards the change set instead of committing it (a stash/clean failure
+    mode) satisfies the recorded success, ``HEAD == origin/<branch>`` **and** the clean-tree
+    check — all on the pre-existing SHAs. Only the HEAD-movement proof separates "the change
+    set landed" from "the change set was thrown away", so the run must fail naming the PR
+    and branch with ``head_sha`` absent, instead of reporting a push that carried nothing.
+    """
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages(discard=True)
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+    before_head = _head(worktree)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    assert stages.names.count("commit-and-push") == 1
+    # The three weaker proofs hold, which is exactly why this one is needed.
+    assert _head(worktree) == before_head
+    assert _git_run(worktree, "rev-parse", "origin/03-H3.3").stdout.strip() == before_head
+    assert _git_run(worktree, "status", "--porcelain").stdout.strip() == ""
+    err = capsys.readouterr().err
+    assert "#7" in err and "03-H3.3" in err
+    assert "HEAD did not move" in err
+    state = _state_of(control)
+    assert PR_HEAD_SHA not in state.pr
+    assert state.status == FAILED
+    assert _commit_records(state)[0].status == SUCCEEDED
 
 
 def test_an_unresolvable_pushed_ref_fails_closed(

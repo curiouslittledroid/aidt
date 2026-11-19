@@ -1051,9 +1051,13 @@ def run(
             a converged run whose tick was withheld still has real fix edits, so this runs
             after ``I7`` succeeded **or** was recorded as skipped, for any skip reason.
 
-            Nothing here is trusted from the agent's exit code alone — a pushed proof (D6)
-            and a clean tree are re-read from git, the O1 precedent. Every failure names the
-            PR and the branch and leaves ``state.pr[PR_HEAD_SHA]`` absent.
+            Nothing here is trusted from the agent's exit code alone — a **new commit**
+            (``HEAD`` moved), the pushed proof (D6) and a clean tree are all re-read from
+            git, the O1 precedent. The HEAD-movement check closes the PR #158 review
+            finding: a stage that stashes or cleans the change set instead of committing
+            leaves ``HEAD == origin/<branch>`` and a clean tree on the *pre-existing* SHAs,
+            so the other checks alone would pass and the fixes would be lost. Every failure
+            names the PR and the branch and leaves ``state.pr[PR_HEAD_SHA]`` absent.
             """
             decision = commit_decision(
                 tree_dirty=not git.is_clean(repo.root), closed_issues=closed_issues
@@ -1079,6 +1083,10 @@ def run(
                     file=sys.stderr,
                 )
                 return 1
+            # The new-commit proof's baseline (PR #158 review finding): `HEAD` as it stands
+            # before the agent runs. Captured here, after the base-branch refusal, so this
+            # is the only worktree read the proof adds, and only on the commit path.
+            before = git.rev_parse(repo.root, "HEAD")
             record = run_stage(
                 specs[COMMIT_STAGE_NAME],
                 repo_root=repo.root,
@@ -1101,10 +1109,27 @@ def run(
                     file=sys.stderr,
                 )
                 return 1
+            # A new commit must exist before "the push landed" means anything (PR #158
+            # review finding). The tree is dirty by construction on this path, so a real
+            # `git commit` always moves `HEAD`; a stashed or cleaned tree leaves it where
+            # `before` found it while the D6 equality and the clean-tree check below both
+            # still hold on the pre-existing SHAs.
+            head = git.rev_parse(repo.root, "HEAD")
+            if before is None or head is None or head == before:
+                print(
+                    commit_failure_message(
+                        pr,
+                        branch,
+                        "the stage reported success but HEAD did not move ("
+                        f"`{before or 'unresolvable'}` -> `{head or 'unresolvable'}`); "
+                        "the change set was not committed",
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
             # D6: the pushed proof is pinned. A successful `git push` updates the
             # remote-tracking ref, so `rev_parse` on both sides is the evidence — no fetch,
             # no `ls-remote`, no `status`/`log` heuristic.
-            head = git.rev_parse(repo.root, "HEAD")
             pushed = git.rev_parse(repo.root, f"origin/{branch}") if branch else None
             if head is None or pushed is None or head != pushed:
                 print(

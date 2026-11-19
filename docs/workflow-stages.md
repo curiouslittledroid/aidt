@@ -367,9 +367,12 @@ loop's head and body.
   tree with nothing closed, are recorded **skips** with `state.pr["commit_skip_reason"]` and exit
   0 (unowned dirt is not this run's to publish, and a no-op run creates no empty commit); a clean
   tree with at least one issue closed fails closed, because issues were closed and there is
-  nothing to push. A stage record alone is not evidence the push landed: AIDT re-reads `HEAD` and
+  nothing to push. A stage record alone is not evidence the push landed: AIDT requires `HEAD` to
+  have **moved** since before the stage (a stage that stashes or cleans the change set instead of
+  committing it would otherwise satisfy every other check), then re-reads `HEAD` and
   `origin/<branch>` and fails the run (naming the PR and branch) when they differ or cannot be
-  resolved, when the tree is still dirty, or when the stage did not succeed.
+  resolved, when `HEAD` did not move, when the tree is still dirty, or when the stage did not
+  succeed.
 
 `F5` is the only stage of `fix` that commits, and it commits everything the run accumulated —
 the fix and tick edits reach the PR instead of staying in the worktree (design §8.4, §13, §17
