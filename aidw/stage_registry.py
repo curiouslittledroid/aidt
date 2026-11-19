@@ -14,6 +14,11 @@ Two stage definitions are **shared between workflows** so their behaviour cannot
 (§8.4). Both are module-level constants referenced from the workflow definitions, never
 copied.
 
+Since 05-P1.1 (design §17 Z9) ``fix``'s post-loop half carries a **second** stage, ``F5
+commit-and-push``: the one stage of ``fix`` that publishes work. It is core, it carries no
+``when=`` token (its trigger is loop convergence, not green evidence — D2), and it is
+modelled on ``implement``'s ``I6 pr``, which is the only stage that commits there.
+
 Dependency direction (EXTRACTION.md §3.5, task E4.1's trap list):
 
 * :mod:`aidw.workflows.implement` → this module is the direction E4.3 installed:
@@ -40,7 +45,7 @@ Dependency direction (EXTRACTION.md §3.5, task E4.1's trap list):
 
 Stage-id vocabulary (R6 — ids are *retained*, never renamed to the semantic
 ``author``/``review``/``implement`` of §3.4's illustrative YAML): ``I1``–``I9``, ``P1``,
-``P2``, ``R1``, ``R2``, ``F1``–``F4``, ``A1`` (:data:`STAGE_IDS`). Two different fields are
+``P2``, ``R1``, ``R2``, ``F1``–``F5``, ``A1`` (:data:`STAGE_IDS`). Two different fields are
 kept apart on purpose — ``id`` is the retained key (``"I1"``) and ``name`` is the runtime
 stage name (``"impliment-task"``), which is what ``state.json`` and the run artifacts key
 on. §3.4's ``author``/``review``/... ids illustrate the *schema shape* only.
@@ -151,6 +156,7 @@ STAGE_IDS = frozenset(
         "F2",
         "F3",
         "F4",
+        "F5",
         "A1",
     }
 )
@@ -292,12 +298,14 @@ class WorkflowDefinition:
     """A workflow's static chain, optional loop, optional post-loop half, and groups.
 
     ``post_loop`` (H3.3) is the stages that run **once per run, after the loop ends**: the
-    roadmap tick ``I7`` for ``fix``, shared with ``implement``'s static half. It is a
-    separate field from ``stages`` because ``expand("fix", …)`` *is* the per-iteration
-    expansion (``fix.py:_planned_iteration`` expands one iteration at a time), and a
-    stage riding it would be planned — and dry-run printed — once per iteration. The
-    expander therefore emits it **only on request** (``include_post_loop``), and it is
-    classified as core for declared-list validation like any static stage (req 2).
+    roadmap tick ``I7`` for ``fix``, shared with ``implement``'s static half, and — since
+    05-P1.1 (Z9) — ``F5 commit-and-push``, the stage that publishes the run's work. They
+    are a separate field from ``stages`` because ``expand("fix", …)`` *is* the
+    per-iteration expansion (``fix.py:_planned_iteration`` expands one iteration at a
+    time), and a stage riding it would be planned — and dry-run printed — once per
+    iteration. The expander therefore emits the half **only on request**
+    (``include_post_loop``), and every id in it is classified as core for declared-list
+    validation like any static stage (req 2).
     """
 
     name: str
@@ -580,6 +588,25 @@ _ROADMAP_TICK_STAGE = StageDefinition(
     when=WHEN_EVIDENCE_GREEN,
 )
 
+#: ``F5`` — the one stage of ``fix`` that **publishes** work (design §8.4, §13; 05-P1.1,
+#: decision Z9). Modelled on ``implement``'s ``I6 pr``: the ``pr-publisher`` agent runs
+#: ``git add -A`` and ``git commit`` and ``git push origin <branch>``; Python only verifies
+#: the result (a stage record alone is not evidence the push landed — the O1 precedent).
+#:
+#: Deliberately **no** ``when=`` token: its trigger is the loop's convergence, not green
+#: evidence. A converged run whose tick was withheld (Z7's unmet conclusion, an empty run,
+#: an unresolvable roadmap target) still has real fix edits that must land, so gating F5 on
+#: ``WHEN_EVIDENCE_GREEN`` would reintroduce the defect the stage exists to fix (decision
+#: D2). ``{pr}`` is its only variable; the branch and the task id are read inside the
+#: PR-head worktree by the prompt itself (D8), exactly as ``pr.md`` does.
+_COMMIT_PUSH_STAGE = StageDefinition(
+    "F5",
+    "commit-and-push",
+    "pr-publisher",
+    "fix-commit.md",
+    ("{pr}",),
+)
+
 _IMPLEMENT = WorkflowDefinition(
     name="implement",
     stages=(
@@ -810,7 +837,9 @@ _FIX = WorkflowDefinition(
     # H3.3: the shared roadmap tick, emitted **once per run** after the loop breaks on
     # ``select`` exit ``EXIT_NONE_AVAILABLE`` — never on the per-iteration expansion
     # (``include_post_loop``). Same definition object as ``implement``'s I7.
-    post_loop=(_ROADMAP_TICK_STAGE,),
+    # 05-P1.1 (Z9): ``F5`` follows it, so a converged run publishes the accumulated change
+    # set (the fix edits plus the tick if it flipped) instead of leaving it uncommitted.
+    post_loop=(_ROADMAP_TICK_STAGE, _COMMIT_PUSH_STAGE),
 )
 
 #: The default registry, keyed by workflow name. Immutable: a caller cannot replace or
@@ -842,7 +871,7 @@ def stage(workflow: str, stage_id: str) -> StageDefinition:
 
     Loop stages are searchable by their id too (``P2``, ``F1``–``F4``, and the loop-internal
     ``P2-fix-*``/``P2-reconcile`` labels), and since H3.3 so is the post-loop half
-    (``fix``'s shared ``I7``).
+    (``fix``'s shared ``I7``, and since 05-P1.1 its ``F5``).
     """
     definition = get_workflow(workflow)
     candidates = list(definition.stages)
@@ -991,14 +1020,14 @@ def validate_stage_list(
       fix/reconcile labels, which would make ``P2-fix-blocking`` look repo-added and be
       silently double-planned. H3.3 req 2: the post-loop half is subtracted too, or
       ``fix``'s ``I7`` would be misclassified as a loop id and refused as undeclarable
-      exactly where a repo wants to declare the canonical ``[A1, I7]``.
+      exactly where a repo wants to declare the canonical ``[A1, I7, F5]``.
     * **core ids** — the static stage ids **followed by the post-loop ids**, minus
       :data:`REPO_OPTIONAL_IDS` (``I1``, ``I2``, ``I5``, ``I8``, ``I9``, ``I7``, ``I6`` for
-      ``implement``; ``A1``, ``I7`` for ``fix``; ``P1``; ``R1``/``R2``). One declared list
-      covers both halves (H3.3 req 2): the post-loop ids are declared **after** every
-      static core id, so there is one core order — static-then-post-loop — for the
-      reorder rule, and a missing ``I7`` in ``fix`` is the same removal ``ERROR`` as a
-      missing ``A1``.
+      ``implement``; ``A1``, ``I7``, ``F5`` for ``fix``; ``P1``; ``R1``/``R2``). One
+      declared list covers both halves (H3.3 req 2): the post-loop ids are declared
+      **after** every static core id, so there is one core order — static-then-post-loop —
+      for the reorder rule, and a missing ``I7`` in ``fix`` is the same removal ``ERROR``
+      as a missing ``A1`` (and, since 05-P1.1, a missing ``F5``).
     * **repo-optional ids** — :data:`REPO_OPTIONAL_IDS` (``I3``/``I4``).
     * anything else is a **repo-added** stage and is accepted here (its fields are
       E4.5b's contract, not this validator's).
@@ -1325,17 +1354,17 @@ def expand(
       omits R2).
     * ``fix`` — ``pr``, ``round_index``, ``iteration``, ``manifest_path``, plus
       ``roadmap_file`` and ``checkbox_id`` **for the post-loop half only** (H3.3 req 1:
-      both are required exactly when ``include_post_loop`` is true, because the shared
-      ``I7`` is the only post-loop stage and it renders them).
+      the shared ``I7`` renders them, and it is emitted only when ``include_post_loop`` is
+      true; 05-P1.1's ``F5`` renders ``{pr}`` and needs nothing new).
     * ``approve`` — ``pr``.
 
     ``include_post_loop`` (H3.3 req 1) appends :attr:`WorkflowDefinition.post_loop` after
     the static and loop halves. It defaults to ``False`` because ``expand("fix", …)`` *is*
     the per-iteration expansion (``fix.py:_planned_iteration`` calls it once per
-    iteration): emitting the tick unconditionally would plan — and dry-run print — the
-    roadmap tick once per iteration instead of once per run. ``fix`` asks for it in one
-    named post-loop planning call after the loop breaks. ``include_post_loop`` is
-    keyword-only so it can never collide with an expansion field.
+    iteration): emitting the half unconditionally would plan — and dry-run print — the
+    roadmap tick and ``F5`` once per iteration instead of once per run. ``fix`` asks for
+    it in one named post-loop planning call after the loop breaks. ``include_post_loop``
+    is keyword-only so it can never collide with an expansion field.
 
     ``manifest_path`` is the findings manifest's **absolute** path in the run directory.
     It is rendered into the publisher stage's ``extra``, whose agent runs with the target
@@ -1362,7 +1391,7 @@ def expand(
                 f"`{definition.loop.kind}`"
             )
     # H3.3: the post-loop half, on request only (see the docstring). Ordered last so the
-    # plan is always static -> loop -> post-loop.
+    # plan is always static -> loop -> post-loop; 05-P1.1's ``F5`` therefore follows ``I7``.
     if include_post_loop:
         planned.extend(_plan(item, local) for item in definition.post_loop)
     return tuple(planned)

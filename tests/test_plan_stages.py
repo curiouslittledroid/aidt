@@ -149,7 +149,7 @@ def _static_ids(workflow: str) -> list[str]:
 def _declarable_ids(workflow: str) -> list[str]:
     """Every id a declared list must carry: the static core order, then the post-loop half.
 
-    Since H3.3 a declared list covers **both** halves (``fix``: ``[A1, I7]``), and the
+    Since H3.3 a declared list covers **both** halves (``fix``: ``[A1, I7, F5]``), and the
     registry's core order — the one the reorder rule compares against — is
     static-then-post-loop (H3.3 req 2). For a workflow with no post-loop half this is
     exactly :func:`_static_ids`.
@@ -306,13 +306,20 @@ def test_fix_plan_is_the_approval_plus_one_iteration(tmp_path: Path) -> None:
         iteration=1,
         manifest_path="artifacts/iter1-review-manifest.json",
     )
-    assert [spec.id for spec in post] == ["A1", "F1", "F2", "F3", "F4", "I7"]
-    assert [spec.name for spec in post][-1] == "update-roadmap"
-    tick = post[-1]
+    assert [spec.id for spec in post] == ["A1", "F1", "F2", "F3", "F4", "I7", "F5"]
+    assert [spec.name for spec in post][-2] == "update-roadmap"
+    tick = post[-2]
     assert (tick.agent_id, tick.prompt) == ("recorder", _toolkit_prompt("update-roadmap.md"))
     assert tick.variables == [ROADMAP_FILE, CHECKBOX_ID]
     # The shared definition carries the condition; the workflow evaluates it (H3.2/H3.3).
     assert tick.when == stage_registry.WHEN_EVIDENCE_GREEN
+    # 05-P1.1 (design §17 Z9): `F5` follows the tick, is unconditional, and its prompt is a
+    # required toolkit default (not a repo-shadowed product prompt).
+    commit = post[-1]
+    assert (commit.id, commit.name) == ("F5", "commit-and-push")
+    assert (commit.agent_id, commit.prompt) == ("pr-publisher", _toolkit_prompt("fix-commit.md"))
+    assert commit.variables == [str(PR)]
+    assert commit.when == ""
 
 
 def test_approve_plan_is_the_single_a1_stage(tmp_path: Path) -> None:
@@ -1321,7 +1328,11 @@ def test_a_declared_fix_list_without_i7_is_refused(tmp_path: Path) -> None:
 
     message = str(excinfo.value)
     assert "stage `I7`: core stage cannot be removed" in message
-    assert "core stage cannot be reordered: declared [A1] but the registry order is [A1, I7]" in message
+    assert "stage `F5`: core stage cannot be removed" in message
+    assert (
+        "core stage cannot be reordered: declared [A1] but the registry order is "
+        "[A1, I7, F5]"
+    ) in message
 
 
 def test_a_declared_fix_list_with_i7_before_a1_is_refused(tmp_path: Path) -> None:
@@ -1341,30 +1352,34 @@ def test_a_declared_fix_list_with_i7_before_a1_is_refused(tmp_path: Path) -> Non
 
     message = str(excinfo.value)
     assert "core stage cannot be reordered: declared [I7, A1]" in message
-    assert "the registry order is [A1, I7]" in message
+    assert "the registry order is [A1, I7, F5]" in message
 
 
 def test_the_canonical_fix_declaration_passes_preflight_and_plans_i7_last(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A declared ``[A1, I7]`` is the acceptance path (H3.3 req 2, trap list).
+    """A declared ``[A1, I7, F5]`` is the acceptance path (H3.3 req 2; 05-P1.1 req 1).
 
-    The plan preflight must treat ``I7`` as a known stage — resolving its registry
-    prompt-file/agent — and must **not** warn about it as a repo-added deferred stage just
-    because ``fix`` is name-keyed. Without that, the canonical declaration would be refused
-    (exit 2) or warned about, and the tick's prompt would never be found.
+    The plan preflight must treat ``I7`` and ``F5`` as known stages — resolving their
+    registry prompt-file/agent — and must **not** warn about them as repo-added deferred
+    stages just because ``fix`` is name-keyed. Without that, the canonical declaration would
+    be refused (exit 2) or warned about, and the tick's or the commit prompt would never be
+    found.
     """
-    root = _target(tmp_path, _fix_declared("A1", "I7"))
+    root = _target(tmp_path, _fix_declared("A1", "I7", "F5"))
     config = _resolved(root)
-    agents = {"review-approver": object(), "recorder": object()}
+    agents = {"review-approver": object(), "recorder": object(), "pr-publisher": object()}
 
     assert (
-        stage_registry.validate_stage_list("fix", [{"id": "A1"}, {"id": "I7"}]) == []
+        stage_registry.validate_stage_list(
+            "fix", [{"id": "A1"}, {"id": "I7"}, {"id": "F5"}]
+        )
+        == []
     )
     assert (
         declared_stage_issues(
             "fix",
-            [{"id": "A1"}, {"id": "I7"}],
+            [{"id": "A1"}, {"id": "I7"}, {"id": "F5"}],
             toolkit_root=TOOLKIT.root,
             target_root=root,
             agents=agents,
@@ -1383,16 +1398,18 @@ def test_the_canonical_fix_declaration_passes_preflight_and_plans_i7_last(
         manifest_path=MANIFEST,
     )
 
-    assert [spec.id for spec in specs] == ["A1", "F1", "F2", "F3", "F4", "I7"]
-    assert specs[-1].prompt == _toolkit_prompt("update-roadmap.md")
-    assert specs[-1].variables == [ROADMAP_FILE, CHECKBOX_ID]
+    assert [spec.id for spec in specs] == ["A1", "F1", "F2", "F3", "F4", "I7", "F5"]
+    assert specs[-2].prompt == _toolkit_prompt("update-roadmap.md")
+    assert specs[-2].variables == [ROADMAP_FILE, CHECKBOX_ID]
+    assert specs[-1].prompt == _toolkit_prompt("fix-commit.md")
+    assert specs[-1].variables == [str(PR)]
     # No deferred-settings warning for a correctly declared known post-loop stage.
     assert [line for line in capsys.readouterr().err.splitlines() if line.startswith("warning:")] == []
 
 
 def test_a_declared_i7_is_withheld_from_the_per_iteration_plan(tmp_path: Path) -> None:
-    """The per-iteration expansion never carries the tick, even when it is declared."""
-    root = _target(tmp_path, _fix_declared("A1", "I7"))
+    """The per-iteration expansion never carries either post-loop stage, declared or not."""
+    root = _target(tmp_path, _fix_declared("A1", "I7", "F5"))
 
     iteration = _plan(
         "fix",
@@ -1415,4 +1432,4 @@ def test_a_declared_i7_is_withheld_from_the_per_iteration_plan(tmp_path: Path) -
     )
 
     assert [spec.id for spec in iteration] == ["A1", "F1", "F2", "F3", "F4"]
-    assert [spec.id for spec in post][-1] == "I7"
+    assert [spec.id for spec in post][-2:] == ["I7", "F5"]

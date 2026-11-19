@@ -138,16 +138,51 @@ class _FakeStages:
 
     ``failing`` names the stages that must come back ``failed`` (H3.3's red ``iter{N}-test``
     case), so the workflow's own stop path runs exactly as a real red stage's would.
+
+    Since 05-P1.1 the fake also models the two writes the workflow *verifies*: an ``F1``
+    stage leaves a real edit in the PR-head worktree (a real fixer edits the repo, so an
+    untouched tree would be D3's fourth case, and the commit case would have nothing to
+    commit), and ``F5 commit-and-push`` performs a real ``git add -A`` + ``git commit`` plus
+    a real ``git update-ref`` for the remote-tracking ref a successful ``git push`` moves — no
+    network, no fake git. ``push=False``, ``commit=False`` and ``leave_dirty=True`` model
+    the failure modes without inventing a signal the workflow does not read.
     """
 
     def __init__(
-        self, review_text: str = APPROVE_REVIEW, *, failing: tuple[str, ...] = ()
+        self,
+        review_text: str = APPROVE_REVIEW,
+        *,
+        failing: tuple[str, ...] = (),
+        push: bool = True,
+        commit: bool = True,
+        leave_dirty: bool = False,
     ) -> None:
         self.names: list[str] = []
         self.specs: list = []
         self.repo_roots: list[Path] = []
         self.review_text = review_text
         self.failing = failing
+        self.push = push
+        self.commit = commit
+        self.leave_dirty = leave_dirty
+
+    @staticmethod
+    def _apply_fix_edit(spec, repo_root: Path) -> None:
+        """Play the fixer's part: leave an uncommitted edit in the PR-head worktree."""
+        path = repo_root / "fix-edits" / f"{spec.name}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixed", encoding="utf-8")
+
+    def _apply_commit(self, repo_root: Path) -> None:
+        """Play ``F5``'s part: commit the change set and move ``origin/<branch>`` to it."""
+        if self.commit:
+            _git_run(repo_root, "add", "-A")
+            _git_run(repo_root, "commit", "-qm", "fix: land the accumulated change set")
+        if self.push:
+            branch = git.current_branch(repo_root)
+            _git_run(repo_root, "update-ref", f"refs/remotes/origin/{branch}", "HEAD")
+        if self.leave_dirty:
+            (repo_root / "left-behind.txt").write_text("dirty", encoding="utf-8")
 
     @staticmethod
     def _apply_tick(spec) -> None:
@@ -168,8 +203,13 @@ class _FakeStages:
         self.names.append(spec.name)
         self.specs.append(spec)
         self.repo_roots.append(kwargs["repo_root"])
-        if spec.name == "update-roadmap" and not kwargs.get("dry_run"):
-            self._apply_tick(spec)
+        if not kwargs.get("dry_run"):
+            if spec.name == "update-roadmap":
+                self._apply_tick(spec)
+            elif spec.name == "commit-and-push" and spec.name not in self.failing:
+                self._apply_commit(kwargs["repo_root"])
+            elif spec.name.endswith("fix-next-review-followup"):
+                self._apply_fix_edit(spec, kwargs["repo_root"])
         directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
@@ -276,13 +316,17 @@ def test_clean_iteration_closes_child(tmp_path: Path, monkeypatch) -> None:
     code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
 
     assert code == 0
+    # The iteration, then the post-loop half: the tick (skipped — this branch maps to no
+    # roadmap entry) and, since 05-P1.1, the commit stage that publishes the fix edit.
     assert stages.names == [
         "round1-approve-review-followups",
         "iter1-fix-next-review-followup",
         "iter1-test",
         "iter1-code-review",
+        "commit-and-push",
     ]
     assert all(root == worktree for root in stages.repo_roots)
+    assert fix_workflow.list_runs(_runs_root(control))[-1].pr[PR_HEAD_SHA]
     state = next(_runs_root(control).iterdir())
     payload = json.loads((state / "artifacts" / "fix.json").read_text(encoding="utf-8"))
     assert payload["iterations"] == 1
@@ -709,7 +753,8 @@ def test_a_disabled_core_approver_is_refused_before_any_side_effect(
         "    stages:\n"
         "      - id: A1\n"
         "        enabled: false\n"
-        "      - id: I7\n",
+        "      - id: I7\n"
+        "      - id: F5\n",
         encoding="utf-8",
     )
     _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
@@ -735,9 +780,9 @@ def test_a_disabled_core_approver_is_refused_before_any_side_effect(
 #: The declared `prompt:` of a repo-added fix stage, relative to the target root.
 REPO_ADDED_PROMPT = "aidw/prompts/repo-added.md"
 
-#: A1, the post-loop I7 (a declared `fix` list must carry it — H3.3 req 2) and a repo-added
-#: one, which `fix`'s name-keyed consumer never runs: E4.5b's non-goal, warned about rather
-#: than silently dropped.
+#: A1, the post-loop I7 and F5 (a declared `fix` list must carry every core id — H3.3
+#: req 2, 05-P1.1 req 1) and a repo-added one, which `fix`'s name-keyed consumer never runs:
+#: E4.5b's non-goal, warned about rather than silently dropped.
 _CONFIG_WITH_REPO_ADDED = (
     "schema_version: 1\n"
     "workflows:\n"
@@ -745,6 +790,7 @@ _CONFIG_WITH_REPO_ADDED = (
     "    stages:\n"
     "      - id: A1\n"
     "      - id: I7\n"
+    "      - id: F5\n"
     "      - id: repo-added-review\n"
     "        agent: code-reviewer\n"
     "        prompt: aidw/prompts/repo-added.md\n"
@@ -788,7 +834,14 @@ def _agent(agent_id: str, model: str) -> AgentConfig:
 #: req 4), and the reviewer-rotation check sees distinct models (so it adds no warning).
 _AGENTS = {
     agent_id: _agent(agent_id, f"{agent_id}-model")
-    for agent_id in ("review-approver", "fixer", "tester", "code-reviewer", "recorder")
+    for agent_id in (
+        "review-approver",
+        "fixer",
+        "tester",
+        "code-reviewer",
+        "recorder",
+        "pr-publisher",
+    )
 }
 
 
@@ -977,33 +1030,14 @@ def test_a_converged_run_ticks_the_box_once_and_records_true(
     assert len(records) == 1
     assert records[0].status == SUCCEEDED
     assert records[0].artifacts["tick"] == "flipped"
-    # Once per run, and after the last iteration's stages (req 7).
+    # Once per run, and after the last iteration's stages (req 7). Since 05-P1.1 the tick is
+    # followed by the commit stage, which is the run's last stage.
     assert stages.names.count("update-roadmap") == 1
-    assert stages.names[-1] == "update-roadmap"
+    assert stages.names[-2:] == ["update-roadmap", "commit-and-push"]
     assert stages.names.index("update-roadmap") > stages.names.index("iter1-code-review")
     log = (run_dir(_runs_root(control), state.run_id) / "run.log").read_text(encoding="utf-8")
     assert log.count("roadmap H3.3") == 1
     assert "flipped `[ ]` -> `[x]`" in log
-
-
-def test_a_converged_fix_leaves_the_roadmap_edit_uncommitted(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """H3.3 req 6: the fix workflow never owns a commit, even after ticking."""
-    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
-    roadmap_file = _write_roadmap(worktree)
-    _git_run(worktree, "add", str(roadmap_file.relative_to(worktree)))
-    _git_run(worktree, "commit", "-qm", "roadmap baseline")
-    before_head = _git_run(worktree, "rev-parse", "HEAD").stdout.strip()
-    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
-    monkeypatch.setattr(fix_workflow, "run_stage", _FakeStages())
-
-    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
-
-    assert _git_run(worktree, "rev-parse", "HEAD").stdout.strip() == before_head
-    status = _git_run(worktree, "status", "--porcelain", "--", str(roadmap_file)).stdout
-    assert status.startswith(" M ")
-    assert roadmap_file.read_text(encoding="utf-8") == _roadmap_text(done=True)
 
 
 def test_a_tick_stage_that_does_not_flip_fails_closed(
@@ -1388,10 +1422,19 @@ def test_the_dry_run_plans_the_tick_once_in_the_final_position(
     ]
     assert len(planned) == 1, out
     assert "(planned)" in planned[0]
-    assert stages.names[-1] == "update-roadmap"
+    # 05-P1.1 req 2/D10: the commit stage is planned once, after the tick, and evaluates no
+    # evidence — the dry run never inspects the tree and never withholds it.
+    assert stages.names[-2:] == ["update-roadmap", "commit-and-push"]
+    commit_lines = [
+        line for line in out.splitlines() if line.startswith("commit-and-push ")
+    ]
+    assert len(commit_lines) == 1, out
+    assert "(planned)" in commit_lines[0]
+    assert out.index("update-roadmap [") < out.index("commit-and-push [")
     # Nothing ran and nothing was evaluated: the roadmap is untouched.
     assert roadmap_file.read_bytes() == before
     assert _state_of(control).pr.get("roadmap_ticked") is None
+    assert fix_workflow.PR_HEAD_SHA not in _state_of(control).pr
 
 
 def test_the_dry_run_reports_an_unresolvable_target_as_the_skip_it_would_record(
@@ -1409,9 +1452,494 @@ def test_the_dry_run_reports_an_unresolvable_target_as_the_skip_it_would_record(
     assert code == 0
     assert capsys.readouterr().out.count("update-roadmap") == 1
     assert "update-roadmap" not in stages.names
+    # D10: an unresolvable target withholds no commit stage in a dry run.
+    assert "commit-and-push" in stages.names
     state = _state_of(control)
     assert _tick_records(state)[0].status == SKIPPED
     assert state.pr["roadmap_ticked"] is False
+
+
+# --------------------------------------------------------------------------- #
+# The post-loop commit-and-push stage (05-P1.1, design §8.4/§13/§17 Z9)
+# --------------------------------------------------------------------------- #
+
+#: ``state.pr`` key the skip writes (decision D7).
+PR_HEAD_SHA = "head_sha"
+
+
+def _commit_records(state) -> list[StageRecord]:
+    return [record for record in state.stages if record.name == "commit-and-push"]
+
+
+def _head(worktree: Path) -> str:
+    return _git_run(worktree, "rev-parse", "HEAD").stdout.strip()
+
+
+def _committed_paths(worktree: Path) -> set[str]:
+    """The paths the branch's ``HEAD`` commit added or changed."""
+    listing = _git_run(
+        worktree, "show", "--name-only", "--pretty=format:", "HEAD"
+    ).stdout
+    return {line.strip() for line in listing.splitlines() if line.strip()}
+
+
+def test_a_converged_run_with_an_unresolvable_roadmap_target_still_publishes_fixes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """D2: convergence, not a green roadmap tick, triggers F5.
+
+    An ambiguous branch-to-task mapping with a real closed issue leaves I7 skipped, but the
+    fixer still produced owned work. F5 must commit and verify that work rather than being
+    withheld with the tick.
+    """
+    control, worktree = _fix_layout(tmp_path, branch="03-H3-3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3-3", select_impl=_converging_select())
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
+
+    state = _state_of(control)
+    tick = _tick_records(state)[0]
+    commit = _commit_records(state)[0]
+    assert tick.status == SKIPPED
+    assert "exactly one" in tick.artifacts[SKIP_REASON_KEY]
+    assert commit.status == SUCCEEDED
+    assert [record.name for record in state.stages][-2:] == [
+        "update-roadmap",
+        "commit-and-push",
+    ]
+    assert stages.names[-1] == "commit-and-push"
+    assert "update-roadmap" not in stages.names
+    assert state.pr[PR_HEAD_SHA] == _head(worktree)
+    assert "fix-edits/iter1-fix-next-review-followup.txt" in _committed_paths(worktree)
+    assert _git_run(worktree, "status", "--porcelain").stdout.strip() == ""
+
+
+def test_a_converged_run_with_an_unmet_recorded_done_when_still_publishes_fixes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """D2/Z7: a withheld completion claim does not withhold the converged fix commit."""
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    roadmap_file = _write_roadmap(worktree)
+    results = worktree / "docs/implementation-results/03-H3.3/build-results.md"
+    results.parent.mkdir(parents=True, exist_ok=True)
+    results.write_text(
+        "## Summary\\n\\nDone when: the task is not yet met.\\n", encoding="utf-8"
+    )
+    _git_run(
+        worktree,
+        "add",
+        str(roadmap_file.relative_to(worktree)),
+        str(results.relative_to(worktree)),
+    )
+    _git_run(worktree, "commit", "-qm", "record an unmet done-when")
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
+
+    state = _state_of(control)
+    tick = _tick_records(state)[0]
+    commit = _commit_records(state)[0]
+    assert tick.status == SKIPPED
+    assert "recorded build results" in tick.artifacts[SKIP_REASON_KEY]
+    assert commit.status == SUCCEEDED
+    assert state.pr[PR_HEAD_SHA] == _head(worktree)
+    assert "fix-edits/iter1-fix-next-review-followup.txt" in _committed_paths(worktree)
+    assert _git_run(worktree, "status", "--porcelain").stdout.strip() == ""
+
+
+def test_a_converged_run_commits_and_pushes_the_change_set(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """D3 case 1: dirty tree + one closed issue → one commit, one push, ``head_sha``.
+
+    The commit must carry the **accumulated** change set — the fixer's edit *and* the
+    roadmap tick ``I7`` flipped — and the recorded ``head_sha`` must be the *remote* head the
+    push produced (D6), not merely ``HEAD``. The run then ends clean, at exit 0.
+    """
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    roadmap_file = _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+    before_head = _head(worktree)
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
+
+    assert stages.names.count("commit-and-push") == 1
+    assert stages.names[-2:] == ["update-roadmap", "commit-and-push"]
+    # The agent's part: one real commit on the PR-head branch, carrying both edits.
+    new_head = _head(worktree)
+    assert new_head != before_head
+    committed = _committed_paths(worktree)
+    assert roadmap_file.relative_to(worktree).as_posix() in committed
+    assert "fix-edits/iter1-fix-next-review-followup.txt" in committed
+    # The pushed proof: HEAD equals the remote-tracking ref, and that is what is recorded.
+    assert _git_run(worktree, "rev-parse", "origin/03-H3.3").stdout.strip() == new_head
+    state = _state_of(control)
+    assert state.pr[PR_HEAD_SHA] == new_head
+    assert fix_workflow.PR_COMMIT_SKIP_REASON not in state.pr
+    assert _git_run(worktree, "status", "--porcelain").stdout.strip() == ""
+    records = _commit_records(state)
+    assert len(records) == 1
+    assert records[0].status == SUCCEEDED
+
+
+def test_a_dirty_tree_with_nothing_closed_is_a_recorded_skip(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """D3 case 2: unowned dirt is not this run's to publish — skip, exit 0, no commit.
+
+    The operator's own file stays uncommitted and ``HEAD`` does not move: the run records
+    *why* it published nothing instead of sweeping somebody else's work into a commit.
+    """
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    operator_file = worktree / "operator-notes.txt"
+    operator_file.write_text("mine\n", encoding="utf-8")
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_select_seq([_select_none()]))
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+    before_head = _head(worktree)
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
+
+    assert "commit-and-push" not in stages.names
+    assert _head(worktree) == before_head
+    assert operator_file.read_text(encoding="utf-8") == "mine\n"
+    assert "?? operator-notes.txt" in _git_run(
+        worktree, "status", "--porcelain"
+    ).stdout
+    state = _state_of(control)
+    reason = state.pr[fix_workflow.PR_COMMIT_SKIP_REASON]
+    assert "this run closed no issue" in reason
+    assert "not this run's" in reason
+    assert PR_HEAD_SHA not in state.pr
+    record = _commit_records(state)[0]
+    assert record.status == SKIPPED
+    assert record.error is None
+    assert record.artifacts[SKIP_REASON_KEY] == reason
+
+
+def test_a_clean_tree_with_nothing_closed_is_a_successful_noop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """D3 case 3: the roadmap's successful no-op — no commit object, no push, exit 0."""
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_select_seq([_select_none()]))
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+    before_head = _head(worktree)
+    before_count = _git_run(worktree, "rev-list", "--count", "HEAD").stdout.strip()
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
+
+    assert "commit-and-push" not in stages.names
+    assert _head(worktree) == before_head
+    assert (
+        _git_run(worktree, "rev-list", "--count", "HEAD").stdout.strip() == before_count
+    )
+    state = _state_of(control)
+    assert "nothing to commit" in state.pr[fix_workflow.PR_COMMIT_SKIP_REASON]
+    assert PR_HEAD_SHA not in state.pr
+    assert _commit_records(state)[0].status == SKIPPED
+
+
+def test_closed_issues_with_a_clean_tree_fail_closed(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """D3 case 4: issues closed and nothing to push is the untruthful state — exit 1.
+
+    An already-ticked (and committed) roadmap plus a fake whose ``F1`` writes nothing models
+    it exactly: the run closed a follow-up issue, so recording "fixed" with no commit to push
+    must be loud, and the message names the PR and the branch (req 5(d)).
+    """
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    roadmap_file = _write_roadmap(worktree, _roadmap_text(done=True))
+    _git_run(worktree, "add", str(roadmap_file.relative_to(worktree)))
+    _git_run(worktree, "commit", "-qm", "roadmap baseline")
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages()
+    stages._apply_fix_edit = lambda _spec, _root: None
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+    before_head = _head(worktree)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    assert "commit-and-push" not in stages.names
+    assert _head(worktree) == before_head
+    err = capsys.readouterr().err
+    assert "#7" in err and "03-H3.3" in err
+    assert "nothing to push" in err
+    state = _state_of(control)
+    assert PR_HEAD_SHA not in state.pr
+    assert state.status == FAILED
+
+
+def test_a_push_that_did_not_land_fails_the_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """D6: the agent reports success but ``origin/<branch>`` never moved — exit 1.
+
+    Trusting the stage's exit code is the exact O1 failure this comparison exists to close.
+    The remote-tracking ref starts at the pre-run commit, so the pair is unequal.
+    """
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _git_run(worktree, "update-ref", "refs/remotes/origin/03-H3.3", "HEAD")
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages(push=False)
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    assert "commit-and-push" in stages.names
+    err = capsys.readouterr().err
+    assert "#7" in err and "03-H3.3" in err
+    assert "the push did not land" in err
+    state = _state_of(control)
+    assert PR_HEAD_SHA not in state.pr
+    assert state.status == FAILED
+
+
+def test_an_unresolvable_pushed_ref_fails_closed(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """D6: an unresolvable remote ref is not evidence of a push."""
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+    real_rev_parse = fix_workflow.git.rev_parse
+
+    def hide_remote_ref(repo: Path, revision: str) -> str | None:
+        if revision == "origin/03-H3.3":
+            return None
+        return real_rev_parse(repo, revision)
+
+    monkeypatch.setattr(fix_workflow.git, "rev_parse", hide_remote_ref)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "#7" in err and "03-H3.3" in err
+    assert "the push did not land" in err
+    assert "unresolvable" in err
+    assert PR_HEAD_SHA not in _state_of(control).pr
+
+
+def test_a_failed_commit_stage_fails_the_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 5(a): a non-``SUCCEEDED`` record on the commit case fails, naming PR + branch."""
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages(failing=("commit-and-push",))
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "#7" in err and "03-H3.3" in err
+    assert "`failed`" in err
+    state = _state_of(control)
+    assert PR_HEAD_SHA not in state.pr
+    assert _commit_records(state)[0].status == FAILED
+
+
+def test_a_tree_left_dirty_after_the_stage_fails_the_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 5(c): a push that landed but left part of the change set behind is a failure."""
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages(leave_dirty=True)
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "#7" in err and "03-H3.3" in err
+    assert "still dirty" in err
+    assert PR_HEAD_SHA not in _state_of(control).pr
+
+
+def test_a_pr_head_that_is_the_base_branch_is_refused_before_any_push(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """D5: a misresolved ref must never commit or push the base branch.
+
+    The preflight resolves the head through ``gh`` (decision K1); when that value *is* the
+    base branch the run refuses before the stage, so no commit is created and no push is
+    attempted — pushing ``main`` is not recoverable in a shared repository.
+    """
+    control, _worktree = _fix_layout(tmp_path)
+    _patch(monkeypatch, branch="main", select_impl=_converging_select())
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+    before_head = _head(control)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    assert "commit-and-push" not in stages.names
+    assert _head(control) == before_head
+    assert _git_run(control, "status", "--porcelain").stdout.strip() != ""
+    err = capsys.readouterr().err
+    assert "#7" in err and "`main`" in err
+    assert "refusing to commit or push" in err
+    assert PR_HEAD_SHA not in _state_of(control).pr
+
+
+def test_a_stopped_loop_records_the_commit_skip_with_the_same_reason(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """D4: one ``stop()`` call site records both post-loop skips, with the same reason."""
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+    before_head = _head(worktree)
+
+    code = fix_workflow.run(
+        pr=7,
+        **_roots(control),
+        approve_all=True,
+        deny_gates=[fix_workflow.GATE_FIX_PR],
+    )
+
+    assert code == 3
+    assert "commit-and-push" not in stages.names
+    assert _head(worktree) == before_head
+    state = _state_of(control)
+    tick_reason = state.pr[fix_workflow.PR_ROADMAP_TICK_SKIP_REASON]
+    commit_reason = state.pr[fix_workflow.PR_COMMIT_SKIP_REASON]
+    assert commit_reason == tick_reason
+    assert fix_workflow.GATE_FIX_PR in commit_reason
+    record = _commit_records(state)[0]
+    assert record.status == SKIPPED
+    assert record.artifacts[SKIP_REASON_KEY] == tick_reason
+    # Nothing was published, so the boolean that is `head_sha`'s presence stays absent.
+    assert PR_HEAD_SHA not in state.pr
+
+
+def test_a_failed_tick_leaves_no_commit_record(tmp_path: Path, monkeypatch) -> None:
+    """D4's other half: a failed ``I7`` keeps exit 1 and records no ``F5`` at all.
+
+    Committing a half-applied tick is worse than leaving the tree for a human, so the failed
+    postcondition short-circuits before the commit stage — neither run nor recorded — rather
+    than pretending the run may publish.
+    """
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages()
+    # A recorder that exits 0 but leaves the roadmap untouched fails the tick postcondition.
+    stages._apply_tick = lambda _spec: None
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    assert "commit-and-push" not in stages.names
+    state = _state_of(control)
+    assert _commit_records(state) == []
+    assert PR_HEAD_SHA not in state.pr
+    assert fix_workflow.PR_COMMIT_SKIP_REASON not in state.pr
+    assert _tick_records(state)[0].status == FAILED
+
+
+# --------------------------------------------------------------------------- #
+# D3's rule as a pure unit: the table, its reasons, and its determinism
+# --------------------------------------------------------------------------- #
+
+#: Pinned seed and run count for the property run below (AGENTS.md "Tests": pytest only, no
+#: ``hypothesis``, so a reproducible sample is the generator and there is no shrinking).
+COMMIT_PROPERTY_SEED = 4407
+COMMIT_PROPERTY_RUNS = 60
+
+
+def test_commit_decision_is_the_four_case_table() -> None:
+    """One hand-calculated example per row of D3's table."""
+    closed = [{"number": 101}]
+
+    commit = fix_workflow.commit_decision(tree_dirty=True, closed_issues=closed)
+    assert commit.action == fix_workflow.COMMIT_ACTION_COMMIT
+    # A decision that runs the stage never carries a reason to print as one.
+    assert commit.reason == ""
+
+    dirty_skip = fix_workflow.commit_decision(tree_dirty=True, closed_issues=[])
+    assert dirty_skip.action == fix_workflow.COMMIT_ACTION_SKIP
+    assert dirty_skip.reason == fix_workflow.COMMIT_SKIP_DIRTY_UNOWNED
+    assert "not this run's" in dirty_skip.reason
+
+    clean_skip = fix_workflow.commit_decision(tree_dirty=False, closed_issues=[])
+    assert clean_skip.action == fix_workflow.COMMIT_ACTION_SKIP
+    assert clean_skip.reason == fix_workflow.COMMIT_SKIP_CLEAN_NOOP
+    assert "nothing to commit" in clean_skip.reason
+
+    clean_fail = fix_workflow.commit_decision(
+        tree_dirty=False, closed_issues=[{"number": 1}, {"number": 2}]
+    )
+    assert clean_fail.action == fix_workflow.COMMIT_ACTION_FAIL
+    assert "2 issue(s)" in clean_fail.reason
+    assert "nothing to push" in clean_fail.reason
+
+
+def test_commit_decision_is_deterministic_and_pure_property() -> None:
+    """Seeded property run (seed/runs pinned above): the table, purity and determinism.
+
+    For every sampled ``(tree_dirty, closed count)`` the decision is the table's action, a
+    second call returns an equal immutable value, a ``commit`` decision carries no reason and
+    every other one always does, and the caller's ``closed_issues`` list — the run's own
+    accumulated list — is never mutated.
+    """
+    rng = random.Random(COMMIT_PROPERTY_SEED)
+    expected = {
+        (True, True): fix_workflow.COMMIT_ACTION_COMMIT,
+        (True, False): fix_workflow.COMMIT_ACTION_SKIP,
+        (False, False): fix_workflow.COMMIT_ACTION_SKIP,
+        (False, True): fix_workflow.COMMIT_ACTION_FAIL,
+    }
+
+    for case in range(COMMIT_PROPERTY_RUNS):
+        dirty = rng.choice([True, False])
+        count = rng.choice([0, 1, 2, 7])
+        closed = [{"number": number, "title": f"child {number}"} for number in range(count)]
+        before = [dict(item) for item in closed]
+
+        first = fix_workflow.commit_decision(tree_dirty=dirty, closed_issues=closed)
+        second = fix_workflow.commit_decision(tree_dirty=dirty, closed_issues=closed)
+
+        assert first == second, case
+        assert closed == before, case
+        assert first.action == expected[(dirty, bool(count))], (case, dirty, count)
+        assert (first.reason == "") == (
+            first.action == fix_workflow.COMMIT_ACTION_COMMIT
+        ), (case, first)
+
+
+def test_commit_failure_message_names_the_pr_and_the_branch() -> None:
+    """Req 5/req 6: every failure is one shape, and it names the PR and the branch."""
+    message = fix_workflow.commit_failure_message(42, "03-H3.3", "the push did not land")
+    assert "#42" in message
+    assert "03-H3.3" in message
+    assert "the push did not land" in message
+    assert message.startswith("commit-and-push failed for PR #42")
+    # An unresolved branch is named as such rather than omitted.
+    assert "(unresolved)" in fix_workflow.commit_failure_message(42, None, "why")
 
 
 # --------------------------------------------------------------------------- #

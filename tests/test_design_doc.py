@@ -120,6 +120,88 @@ def test_section_86_chain_ends_gracefully_when_review_published_nothing() -> Non
     assert "No review-follow-up parent issue found" in i2
 
 
+def _section_84_block(design: str) -> str:
+    """The §8.4 ``aidw fix`` block: its heading up to the §8.5 heading."""
+    start = design.index("### 8.4 `aidw fix --pr <n>`")
+    end = design.index("### 8.5 ", start)
+    return design[start:end]
+
+
+def test_section_84_fix_publishes_its_own_work() -> None:
+    """05-P1.1: the "no stage of `fix` commits" claim is reversed, not left contradicting.
+
+    The reversal is the whole point of the task: `F1` closes each issue as `Status: fixed`,
+    so a `fix` run that never committed reported work done that never reached the PR. The
+    design must name the new stage, its position and its four-case no-op boundary, and must
+    no longer assert that no stage of `fix` commits.
+    """
+    design = _design_md()
+
+    block = _section_84_block(design)
+    assert "→ F5 commit-and-push" in block
+    assert "`F5 commit-and-push`" in block
+    # The reversed sentence, and the §13 claim it leaned on.
+    assert "no stage of `fix` commits" not in block
+    assert "The edit stays **uncommitted**" not in block
+    # The contract the code implements: convergence-triggered, not green-gated; verified
+    # remote head; skipped no-ops; fail-closed fourth case.
+    assert "convergence" in block
+    assert 'state.pr["head_sha"]' in block
+    assert 'state.pr["commit_skip_reason"]' in block
+    assert 'git.rev_parse(worktree, "origin/<branch>")' in block
+    assert "[A1, I7, F5]" in block
+
+
+def test_section_13_names_both_owners_of_the_documented_git_add_all() -> None:
+    """05-P1.1: the broad `git add -A` has two owners — `I6 pr` and `F5` — both agent-run."""
+    design = _design_md()
+    section = _section(design, "## 13. Git and GitHub safety", "## 14. CLI reference")
+
+    assert "git add -A" in section
+    assert "`I6 pr`" in section
+    assert "`F5 commit-and-push`" in section
+    assert "`pr-publisher` agent" in section
+    assert "not by Python" in section
+    # The preserving-unrelated-work rule survives the widening.
+    assert "preserves unrelated user changes" in section
+
+
+def test_section_17_has_one_z9_row_recording_the_reversal() -> None:
+    """05-P1.1: one row, not two — the reversal and P1.2's close-after-push ordering."""
+    design = _design_md()
+    section = _section(design, "## 17. Resolved decisions", "## 18. Risks")
+
+    rows = [line for line in section.splitlines() if line.startswith("| Z9 |")]
+    assert len(rows) == 1, f"expected exactly one §17 Z9 row, found {len(rows)}"
+    z9 = rows[0]
+    assert "F5" in z9 and "commit-and-push" in z9
+    assert "reverses" in z9
+    assert "P1.2" in z9
+    # The prompt-fixed decisions travel with the row (Z2's precedent).
+    assert "Prompt-fixed decisions" in z9
+    for decision in ("(D1)", "(D2)", "(D3)", "(D4)", "(D5)", "(D6)", "(D7)", "(D8)", "(D9)", "(D10)"):
+        assert decision in z9, decision
+
+
+def test_section_18_row_is_no_longer_contradictory() -> None:
+    """05-P1.1: the risk row is resolved with the F5 boundary, not left asserting the old rule."""
+    design = _design_md()
+    risks = _section(design, "## 18. Risks", "## 19. Acceptance criteria")
+
+    rows = [
+        line
+        for line in risks.splitlines()
+        if line.startswith("| The fix-loop prompts leave their changes uncommitted")
+    ]
+    assert len(rows) == 1, f"expected exactly one §18 risk row, found {len(rows)}"
+    row = rows[0]
+    assert "Resolved" in row
+    assert "F5" in row and "commit-and-push" in row
+    # The old claim ("AIDT never commits") must be gone from the row's status/notes.
+    assert "AIDT never commits" not in row
+    assert "Not AIDT's to fix" not in row
+
+
 def _section(design: str, heading: str, next_heading: str) -> str:
     """Return one design section, excluding the following section."""
     start = design.index(heading)

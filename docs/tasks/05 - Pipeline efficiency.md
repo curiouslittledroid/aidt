@@ -36,7 +36,7 @@ while its stages close the follow-up issues as `Status: fixed`. On PR #300 this 
 commit unpushed, two fixes uncommitted, and all three follow-up issues closed. This epic makes
 `fix` land its work and keeps "issue closed" truthful.
 
-- [ ] **P1.1. Add a commit-and-push stage to `aidw fix`** (Design 8.4, Design 13, Design 17)
+- [x] **P1.1. Add a commit-and-push stage to `aidw fix`** (Design 8.4, Design 13, Design 17)
   - Done when: a `fix` run whose loop closed at least one issue ends with a new core stage that commits the accumulated change set (the fixes plus the `I7` roadmap tick) and pushes it to the PR head branch; the run records the pushed head SHA in `state.pr`; a stage that cannot commit or push fails the run (exit non-zero) with a message naming the PR and branch instead of succeeding silently; `--dry-run` plans the stage exactly once, after `I7`, and evaluates no evidence; the §8.4 sentence "The edit stays uncommitted: no stage of `fix` commits (§13)" and the §13 clause it cites are reversed, recorded as decision Z9; and the five gates above are green.
   - Deliverable: a new retained core stage id (e.g. `F5 commit-and-push`) in `aidw/stage_registry.py` and `aidw/workflows/fix.py` (emitted from the `post_loop` half, after `I7`); a prompt `prompts/fix-commit.md` plus its `REQUIRED_PROMPTS` entry in `aidw/inventory.py`; design.md §§8.4, 13, 17 (row Z9); `docs/workflow-stages.md`; the `aidw fix` block in `README.md`; and the tests below.
   - Tests: `tests/test_fix_workflow.py`, `tests/test_stage_registry.py`, `tests/test_plan_stages.py`, `tests/test_inventory.py`, `tests/test_design_doc.py`, `tests/test_workflow_stages_doc.py`.

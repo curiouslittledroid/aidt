@@ -267,7 +267,7 @@ def test_retained_stage_ids_are_the_vocabulary() -> None:
     """R6: ids are retained. §3.4's `author`/`review`/`implement` example ids are not."""
     assert registry.STAGE_IDS == frozenset(
         {"I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9", "P1", "P2",
-         "R1", "R2", "F1", "F2", "F3", "F4", "A1"}
+         "R1", "R2", "F1", "F2", "F3", "F4", "F5", "A1"}
     )
     for workflow in ("implement", "review", "approve"):
         for stage in registry.get_workflow(workflow).stages:
@@ -930,9 +930,17 @@ def test_fix_expansion_reproduces_the_dry_run_plan() -> None:
 
 
 def test_the_post_loop_field_exists_and_defaults_empty() -> None:
-    """``WorkflowDefinition.post_loop`` is additive: only ``fix`` carries one today."""
+    """``WorkflowDefinition.post_loop`` is additive: only ``fix`` carries one today.
+
+    05-P1.1 (design §17 Z9) made it a **two**-stage half: the shared tick ``I7`` and the
+    ``F5 commit-and-push`` stage that publishes the run's work, in that order.
+    """
     definition = registry.get_workflow("fix")
-    assert definition.post_loop == (registry.stage("fix", "I7"),)
+    assert definition.post_loop == (
+        registry.stage("fix", "I7"),
+        registry.stage("fix", "F5"),
+    )
+    assert [item.id for item in definition.post_loop] == ["I7", "F5"]
     for workflow in ("implement", "prompt", "review", "approve"):
         assert registry.get_workflow(workflow).post_loop == (), workflow
 
@@ -975,13 +983,21 @@ def test_expand_emits_the_post_loop_stage_only_on_request() -> None:
     )
 
     assert [stage.id for stage in iteration] == ["A1", "F1", "F2", "F3", "F4"]
-    assert [stage.id for stage in post] == ["A1", "F1", "F2", "F3", "F4", "I7"]
+    assert [stage.id for stage in post] == ["A1", "F1", "F2", "F3", "F4", "I7", "F5"]
     assert post[: len(iteration)] == iteration
-    tick = post[-1]
+    tick = post[-2]
     assert (tick.name, tick.agent) == ("update-roadmap", "recorder")
     assert tick.variables == (ROADMAP_FILE, CHECKBOX_ID)
     # Carried, never expanded away (H3.2's rule for the shared condition).
     assert tick.when == registry.WHEN_EVIDENCE_GREEN
+    # 05-P1.1: `F5` follows the tick and carries **no** condition — its trigger is the
+    # loop's convergence, not green evidence (decision D2).
+    commit = post[-1]
+    assert commit.id == "F5"
+    assert (commit.name, commit.agent) == ("commit-and-push", "pr-publisher")
+    assert commit.prompt_file == "fix-commit.md"
+    assert commit.variables == (str(PR),)
+    assert commit.when == ""
 
 
 def test_the_post_loop_expansion_needs_its_two_fields() -> None:
@@ -1032,12 +1048,53 @@ def test_validate_stage_list_treats_the_fix_post_loop_i7_as_core() -> None:
     assert any(
         "core stage cannot be reordered" in issue.message
         and "declared [I7, A1]" in issue.message
-        and "registry order is [A1, I7]" in issue.message
+        and "registry order is [A1, I7, F5]" in issue.message
         for issue in reordered
     )
 
     # And the canonical declaration is clean — I7 is not misclassified as a loop stage.
-    assert registry.validate_stage_list("fix", [{"id": "A1"}, {"id": "I7"}]) == []
+    assert registry.validate_stage_list(
+        "fix", [{"id": "A1"}, {"id": "I7"}, {"id": "F5"}]
+    ) == []
+
+
+def test_the_commit_stage_is_core_and_is_the_second_post_loop_entry() -> None:
+    """Reqs 1/4/5: ``F5`` is a core ``fix`` stage, and removal, disable and reorder refuse."""
+    definition = registry.get_workflow("fix")
+    commit = registry.stage("fix", "F5")
+    assert "F5" in registry.STAGE_IDS
+    # 05-P1.1 req 1: the repo-optional set is unchanged — F5 is core.
+    assert registry.REPO_OPTIONAL_IDS == frozenset({"I3", "I4"})
+    assert commit is definition.post_loop[-1]
+    assert commit.name == "commit-and-push"
+    assert commit.agent == "pr-publisher"
+    assert commit.prompt_file == "fix-commit.md"
+    assert commit.variables == ("{pr}",)
+    assert commit.when == ""
+
+    removal = registry.validate_stage_list("fix", [{"id": "A1"}, {"id": "I7"}])
+    assert any(
+        "F5" in issue.message and "core stage cannot be removed" in issue.message
+        for issue in removal
+    )
+
+    disabled = registry.validate_stage_list(
+        "fix", [{"id": "A1"}, {"id": "I7"}, {"id": "F5", "enabled": False}]
+    )
+    assert any(
+        "F5" in issue.message and "core stage cannot be disabled" in issue.message
+        for issue in disabled
+    )
+
+    reordered = registry.validate_stage_list(
+        "fix", [{"id": "A1"}, {"id": "F5"}, {"id": "I7"}]
+    )
+    assert any(
+        "core stage cannot be reordered" in issue.message
+        and "declared [A1, F5, I7]" in issue.message
+        and "registry order is [A1, I7, F5]" in issue.message
+        for issue in reordered
+    )
 
 
 def test_the_post_loop_expansion_does_no_io(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1449,7 +1506,8 @@ def test_validate_stage_list_accepts_every_workflow_s_own_static_list() -> None:
     """The registry's list, written out as a declared list, is valid for all five.
 
     Since H3.3 a declared list covers the post-loop half too, so ``fix``'s own list is
-    ``[A1, I7]`` — its static stage followed by the shared tick (req 2).
+    ``[A1, I7, F5]`` — its static stage followed by the shared tick and the commit
+    stage (H3.3 req 2; 05-P1.1 req 1).
     """
     for workflow in ("implement", "prompt", "review", "fix", "approve"):
         definition = registry.get_workflow(workflow)
@@ -1674,10 +1732,11 @@ def test_validate_stage_list_rejects_a_declared_loop_stage() -> None:
     assert "P2" in issues[0].message
     assert "core stage cannot be disabled" in issues[0].message
 
-    # The ``fix`` loop's F1–F4 are loop stages too (A1 and the post-loop I7 are that
-    # workflow's core stages — H3.3 req 2 keeps I7 out of the loop classification).
+    # The ``fix`` loop's F1–F4 are loop stages too (A1 and the post-loop I7/F5 are that
+    # workflow's core stages — H3.3 req 2 and 05-P1.1 keep the post-loop half out of the
+    # loop classification, so I7/F5 are declared *after* the core order here).
     issues = registry.validate_stage_list(
-        "fix", [{"id": "A1"}, {"id": "I7"}, {"id": "F1"}]
+        "fix", [{"id": "A1"}, {"id": "I7"}, {"id": "F5"}, {"id": "F1"}]
     )
     assert len(issues) == 1
     assert "F1" in issues[0].message

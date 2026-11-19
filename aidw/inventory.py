@@ -56,6 +56,10 @@ REQUIRED_PROMPTS = (
     "review-findings-to-github.md",
     "approve-review-followups.md",
     "fix-next-review-followup.md",
+    # 05-P1.1 (design §17 Z9): ``F5 commit-and-push`` — the one stage of ``fix`` that
+    # publishes the run's work. Listed here so a rename fails loudly at `prompts check`
+    # instead of at Pi invocation, exactly as every other scheduled prompt does.
+    "fix-commit.md",
 )
 
 #: Helper scripts the review/fix prompts invoke.

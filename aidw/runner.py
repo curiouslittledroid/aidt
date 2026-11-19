@@ -215,7 +215,7 @@ def declared_stage_issues(
     """
     definition = stage_registry.get_workflow(workflow)
     # Known ids are the static chain **and** the post-loop half (H3.3 req 2): a repo's
-    # canonical `workflows.fix.stages: [A1, I7]` must resolve `I7` by its registry
+    # canonical `workflows.fix.stages: [A1, I7, F5]` must resolve `I7` by its registry
     # prompt-file/agent like any other known stage, or this preflight refuses it as
     # repo-added ("a repo-added stage must declare `agent`") and exits 2 before any run
     # record.
