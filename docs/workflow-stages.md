@@ -90,6 +90,7 @@ shape there (static ids first, post-loop ids last, in that order).
 | `blocking` | One stage per blocking (`must-fix`/`should-fix`) finding of the preceding review. | `expand()`, from the parsed findings. |
 | `could-fix` | One **combined** stage carrying every non-blocking `could-fix` finding. | `expand()`, from the parsed findings. |
 | `unparseable` | One fallback stage carrying the whole review verbatim, used when the review did not parse into findings (or a block was malformed). | `expand()`, from the parse result. |
+| `paths-changed` | The stage runs only when the run's **change set touches one of the stage's declared paths** (S1.1). The paths are the repo's declaration — the optional per-stage `when_paths` list of repo-relative prefixes (`docs/target-repo-config.md`) — never a toolkit default: an **absent or empty** list means the stage is unconditional, which is the toolkit default and today's behaviour. Like `evidence-green` the token is *carried*, never expanded away: `plan_stages`, `build_plan` and `--dry-run` plan the stage in position and the workflow decides before `run_stage`. A withheld stage is recorded `skipped` with the declared prefixes named, and the run still succeeds; a change set that cannot be computed (an unresolvable base) **runs** the stage rather than skipping it, because dropping a stage that may be needed is not fail-closed. | The workflow, from the run's change set (`git.changed_paths` against `BASE_DEFAULT` plus untracked paths, the run's state root excluded) — see `I3` in [implement](#aidw-implement--implement-a-task-prompt-and-open-the-pr). |
 | `evidence-green` | The stage runs only when **the workflow's own evidence** says so. The token is *carried*, never expanded away: `plan_stages`, `build_plan` and `--dry-run` plan the stage in its position, and the workflow decides before `run_stage`, so no agent can ever run a stage this condition withheld. A withheld stage is recorded as `skipped` with its reason, and the run still succeeds. | The workflow, from state no expansion can see (see `I7` in [implement](#aidw-implement--implement-a-task-prompt-and-open-the-pr) and [fix](#aidw-fix--fix-approved-review-follow-ups)). |
 
 ### Context blocks
@@ -203,7 +204,7 @@ preflight (target config, declared stage list, worktree located, no other run ac
 |---|---|---|---|---|---|---|
 | `I1` | `impliment-task` | `implementer` | `impliment-task.md` | `{prompt_rel}` | — | — |
 | `I2` | `test` | `tester` | `test.md` | — | — | `stage context` |
-| `I3` | `update-traceability` | `implementer` | `update-traceability.md` | `{branch}` | — | — |
+| `I3` | `update-traceability` | `implementer` | `update-traceability.md` | `{branch}` | `paths-changed` | — |
 | `I4` | `update-architecture` | `implementer` | `update-architecture.md` | `{branch}`, `{base_branch}` | — | — |
 | `I5` | `record-implementation-results` | `recorder` | `record-implementation-results.md` | `{branch}` | — | — |
 | `I8` | `summarize-implementation-results` | `recorder` | `summarize-implementation-results.md` | `{branch}` | — | — |
@@ -218,7 +219,10 @@ preflight (target config, declared stage list, worktree located, no other run ac
 - **`I2` test** — proves the change against the prompt's acceptance criteria with focused checks
   (a real browser for browser-facing work), through the repo's gates (`aidw gate run`).
 - **`I3` update-traceability** — updates the repo's traceability artefacts for the change. Runs
-  after `I2` because traceability cites the test names `I2` may add. **Repo-optional.**
+  after `I2` because traceability cites the test names `I2` may add. **Repo-optional.** It
+  carries `when=paths-changed` (S1.1): when the stage entry declares `when_paths`, it runs
+  only if the change set touches one of those prefixes, and a withheld stage is recorded
+  `skipped` naming them. No `when_paths` means unconditional, which is the toolkit default.
 - **`I4` update-architecture** — updates the repo's architecture documents. Disjoint from `I2`'s
   file set, which is why `test` + `update-architecture` is the default `parallel_groups` pair.
   **Repo-optional.**
@@ -516,7 +520,10 @@ workflows:
   never merged element-wise, so an omitted core id is a removal `ERROR`, not an inheritance. A
   stage entry the list does not carry keeps the registry's own agent and no overrides, which is
   why the practical shape is: declare every core id, and put `prompt`/`agent`/`model`/`thinking`/
-  `timeout_seconds` on the entries you want to change.
+  `timeout_seconds`/`when_paths` on the entries you want to change.
+- `when_paths` is the per-stage path set a `paths-changed` stage is gated on (S1.1). Because a
+  declared list replaces the whole chain, setting it means declaring the full list; leaving the
+  key off an entry keeps the stage unconditional.
 - `parallel_groups` members are stage **runtime names** of that workflow's static chain, not ids.
 - Unknown ids are refused; a malformed list is a refusal (exit 2) before any run state exists.
 - **Repo-added stages run in `implement`, `review` and `approve`, not in `prompt` or `fix`.**

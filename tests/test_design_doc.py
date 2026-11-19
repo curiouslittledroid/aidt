@@ -112,6 +112,78 @@ def test_section_17_has_one_z10_row_recording_the_test_verdict_gate() -> None:
         assert decision in z10, decision
 
 
+def test_section_82_documents_the_path_scoped_condition_on_i3() -> None:
+    """S1.1: §8.2 states the token, the carry rule, the change set and the skip shape.
+
+    Without the paragraph the next reader would find `I3` skipping with no design behind
+    it — and would be free to "fix" the condition away, or to give the toolkit a default
+    path set, which is exactly the product literal the decision forbids.
+    """
+    block = " ".join(_section_82_block(_design_md()).split())
+
+    assert "**`when=WHEN_PATHS_CHANGED`**" in block
+    assert "`when_paths`" in block
+    assert "carried, never expanded away" in block
+    assert "`_expand_static`" in block
+    assert "`git.changed_paths`" in block and "`BASE_DEFAULT`" in block
+    assert "`git.untracked_paths`" in block
+    assert "`verification.normalise_ignore`" in block
+    assert "`runner.record_skipped`" in block
+    assert "`SKIP_REASON_KEY`" in block
+    # The empty-default rule and the fail-closed direction are both stated.
+    assert "absent or empty" in block and "**unconditional**" in block
+    assert "Cannot prove" in block and "**runs** the stage" in block
+    # The skip is a cost control, not a gate verdict.
+    assert "cost-control skip, not a gate verdict" in block
+    assert "no `state.status`/`state.resume` write" in block
+
+
+def test_section_12_2_documents_the_token_and_the_stage_key() -> None:
+    """S1.1: the registry/override section names both halves a repo has to know."""
+    section = _section(
+        _design_md(), "### 12.2 Stage registry", "### 12.3 Prompt resolution"
+    )
+
+    assert "`when=paths-changed`" in section
+    assert "`when_paths`" in section
+    assert "`verification.normalise_ignore`" in section
+    assert "absent or empty" in section and "unconditional" in section
+    # The token is one of the two the expander cannot resolve.
+    assert "`evidence-green`" in section
+
+
+def test_section_17_has_one_z11_row_recording_the_path_scoped_condition() -> None:
+    """S1.1: one §17 row records the token, `I3`, its fail-closed edges and its choices."""
+    design = _design_md()
+    section = _section(design, "## 17. Resolved decisions", "## 18. Risks")
+
+    rows = [line for line in section.splitlines() if line.startswith("| Z11 |")]
+    assert len(rows) == 1, f"expected exactly one §17 Z11 row, found {len(rows)}"
+    z11 = rows[0]
+    assert "WHEN_PATHS_CHANGED" in z11 and "paths-changed" in z11
+    assert "`I3`" in z11 and "`when_paths`" in z11
+    # The principles it must not violate, and the follow-up task it must not do.
+    assert "product literal" in z11
+    assert "unconditional" in z11
+    assert "S1.2" in z11
+    assert "record_skipped" in z11
+    assert "BASE_DEFAULT" in z11
+    # The prompt-fixed decisions travel with the row (Z1/Z9's precedent).
+    assert "Prompt-fixed decisions" in z11
+    for decision in ("(a)", "(b)", "(c)", "(d)", "(e)"):
+        assert decision in z11, decision
+    # The touched set is named, so a later reader can find the contract tests.
+    for path in (
+        "aidw/stage_registry.py",
+        "aidw/runner.py",
+        "aidw/target_config.py",
+        "aidw/workflows/implement.py",
+        "docs/workflow-stages.md",
+        "tests/test_implement_workflow.py",
+    ):
+        assert path in z11, path
+
+
 def _section_83_block(design: str) -> str:
     """The §8.3 ``aidw review`` block: its heading up to the §8.4 heading."""
     start = design.index("### 8.3 `aidw review --pr <n>`")

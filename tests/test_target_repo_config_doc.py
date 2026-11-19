@@ -131,6 +131,8 @@ EXPECTED_DEFAULTS: dict[str, str] = {
     "model": "unset",
     "thinking": "unset",
     "timeout_seconds": "unset",
+    # S1.1's path-scoped stage field: optional, and its absence means "unconditional".
+    "when_paths": "unset",
     # github: markers / labels. The two containers stay "unset" (a mapping key has no value
     # of its own; its leaves resolve individually), the three marker leaves carry the frozen
     # D5 templates (E6.1), and a label entry's two fields are required.
@@ -492,6 +494,43 @@ def test_stage_metadata_fields_are_documented_as_configurable():
     assert "positive integer" in doc
     # The pre-E4.6 "not stage fields" claim is gone.
     assert "not** stage fields" not in doc
+
+
+def test_when_paths_is_documented_as_a_stage_field_and_loads(tmp_path: Path) -> None:
+    """S1.1: the path set the doc documents is one the loader accepts and normalises.
+
+    Proves the doc's claim rather than restating it: a declared `./docs/x/` loads, comes
+    back canonical, and survives `to_dict` as the normalised list.
+    """
+    rows = _inventory_rows()
+    assert "when_paths" in rows
+    assert "when_paths" in STAGE_KEYS
+    assert rows["when_paths"][0] == "list of strings"
+    assert "paths-changed" in rows["when_paths"][2]
+
+    path = tmp_path / "aidw" / "config.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "schema_version: 1\n"
+        "workflows:\n"
+        "  implement:\n"
+        "    stages:\n"
+        "      - id: update-traceability\n"
+        "        when_paths:\n"
+        "          - ./docs/traceability/\n"
+        "          - docs/rules-coverage\n",
+        encoding="utf-8",
+    )
+
+    declared = load_target_config(path)
+
+    assert [issue for issue in declared.issues if issue.level == ERROR] == []
+    stage = declared.workflows["implement"].stages[0]
+    assert stage.when_paths == ["docs/rules-coverage", "docs/traceability"]
+    assert declared.to_dict()["workflows"]["implement"]["stages"][0] == {
+        "id": "update-traceability",
+        "when_paths": ["docs/rules-coverage", "docs/traceability"],
+    }
 
 
 @pytest.mark.parametrize(

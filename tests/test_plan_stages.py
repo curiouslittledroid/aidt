@@ -51,6 +51,7 @@ from aidw.log import RunLogger
 from aidw.paths import ToolkitPaths
 from aidw.runner import (
     StageSpec,
+    _declared_when_paths as runner_declared_when_paths,
     declared_stage_issues,
     plan_stages,
     run_stage,
@@ -193,7 +194,15 @@ def _config(workflow: str, entries: list[dict[str, object]]) -> str:
     for entry in entries:
         for index, (key, value) in enumerate(entry.items()):
             prefix = "      - " if index == 0 else "        "
-            rendered = ("true" if value else "false") if isinstance(value, bool) else str(value)
+            if isinstance(value, list):
+                # Only `when_paths` is list-valued on a stage entry (S1.1): an inline
+                # flow list keeps the fixture one line per key, and quotes the strings so
+                # a prefix with a space or a `#` survives YAML.
+                rendered = "[" + ", ".join(f'"{item}"' for item in value) + "]"
+            elif isinstance(value, bool):
+                rendered = "true" if value else "false"
+            else:
+                rendered = str(value)
             lines.append(f"{prefix}{key}: {rendered}")
     return "\n".join(lines) + "\n"
 
@@ -246,6 +255,75 @@ def test_implement_plan_is_the_nine_registry_stages(tmp_path: Path) -> None:
     assert all(spec.explicit_prompt is None for spec in specs)
     assert all(spec.workflow == "implement" for spec in specs)
     assert all(isinstance(spec.variables, list) for spec in specs)
+
+
+def test_i3_plans_with_paths_changed_and_the_declared_when_paths(tmp_path: Path) -> None:
+    """S1.1 req 2/req 4: the token is carried and the repo's path set rides the spec.
+
+    With no declared entry `I3` keeps the empty default (the stage is then unconditional —
+    the toolkit default), and with a declared entry its normalised `when_paths` reaches
+    `StageSpec.when_paths` while every other spec's stays empty (the field is set only from
+    the declared entry, never from the condition).
+    """
+    fields = {
+        "prompt_rel": PROMPT_REL,
+        "branch": BRANCH,
+        "task_id": TASK_ID,
+        "base_branch": "main",
+    }
+    plain = _plan("implement", root=_target(tmp_path / "plain"), **fields)
+    i3 = next(spec for spec in plain if spec.id == "I3")
+    assert i3.when == stage_registry.WHEN_PATHS_CHANGED
+    assert i3.when_paths == ()
+    assert all(
+        spec.when_paths == () for spec in plain if spec.id != "I3"
+    )
+
+    declared_paths = ["docs/traceability", "docs/rules-coverage"]
+    root = _target(
+        tmp_path / "declared",
+        _config(
+            "implement",
+            _stage_entries(
+                "implement", overrides={"I3": {"when_paths": declared_paths}}
+            ),
+        ),
+    )
+    declared = _plan("implement", config=_resolved(root), root=root, **fields)
+    i3 = next(spec for spec in declared if spec.id == "I3")
+    # Canonical and sorted by the loader (`normalise_ignore`), not by declaration order.
+    assert i3.when_paths == ("docs/rules-coverage", "docs/traceability")
+    assert i3.when == stage_registry.WHEN_PATHS_CHANGED
+    assert all(
+        spec.when_paths == () for spec in declared if spec.id != "I3"
+    )
+    # The overlay is additive: nothing else about the plan moves.
+    assert _shape(declared) == _shape(plain)
+
+
+def test_the_declared_when_paths_is_type_guarded_at_the_plan_seam() -> None:
+    """S1.1 req 4: a directly-passed entry degrades to the empty default, never crashes.
+
+    The loader refuses these shapes on the config path (``target_config._parse_when_paths``),
+    but ``plan_stages`` is also called with plain dicts (``aidw exec``, tests), so the
+    carrier filters them: only a list/tuple of non-blank strings reaches the workflow's
+    matcher. Entries are not re-ordered here — canonicalisation is the workflow's one call
+    to ``verification.normalise_ignore``.
+    """
+    carry = runner_declared_when_paths
+
+    assert carry(None) == ()
+    assert carry({}) == ()
+    assert carry({"when_paths": "docs/x"}) == ()
+    assert carry({"when_paths": 7}) == ()
+    assert carry({"when_paths": ["docs/x", 7, "  ", None]}) == ("docs/x",)
+
+    declared = ("docs/a", "docs/b")
+    assert carry({"when_paths": declared}) == declared
+    # Purity: the input dict and its list are not mutated.
+    entry = {"when_paths": ["docs/a"]}
+    assert carry(entry) == ("docs/a",)
+    assert entry == {"when_paths": ["docs/a"]}
 
 
 def test_review_plan_is_r1_plus_the_r2_manifest_pointer(tmp_path: Path) -> None:

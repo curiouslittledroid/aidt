@@ -58,6 +58,7 @@ from aidw.stage_registry import (
     WHEN_COULD_FIX,
     WHEN_EVIDENCE_GREEN,
     WHEN_FINDINGS,
+    WHEN_PATHS_CHANGED,
     WHEN_UNPARSEABLE,
     StageDefinition,
     get_workflow,
@@ -327,6 +328,7 @@ def test_condition_table_names_exactly_the_declarable_tokens() -> None:
         WHEN_COULD_FIX,
         WHEN_UNPARSEABLE,
         WHEN_EVIDENCE_GREEN,
+        WHEN_PATHS_CHANGED,
     }
     assert documented == expected, (
         f"condition tokens drifted: missing={expected - documented}, "

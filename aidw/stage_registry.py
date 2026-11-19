@@ -58,8 +58,9 @@ Loops are not flat lists (design §8's ``⟳``/``if`` notation):
   ("the ``max_revisions``-th review is review-only; a review is always the last stage").
   ``unprimed_first`` is L2.3 ("round 1 is deliberately unprimed" — no delta brief).
 * :class:`StageDefinition.when` is the ``if`` of §8.3/§8.4 (``if findings: → R2``), and
-  also :data:`WHEN_EVIDENCE_GREEN` (H3.2) — the one condition the expander cannot
-  resolve, so it is carried onto the planned stage and evaluated by the workflow.
+  also the two conditions the expander cannot resolve — :data:`WHEN_EVIDENCE_GREEN`
+  (H3.2) and :data:`WHEN_PATHS_CHANGED` (S1.1) — so they are carried onto the planned
+  stage and evaluated by the workflow.
 * :class:`FixBatch` carries one round's finding partition, so the ``prompt`` loop's
   per-finding / combined-could-fix / whole-review-fallback staging is *input*, not
   branching code inside the expander.
@@ -197,6 +198,15 @@ WHEN_UNPARSEABLE = "unparseable"
 #: ``implement``; H3.3 reuses it for ``fix``) and records a ``skipped`` stage with its
 #: reason when the condition does not hold.
 WHEN_EVIDENCE_GREEN = "evidence-green"
+#: The stage runs only when the run's **change set touches one of the stage's declared
+#: paths** (S1.1, design §§8.2, 12.2). The paths are a repo's declaration — the additive
+#: per-stage ``when_paths`` field of ``workflows.<name>.stages[]`` — never a toolkit
+#: default: a hardcoded path set would be a product literal (design §7.1/§17 S1), so the
+#: toolkit set is empty and an empty set means the stage runs unconditionally. Like
+#: :data:`WHEN_EVIDENCE_GREEN` the token is **carried, never expanded away** — the
+#: expander cannot see a change set — so ``plan_stages``/``build_plan``/``--dry-run`` plan
+#: the stage in position and the workflow decides before ``run_stage``.
+WHEN_PATHS_CHANGED = "paths-changed"
 
 # Runtime-assembled ``extra`` kinds. The workflow owns the payload (prior review text, the
 # real ``git diff``); these helpers own the wording, so the text cannot drift.
@@ -624,12 +634,19 @@ _IMPLEMENT = WorkflowDefinition(
             "test.md",
             extra=TEST_CONTEXT_EXTRA,
         ),
+        # S1.1 (design §17 Z11): traceability is the first **path-scoped** stage. The
+        # condition is carried (the expander has no change set) and the *paths* are always
+        # the repo's, never a registry default — a toolkit-hardcoded set would be a product
+        # literal (design §7.1) and would skip the stage in every repo that lacks those
+        # directories. With no declared ``when_paths`` the stage is unconditional, exactly
+        # as it was before this token existed.
         StageDefinition(
             "I3",
             "update-traceability",
             "implementer",
             "update-traceability.md",
             ("{branch}",),
+            when=WHEN_PATHS_CHANGED,
         ),
         StageDefinition(
             "I4",
