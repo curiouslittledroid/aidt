@@ -64,6 +64,7 @@ rendered with the run's fields.
 | `F2` | loop-internal | `fix` |
 | `F3` | loop-internal | `fix` |
 | `F4` | loop-internal | `fix` |
+| `F5` | core | `fix` |
 | `A1` | core | `approve`, `fix` |
 
 What each kind permits in `workflows.<name>.stages`:
@@ -78,8 +79,8 @@ What each kind permits in `workflows.<name>.stages`:
   **refused** in a declared list, whether or not they carry `enabled: false`. The loop is core.
 
 A stage id is classification-stable across workflows: `I7` is core in **both** workflows that run
-it, so a declared `workflows.fix.stages` list must carry it — `[A1, I7]` is the canonical shape
-there (static ids first, post-loop ids last).
+it, so a declared `workflows.fix.stages` list must carry it — `[A1, I7, F5]` is the canonical
+shape there (static ids first, post-loop ids last, in that order).
 
 ### Conditions
 
@@ -310,6 +311,7 @@ preflight (PR exists, targets main, the PR head's worktree is located)
          ◇ approve-fix-pr
      repeat until select reports no available child (or --max-iterations)
   → I7 update-roadmap                 recorder        if this run's evidence is green
+  → F5 commit-and-push                pr-publisher    commits the change set and pushes the branch
 ```
 
 ### `fix` — stage inventory
@@ -322,9 +324,11 @@ preflight (PR exists, targets main, the PR head's worktree is located)
 | `F3` | `iter{iteration}-code-review` | `code-reviewer` | `code-review.md` | — | — | — |
 | `F4` | `iter{iteration}-review-findings-to-github` | `review-publisher` | `review-findings-to-github.md` | `{pr}` | `findings` | `manifest pointer` |
 | `I7` | `update-roadmap` | `recorder` | `update-roadmap.md` | `{roadmap_file}`, `{checkbox_id}` | `evidence-green` | — |
+| `F5` | `commit-and-push` | `pr-publisher` | `fix-commit.md` | `{pr}` | — | — |
 
-The `A1` row is the **static** half and `I7` is the **post-loop** half: `I7` is emitted once per
-run, after the loop, and never per iteration. `F1`–`F4` are the loop's head and body.
+The `A1` row is the **static** half and `I7`/`F5` are the **post-loop** half: both are emitted
+once per run, after the loop, and never per iteration — `I7` first, then `F5`. `F1`–`F4` are the
+loop's head and body.
 
 ### What each stage does
 
@@ -353,8 +357,27 @@ run, after the loop, and never per iteration. `F1`–`F4` are the loop's head an
   run's recorded state for this branch, falling back to reversing `repo.branch_pattern`; when
   neither yields exactly one roadmap entry the stage is **skipped with a reason and the run still
   succeeds**, because `fix` must keep working on PRs that are not AIDT tasks.
+- **`F5` commit-and-push** — the one stage of `fix` that publishes the run's work, and it carries
+  **no** `when=` condition: its trigger is the loop's convergence, not the tick's outcome, so a
+  converged run whose tick was withheld still lands its fixes. The `pr-publisher` agent commits
+  the accumulated change set (the fix edits plus the tick when it flipped) and pushes the PR-head
+  branch — never the base branch, never a force-push. AIDT picks the case, then verifies the
+  result: a dirty tree with at least one issue closed this run commits and pushes and records the
+  verified remote head as `state.pr["head_sha"]`; a dirty tree with nothing closed, and a clean
+  tree with nothing closed, are recorded **skips** with `state.pr["commit_skip_reason"]` and exit
+  0 (unowned dirt is not this run's to publish, and a no-op run creates no empty commit); a clean
+  tree with at least one issue closed fails closed, because issues were closed and there is
+  nothing to push. A stage record alone is not evidence the push landed: AIDT requires `HEAD` to
+  have **moved** since before the stage (a stage that stashes or cleans the change set instead of
+  committing it would otherwise satisfy every other check), then re-reads `HEAD` and
+  `origin/<branch>` and fails the run (naming the PR and branch) when they differ or cannot be
+  resolved, when `HEAD` did not move, when the tree is still dirty, or when the stage did not
+  succeed.
 
-No stage of `fix` commits: the fix and tick edits stay uncommitted (design §13).
+`F5` is the only stage of `fix` that commits, and it commits everything the run accumulated —
+the fix and tick edits reach the PR instead of staying in the worktree (design §8.4, §13, §17
+Z9). A stopped loop still commits nothing: every stop path records both post-loop stages as
+skipped with the stop as the reason.
 
 ## `aidw approve-followups` — record the approval decision only
 
@@ -400,9 +423,9 @@ declared under `workflows.fix.stages`.
   another `A1` round).
 - Bounded by `--max-iterations` (default 10) and, in practice, by GitHub state: `select` reporting
   no available child ends the loop **successfully**.
-- `expand("fix", …)` *is* the per-iteration expansion, which is why `I7` lives in the workflow's
-  `post_loop` half and is emitted only when a caller asks (`include_post_loop=True`) — once, after
-  the loop, by `aidw fix` itself.
+- `expand("fix", …)` *is* the per-iteration expansion, which is why `I7` and `F5` live in the
+  workflow's `post_loop` half and are emitted only when a caller asks
+  (`include_post_loop=True`) — once each, after the loop, by `aidw fix` itself.
 
 ## Gates
 

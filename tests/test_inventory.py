@@ -151,6 +151,63 @@ def test_required_prompts_include_the_integration_guide_stage() -> None:
     assert _errors(_defaults(toolkit_root())) == []
 
 
+def test_required_prompts_include_the_fix_commit_stage() -> None:
+    """05-P1.1 (design §17 Z9): the `F5` stage's prompt is a required default.
+
+    ``REQUIRED_PROMPTS`` is what makes a rename fail loudly instead of at Pi invocation
+    (AGENTS.md "Prompts and agent configs are the product contract"), so the stage the
+    registry schedules as ``F5 commit-and-push`` must be listed here beside the other
+    ``fix`` prompts.
+    """
+    assert "fix-commit.md" in inventory.REQUIRED_PROMPTS
+    # The real toolkit ships it, and the defaults half resolves it without issues.
+    assert "fix-commit.md" in inventory.list_files(toolkit_root())
+    assert _errors(_defaults(toolkit_root())) == []
+
+
+def test_the_fix_commit_prompt_commits_and_pushes_only() -> None:
+    """05-P1.1 req 8: commit + push only — no PR creation and no build-results backfill.
+
+    ``F5`` reuses the ``pr-publisher`` agent but not ``/pr``'s duties: the PR already
+    exists, and the build results belong to the implement chain. A prompt that opened a PR
+    or edited the results document would make ``fix`` a second delivery owner.
+    """
+    text = (toolkit_root() / "prompts" / "fix-commit.md").read_text(encoding="utf-8")
+
+    # No PR creation, and none of `/pr`'s backfill machinery: the prompt may *forbid*
+    # editing the results document, but it must not name the literals that do it.
+    assert "gh pr create" not in text
+    assert "docs/implementation-results" not in text
+    assert "not yet opened" not in text
+    assert "TEMPLATE" not in text
+    # The branch, the remote and the no-force rule the stage contract states.
+    assert "git push origin" in text
+    assert "git add -A" in text
+    assert "--force" in text
+    assert "closed no issue" in text
+    assert "Refuse before pushing" in text
+
+
+def test_the_pr_publisher_guidance_scopes_its_hard_rules_by_prompt() -> None:
+    """05-P1.1 req 9 (D9): the agent file, not the prompt text, carries the carve-out.
+
+    ``pr-publisher`` is F5's agent, so its "you own the delivery step / open the pull
+    request" rules must be scoped: ``/pr`` keeps them, ``/fix-commit`` commits and pushes
+    only. The agent id and its allowlist are untouched.
+    """
+    text = (toolkit_root() / "agents" / "pr-publisher" / "AGENTS.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "/fix-commit" in text
+    assert "`/pr`" in text
+    assert "No `gh pr create`" in text
+    assert "no build-results edit" in text
+    # The agent still owns the PR half, and never merges.
+    assert "gh pr create" in text
+    assert "Never merge" in text
+
+
 def test_missing_prompts_dir_is_error(tmp_path: Path) -> None:
     issues = inventory.check_defaults(tmp_path / "aidt")
     assert issues and issues[0].level == ERROR

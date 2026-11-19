@@ -13,6 +13,8 @@ preflight (PR exists, targets main, the PR head's worktree is located)
        else:
          ◇ approve-fix-pr
      repeat until no approved child remains
+  → I7 update-roadmap               (agent recorder, fresh)     once per run, if green
+  → F5 commit-and-push              (agent pr-publisher, fresh)  once per run, and publishes
 ```
 
 Selection is always re-derived from ``review_followup.py select`` (never by counting), so
@@ -26,8 +28,9 @@ lives:
 
 * the stage is a :attr:`~aidw.stage_registry.WorkflowDefinition.post_loop` entry, emitted
   only when a caller asks for the post-loop half. ``_planned_iteration`` calls
-  ``plan_stages`` once per iteration and must never carry the tick, or it would run — and
-  dry-run print — once per iteration instead of once per run;
+  ``plan_stages`` once per iteration and must never carry the tick (or ``F5``, which shares
+  that half through :func:`_post_loop_specs`), or it would run — and dry-run print — once
+  per iteration instead of once per run;
 * the task id comes from the newest ``implement`` run's recorded ``state.task`` for the
   PR-head branch (``run.py:find_pr_number``'s re-read-the-run-state trade-off: no new ``gh``
   query, never the PR title), falling back to reversing ``repo.branch_pattern``. When neither
@@ -40,11 +43,17 @@ lives:
   an ambiguous verdict, a failed stage) records the same skip with the stop as its reason and
   leaves the roadmap byte-identical.
 
+Since 05-P1.1 (design §17 Z9) a second post-loop stage follows the tick: ``F5
+commit-and-push``. Before it, no stage of ``fix`` committed, so a run's fixes and its
+roadmap tick stayed uncommitted in the PR-head worktree while its stages closed the
+follow-up issues as ``Status: fixed`` — the work never reached the PR. ``F5`` is the
+single owner of that write: the ``pr-publisher`` agent commits the accumulated change set
+and pushes the PR-head branch, and this module only decides *whether* it may (D3's
+four-case table) and verifies what landed (D6's head comparison). Python never commits and
+never pushes.
+
 All GitHub writes are performed by AIDT's bundled prompts/scripts (the fixer and approver
 agents). AIDT only reads: ``gh pr view`` and ``review_followup.py select``.
-
-The tick's edit stays **uncommitted**, like every other ``fix`` stage: no stage of ``fix``
-commits (design §13).
 
 The run lock (``aidw.lock``, EXTRACTION.md §3.2/§3.10) is keyed on the **re-resolved
 PR-head worktree**, acquired immediately before ``create_run`` and released on every exit
@@ -58,9 +67,10 @@ from __future__ import annotations
 import json
 import string
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from aidw import __version__, findings as findings_mod
 from aidw import git, github, lock, roadmap, stage_registry
@@ -108,6 +118,11 @@ GATE_FOLLOWUPS = "approve-followups"
 GATE_FIX_PR = "approve-fix-pr"
 DEFAULT_MAX_ITERATIONS = 10
 
+#: The runtime name of ``F5`` (``stage_registry``'s ``_COMMIT_PUSH_STAGE``). The workflow
+#: keys on the *name* — the same rule ``implement.TICK_STAGE_NAME`` follows — because
+#: ``state.json`` and the stage block are name-keyed (R6).
+COMMIT_STAGE_NAME = "commit-and-push"
+
 #: The two ``state.pr`` fields the post-loop tick records (H3.3 req 6). ``roadmap_ticked``
 #: is the roadmap's own name; the skip reason's key is prompt-fixed here because the roadmap
 #: fixes only ``roadmap_ticked``. A ``True`` means the tick was **run** and verified
@@ -121,6 +136,40 @@ PR_ROADMAP_TICK_SKIP_REASON = "roadmap_tick_skip_reason"
 #: nothing. ``select`` never returned ``EXIT_NONE_AVAILABLE``, so the loop did not converge.
 STOP_REASON = (
     "fix stopped before the loop converged ({stop}), so the roadmap tick was withheld"
+)
+
+#: The ``state.pr`` fields ``F5`` records (05-P1.1, decisions D6/D7). ``head_sha`` is the
+#: **verified remote** SHA — ``origin/<branch>`` at verification time, written only when the
+#: head comparison holds — so its presence *is* the "committed and pushed" boolean; there is
+#: deliberately no second ``committed``/``pushed`` flag. A skip writes the reason instead,
+#: mirroring H3.3's ``roadmap_tick_skip_reason``.
+PR_HEAD_SHA = "head_sha"
+PR_COMMIT_SKIP_REASON = "commit_skip_reason"
+
+#: The three things D3's table can decide. ``commit`` is the only one that runs the stage.
+COMMIT_ACTION_COMMIT = "commit"
+COMMIT_ACTION_SKIP = "skip"
+COMMIT_ACTION_FAIL = "fail"
+
+#: D3 case 2: a dirty tree with nothing closed this run. The dirt is real but **unowned** —
+#: nothing records which paths a fixer touched, so publishing it would publish somebody
+#: else's work (design §13 preserves unrelated user changes).
+COMMIT_SKIP_DIRTY_UNOWNED = (
+    "this run closed no issue; the working-tree changes are not this run's"
+)
+
+#: D3 case 3: the roadmap's successful no-op — nothing closed, nothing to publish. No empty
+#: commit, no push.
+COMMIT_SKIP_CLEAN_NOOP = (
+    "this run closed no issue and the working tree is clean, so there is nothing to commit"
+)
+
+#: D3 case 4: issues were closed but there is nothing to push — exactly the untruthful
+#: state this epic removes, so it fails closed (P1.2's close-after-push ordering makes it
+#: unrepresentable later).
+COMMIT_FAIL_NOTHING_TO_PUSH = (
+    "this run closed {closed} issue(s) but the working tree is clean, so there is nothing "
+    "to push"
 )
 
 #: The loop's re-test stage names (``iter1-test``, ``iter2-test``) — H3.3 req 4(b)'s
@@ -206,6 +255,66 @@ def tick_evidence(
             False, f"the last re-review verdict is `{latest_verdict}`, not `Approve`"
         )
     return FixTickEvidence(True, "")
+
+
+@dataclass(frozen=True)
+class CommitDecision:
+    """What ``F5`` may do with this run's tree and its closed-issue list (decision D3).
+
+    ``action`` is one of :data:`COMMIT_ACTION_COMMIT` / :data:`COMMIT_ACTION_SKIP` /
+    :data:`COMMIT_ACTION_FAIL`; ``reason`` is the human-readable explanation a skip records
+    (``state.pr[PR_COMMIT_SKIP_REASON]`` and the skipped stage's ``artifacts``) or a failure
+    prints. It is empty exactly on ``commit``, so a decision that runs the stage can never
+    carry a reason somebody might print as one.
+    """
+
+    action: str
+    reason: str = ""
+
+
+def commit_decision(
+    *, tree_dirty: bool, closed_issues: Sequence[Mapping[str, Any]]
+) -> CommitDecision:
+    """**The rule** (decision D3): may ``F5`` publish this run's tree?
+
+    ``closed_issues`` is this run's **own** accumulated list (the loop's ``closed_issues``),
+    never a ``gh`` query and never a count of ``Status: fixed`` comments — so "this run
+    closed nothing" and "somebody else closed something" cannot be confused. ``tree_dirty``
+    is the worktree state *before* the stage runs, i.e. after the tick has flipped (the tick
+    is part of the change set ``F5`` commits).
+
+    | tree | ``closed_issues`` | decision |
+    |---|---|---|
+    | dirty | >= 1 | commit (the fix edits plus the tick if it flipped) |
+    | dirty | 0 | skip — unowned dirt is not this run's to publish (design §13) |
+    | clean | 0 | skip — the roadmap's successful no-op, no empty commit |
+    | clean | >= 1 | **fail closed** — issues were closed and there is nothing to push |
+
+    Pure: no I/O, no mutation of ``closed_issues``, and the result is a frozen value.
+    """
+    closed = len(closed_issues)
+    if not closed:
+        return CommitDecision(
+            COMMIT_ACTION_SKIP,
+            COMMIT_SKIP_DIRTY_UNOWNED if tree_dirty else COMMIT_SKIP_CLEAN_NOOP,
+        )
+    if not tree_dirty:
+        return CommitDecision(
+            COMMIT_ACTION_FAIL, COMMIT_FAIL_NOTHING_TO_PUSH.format(closed=closed)
+        )
+    return CommitDecision(COMMIT_ACTION_COMMIT)
+
+
+def commit_failure_message(pr: int, branch: str | None, detail: str) -> str:
+    """The one shape of an ``F5`` failure: it names the PR and the branch (req 5/req 6).
+
+    Requirement 5 is explicit that a failure must never surface as a raw exception or a bare
+    ``git`` message: an operator reading stderr has to know which PR and which branch are in
+    an untruthful state. Pure.
+    """
+    return "commit-and-push failed for PR #{pr} on branch `{branch}`: {detail}".format(
+        pr=pr, branch=branch or "(unresolved)", detail=detail
+    )
 
 
 def reverse_branch_pattern(branch: str, pattern: str) -> list[tuple[str, str]]:
@@ -371,7 +480,7 @@ def resolve_roadmap_target(
     )
 
 
-def _tick_spec(
+def _post_loop_specs(
     *,
     target: RoadmapTarget,
     pr: int,
@@ -381,17 +490,21 @@ def _tick_spec(
     aidt: Path,
     repo: Path,
     directory: Path,
-) -> StageSpec:
-    """The shared post-loop stage as a runnable spec — planned once per run (req 1/req 7).
+) -> dict[str, StageSpec]:
+    """The post-loop half as runnable specs, keyed by stage name — **one** planning call.
 
-    ``include_post_loop`` is what keeps the tick out of ``_planned_iteration``'s
-    per-iteration plan: the same ``plan_stages`` call produces it only here. An unresolved
-    target renders empty roadmap values, which is honest for a stage that is only ever
-    **recorded as skipped** in that case — the record needs the stage's name and agent, not
-    its variables.
+    ``include_post_loop`` is what keeps ``I7`` and ``F5`` out of ``_planned_iteration``'s
+    per-iteration plan: the same ``plan_stages`` call produces them only here, so a run
+    plans (and a dry run prints) each of them exactly once, after the loop. One call for
+    both stages rather than one per stage keeps their variables, order and any declared
+    override in a single place (05-P1.1 req 2).
+
+    An unresolved target renders empty roadmap values, which is honest for the tick: in
+    that case it is only ever **recorded as skipped** — the record needs the stage's name
+    and agent, not its variables. ``F5`` renders nothing but ``{pr}``.
 
     ``round_index``/``iteration`` are the loop's current position for a converged run; the
-    skip paths pass ``1``/``1``, because the stage being recorded has neither variable.
+    skip paths pass ``1``/``1``, because neither stage carries those variables.
     """
     planned = plan_stages(
         "fix",
@@ -406,13 +519,17 @@ def _tick_spec(
         roadmap_file=str(target.roadmap_file) if target.roadmap_file else "",
         checkbox_id=target.task,
     )
-    for spec in planned:
-        if spec.name == TICK_STAGE_NAME:
-            return spec
-    raise AssertionError(  # pragma: no cover - the preflight refuses a list without I7
-        "the `fix` plan carries no post-loop `update-roadmap` stage; a declared "
-        "`workflows.fix.stages` list must include `I7`"
-    )
+    specs = {spec.name: spec for spec in planned}
+    missing = [
+        name for name in (TICK_STAGE_NAME, COMMIT_STAGE_NAME) if name not in specs
+    ]
+    if missing:  # pragma: no cover - the preflight refuses a list without a core id
+        raise AssertionError(
+            "the `fix` plan carries no post-loop stage(s) "
+            f"{', '.join('`' + name + '`' for name in missing)}; a declared "
+            "`workflows.fix.stages` list must include `I7` and `F5`"
+        )
+    return specs
 
 
 def _planned_iteration(
@@ -435,8 +552,8 @@ def _planned_iteration(
     ``review.py`` passes an absolute path: F4 runs with the target repo as its cwd.
 
     Deliberately **no** ``include_post_loop``: this is the per-iteration expansion, and the
-    roadmap tick runs once per run, after the loop (H3.3 req 1/req 7). ``_tick_spec`` is the
-    one caller that asks for the post-loop half.
+    roadmap tick and ``F5`` run once per run, after the loop (H3.3 req 1/req 7; 05-P1.1
+    req 2). :func:`_post_loop_specs` is the one caller that asks for the post-loop half.
     """
     planned = plan_stages(
         "fix",
@@ -845,13 +962,14 @@ def run(
         print(f"run:    {state.run_id}")
         print(f"pr:     #{pr}" + (f" {pr_info['url']}" if pr_info.get("url") else ""))
 
-        # --- the post-loop roadmap tick (H3.3, design §8.4) ---------------------- #
-        # Planned and run exactly once per run, after the loop — never inside it. The split
-        # mirrors ``implement``'s ``withhold_tick``/``settle_tick`` (H3.2): the condition is
-        # evaluated **before** ``run_stage``, and the skip is routed around the
-        # postcondition, because ``settle_roadmap_tick`` would otherwise stamp
+        # --- the post-loop half: the tick, then the commit (design §8.4) --------- #
+        # Two stages, planned **together** and run exactly once per run, after the loop —
+        # never inside it: `I7 update-roadmap` (H3.3) and `F5 commit-and-push` (05-P1.1).
+        # The tick's split mirrors ``implement``'s ``withhold_tick``/``settle_tick``
+        # (H3.2): its condition is evaluated **before** ``run_stage``, and the skip is routed
+        # around the postcondition, because ``settle_roadmap_tick`` would otherwise stamp
         # ``tick: already`` onto a stage that never ran.
-        def withhold_tick(reason: str, target: RoadmapTarget | None = None) -> StageRecord:
+        def withhold_tick(reason: str, specs: Mapping[str, StageSpec]) -> StageRecord:
             """Record the post-loop tick as skipped, with ``reason`` (H3.3 req 4/req 6).
 
             ``record_skipped`` publishes a full ``StageRecord`` (status ``skipped``, the
@@ -861,17 +979,11 @@ def run(
             ``state.pr[PR_ROADMAP_TICK_SKIP_REASON]`` and ``state.pr[PR_ROADMAP_TICKED]``
             becomes ``False`` (H3.3 req 6). A skip never changes ``state.status`` and never
             fails the run: the stop that caused it already decided the outcome.
+
+            ``specs`` is the one post-loop plan this decision belongs to
+            (:func:`_post_loop_specs`), never a fresh per-stage planning call.
             """
-            spec = _tick_spec(
-                target=target or RoadmapTarget(),
-                pr=pr,
-                round_index=1,
-                iteration=1,
-                config=resolved_config,
-                aidt=aidt.root,
-                repo=repo.root,
-                directory=directory,
-            )
+            spec = specs[TICK_STAGE_NAME]
             record = record_skipped(
                 spec,
                 state=state,
@@ -885,19 +997,180 @@ def run(
             print_stage(record, repo_root=repo.root)
             return record
 
+        def withhold_commit(reason: str, specs: Mapping[str, StageSpec]) -> StageRecord:
+            """Record ``F5`` as skipped with ``reason``, and why in ``state.pr`` (D3/D7).
+
+            Same shape as :func:`withhold_tick`: a full ``StageRecord`` with status
+            ``skipped``, the reason in ``artifacts[SKIP_REASON_KEY]`` and ``error`` unset,
+            plus ``state.pr[PR_COMMIT_SKIP_REASON]``. ``state.pr[PR_HEAD_SHA]`` stays
+            absent — its presence is the "committed and pushed" boolean (D7) — and a skip
+            never changes ``state.status`` or the exit code.
+            """
+            spec = specs[COMMIT_STAGE_NAME]
+            record = record_skipped(
+                spec,
+                state=state,
+                directory=directory,
+                agents=agents,
+                reason=reason,
+            )
+            state.pr[PR_COMMIT_SKIP_REASON] = reason
+            logger.info(f"stage {spec.name}: skipped — {reason}")
+            print_stage(record, repo_root=repo.root)
+            return record
+
         def stop(reason: str) -> None:
-            """Record why a stopped loop ticked nothing, before its own return (req 1)."""
-            withhold_tick(STOP_REASON.format(stop=reason))
+            """Record why a stopped loop ticked nothing **and** published nothing (req 4).
+
+            The one call site every stop path shares (``--max-iterations``, a denied gate,
+            an ambiguous or ``Blocked`` verdict, an unparseable manifest, a failed stage):
+            it records ``I7``'s skip and ``F5``'s skip with the same stop reason, instead of
+            a ``record_skipped`` at each ``return``. A stopped loop never commits and never
+            pushes (decision D4).
+            """
+            stop_reason = STOP_REASON.format(stop=reason)
+            specs = _post_loop_specs(
+                target=RoadmapTarget(),
+                pr=pr,
+                round_index=1,
+                iteration=1,
+                config=resolved_config,
+                aidt=aidt.root,
+                repo=repo.root,
+                directory=directory,
+            )
+            withhold_tick(stop_reason, specs)
+            withhold_commit(stop_reason, specs)
+
+        def run_commit(
+            specs: Mapping[str, StageSpec], *, closed_issues: Sequence[Mapping[str, Any]]
+        ) -> int:
+            """Apply D3's table, then run and verify ``F5`` (req 3/req 4/req 5/req 6).
+
+            The trigger is the loop's convergence, not the tick's outcome (decision D2):
+            a converged run whose tick was withheld still has real fix edits, so this runs
+            after ``I7`` succeeded **or** was recorded as skipped, for any skip reason.
+
+            Nothing here is trusted from the agent's exit code alone — a **new commit**
+            (``HEAD`` moved), the pushed proof (D6) and a clean tree are all re-read from
+            git, the O1 precedent. The HEAD-movement check closes the PR #158 review
+            finding: a stage that stashes or cleans the change set instead of committing
+            leaves ``HEAD == origin/<branch>`` and a clean tree on the *pre-existing* SHAs,
+            so the other checks alone would pass and the fixes would be lost. Every failure
+            names the PR and the branch and leaves ``state.pr[PR_HEAD_SHA]`` absent.
+            """
+            decision = commit_decision(
+                tree_dirty=not git.is_clean(repo.root), closed_issues=closed_issues
+            )
+            if decision.action == COMMIT_ACTION_SKIP:
+                withhold_commit(decision.reason, specs)
+                return 0
+            if decision.action == COMMIT_ACTION_FAIL:
+                print(commit_failure_message(pr, branch, decision.reason), file=sys.stderr)
+                return 1
+            # D5: the branch is the PR head the preflight already resolved (decision K1),
+            # never the control root's `main`. A misresolved ref must never push the base
+            # branch, so the refusal sits **before** the stage — the agent commits and
+            # pushes in one invocation, and a `git push` is not reversible.
+            if branch == repo.base_branch:
+                print(
+                    commit_failure_message(
+                        pr,
+                        branch,
+                        f"the resolved PR head is the base branch "
+                        f"`{repo.base_branch}`; refusing to commit or push it",
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            # The new-commit proof's baseline (PR #158 review finding): `HEAD` as it stands
+            # before the agent runs. Captured here, after the base-branch refusal, so this
+            # is the only worktree read the proof adds, and only on the commit path.
+            before = git.rev_parse(repo.root, "HEAD")
+            record = run_stage(
+                specs[COMMIT_STAGE_NAME],
+                repo_root=repo.root,
+                toolkit_root=aidt.root,
+                runs_root=runs_root,
+                state=state,
+                logger=logger,
+                agents=agents,
+                config=resolved_config,
+            )
+            print_stage(record, repo_root=repo.root)
+            if record.status != SUCCEEDED:
+                print(
+                    commit_failure_message(
+                        pr,
+                        branch,
+                        f"the stage ended `{record.status}`"
+                        + (f": {record.error}" if record.error else ""),
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            # A new commit must exist before "the push landed" means anything (PR #158
+            # review finding). The tree is dirty by construction on this path, so a real
+            # `git commit` always moves `HEAD`; a stashed or cleaned tree leaves it where
+            # `before` found it while the D6 equality and the clean-tree check below both
+            # still hold on the pre-existing SHAs.
+            head = git.rev_parse(repo.root, "HEAD")
+            if before is None or head is None or head == before:
+                print(
+                    commit_failure_message(
+                        pr,
+                        branch,
+                        "the stage reported success but HEAD did not move ("
+                        f"`{before or 'unresolvable'}` -> `{head or 'unresolvable'}`); "
+                        "the change set was not committed",
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            # D6: the pushed proof is pinned. A successful `git push` updates the
+            # remote-tracking ref, so `rev_parse` on both sides is the evidence — no fetch,
+            # no `ls-remote`, no `status`/`log` heuristic.
+            pushed = git.rev_parse(repo.root, f"origin/{branch}") if branch else None
+            if head is None or pushed is None or head != pushed:
+                print(
+                    commit_failure_message(
+                        pr,
+                        branch,
+                        "the push did not land: HEAD is "
+                        f"`{head or 'unresolvable'}` and `origin/{branch}` is "
+                        f"`{pushed or 'unresolvable'}`",
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            # Nothing records which paths the fixers touched, so the add is broad by design
+            # (`git add -A`, §13's documented primitive executed by the agent); a tree that
+            # is still dirty means part of the change set did not make it into the commit.
+            if not git.is_clean(repo.root):
+                print(
+                    commit_failure_message(
+                        pr, branch, "the working tree is still dirty after the stage"
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            state.pr[PR_HEAD_SHA] = pushed
+            state.pr.pop(PR_COMMIT_SKIP_REASON, None)
+            logger.info(f"stage {record.name}: pushed `{pushed}` to `origin/{branch}`")
+            return 0
 
         def run_post_loop(*, iteration: int, latest_verdict: str | None) -> int:
-            """Plan and — on green evidence — run the single post-loop tick (req 1/4/5).
+            """Plan the post-loop half once, tick the roadmap, then publish (req 1-5).
 
             Called exactly once, after the loop breaks on ``EXIT_NONE_AVAILABLE``. The
-            target is resolved first (req 3): with no single roadmap entry the stage is
+            target is resolved first (req 3): with no single roadmap entry the tick is
             skipped with that reason and the run still succeeds, because ``fix`` must keep
             working on PRs that are not AIDT tasks. Then this run's own evidence decides
-            (req 4). Only a green verdict reads the file, runs the shared stage and applies
-            ``implement``'s byte-exact postcondition (req 5).
+            the tick (req 4); only a green verdict reads the file, runs the shared stage and
+            applies ``implement``'s byte-exact postcondition (req 5). ``F5`` then applies
+            D3's table whatever the tick decided (D2) — a failed tick stage is the one
+            exception, because committing a half-applied tick is worse than leaving the
+            tree for a human (D4).
             """
             target = resolve_roadmap_target(
                 runs_root=runs_root,
@@ -906,49 +1179,60 @@ def run(
                 repo_root=repo.root,
                 config=resolved_config,
             )
-            if target.roadmap_file is None:
-                withhold_tick(target.reason, target)
-                return 0
-            evidence = tick_evidence(
-                loop_closed=True,
-                test_records=[
-                    record for record in state.stages if is_test_stage(record.name)
-                ],
-                latest_verdict=latest_verdict,
-            )
-            if not evidence.green:
-                withhold_tick(evidence.reason, target)
-                return 0
-            # The loop converged, so this run's own evidence is green — but the tick is a
-            # completion claim and must also agree with what the run recorded about the
-            # task's Done-when (design §8.2; the rule is shared with `implement` so the two
-            # ticks cannot drift, H3.3). Withheld, never failed: the recorded verdict is the
-            # thing to fix, and `fix` cannot repair a build-results document it did not write.
-            conclusion = roadmap.recorded_unmet_conclusion(
-                repo.root,
-                implementation_results_dir=(
-                    resolved_config["paths.implementation_results_dir"].value
-                ),
-                phase=target.phase,
-                task=target.task,
-            )
-            if conclusion is not None:
-                withhold_tick(roadmap.unmet_conclusion_reason(conclusion), target)
-                return 0
-            spec = _tick_spec(
+            # One planning call for both post-loop stages (req 2); an empty converged run
+            # records `iterations == 0`, and the value only names the discarded loop stages
+            # of this planning call, so keep it legible.
+            specs = _post_loop_specs(
                 target=target,
                 pr=pr,
                 round_index=round_index,
-                # An empty converged run records `iterations == 0`; the value only names
-                # the discarded loop stages of this planning call, so keep it legible.
                 iteration=max(iteration, 1),
                 config=resolved_config,
                 aidt=aidt.root,
                 repo=repo.root,
                 directory=directory,
             )
-            # Narrowed above: a ``None`` roadmap file returned early with its reason.
-            roadmap_file = target.roadmap_file
+            if target.roadmap_file is None:
+                withhold_tick(target.reason, specs)
+            else:
+                evidence = tick_evidence(
+                    loop_closed=True,
+                    test_records=[
+                        record for record in state.stages if is_test_stage(record.name)
+                    ],
+                    latest_verdict=latest_verdict,
+                )
+                if not evidence.green:
+                    withhold_tick(evidence.reason, specs)
+                else:
+                    # The loop converged, so this run's own evidence is green — but the tick
+                    # is a completion claim and must also agree with what the run recorded
+                    # about the task's Done-when (design §8.2; the rule is shared with
+                    # `implement` so the two ticks cannot drift, H3.3). Withheld, never
+                    # failed: the recorded verdict is the thing to fix, and `fix` cannot
+                    # repair a build-results document it did not write.
+                    conclusion = roadmap.recorded_unmet_conclusion(
+                        repo.root,
+                        implementation_results_dir=(
+                            resolved_config["paths.implementation_results_dir"].value
+                        ),
+                        phase=target.phase,
+                        task=target.task,
+                    )
+                    if conclusion is not None:
+                        withhold_tick(
+                            roadmap.unmet_conclusion_reason(conclusion), specs
+                        )
+                    else:
+                        code = _tick(
+                            specs[TICK_STAGE_NAME], target.roadmap_file, target.task
+                        )
+                        if code != 0:
+                            return code
+            return run_commit(specs, closed_issues=closed_issues)
+
+        def _tick(spec: StageSpec, roadmap_file: Path, checkbox_id: str) -> int:
+            """Run the shared tick stage and apply ``implement``'s byte-exact postcondition."""
             before = roadmap_file.read_text(encoding="utf-8")
             record = run_stage(
                 spec,
@@ -963,7 +1247,7 @@ def run(
             print_stage(record, repo_root=repo.root)
             settle_roadmap_tick(
                 record,
-                checkbox_id=target.task,
+                checkbox_id=checkbox_id,
                 roadmap_file=roadmap_file,
                 before=before,
                 logger=logger,
@@ -1041,10 +1325,12 @@ def run(
                     else ""
                 )
                 print(f"{record.name} [{record.status}] (planned) agent={record.agent}{note}")
-            # H3.3 req 7: the post-loop tick is planned here, in the final position, and
-            # evaluates **no** evidence — a dry run never withholds and never ticks. An
-            # unresolvable target (a PR that is not an AIDT task, or the chain's
-            # placeholder PR 0) still shows the stage once, as the skip a real run records.
+            # H3.3 req 7 + 05-P1.1 req 2/D10: the post-loop half is planned here, once
+            # each and in order, and evaluates **no** evidence — a dry run never withholds
+            # and never ticks. An unresolvable target (a PR that is not an AIDT task, or the
+            # chain's placeholder PR 0) still shows the tick once, as the skip a real run
+            # would record; ``F5`` is planned regardless, because a dry run inspects no
+            # tree and never withholds.
             dry_target = resolve_roadmap_target(
                 runs_root=runs_root,
                 branch=branch,
@@ -1052,20 +1338,21 @@ def run(
                 repo_root=repo.root,
                 config=resolved_config,
             )
+            dry_specs = _post_loop_specs(
+                target=dry_target,
+                pr=pr,
+                round_index=1,
+                iteration=1,
+                config=resolved_config,
+                aidt=aidt.root,
+                repo=repo.root,
+                directory=directory,
+            )
             if dry_target.roadmap_file is None:
-                withhold_tick(dry_target.reason, dry_target)
+                withhold_tick(dry_target.reason, dry_specs)
             else:
                 record = run_stage(
-                    _tick_spec(
-                        target=dry_target,
-                        pr=pr,
-                        round_index=1,
-                        iteration=1,
-                        config=resolved_config,
-                        aidt=aidt.root,
-                        repo=repo.root,
-                        directory=directory,
-                    ),
+                    dry_specs[TICK_STAGE_NAME],
                     repo_root=repo.root,
                     toolkit_root=aidt.root,
                     runs_root=runs_root,
@@ -1079,6 +1366,21 @@ def run(
                     f"{record.name} [{record.status}] (planned) agent={record.agent} "
                     f"(after the loop, only when this run's evidence is green)"
                 )
+            record = run_stage(
+                dry_specs[COMMIT_STAGE_NAME],
+                repo_root=repo.root,
+                toolkit_root=aidt.root,
+                runs_root=runs_root,
+                state=state,
+                logger=logger,
+                agents=agents,
+                dry_run=True,
+                config=resolved_config,
+            )
+            print(
+                f"{record.name} [{record.status}] (planned) agent={record.agent} "
+                f"(after the loop, only when this run closed an issue)"
+            )
             print("gates (planned): approve-followups, approve-fix-pr")
             print(f"loop: bounded by --max-iterations={max_iterations}")
             state.status = SUCCEEDED
@@ -1105,8 +1407,9 @@ def run(
         )
         if code is not None:
             state.status = BLOCKED if code == 3 else FAILED
-            # H3.3 req 1: a stopped run records why it ticked nothing, once, with the stop
-            # as the reason — then keeps its own exit code.
+            # H3.3 req 1 + 05-P1.1 req 4: a stopped run records why it ticked nothing and
+            # published nothing, once, with the stop as the reason — then keeps its own exit
+            # code.
             stop("the entry `approve-followups` round")
             save(directory, state)
             return code
@@ -1366,17 +1669,20 @@ def run(
                 return 3
             closed_issues.append(selected)
 
-        # --- the post-loop tick, once per run (H3.3 req 1/req 7) ------------------ #
+        # --- the post-loop half, once per run (H3.3 req 1/req 7; 05-P1.1 req 1-5) -- #
         # The loop only reaches here through its `break` on `select` exit
-        # `EXIT_NONE_AVAILABLE`, so this is the converged path: the tick is planned and —
-        # on this run's green evidence — run exactly here, after the last iteration and
-        # never inside it. `run_post_loop` records the skip with its own reason when the
-        # target or the evidence is not good enough, which is still exit 0.
-        tick_code = run_post_loop(iteration=iterations, latest_verdict=latest_verdict)
-        if tick_code != 0:
+        # `EXIT_NONE_AVAILABLE`, so this is the converged path: the roadmap tick and the
+        # commit-and-push stage are planned once, run exactly here — after the last
+        # iteration and never inside it. `run_post_loop` records each with its own reason
+        # when the target, the evidence or the tree is not good enough, which is still exit
+        # 0 for a skip; the commit case fails the run when it cannot publish.
+        post_loop_code = run_post_loop(
+            iteration=iterations, latest_verdict=latest_verdict
+        )
+        if post_loop_code != 0:
             state.status = FAILED
             save(directory, state)
-            return tick_code
+            return post_loop_code
 
         _write_json(
             directory / "artifacts" / "fix.json",

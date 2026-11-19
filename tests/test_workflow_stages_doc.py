@@ -433,6 +433,27 @@ def test_default_parallel_pair_is_documented() -> None:
             assert member in doc, f"default parallel member `{member}` is undocumented"
 
 
+def test_fix_inventory_names_the_commit_stage_after_the_tick() -> None:
+    """05-P1.1: the doc leads with `F5` right after `I7`, and no longer says nothing commits.
+
+    The table-order check above already fails when the row is missing or moved; this pins
+    the two claims a reader acts on — the commit stage's position in the inventory, and the
+    reversed "no stage of `fix` commits" sentence — so the operator guide cannot keep
+    telling them their fixes stay uncommitted.
+    """
+    rows = _documented_inventory("fix")
+    ids = [row[0] for row in rows]
+    assert ids[-2:] == ["I7", "F5"], ids
+
+    section = _section(_doc(), "### `fix` — stage inventory")
+    assert "No stage of `fix` commits" not in section
+    assert "F5" in section and "commit-and-push" in section
+    # The paragraph after the table states the boundary, not the old one.
+    body = _doc()[_doc().index("### `fix` — stage inventory") :]
+    assert "`F5` is the only stage of `fix` that commits" in body
+    assert "stays uncommitted" not in body.split("## `aidw approve-followups`")[0]
+
+
 def test_readme_implement_block_lists_the_registry_chain() -> None:
     """the operator guide's ``aidw implement`` block matches the static chain, in order."""
     readme = (toolkit_root() / "README.md").read_text(encoding="utf-8")
