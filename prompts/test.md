@@ -59,11 +59,37 @@ Report each criterion in this shape:
 ```text
 Criterion: <ID or exact wording>
 Result: Pass / Fail / Unverified
+Scope: in-scope / out-of-scope / pre-existing
 Evidence: <command, browser flow, or artifact>
 Gap: <what remains unknown, or None>
 ```
 
+The `Scope:` line is what keeps the verdict honest: a `Fail` is a failure of *this change's*
+acceptance criteria, while an `Unverified` criterion, a criterion outside this change's scope,
+and a failure that already existed or is unrelated (a pre-existing or flaky test in a package
+this change did not touch) belong in the report with their own `Scope:` value and never make
+the verdict `Fail`.
+
 Lead with failures and unverified criteria. Do not hide them below passing checks.
+
+### Verdict
+
+End the report with a declaration block. Each declaration is a **bare line** — exactly this
+form, on its own line, with no heading, no bold, no surrounding backticks and no code fence:
+
+Test verdict: Pass
+
+Write `Pass` when every in-scope criterion passed, or `Fail` when any in-scope criterion
+failed. The `Fail` block is the declaration followed by one criteria line naming the failing
+in-scope criteria, comma-separated:
+
+Test verdict: Fail
+Failing in-scope criteria: AC-1, AC-3
+
+The orchestrator reads that declaration mechanically and withholds the pull request on `Fail`
+or on a declaration it cannot read, so capitalise the tokens exactly (`Pass`, `Fail`) and keep
+each declaration on a bare line. An example inside a fence or a code span is treated as prose,
+not as a verdict.
 
 ## Boundaries
 
@@ -77,3 +103,7 @@ Lead with failures and unverified criteria. Do not hide them below passing check
 ## Final response
 
 State the criteria you proved, the tests you added or updated (with paths), the exact commands run and their real outcomes, and every criterion left `Fail` or `Unverified` with the reason. If a `Fail` is an implementation defect, say so explicitly so it is fixed in a separate, deliberate change.
+
+Finish with the `Test verdict:` declaration block from **Return** — `Test verdict: Pass`, or
+`Test verdict: Fail` followed by `Failing in-scope criteria: <comma-separated list>`. It is the
+last thing you write and the only part of the report the workflow parses.

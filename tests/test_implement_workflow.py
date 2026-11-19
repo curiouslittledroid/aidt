@@ -12,6 +12,7 @@ with real git, and never fakes git output; only the Pi seam (``run_stage``) is m
 from __future__ import annotations
 
 import dataclasses
+import random
 import subprocess
 import threading
 import time
@@ -24,6 +25,7 @@ from aidw.config import ERROR, Issue
 from aidw.gates import GateOutcome
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import (
+    BLOCKED,
     FAILED,
     SKIP_REASON_KEY,
     SKIPPED,
@@ -175,6 +177,21 @@ def _runs_root(control: Path) -> Path:
     return _roots(control)["workspace"].state_root / "runs"
 
 
+def _stage_out_text(name: str) -> str:
+    """The final message a fake stage leaves in its ``out.txt``.
+
+    Q1.1 re-baseline: I2's message now carries the verdict block ``implement`` parses, so the
+    baseline fake emits a *passing* one. ``Test verdict: Pass`` is hand-written here (not
+    imported from the workflow) so a changed token fails this fake loudly; ``pr`` keeps the
+    URL ``_record_pr`` parses and every other stage keeps the ``ok`` transcript.
+    """
+    if name == "pr":
+        return "https://github.com/o/r/pull/42\n"
+    if name == implement_workflow.TEST_STAGE_NAME:
+        return "Test verdict: Pass\n"
+    return "ok\n"
+
+
 class _Recorder:
     """Fake ``run_stage`` that records stages and returns canned statuses."""
 
@@ -209,10 +226,7 @@ class _Recorder:
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
         out = stages / f"{spec.name}.out.txt"
-        out.write_text(
-            "https://github.com/o/r/pull/42\n" if spec.name == "pr" else "ok\n",
-            encoding="utf-8",
-        )
+        out.write_text(_stage_out_text(spec.name), encoding="utf-8")
         status = FAILED if spec.name in self.fail else SUCCEEDED
         record = StageRecord(
             name=spec.name,
@@ -369,6 +383,30 @@ class _GateEvidenceStages(_Recorder):
             keys=self.keys,
             failing=self.failing,
         )
+        return record
+
+
+class _VerdictStages(_GateEvidenceStages):
+    """A fake chain whose I2 final message is whatever the scenario wrote (Q1.1).
+
+    ``test_out`` is the exact text I2 leaves in its ``out.txt`` (the tester's final message,
+    which is where the verdict lives — the stage itself exits 0 whether it passes or fails).
+    ``None`` removes the file *after* the stage recorded the artifact: the resumed/lost-out
+    case the gate must fail closed on. Gate evidence and the roadmap flip are unchanged.
+    """
+
+    def __init__(self, test_out: str | None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.test_out = test_out
+
+    def __call__(self, spec, **kwargs):
+        record = super().__call__(spec, **kwargs)
+        if spec.name == implement_workflow.TEST_STAGE_NAME:
+            out = Path(record.artifacts["out"])
+            if self.test_out is None:
+                out.unlink()
+            else:
+                out.write_text(self.test_out, encoding="utf-8")
         return record
 
 
@@ -961,6 +999,195 @@ def test_missing_worktree_is_refused_with_the_command(
 
 
 # --------------------------------------------------------------------------- #
+# Q1.1: the I2 verdict parser (`_parse_test_verdict`, design §8.2 / §17 Z10)
+# --------------------------------------------------------------------------- #
+
+
+#: A whole final message whose only declaration is a bare `Pass` line.
+_PASS_REPORT = (
+    "Criterion: AC-1\n"
+    "Result: Pass\n"
+    "Scope: in-scope\n"
+    "Evidence: uv run --frozen pytest tests/test_x.py\n"
+    "Gap: None\n"
+    "\n"
+    "Test verdict: Pass\n"
+)
+
+#: A whole final message declaring an in-scope failure for two criteria.
+_FAIL_REPORT = (
+    "Criterion: AC-1\n"
+    "Result: Fail\n"
+    "Scope: in-scope\n"
+    "Evidence: uv run --frozen pytest tests/test_x.py\n"
+    "Gap: None\n"
+    "\n"
+    "Criterion: AC-3\n"
+    "Result: Fail\n"
+    "Scope: in-scope\n"
+    "Evidence: uv run --frozen pytest tests/test_y.py\n"
+    "Gap: None\n"
+    "\n"
+    "Test verdict: Fail\n"
+    "Failing in-scope criteria: AC-1, AC-3\n"
+)
+
+
+def test_parse_test_verdict_reads_a_bare_pass_declaration() -> None:
+    """Hand-calculated spec example: a bare `Pass` line proceeds, with no criteria."""
+    assert implement_workflow._parse_test_verdict(_PASS_REPORT) == ("Pass", [])
+
+
+def test_parse_test_verdict_reads_the_failing_criteria_list() -> None:
+    """Hand-calculated spec example: `Fail` plus the following criteria line."""
+    assert implement_workflow._parse_test_verdict(_FAIL_REPORT) == (
+        "Fail",
+        ["AC-1", "AC-3"],
+    )
+
+
+def test_parse_test_verdict_fail_without_a_criteria_line_is_still_fail() -> None:
+    """A missing criteria line is best-effort naming, never "ambiguous" (req 5)."""
+    assert implement_workflow._parse_test_verdict("Test verdict: Fail\n") == ("Fail", [])
+
+
+def test_parse_test_verdict_ignores_a_declaration_inside_a_fence() -> None:
+    """M1: the prompt's own fenced template is never read as the tester's verdict."""
+    report = (
+        "The template asks for this shape:\n"
+        "\n"
+        "```text\n"
+        "Test verdict: Fail\n"
+        "Failing in-scope criteria: AC-1\n"
+        "```\n"
+        "\n"
+        "Test verdict: Pass\n"
+    )
+    assert implement_workflow._parse_test_verdict(report) == ("Pass", [])
+    # A fenced declaration on its own is not a declaration at all (the E4.5b lesson).
+    assert (
+        implement_workflow._parse_test_verdict("```\nTest verdict: Fail\n```\n") is None
+    )
+
+
+def test_parse_test_verdict_rejects_a_code_span_declaration() -> None:
+    """Only a bare line is a declaration (`verdict.py`'s `DECLARATION_RE` differs)."""
+    assert implement_workflow._parse_test_verdict("`Test verdict: Fail`\n") is None
+    assert (
+        implement_workflow._parse_test_verdict(
+            "Write `Test verdict: Fail` when a criterion failed.\n"
+        )
+        is None
+    )
+    # Nor is a heading a declaration.
+    assert implement_workflow._parse_test_verdict("## Test verdict: Fail\n") is None
+
+
+def test_parse_test_verdict_with_no_declaration_is_none() -> None:
+    """No declaration is `None`, which the workflow fails closed on (req 4/5)."""
+    assert implement_workflow._parse_test_verdict("") is None
+    assert (
+        implement_workflow._parse_test_verdict("Criterion: AC-1\nResult: Fail\n")
+        is None
+    )
+
+
+def test_the_test_prompt_carries_the_declarations_the_parser_reads() -> None:
+    """`prompts/test.md` is the contract that emits the block §8.2 parses (§7.2's rule).
+
+    The prompt's own examples are fed to the parser, so a reformat that stops asking for a
+    bare declaration — or ropes it into a fence or a code span — fails here instead of making
+    every real run stop `BLOCKED` on a verdict no tester can produce.
+    """
+    prompt = (ToolkitPaths.resolve().prompts_dir / "test.md").read_text(encoding="utf-8")
+    lines = prompt.splitlines()
+
+    # The per-criterion template carries the `Scope:` separation the verdict relies on.
+    assert "Scope: in-scope / out-of-scope / pre-existing" in lines
+
+    # Both declaration shapes are bare lines in the prompt, and each parses as itself.
+    pass_at = lines.index("Test verdict: Pass")
+    assert implement_workflow._parse_test_verdict(
+        "\n".join(lines[pass_at - 1 : pass_at + 1])
+    ) == ("Pass", [])
+    fail_at = lines.index("Test verdict: Fail")
+    assert implement_workflow._parse_test_verdict(
+        "\n".join(lines[fail_at : fail_at + 2])
+    ) == ("Fail", ["AC-1", "AC-3"])
+
+
+def test_parse_test_verdict_is_pure() -> None:
+    """No I/O, no mutation, repeatable: the helper is the executable spec."""
+    before = _FAIL_REPORT
+    first = implement_workflow._parse_test_verdict(_FAIL_REPORT)
+    second = implement_workflow._parse_test_verdict(_FAIL_REPORT)
+    assert _FAIL_REPORT == before
+    assert first == second == ("Fail", ["AC-1", "AC-3"])
+    # The criteria list is a fresh object, so a caller cannot mutate a cached result.
+    assert first is not second
+    assert first[1] is not second[1]
+
+
+#: Pinned seed and run count for the seeded property run below (AGENTS.md "Tests": pytest
+#: only, no ``hypothesis``, so a reproducible sample is the generator and there is no
+#: shrinking).
+TEST_VERDICT_PROPERTY_SEED = 51011
+TEST_VERDICT_PROPERTY_RUNS = 64
+
+#: Prose a sampler may wrap around the declaration. None of it is a bare declaration line,
+#: and it includes the trap the gate exists to avoid: a `Result: Fail` for an out-of-scope or
+#: pre-existing criterion, and a code span that names the label.
+_TEST_VERDICT_PROSE = (
+    "Criterion: AC-1",
+    "Result: Fail",
+    "Result: Unverified",
+    "Scope: in-scope",
+    "Scope: out-of-scope",
+    "Scope: pre-existing",
+    "Evidence: uv run --frozen pytest",
+    "Gap: None",
+    "The template asks for a `Test verdict: Fail` line on its own.",
+)
+
+
+def test_parse_test_verdict_is_a_seeded_property() -> None:
+    """Metamorphic property (seed/runs pinned above): only the bare block decides.
+
+    For every sampled report, the parsed verdict is exactly the one the **bare** declaration
+    block planted and the criteria are that block's comma-separated names — a fenced example
+    declaring the opposite verdict, an out-of-scope `Result: Fail`, an `Unverified` criterion
+    and a code span naming the label never change it. Two calls agree, which is the purity
+    half of the property.
+    """
+    rng = random.Random(TEST_VERDICT_PROPERTY_SEED)
+
+    for _ in range(TEST_VERDICT_PROPERTY_RUNS):
+        verdict = rng.choice(["Pass", "Fail"])
+        criteria = [f"AC-{rng.randint(1, 12)}" for _ in range(rng.randint(0, 3))]
+        prose = [rng.choice(_TEST_VERDICT_PROSE) for _ in range(rng.randint(0, 4))]
+        fenced = rng.choice(["Pass", "Fail"])
+        report = "\n".join(
+            [
+                *prose,
+                "```text",
+                f"Test verdict: {fenced}",
+                "Failing in-scope criteria: AC-999",
+                "```",
+                f"Test verdict: {verdict}",
+                *(
+                    [f"Failing in-scope criteria: {', '.join(criteria)}"]
+                    if criteria
+                    else []
+                ),
+                "",
+            ]
+        )
+        expected = ("Pass", []) if verdict == "Pass" else ("Fail", criteria)
+        assert implement_workflow._parse_test_verdict(report) == expected
+        assert implement_workflow._parse_test_verdict(report) == expected
+
+
+# --------------------------------------------------------------------------- #
 # Execution, gates, resume
 # --------------------------------------------------------------------------- #
 
@@ -1101,6 +1328,314 @@ def test_gate_denied_returns_blocked(tmp_path: Path, monkeypatch) -> None:
     assert code == 3
     # The PR stage must not have run after a denied gate.
     assert "pr" not in recorder.names
+
+
+# --------------------------------------------------------------------------- #
+# Q1.1: an in-scope tester `Fail` withholds I6 and opens no PR (design §8.2 / §17 Z10)
+# --------------------------------------------------------------------------- #
+
+
+def test_an_in_scope_fail_withholds_the_pr_and_records_the_criteria(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Done-when: I2 reports `Fail` in its message, so `pr` never runs and the run is BLOCKED.
+
+    The stage itself stays `SUCCEEDED` (that is the whole point), the approve gate is never
+    recorded, the criteria are recorded on `state.pr`, and the stop names both the criteria
+    and the `--from test` re-test path — the forward path the resume rule requires.
+    """
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _VerdictStages(_FAIL_REPORT)
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 3
+    # I6 never runs, so no PR is opened — and the approve gate was never even offered.
+    assert "pr" not in recorder.names
+    # The roadmap scopes the stop to I6: the tick still ran (and stays uncommitted).
+    assert "update-roadmap" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert state.status == BLOCKED
+    assert state.stage("test").status == SUCCEEDED
+    assert state.pr["test_verdict"] == "Fail"
+    assert state.pr["test_failing_criteria"] == ["AC-1", "AC-3"]
+    assert [gate.name for gate in state.gates] == []
+
+    err = capsys.readouterr().err
+    assert "AC-1, AC-3" in err
+    assert "--from test" in err
+    assert "--resume" in err
+
+
+def test_an_in_scope_fail_withholds_the_pr_on_the_parallel_dispatch_path(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 3: the post-pre-PR verdict gate also runs after ``--parallel`` dispatch."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _VerdictStages(_FAIL_REPORT)
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt,
+        **_roots(control),
+        approve_all=True,
+        parallel=True,
+    )
+
+    assert code == 3
+    assert recorder.names.count("test") == 1
+    assert "pr" not in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert state.status == BLOCKED
+    assert state.stage("test").status == SUCCEEDED
+    assert state.pr["test_verdict"] == "Fail"
+    assert state.pr["test_failing_criteria"] == ["AC-1", "AC-3"]
+    assert state.gates == []
+    assert "--from test" in capsys.readouterr().err
+
+
+def test_from_test_reruns_i2_and_can_clear_a_recorded_fail(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 5: ``--from test`` is the explicit re-test route, unlike plain resume."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _VerdictStages(_FAIL_REPORT)
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    first = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+    assert first == 3
+    recorder.test_out = _PASS_REPORT
+
+    second = implement_workflow.run(
+        task_prompt_path=prompt,
+        **_roots(control),
+        resume=True,
+        from_stage="test",
+        approve_all=True,
+    )
+
+    assert second == 0
+    assert recorder.names.count("test") == 2
+    # The second invocation starts at I2: I1 was already succeeded, while every later
+    # stage (including I6) is eligible to run after the new verdict is read.
+    second_test = recorder.names.index("test", recorder.names.index("test") + 1)
+    assert "impliment-task" not in recorder.names[second_test:]
+    assert recorder.names[-1] == "pr"
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert state.status == SUCCEEDED
+    assert state.pr["test_verdict"] == "Pass"
+
+
+def test_a_resumed_run_re_reads_the_recorded_fail_and_stops_again(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 5: the recorded verdict decides, so a plain `--resume` repeats the stop.
+
+    Every pre-PR stage is already `SUCCEEDED`, I2 included, so nothing re-runs: the gate
+    re-reads the recorded `out.txt` and stops identically. That repeat-stop is the intended
+    resume semantics — the message must say so and name the re-test path.
+    """
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    runs_dir = _runs_root(control)
+    state = create_run(
+        runs_dir, control, "implement", label="03-E4.1", branch="03-E4.1"
+    )
+    directory = run_dir(runs_dir, state.run_id)
+    stages = directory / "stages"
+    stages.mkdir(parents=True, exist_ok=True)
+    out = stages / "test.out.txt"
+    out.write_text(_FAIL_REPORT, encoding="utf-8")
+    for name in DEFAULT_ORDER[:-1]:
+        state.record_stage(
+            StageRecord(
+                name=name,
+                agent="tester",
+                model="m",
+                status=SUCCEEDED,
+                artifacts={"out": str(out)} if name == "test" else {},
+            )
+        )
+    state.status = BLOCKED
+    save(directory, state)
+
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt,
+        **_roots(control),
+        resume=True,
+        approve_all=True,
+    )
+
+    assert code == 3
+    assert recorder.names == []  # nothing re-ran: I2 is skipped and its verdict re-read
+    state = implement_workflow.list_runs(runs_dir)[-1]
+    assert state.status == BLOCKED
+    assert state.pr["test_failing_criteria"] == ["AC-1", "AC-3"]
+    err = capsys.readouterr().err
+    assert "AC-1, AC-3" in err
+    assert "--from test" in err
+
+
+def test_a_pass_verdict_proceeds_to_the_gate_and_dispatches_pr(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 6: `Pass` leaves the gate and I6 exactly as they were, and is recorded."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _VerdictStages(_PASS_REPORT)
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert recorder.names[-1] == "pr"
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert state.status == SUCCEEDED
+    assert state.pr["test_verdict"] == "Pass"
+    assert implement_workflow.TEST_FAILING_CRITERIA_KEY not in state.pr
+    assert state.gates[-1].name == implement_workflow.GATE
+    assert state.pr.get("number") == 42
+
+
+def test_a_pass_verdict_survives_an_out_of_scope_failure_in_the_report(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Done-when: a pre-existing/out-of-scope `Result: Fail` never withholds a legitimate PR."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    report = (
+        "Criterion: AC-1\n"
+        "Result: Pass\n"
+        "Scope: in-scope\n"
+        "Evidence: uv run --frozen pytest tests/test_x.py\n"
+        "Gap: None\n"
+        "\n"
+        "Criterion: pre-existing suite failure in an untouched package\n"
+        "Result: Fail\n"
+        "Scope: pre-existing\n"
+        "Evidence: uv run --frozen pytest tests/test_untouched.py\n"
+        "Gap: None\n"
+        "\n"
+        "Criterion: AC-2\n"
+        "Result: Unverified\n"
+        "Scope: out-of-scope\n"
+        "Evidence: none\n"
+        "Gap: no browser tooling\n"
+        "\n"
+        "Test verdict: Pass\n"
+    )
+    recorder = _VerdictStages(report)
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "pr" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert state.status == SUCCEEDED
+    assert state.pr["test_verdict"] == "Pass"
+
+
+@pytest.mark.parametrize(
+    ("test_out", "reason"),
+    [
+        (None, "no readable out.txt"),
+        ("", "final message is empty"),
+        ("Criterion: AC-1\nResult: Pass\n", "no bare `Test verdict: Pass|Fail`"),
+    ],
+    ids=["missing-out", "empty-message", "no-declaration"],
+)
+def test_an_unreadable_test_verdict_fails_closed_without_a_pr(
+    tmp_path: Path, monkeypatch, capsys, test_out: str | None, reason: str
+) -> None:
+    """Req 5: an unparseable verdict — including a missing/empty out.txt — is BLOCKED/3.
+
+    A fresh run whose I2 exhausted the U1 retry records a `SUCCEEDED` stage with an empty
+    final message (`runner.py` leaves that case to the workflow, H1.1), and ``None`` here is
+    the same record with its ``out.txt`` lost; both fail closed naming the ambiguity rather
+    than proceeding to a PR nobody can justify.
+    """
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _VerdictStages(test_out)
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 3
+    assert "pr" not in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert state.status == BLOCKED
+    assert state.pr["test_verdict"] is None
+    assert [gate.name for gate in state.gates] == []
+    err = capsys.readouterr().err
+    assert "cannot read I2's verdict" in err
+    assert reason in err
+    assert "--from test" in err
+
+
+def test_a_resumed_run_with_a_lost_out_txt_fails_closed(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 5: a resumed run can carry a `SUCCEEDED` test record whose out.txt is absent."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    runs_dir = _runs_root(control)
+    state = create_run(
+        runs_dir, control, "implement", label="03-E4.1", branch="03-E4.1"
+    )
+    directory = run_dir(runs_dir, state.run_id)
+    # The artifact path is recorded but the file was never written / has been removed.
+    lost = directory / "stages" / "test.out.txt"
+    for name in DEFAULT_ORDER[:-1]:
+        state.record_stage(
+            StageRecord(
+                name=name,
+                agent="tester",
+                model="m",
+                status=SUCCEEDED,
+                artifacts={"out": str(lost)} if name == "test" else {},
+            )
+        )
+    state.status = BLOCKED
+    save(directory, state)
+
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt,
+        **_roots(control),
+        resume=True,
+        approve_all=True,
+    )
+
+    assert code == 3
+    assert recorder.names == []
+    assert "pr" not in recorder.names
+    state = implement_workflow.list_runs(runs_dir)[-1]
+    assert state.status == BLOCKED
+    assert state.pr["test_verdict"] is None
+    err = capsys.readouterr().err
+    assert "no readable out.txt" in err
+    assert "--from test" in err
 
 
 def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
@@ -2515,9 +3050,21 @@ def test_from_update_roadmap_validates_against_the_plan(
         runs_dir, control, "implement", label="03-E4.1", branch="03-E4.1"
     )
     directory = run_dir(runs_dir, state.run_id)
+    stages_dir = directory / "stages"
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    test_out = stages_dir / "test.out.txt"
+    test_out.write_text("Test verdict: Pass\n", encoding="utf-8")
     for name in DEFAULT_ORDER[: DEFAULT_ORDER.index("update-roadmap")]:
         state.record_stage(
-            StageRecord(name=name, agent="implementer", model="m", status=SUCCEEDED)
+            StageRecord(
+                name=name,
+                agent="implementer",
+                model="m",
+                status=SUCCEEDED,
+                # Q1.1: the verdict gate re-reads I2's recorded final message, so a resumed
+                # run carries the passing declaration a real tester leaves behind.
+                artifacts={"out": str(test_out)} if name == "test" else {},
+            )
         )
     save(directory, state)
     _record_evidence(
@@ -2538,6 +3085,7 @@ def test_from_update_roadmap_validates_against_the_plan(
     assert code == 0
     assert recorder.names[0] == "update-roadmap"
     assert "impliment-task" not in recorder.names
+    assert "test" not in recorder.names  # I2 is skipped; its recorded verdict still decides
 
 
 def test_a_typoed_from_name_still_refuses_with_the_known_names(

@@ -65,6 +65,18 @@ Core and unconditional like `I8` (no `when=` token), serial between `I8` and `I7
 `parallel_group`, and its four-section structure and five per-scenario fields live in the
 prompt, not in config.
 
+Q1.1 adds the **I2 verdict gate** (design §8.2, §17 Z10): a `test` stage that reports an
+in-scope `Fail` exits 0 and stays `SUCCEEDED`, so its failure lives in the final *message*, not
+in the stage status. The workflow parses a bare `Test verdict: Pass|Fail` declaration (plus, on
+`Fail`, a following `Failing in-scope criteria:` line) from the recorded I2 `out.txt` with
+:func:`_parse_test_verdict` — fenced blocks blanked and code-span/heading lines rejected, the
+same prose-only discipline `aidw.verdict` records (M1/M3, design §18) — after the pre-PR stages
+and **before** the `approve-implementation-pr` gate, so `I6 pr` never opens a PR for a failing
+in-scope criterion. `Fail` and an unparseable verdict (including a missing or empty recorded
+message) each stop the run `BLOCKED` with exit 3, mirroring `review.py`'s ambiguous verdict; a
+`Pass` proceeds unchanged. `Unverified`, out-of-scope and pre-existing failures stay in the
+tester's per-criterion report and never make the verdict `Fail`.
+
 The nine stages are not hardcoded here since E4.3: ``run()`` builds them with
 :func:`aidw.runner.plan_stages` over the ``aidw.stage_registry`` defaults, so the target
 repo's per-stage ``prompt:`` overlay applies and the prompts resolve against the located
@@ -531,11 +543,194 @@ def settle_roadmap_tick(
 _settle_roadmap_tick = settle_roadmap_tick
 
 
+#: The registry **name** of I2, whose final message carries the tester's verdict block
+#: (Q1.1, design §8.2). Matched by name — never by position — so a repo-declared stage list
+#: (`workflows.implement.stages`) cannot move the stage the gate reads.
+TEST_STAGE_NAME = "test"
+
+#: The two verdict tokens the tester declares (Q1.1; prompt-fixed by `prompts/test.md`,
+#: because §8.2 names none). Case is load-bearing: only the capitalised token parses, so a
+#: lowercase `pass`/`fail` mention in prose can never be read as a declaration.
+PASS = "Pass"
+FAIL = "Fail"
+
+#: `state.pr` keys recording I2's parsed verdict (Q1.1; additive at the same
+#: `schema_version`, design §9.2). `test_verdict` is always written by the gate — `None` for
+#: an unreadable verdict, so "no verdict parsed" is distinguishable from "never reached".
+TEST_VERDICT_KEY = "test_verdict"
+TEST_FAILING_CRITERIA_KEY = "test_failing_criteria"
+
+#: The forward path every Q1.1 stop message must name (design §8.2's resume rule, §9.4). A
+#: plain `--resume` skips the already-`SUCCEEDED` I2 (`should_run`) and re-reads the *same*
+#: recorded verdict, so it repeats the stop identically — correct while the verdict is
+#: unchanged, not "stuck". Re-testing therefore needs `--from test`, which overrides §9.4's
+#: completed-stages-never-rerun rule; `--resume` keeps the same run.
+TEST_VERDICT_RESUME_HINT = (
+    "A plain `--resume` skips the already-SUCCEEDED I2 and re-reads this same recorded "
+    "verdict, so it stops here again while the verdict is unchanged (a repeat-stop, not a "
+    "stuck run). To re-test, run `aidw implement <task-prompt> --resume --from test`."
+)
+
+#: The bare declaration line (Q1.1 req 2/4): the label, a colon, exactly one capitalised
+#: token and nothing else on the line. Anchored, so a heading (`## Test verdict: Fail`), a
+#: code span (`` `Test verdict: Fail` ``) or a sentence that *mentions* the declaration is
+#: never a declaration — `verdict.py`'s M1/M3 lesson, specialised to a token that needs no
+#: prose fallback because there is exactly one place this verdict is stated.
+_TEST_VERDICT_RE = re.compile(
+    rf"^[ \t]*Test verdict:[ \t]*(?P<verdict>{PASS}|{FAIL})[ \t]*\r?$", re.MULTILINE
+)
+
+#: The criteria line a `Fail` declaration is followed by. Read **best-effort**: a `Fail`
+#: without it is still `Fail` (the list only names what to re-test), so a missing line never
+#: turns a definite failure into an "ambiguous" stop.
+_TEST_CRITERIA_RE = re.compile(
+    r"^[ \t]*Failing in-scope criteria:[ \t]*(?P<criteria>[^\n]*)$", re.MULTILINE
+)
+
+#: Fenced code blocks quote the required shape (`prompts/test.md`'s own per-criterion
+#: template) or an example; they are never the tester's own conclusion (M1, design §18).
+_TEST_FENCE_RE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
+
+#: Markdown decoration (and a CRLF's carriage return) stripped from each criterion, so the
+#: recorded list holds the tester's wording rather than its emphasis markers.
+_CRITERION_DECORATION = " \t\r`*_\u201c\u201d\"'"
+
+
 def _read_out(record) -> str | None:
     out = record.artifacts.get("out")
     if out and Path(out).is_file():
         return Path(out).read_text(encoding="utf-8")
     return None
+
+
+def _blank_test_fences(text: str) -> str:
+    """``text`` with fenced code blocks blanked, offsets and line starts preserved (M1)."""
+    return _TEST_FENCE_RE.sub(
+        lambda match: re.sub(r"[^\n]", " ", match.group(0)), text
+    )
+
+
+def _failing_criteria(prose: str, start: int) -> list[str]:
+    """The criteria named on the first ``Failing in-scope criteria:`` line after ``start``.
+
+    Returns ``[]`` when the tester named none: the verdict is still `Fail`, and the criteria
+    are only the wording a human needs to re-test (Q1.1 req 5).
+    """
+    for match in _TEST_CRITERIA_RE.finditer(prose, start):
+        items = (
+            item.strip(_CRITERION_DECORATION)
+            for item in match.group("criteria").split(",")
+        )
+        return [item for item in items if item]
+    return []
+
+
+def _parse_test_verdict(text: str) -> tuple[str, list[str]] | None:
+    """Parse I2's verdict block (Q1.1; design §8.2, §17 Z10). Pure.
+
+    Returns ``(PASS, [])``, ``(FAIL, [criteria...])``, or ``None`` when no declaration line
+    parses. Fenced code blocks are blanked first, because `prompts/test.md` shows the block
+    as a template inside a fence and a naive read would take the *example* for the verdict
+    (design §18's M1 lesson, E4.5b). A code-span declaration (`` `Test verdict: Fail` ``) is
+    rejected by the same anchoring: only a bare line is a declaration, while
+    `verdict.py`'s `DECLARATION_RE` deliberately *accepts* backticked tokens for a label that
+    carries its own meaning — this label does not, so prose must not supply it.
+
+    No I/O, no mutation, no state: every workflow decision about I2 is derived from the text
+    it is handed. When several declarations parse, the **last** wins, mirroring
+    `verdict.parse_verdict`'s declaration pass: a report's conclusion is its final word.
+    """
+    prose = _blank_test_fences(text)
+    declarations = list(_TEST_VERDICT_RE.finditer(prose))
+    if not declarations:
+        return None
+    declaration = declarations[-1]
+    verdict = declaration.group("verdict")
+    if verdict == PASS:
+        return (PASS, [])
+    return (FAIL, _failing_criteria(prose, declaration.end()))
+
+
+def _test_verdict_ambiguity(record: StageRecord | None, text: str | None) -> str:
+    """Why I2's verdict could not be read, named for the operator (Q1.1 req 5).
+
+    A missing record and an empty message are distinct failures — a resumed run can carry a
+    `SUCCEEDED` `test` record whose `out.txt` is gone, and a fresh run whose I2 exhausted the
+    U1 retry records a successful stage with an empty final message (H1.1: `runner.py` leaves
+    the empty-final-message case to the workflow) — and both fail closed here.
+    """
+    if record is None:
+        return "no recorded `test` stage to read"
+    if text is None:
+        return "the recorded `test` stage has no readable out.txt"
+    if not text.strip():
+        return "the recorded `test` final message is empty"
+    return (
+        "no bare `Test verdict: Pass|Fail` declaration line parses from the recorded "
+        "final message"
+    )
+
+
+def _test_verdict_stop(
+    state: RunState, directory: Path, logger: RunLogger
+) -> int | None:
+    """Withhold I6 unless the tester's in-scope verdict is `Pass` (Q1.1, design §8.2).
+
+    The verdict is in I2's **message**, not its stage status: the tester exits 0 and reports
+    an in-scope `Fail` in prose, so a `record.status == SUCCEEDED` check would let the failure
+    through. The message is read from the *recorded* stage through :func:`_read_out`, so a
+    resumed run (whose I2 is skipped as already-`SUCCEEDED`) reaches the same decision as a
+    fresh one — the flip side is that a plain `--resume` re-reads the same verdict and stops
+    again, which :data:`TEST_VERDICT_RESUME_HINT` states rather than leaving as a dead end.
+
+    Returns the exit code to stop with (3, `state.status = BLOCKED`) or ``None`` to continue
+    to the approve gate and I6. Both stop paths write `state.pr` before returning, so the
+    decision is recorded even though the run ends here.
+    """
+    record = state.stage(TEST_STAGE_NAME)
+    text = _read_out(record) if record is not None else None
+    parsed = _parse_test_verdict(text) if text is not None else None
+
+    if parsed is None:
+        reason = _test_verdict_ambiguity(record, text)
+        state.pr[TEST_VERDICT_KEY] = None
+        state.status = BLOCKED
+        save(directory, state)
+        logger.warn(f"test verdict: unreadable ({reason}); withholding I6 pr")
+        print(
+            f"test verdict gate: cannot read I2's verdict — {reason}; failing closed "
+            "with state.status = BLOCKED and no PR opened.",
+            file=sys.stderr,
+        )
+        print(TEST_VERDICT_RESUME_HINT, file=sys.stderr)
+        return 3
+
+    verdict, criteria = parsed
+    state.pr[TEST_VERDICT_KEY] = verdict
+    if verdict == PASS:
+        save(directory, state)
+        logger.info("test verdict: Pass; I6 pr may run")
+        print(f"test verdict: {PASS}")
+        return None
+
+    state.pr[TEST_FAILING_CRITERIA_KEY] = criteria
+    state.status = BLOCKED
+    save(directory, state)
+    named = ", ".join(criteria)
+    logger.warn(
+        f"test verdict: Fail ({named or 'criteria not named'}); withholding I6 pr"
+    )
+    print(
+        "test verdict gate: I2 test reported `Fail` for in-scope criteria: "
+        f"{named or '(the message names no `Failing in-scope criteria:` line)'}",
+        file=sys.stderr,
+    )
+    print(
+        "no PR opened: `I6 pr` is withheld, so this run opens no pull request.",
+        file=sys.stderr,
+    )
+    print(TEST_VERDICT_RESUME_HINT, file=sys.stderr)
+    return 3
 
 
 def _latest_implement_run(runs_root: Path, branch: str) -> RunState | None:
@@ -1237,6 +1432,15 @@ def run(
             for index, entry in enumerate(pre_pr):
                 if not execute(entry, index):
                     return 1
+
+        # --- I2's verdict withholds I6 (Q1.1, design §8.2, §17 Z10) ---------------- #
+        # After the whole pre-PR block (I1..I9 plus I7 on both dispatch paths) and before
+        # the approve gate: an in-scope `Fail` withholds the PR, and the roadmap explicitly
+        # does **not** withhold the tick — I6 is the only committer, and it never runs. Read
+        # from the recorded stage, so a resumed run decides the same way (`_read_out`).
+        withheld = _test_verdict_stop(state, directory, logger)
+        if withheld is not None:
+            return withheld
 
         # --- gate ---------------------------------------------------------------- #
         approved = any(g.name == GATE and g.decision == "approved" for g in state.gates)
