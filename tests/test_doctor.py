@@ -797,6 +797,11 @@ def test_doctor_warns_only_for_enabled_i4_with_an_empty_effective_path_set(
         if check.status == WARN and "I4" in f"{check.name} {check.detail}"
     ]
     assert bool(i4_warnings) is warns
+    if warns:
+        assert len(i4_warnings) == 1
+        detail = i4_warnings[0].detail
+        assert "docs/architecture" in detail
+        assert "diagram-input" in detail
 
 
 def test_missing_target_config_reports_defaults(

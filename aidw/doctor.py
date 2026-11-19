@@ -460,6 +460,49 @@ def _check_compat(root: Path) -> Check:
     )
 
 
+def _check_architecture_trigger(root: Path) -> Check:
+    """Warn when ``I4 update-architecture`` is enabled with an **empty** path set (S1.2).
+
+    ``I4`` carries ``when=paths-changed`` with the registry default ``docs/architecture``
+    (design §17 Z12). A repo that declares ``when_paths: []`` **replaces** that default
+    (the S1.1/S1.2 override rule; the two never merge), which is the one way the effective
+    set is empty — and an empty set means the stage runs unconditionally, defeating the
+    path gate. That is worth a WARN, not a FAIL: the run still works, it just buys an
+    architecture agent invocation on every change.
+
+    The warning fires only when the stage is **enabled**: a repo with ``enabled: false``
+    has no write-target to justify one, and an absent ``when_paths`` keeps the default, so
+    neither warns. A non-empty declaration is the operator's own trigger set and needs no
+    advice. Read-only: one config load, nothing written (§3.1).
+    """
+    declared = load_target_config(root / "aidw" / "config.yaml")
+    workflow = declared.workflows.get("implement")
+    entry = None
+    if workflow is not None:
+        entry = next((stage for stage in workflow.stages if stage.id == "I4"), None)
+    if entry is None or not entry.enabled:
+        return Check("architecture trigger", OK, "I4 update-architecture not enabled")
+    if entry.when_paths is None:
+        return Check(
+            "architecture trigger",
+            OK,
+            "I4 update-architecture uses the toolkit default docs/architecture",
+        )
+    if entry.when_paths:
+        return Check(
+            "architecture trigger",
+            OK,
+            "I4 update-architecture declares " + ", ".join(entry.when_paths),
+        )
+    return Check(
+        "architecture trigger",
+        WARN,
+        "`I4 update-architecture` has `when_paths: []`, so it runs unconditionally; "
+        "declare docs/architecture plus any diagram-input paths in its when_paths, or "
+        "remove the empty list to use the toolkit default.",
+    )
+
+
 def _check_prompts(aidt: Path) -> Check:
     # Toolkit defaults only (E7.5 requirement 7): the resolved-per-target half lives in
     # ``aidw prompts check``, which knows the target; doctor stays toolkit-side.
@@ -628,6 +671,7 @@ def collect_checks(explicit: Path | None = None) -> list[Check]:
     # a bare directory must short-circuit first (it has no ``aidw/`` to read).
     checks.append(_check_target_config(target.root))
     checks.append(_check_compat(target.root))
+    checks.append(_check_architecture_trigger(target.root))
 
     aidt = toolkit_root()
     checks.append(_check_prompts(aidt))

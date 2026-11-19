@@ -199,13 +199,18 @@ WHEN_UNPARSEABLE = "unparseable"
 #: reason when the condition does not hold.
 WHEN_EVIDENCE_GREEN = "evidence-green"
 #: The stage runs only when the run's **change set touches one of the stage's declared
-#: paths** (S1.1, design §§8.2, 12.2). The paths are a repo's declaration — the additive
-#: per-stage ``when_paths`` field of ``workflows.<name>.stages[]`` — never a toolkit
-#: default: a hardcoded path set would be a product literal (design §7.1/§17 S1), so the
-#: toolkit set is empty and an empty set means the stage runs unconditionally. Like
-#: :data:`WHEN_EVIDENCE_GREEN` the token is **carried, never expanded away** — the
-#: expander cannot see a change set — so ``plan_stages``/``build_plan``/``--dry-run`` plan
-#: the stage in position and the workflow decides before ``run_stage``.
+#: paths** (S1.1/S1.2, design §§8.2, 12.2). The paths are normally a repo's declaration —
+#: the additive per-stage ``when_paths`` field of ``workflows.<name>.stages[]``. A stage
+#: definition may also carry a **product-neutral** registry default
+#: (:attr:`StageDefinition.when_paths`); today only ``I4`` does, with D17's own
+#: ``architecture_dir`` default ``docs/architecture``. Hardcoding any repo's diagram-input
+#: directories here would be a product literal (design §7.1/§17 S1). A repo-declared list
+#: **replaces** the registry default (S1.2, decision Z12), so an explicitly empty
+#: ``when_paths: []`` is the one way the effective set is empty, and an empty set means
+#: the stage runs unconditionally. Like :data:`WHEN_EVIDENCE_GREEN` the token is
+#: **carried, never expanded away** — the expander cannot see a change set — so
+#: ``plan_stages``/``build_plan``/``--dry-run`` plan the stage in position and the workflow
+#: decides before ``run_stage``.
 WHEN_PATHS_CHANGED = "paths-changed"
 
 # Runtime-assembled ``extra`` kinds. The workflow owns the payload (prior review text, the
@@ -267,10 +272,14 @@ class StageDefinition:
     ``name``, ``variables`` and ``extra`` are ``str.format`` templates rendered from the
     expansion fields (``{branch}``, ``{prompt_rel}``, ``{iteration}``, ``{index}``, …), so
     the same definition serves every iteration of a loop. ``when`` marks a conditional
-    stage (``if findings``). ``brief`` names a runtime-assembled ``extra``
-    (:data:`BRIEF_DELTA` / :data:`BRIEF_RECONCILE`) that the workflow renders with
-    :func:`render_delta_brief` / :func:`render_reconcile` once it has the review text and
-    the diff.
+    stage (``if findings``). ``when_paths`` is the optional registry-default trigger set a
+    ``when=paths-changed`` stage is evaluated against when the repo declares none (S1.2):
+    the value is a **prefix**, not a glob, because the matcher is prefix-based. It must be
+    product-neutral — ``I4``'s ``docs/architecture`` is D17's own ``architecture_dir``
+    default — so no repo's diagram-input directories are hardcoded here. ``brief`` names a
+    runtime-assembled ``extra`` (:data:`BRIEF_DELTA` / :data:`BRIEF_RECONCILE`) that the
+    workflow renders with :func:`render_delta_brief` / :func:`render_reconcile` once it has
+    the review text and the diff.
     """
 
     id: str
@@ -280,6 +289,7 @@ class StageDefinition:
     variables: tuple[str, ...] = ()
     extra: str = ""
     when: str = ""
+    when_paths: tuple[str, ...] = ()
     brief: str = ""
 
 
@@ -356,6 +366,7 @@ class PlannedStage:
     variables: tuple[str, ...] = ()
     extra: str = ""
     when: str = ""
+    when_paths: tuple[str, ...] = ()
     brief: str = ""
 
 
@@ -648,12 +659,23 @@ _IMPLEMENT = WorkflowDefinition(
             ("{branch}",),
             when=WHEN_PATHS_CHANGED,
         ),
+        # S1.2 (design §17 Z12): architecture is the second **path-scoped** stage and the
+        # first with a registry-default trigger set. The default is D17's own
+        # ``architecture_dir`` default ``docs/architecture`` — the *prefix*, because
+        # ``verification._excluded`` matches ``path == prefix or path.startswith(prefix +
+        # "/")`` and the roadmap's informal ``docs/architecture/**`` would match nothing.
+        # It is product-neutral (a toolkit default, not a repo's diagram-input list); a
+        # repo-declared ``when_paths`` **replaces** it (S1.2's confirmed replace semantics),
+        # and an explicit ``[]`` is the one reachable empty set, which ``aidw doctor``
+        # warns about because it makes the stage unconditional.
         StageDefinition(
             "I4",
             "update-architecture",
             "implementer",
             "update-architecture.md",
             ("{branch}", "{base_branch}"),
+            when=WHEN_PATHS_CHANGED,
+            when_paths=("docs/architecture",),
         ),
         StageDefinition(
             "I5",
@@ -1215,6 +1237,7 @@ def _plan(definition: StageDefinition, fields: Mapping[str, Any]) -> PlannedStag
         if definition.extra
         else "",
         when=definition.when,
+        when_paths=definition.when_paths,
         brief=definition.brief,
     )
 

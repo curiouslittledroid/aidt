@@ -282,7 +282,8 @@ def test_i3_carries_the_paths_changed_condition_and_no_default_path_set() -> Non
     The condition is on the *definition* (the workflow carries it to the plan), and the
     path set is deliberately **not** a registry field: a toolkit default would be a product
     literal (design §7.1, §17 S1/Z11) and would skip `I3` in every repo without those
-    directories. Only `I3` carries the token.
+    directories. `I4` carries the token too since S1.2, with D17's product-neutral
+    ``docs/architecture`` default; this test pins I3's half of the contract.
     """
     i3 = registry.stage("implement", "I3")
     assert i3.name == "update-traceability"
@@ -299,14 +300,20 @@ def test_i3_carries_the_paths_changed_condition_and_no_default_path_set() -> Non
             for stage in stages
             if stage.when == registry.WHEN_PATHS_CHANGED
         ]
-        expected = ["update-traceability"] if workflow == "implement" else []
+        expected = (
+            ["update-traceability", "update-architecture"]
+            if workflow == "implement"
+            else []
+        )
         assert carried == expected, workflow
 
-    # No registry-default path set exists to leak into a repo: the paths live on the
-    # repo-declared stage entry (`when_paths`), never on the definition.
-    assert "when_paths" not in {
+    # S1.2 re-baseline: the field exists for I4's product-neutral default, but I3
+    # deliberately declares **none** — an empty effective set is unconditional, and I3's
+    # paths stay the repo's declaration, never a toolkit literal (§7.1, Z11).
+    assert "when_paths" in {
         field.name for field in dataclass_fields(registry.StageDefinition)
     }
+    assert i3.when_paths == ()
 
 
 def test_i4_carries_paths_changed_and_its_architecture_default() -> None:
