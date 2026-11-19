@@ -223,11 +223,11 @@ def test_the_evidence_green_condition_is_carried_never_expanded_away() -> None:
     # S1.1: the second carried token rides the same field (I3's path gate).
     assert carried["I3"] == registry.WHEN_PATHS_CHANGED
     assert {
-        key: value for key, value in carried.items() if key not in ("I7", "I3")
+        key: value for key, value in carried.items() if key not in ("I7", "I3", "I4")
     } == {
-        "I1": "", "I2": "", "I4": "", "I5": "", "I8": "",
-        "I9": "", "I6": "",
+        "I1": "", "I2": "", "I5": "", "I8": "", "I9": "", "I6": "",
     }
+    assert carried["I4"] == registry.WHEN_PATHS_CHANGED
     # A lowered ``findings`` field cannot drop it either — that switch is R2/F4's alone.
     with_findings_flag = expand(
         "implement",
@@ -307,6 +307,28 @@ def test_i3_carries_the_paths_changed_condition_and_no_default_path_set() -> Non
     assert "when_paths" not in {
         field.name for field in dataclass_fields(registry.StageDefinition)
     }
+
+
+def test_i4_carries_paths_changed_and_its_architecture_default() -> None:
+    """S1.2: I4 carries the path gate and D17's literal architecture prefix."""
+    i4 = registry.stage("implement", "I4")
+
+    assert i4.when == registry.WHEN_PATHS_CHANGED
+    assert i4.when_paths == ("docs/architecture",)
+
+    expanded = expand(
+        "implement",
+        prompt_rel=PROMPT_REL,
+        branch=BRANCH,
+        task_id=TASK_ID,
+        base_branch="main",
+        roadmap_file=ROADMAP_FILE,
+        checkbox_id=CHECKBOX_ID,
+    )
+    assert {stage.id: stage.when for stage in expanded}["I4"] == "paths-changed"
+    assert {stage.id: stage.when_paths for stage in expanded}["I4"] == (
+        "docs/architecture",
+    )
 
 
 def test_retained_stage_ids_are_the_vocabulary() -> None:

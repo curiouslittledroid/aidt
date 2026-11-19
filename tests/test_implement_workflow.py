@@ -609,7 +609,9 @@ def test_dry_run_plans_locate_and_all_eight_stages(
     assert all(
         spec.when == ""
         for spec in recorder.specs
-        if spec.name not in ("update-roadmap", "update-traceability")
+        if spec.name not in (
+            "update-roadmap", "update-traceability", "update-architecture"
+        )
     )
     out = capsys.readouterr().out
     command = (
@@ -3857,6 +3859,167 @@ def test_a_parallel_group_member_naming_i3_is_withheld_on_the_member_path(
     record = _stage_record(state, "update-traceability")
     assert record.status == SKIPPED
     assert "docs/traceability" in record.artifacts[SKIP_REASON_KEY]
+
+
+def _declared_implement_stages_with_i4_when_paths(
+    when_paths: list[str], parallel_group: list[str] | None = None
+) -> str:
+    """The full implement declaration with S1.2's I4 path set."""
+    lines = ["schema_version: 1", "workflows:", "  implement:", "    stages:"]
+    for stage_id in IMPLEMENT_STAGE_IDS:
+        lines.append(f"      - id: {stage_id}")
+        if stage_id == "I4":
+            if when_paths:
+                lines.append("        when_paths:")
+                lines.extend(f'          - "{path}"' for path in when_paths)
+            else:
+                lines.append("        when_paths: []")
+    if parallel_group is not None:
+        lines.append("    parallel_groups:")
+        lines.append("      - [" + ", ".join(parallel_group) + "]")
+    return "\n".join(lines) + "\n"
+
+
+def test_i4_default_skips_an_unrelated_change_and_records_a_cost_control_skip(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2: the registry default skips I4 when architecture is untouched."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-architecture" not in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-architecture")
+    assert record.status == SKIPPED
+    assert record.error is None
+    assert "docs/architecture" in record.artifacts[SKIP_REASON_KEY]
+    assert state.status == SUCCEEDED
+    assert state.resume == {"next_stage": None}
+
+
+def test_i4_default_runs_when_architecture_is_touched(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2: the literal D17 architecture prefix includes files below the directory."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    architecture_file = worktree / "docs" / "architecture" / "ARCHITECTURE.md"
+    architecture_file.parent.mkdir(parents=True)
+    architecture_file.write_text("# architecture\n", encoding="utf-8")
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-architecture" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-architecture").status == SUCCEEDED
+
+
+def test_i4_declared_diagram_input_replaces_default_and_runs_on_that_input(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2 proposed (b): a declared input prefix is sufficient to run I4."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        _declared_implement_stages_with_i4_when_paths(["docs/diagrams"]),
+    )
+    diagram = worktree / "docs" / "diagrams" / "system.mmd"
+    diagram.parent.mkdir(parents=True)
+    diagram.write_text("flowchart LR\n", encoding="utf-8")
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-architecture" in recorder.names
+    spec = next(spec for spec in recorder.specs if spec.name == "update-architecture")
+    assert spec.when_paths == ("docs/diagrams",)
+
+
+def test_i4_explicit_empty_paths_runs_unconditionally(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2: explicit ``when_paths: []`` overrides the registry default."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_implement_stages_with_i4_when_paths([]))
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-architecture" in recorder.names
+    spec = next(spec for spec in recorder.specs if spec.name == "update-architecture")
+    assert spec.when_paths == ()
+
+
+def test_i4_runs_when_the_change_set_cannot_be_resolved(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2 fail-closed rule: ``changed_paths() is None`` never withholds I4."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        _declared_implement_stages_with_i4_when_paths(["docs/diagrams"]),
+    )
+    _patch(monkeypatch)
+    monkeypatch.setattr(implement_workflow.git, "changed_paths", lambda repo, base: None)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-architecture" in recorder.names
+
+
+def test_i4_is_withheld_on_the_parallel_member_dispatch_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2: ``--parallel`` must apply the path condition before dispatching I4."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        _declared_implement_stages_with_i4_when_paths(
+            ["docs/diagrams"], parallel_group=["test", "update-architecture"]
+        ),
+    )
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt,
+        **_roots(control),
+        approve_all=True,
+        parallel=True,
+    )
+
+    assert code == 0
+    assert "update-architecture" not in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-architecture").status == SKIPPED
 
 
 def test_dry_run_plans_i3_with_its_declared_paths_and_evaluates_nothing(

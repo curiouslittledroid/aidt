@@ -336,6 +336,18 @@ def test_condition_table_names_exactly_the_declarable_tokens() -> None:
     )
 
 
+def test_i4_documents_the_paths_changed_condition_and_default() -> None:
+    """S1.2: the operator index exposes I4's carried condition and default prefix."""
+    rows = _documented_inventory("implement")
+    i4 = next(row for row in rows if row[0] == "I4")
+    assert i4[5] == "paths-changed"
+
+    implement = _section(_doc(), "## `aidw implement` — implement a task prompt and open the PR")
+    assert "I4" in implement
+    assert "docs/architecture" in implement
+    assert "doctor" in implement
+
+
 def test_context_table_names_exactly_the_context_blocks() -> None:
     """The labels the prose uses and the kinds the registry attaches are the same set."""
     rows = _rows(_section(_doc(), "### Context blocks"))

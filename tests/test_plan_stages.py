@@ -275,8 +275,10 @@ def test_i3_plans_with_paths_changed_and_the_declared_when_paths(tmp_path: Path)
     i3 = next(spec for spec in plain if spec.id == "I3")
     assert i3.when == stage_registry.WHEN_PATHS_CHANGED
     assert i3.when_paths == ()
+    i4 = next(spec for spec in plain if spec.id == "I4")
+    assert i4.when_paths == ("docs/architecture",)
     assert all(
-        spec.when_paths == () for spec in plain if spec.id != "I3"
+        spec.when_paths == () for spec in plain if spec.id not in ("I3", "I4")
     )
 
     declared_paths = ["docs/traceability", "docs/rules-coverage"]
@@ -294,11 +296,41 @@ def test_i3_plans_with_paths_changed_and_the_declared_when_paths(tmp_path: Path)
     # Canonical and sorted by the loader (`normalise_ignore`), not by declaration order.
     assert i3.when_paths == ("docs/rules-coverage", "docs/traceability")
     assert i3.when == stage_registry.WHEN_PATHS_CHANGED
+    i4 = next(spec for spec in declared if spec.id == "I4")
+    assert i4.when_paths == ("docs/architecture",)
     assert all(
-        spec.when_paths == () for spec in declared if spec.id != "I3"
+        spec.when_paths == () for spec in declared if spec.id not in ("I3", "I4")
     )
     # The overlay is additive: nothing else about the plan moves.
     assert _shape(declared) == _shape(plain)
+
+
+def test_i4_uses_the_registry_default_but_explicit_empty_stays_empty(
+    tmp_path: Path,
+) -> None:
+    """S1.2: absent and explicitly empty I4 declarations are different contracts."""
+    fields = {
+        "prompt_rel": PROMPT_REL,
+        "branch": BRANCH,
+        "task_id": TASK_ID,
+        "base_branch": "main",
+    }
+    plain = _plan("implement", root=_target(tmp_path / "plain"), **fields)
+    i4 = next(spec for spec in plain if spec.id == "I4")
+    assert i4.when == stage_registry.WHEN_PATHS_CHANGED
+    assert i4.when_paths == ("docs/architecture",)
+
+    root = _target(
+        tmp_path / "empty",
+        _config(
+            "implement",
+            _stage_entries("implement", overrides={"I4": {"when_paths": []}}),
+        ),
+    )
+    explicit_empty = _plan("implement", config=_resolved(root), root=root, **fields)
+    i4 = next(spec for spec in explicit_empty if spec.id == "I4")
+    assert i4.when == stage_registry.WHEN_PATHS_CHANGED
+    assert i4.when_paths == ()
 
 
 def test_the_declared_when_paths_is_type_guarded_at_the_plan_seam() -> None:

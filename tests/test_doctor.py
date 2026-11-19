@@ -734,6 +734,71 @@ def test_valid_target_config_reports_the_path_and_resolved_schema_version(
     assert run_doctor(explicit=control) == 0
 
 
+@pytest.mark.parametrize(
+    ("config_text", "warns"),
+    [
+        pytest.param(
+            "schema_version: 1\n"
+            "workflows:\n"
+            "  implement:\n"
+            "    stages:\n"
+            "      - id: I4\n"
+            "        when_paths: []\n",
+            True,
+            id="enabled-explicit-empty",
+        ),
+        pytest.param(
+            "schema_version: 1\n"
+            "workflows:\n"
+            "  implement:\n"
+            "    stages:\n"
+            "      - id: I4\n"
+            "        when_paths: [docs/diagrams]\n",
+            False,
+            id="enabled-non-empty",
+        ),
+        pytest.param(
+            "schema_version: 1\n"
+            "workflows:\n"
+            "  implement:\n"
+            "    stages:\n"
+            "      - id: I4\n",
+            False,
+            id="enabled-absent-default",
+        ),
+        pytest.param(
+            "schema_version: 1\n"
+            "workflows:\n"
+            "  implement:\n"
+            "    stages:\n"
+            "      - id: I4\n"
+            "        enabled: false\n"
+            "        when_paths: []\n",
+            False,
+            id="disabled-explicit-empty",
+        ),
+    ],
+)
+def test_doctor_warns_only_for_enabled_i4_with_an_empty_effective_path_set(
+    tmp_path: Path,
+    fake_external_clis: None,  # noqa: ARG001
+    config_text: str,
+    warns: bool,
+) -> None:
+    """S1.2: the warning is about an enabled, unconditionally-running I4 only."""
+    _bare, control = _make_supported(tmp_path)
+    if config_text:
+        _write_target_config(control, config_text)
+
+    checks = collect_checks(explicit=control)
+    i4_warnings = [
+        check
+        for check in checks
+        if check.status == WARN and "I4" in f"{check.name} {check.detail}"
+    ]
+    assert bool(i4_warnings) is warns
+
+
 def test_missing_target_config_reports_defaults(
     tmp_path: Path, fake_external_clis: None  # noqa: ARG001
 ) -> None:
