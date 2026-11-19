@@ -123,6 +123,13 @@
           "type": "integer",
           "minimum": 1,
           "description": "Per-stage wall-clock timeout in seconds (E4.6); must be positive."
+        },
+        "when_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Repo-relative path prefixes a when=paths-changed stage must touch to run (S1.1, design §12.2). Optional; absent or empty means unconditional."
         }
       }
     },

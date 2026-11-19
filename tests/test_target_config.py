@@ -132,8 +132,11 @@ FULL_CONFIG: dict[str, Any] = {
                     "model": "meta/muse-spark-1.3",
                     "thinking": "high",
                     "timeout_seconds": 1800,
+                    # S1.1: sorted, as the loader normalises it, so the round-trip is exact;
+                    # `architecture` below declares the explicit empty list that must keep.
+                    "when_paths": ["docs/rules-coverage", "docs/traceability"],
                 },
-                {"id": "architecture", "enabled": False},
+                {"id": "architecture", "enabled": False, "when_paths": []},
             ],
             "parallel_groups": [["test", "architecture"]],
         },
@@ -173,6 +176,7 @@ STAGE_CONFIG_KEYS = {
     "model",
     "thinking",
     "timeout_seconds",
+    "when_paths",
 }
 LABEL_CONFIG_KEYS = {"color", "description"}
 TOP_LEVEL_CONFIG_KEYS = {
@@ -540,6 +544,162 @@ def test_stage_override_bad_value_fails_naming_the_field_path(
         f"workflows.implement.stages[0].{key}" in message and fragment in message
         for message in errors
     ), format_issues(config.issues)
+
+
+# ---------------------------------------------------------------------------
+# S1.1: the path-scoped stage field ``when_paths``
+# ---------------------------------------------------------------------------
+
+WHEN_PATHS_VECTORS = [
+    pytest.param(["docs/traceability"], ["docs/traceability"], id="single"),
+    pytest.param(
+        ["./docs/traceability/", "docs/rules-coverage", "docs/traceability"],
+        ["docs/rules-coverage", "docs/traceability"],
+        id="normalised-sorted-deduped",
+    ),
+    pytest.param([], [], id="explicit-empty"),
+]
+
+
+@pytest.mark.parametrize(("declared", "expected"), WHEN_PATHS_VECTORS)
+def test_stage_when_paths_is_normalised_and_round_trips(
+    tmp_path: Path, declared: list[str], expected: list[str]
+) -> None:
+    """S1.1 req 3: the path set loads canonically and serialises as it resolved.
+
+    One hand-calculated vector per behaviour: a single prefix, `normalise_ignore`'s folding
+    of `./`/a trailing slash and its sort+dedup, and the **explicit empty list**, which is a
+    real declaration and must survive rather than being dropped as absent.
+    """
+    config = _load(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "workflows": {
+                "implement": {
+                    "stages": [{"id": "implement", "when_paths": declared}]
+                }
+            },
+        },
+    )
+
+    assert config.issues == []
+    stage = config.workflows["implement"].stages[0]
+    assert stage.when_paths == expected
+    assert config.to_dict()["workflows"]["implement"]["stages"][0] == {
+        "id": "implement",
+        "when_paths": expected,
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("docs/x", id="string"),
+        pytest.param({"x": "docs/x"}, id="mapping"),
+        pytest.param(7, id="integer"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_stage_when_paths_wrong_type_is_one_error_and_the_field_is_dropped(
+    tmp_path: Path, value: object
+) -> None:
+    """S1.1 req 3: a non-list is **one** `ERROR` naming the field, and the field is gone."""
+    config = _load(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "workflows": {
+                "implement": {"stages": [{"id": "implement", "when_paths": value}]}
+            },
+        },
+    )
+
+    errors = _errors(config)
+    assert len(errors) == 1, format_issues(config.issues)
+    assert "workflows.implement.stages[0].when_paths" in errors[0]
+    assert "must be a list of repo-relative path prefixes" in errors[0]
+    stage = config.workflows["implement"].stages[0]
+    assert stage.when_paths is None
+    # ``None`` is "not declared", never ``null`` in the file.
+    assert config.to_dict()["workflows"]["implement"]["stages"] == [
+        {"id": "implement"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(7, id="non-string"),
+        pytest.param(True, id="bool"),
+        pytest.param("/docs/x", id="absolute"),
+        pytest.param(".", id="dot"),
+        pytest.param("..", id="dot-dot"),
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="blank"),
+    ],
+)
+def test_a_bad_when_paths_entry_is_one_named_error_and_parsing_continues(
+    tmp_path: Path, bad: object
+) -> None:
+    """S1.1 req 3: each bad entry is one `ERROR` naming its **entry** path, then dropped.
+
+    The valid sibling survives, so a single typo neither hides the rest of the list nor
+    silently changes what the stage is gated on.
+    """
+    config = _load(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "workflows": {
+                "implement": {
+                    "stages": [
+                        {"id": "implement", "when_paths": [bad, "docs/keep"]}
+                    ]
+                }
+            },
+        },
+    )
+
+    errors = _errors(config)
+    assert len(errors) == 1, format_issues(config.issues)
+    assert "workflows.implement.stages[0].when_paths[0]" in errors[0]
+    stage = config.workflows["implement"].stages[0]
+    assert stage.when_paths == ["docs/keep"]
+    assert config.to_dict()["workflows"]["implement"]["stages"][0] == {
+        "id": "implement",
+        "when_paths": ["docs/keep"],
+    }
+
+
+def test_each_bad_when_paths_entry_is_reported_independently(tmp_path: Path) -> None:
+    """S1.1 req 3: two bad entries are two `ERROR`s, one per dotted entry path.
+
+    Per-entry reporting is the `_parse_parallel_groups` discipline: the operator fixes every
+    bad prefix in one pass instead of one per run.
+    """
+    config = _load(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "workflows": {
+                "implement": {
+                    "stages": [
+                        {
+                            "id": "implement",
+                            "when_paths": ["/absolute", 7, "docs/keep"],
+                        }
+                    ]
+                }
+            },
+        },
+    )
+
+    errors = _errors(config)
+    assert len(errors) == 2, format_issues(config.issues)
+    assert "workflows.implement.stages[0].when_paths[0]" in errors[0]
+    assert "workflows.implement.stages[0].when_paths[1]" in errors[1]
+    assert config.workflows["implement"].stages[0].when_paths == ["docs/keep"]
 
 
 def test_absent_stage_overrides_are_never_serialised_as_null(tmp_path: Path) -> None:
@@ -993,6 +1153,18 @@ def test_json_schema_carries_the_boolean_enum_mechanism() -> None:
 
     assert enabled["type"] == "boolean"
     assert enabled["enum"] == [True, False]
+
+
+def test_json_schema_describes_when_paths_as_an_array_of_strings() -> None:
+    """S1.1: the machine-readable shape matches the loader's one list-valued stage field."""
+    stage = _schema_node(_load_schema(), "workflows/*/stages[]")
+
+    assert stage["additionalProperties"] is False
+    node = stage["properties"]["when_paths"]
+    assert node["type"] == "array"
+    assert node["items"] == {"type": "string"}
+    # The empty list is a declaration, so no `minItems` is imposed on it.
+    assert "minItems" not in node
 
 
 @pytest.mark.parametrize(
@@ -1709,10 +1881,18 @@ def _random_config(rng: random.Random) -> dict[str, Any]:
             "architecture_dir": "docs/architecture",
         }
     if rng.random() < 0.4:
+        stage: dict[str, Any] = {
+            "id": rng.choice(["author", "review", "implement"])
+        }
+        if rng.random() < 0.5:
+            # S1.1: declared in non-canonical spellings so the sweep proves the loader's
+            # normalisation (sorted, deduped, `./x`/`x/` folded) is idempotent.
+            stage["when_paths"] = rng.sample(
+                ["docs/x", "./docs/x", "docs/x/", "src/rules", "docs/y/z"],
+                rng.randint(0, 3),
+            )
         config["workflows"] = {
-            rng.choice(["prompt", "implement"]): {
-                "stages": [{"id": rng.choice(["author", "review", "implement"])}]
-            }
+            rng.choice(["prompt", "implement"]): {"stages": [stage]}
         }
     if rng.random() < 0.4:
         config["github"] = {

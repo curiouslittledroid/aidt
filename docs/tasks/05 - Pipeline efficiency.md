@@ -68,7 +68,7 @@ unconditionally. In the audited runs they consumed 22.6% and 26.4% of an impleme
 for a single roadmap checkbox and prose edits respectively. This epic adds a path-scoped stage
 condition beside the existing `WHEN_EVIDENCE_GREEN`, so a repo can skip them cheaply.
 
-- [ ] **S1.1. Add a path-scoped stage condition and gate `update-traceability` (I3) on it** (Design 8.2, Design 12.2)
+- [x] **S1.1. Add a path-scoped stage condition and gate `update-traceability` (I3) on it** (Design 8.2, Design 12.2)
   - Done when: `aidw/stage_registry.py` gains a `WHEN_PATHS_CHANGED` condition carrying a config-declared path set (default empty, which means the stage always runs as today); the workflow evaluates it before `run_stage` (the same place `WHEN_EVIDENCE_GREEN` is evaluated) and records a `skipped` stage with the reason when the gated tree's change set touches none of the paths; `I3 update-traceability` carries it by default with a repo-overridable path set covering the rules-engine sources, `docs/rules-coverage` and the vector-matrix directories; a repo that declares no set keeps today's unconditional behaviour; design §§8.2, 12.2 are updated and the decision recorded as Z11; and the five gates above are green.
   - Deliverable: `aidw/stage_registry.py` (the condition token and the `I3` default), `aidw/runner.py` and `aidw/workflows/implement.py` (evaluation), an optional key in `aidw/config.py` surfaced through `docs/target-repo-config.md`, design.md §§8.2, 12.2, 17 (row Z11), and the tests below.
   - Tests: `tests/test_stage_registry.py`, `tests/test_plan_stages.py`, `tests/test_implement_workflow.py`, `tests/test_design_doc.py`.

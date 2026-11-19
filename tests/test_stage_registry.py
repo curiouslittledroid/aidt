@@ -25,7 +25,7 @@ import inspect
 import itertools
 import random
 from collections.abc import Collection, Sequence
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields as dataclass_fields
 from pathlib import Path
 
 import pytest
@@ -220,8 +220,12 @@ def test_the_evidence_green_condition_is_carried_never_expanded_away() -> None:
     ]
     carried = {stage.id: stage.when for stage in stages}
     assert carried["I7"] == registry.WHEN_EVIDENCE_GREEN
-    assert {key: value for key, value in carried.items() if key != "I7"} == {
-        "I1": "", "I2": "", "I3": "", "I4": "", "I5": "", "I8": "",
+    # S1.1: the second carried token rides the same field (I3's path gate).
+    assert carried["I3"] == registry.WHEN_PATHS_CHANGED
+    assert {
+        key: value for key, value in carried.items() if key not in ("I7", "I3")
+    } == {
+        "I1": "", "I2": "", "I4": "", "I5": "", "I8": "",
         "I9": "", "I6": "",
     }
     # A lowered ``findings`` field cannot drop it either — that switch is R2/F4's alone.
@@ -241,17 +245,23 @@ def test_the_evidence_green_condition_is_carried_never_expanded_away() -> None:
 
 
 def test_the_when_vocabulary_is_exported_and_distinct() -> None:
-    """H3.2 req 1: the token joins the ``when=`` vocabulary beside the other four."""
+    """H3.2 req 1 / S1.1 req 1: the tokens join the ``when=`` vocabulary."""
     tokens = (
         registry.WHEN_FINDINGS,
         registry.WHEN_BLOCKING,
         registry.WHEN_COULD_FIX,
         registry.WHEN_UNPARSEABLE,
         registry.WHEN_EVIDENCE_GREEN,
+        registry.WHEN_PATHS_CHANGED,
     )
 
     assert tokens == (
-        "findings", "blocking", "could-fix", "unparseable", "evidence-green"
+        "findings",
+        "blocking",
+        "could-fix",
+        "unparseable",
+        "evidence-green",
+        "paths-changed",
     )
     assert len(set(tokens)) == len(tokens)
     # Exported as module-level constants, beside the others (importable by name).
@@ -261,8 +271,42 @@ def test_the_when_vocabulary_is_exported_and_distinct() -> None:
         "WHEN_COULD_FIX",
         "WHEN_UNPARSEABLE",
         "WHEN_EVIDENCE_GREEN",
+        "WHEN_PATHS_CHANGED",
     ):
         assert isinstance(getattr(registry, name), str)
+
+
+def test_i3_carries_the_paths_changed_condition_and_no_default_path_set() -> None:
+    """S1.1 req 1/req 2: ``I3`` carries the token, and the registry declares no paths.
+
+    The condition is on the *definition* (the workflow carries it to the plan), and the
+    path set is deliberately **not** a registry field: a toolkit default would be a product
+    literal (design §7.1, §17 S1/Z11) and would skip `I3` in every repo without those
+    directories. Only `I3` carries the token.
+    """
+    i3 = registry.stage("implement", "I3")
+    assert i3.name == "update-traceability"
+    assert i3.when == registry.WHEN_PATHS_CHANGED
+
+    for workflow in ("implement", "prompt", "review", "approve", "fix"):
+        definition = registry.get_workflow(workflow)
+        stages = (*definition.stages, *definition.post_loop)
+        if definition.loop is not None:
+            stages = (*stages, *definition.loop.head, *definition.loop.body,
+                      *definition.loop.tail)
+        carried = [
+            stage.name
+            for stage in stages
+            if stage.when == registry.WHEN_PATHS_CHANGED
+        ]
+        expected = ["update-traceability"] if workflow == "implement" else []
+        assert carried == expected, workflow
+
+    # No registry-default path set exists to leak into a repo: the paths live on the
+    # repo-declared stage entry (`when_paths`), never on the definition.
+    assert "when_paths" not in {
+        field.name for field in dataclass_fields(registry.StageDefinition)
+    }
 
 
 def test_retained_stage_ids_are_the_vocabulary() -> None:

@@ -48,6 +48,17 @@ gates or the absence, the roadmap file is never touched, the run's exit status i
 and no agent ever got the chance to make the claim. An already-`[x]` entry under green
 evidence is still H3.1's successful no-op.
 
+Since S1.1 `I3 update-traceability` is the first **path-scoped** stage: its registry entry
+carries `when=WHEN_PATHS_CHANGED`, and a repo declares the paths it owns as the per-stage
+`when_paths` list (repo-relative prefixes). The workflow evaluates the token in the same
+two dispatch points as H3.2's evidence check and with the same change set I7 measures
+(`git.changed_paths` against `BASE_DEFAULT` plus untracked paths, state root excluded);
+when the change set touches none of the declared prefixes the stage is recorded `skipped`
+with the prefixes in its reason and no agent is invoked. An **undeclared/empty**
+`when_paths` is the toolkit default and means "unconditional" — today's behaviour — and an
+unresolvable change set runs the stage rather than skipping it. The decision is
+`paths_changed_reason` (pure); the I/O is `change_set_paths`.
+
 X1.1 adds `I8` (design §8.2, §17 Z3): a read-only narration of what `I5` recorded. It runs
 no verification gate and re-runs no command — `I5` remains the single owner of the whole-repo
 gate, so a second run here would double the run's most expensive step for no new evidence —
@@ -435,6 +446,86 @@ def roadmap_tick_evidence(
     """
     tree = verification.tree_identity(repo_root, exclude=exclude, ignore=ignore)
     return tick_evidence(state.gate_outcomes, tree)
+
+
+def _declared_prefixes(declared: Sequence[str]) -> tuple[str, ...]:
+    """A stage's declared ``when_paths`` as canonical prefixes, or ``()`` when unusable.
+
+    :func:`aidw.verification.normalise_ignore` is the one rule for "a repo-relative
+    prefix", so the matcher reuses it rather than restating it (S1.1 req 7). The loader
+    has already refused a bad entry on the config path (req 3); a plain dict handed to
+    :func:`aidw.runner.plan_stages` directly can still carry one, and an unusable
+    declaration fails closed the only way a **cost-control** skip may: by running the
+    stage.
+    """
+    values = [value for value in declared if isinstance(value, str) and value.strip()]
+    if not values:
+        return ()
+    try:
+        return verification.normalise_ignore(values)
+    except ValueError:
+        return ()
+
+
+def paths_changed_reason(
+    changed: Sequence[str] | None, declared: Sequence[str]
+) -> str | None:
+    """**The rule**: withhold a ``WHEN_PATHS_CHANGED`` stage? (S1.1, design §8.2).
+
+    Returns the skip reason when the stage has nothing to do, and ``None`` when it runs.
+    It runs — never skips — in all three of these cases, each for its own reason:
+
+    * the declaration is empty (or unusable): an undeclared path set is the toolkit
+      default and means "unconditional", which is exactly what I3 did before this token;
+    * ``changed is None``: the change set could not be computed (an unresolvable base), so
+      "cannot prove the stage is irrelevant" is never "skip" — the fail-closed direction
+      is running a stage that may be unnecessary, not dropping one that may be needed;
+    * some changed path **touches** a declared prefix: ``path == prefix or
+      path.startswith(prefix + "/")``, the same rule ``verification._excluded`` applies
+      to a gate's declared scope, so ``docs/x`` matches the file and everything under the
+      directory but never the sibling ``docs/xy``.
+
+    Pure: no I/O, no mutation of ``changed``/``declared``, and the returned reason is a
+    freshly built string.
+    """
+    prefixes = _declared_prefixes(declared)
+    if not prefixes:
+        return None
+    if changed is None:
+        return None
+    if any(verification._excluded(path, prefixes) for path in changed):
+        return None
+    return (
+        "no changed path matches the declared when_paths "
+        f"({', '.join(prefixes)}): the change set does not touch any of them"
+    )
+
+
+def change_set_paths(
+    repo_root: Path, *, exclude: Sequence[Path] = ()
+) -> list[str] | None:
+    """The change set I7's evidence already measures against (S1.1 req 6, design §8.2).
+
+    ``git.changed_paths`` against :data:`aidw.verification.BASE_DEFAULT` — never
+    ``repo.base_branch``: the prompts pass no ``--base`` to ``aidw gate run``, so a
+    different base would silently always- or never-skip — plus every untracked path, with
+    ``exclude`` removed exactly as :func:`aidw.verification.tree_identity` removes its own
+    ``exclude`` (the run's state root: the run's logs are not a change a stage could have to
+    trace). ``verification._relative_prefixes``/``_excluded`` are reused rather than
+    restated, so this exclusion is the gate's own rule.
+
+    ``None`` **only** when ``changed_paths`` could not resolve the base; an empty list is a
+    real answer ("no changes") and does skip. I/O: three read-only ``git`` invocations.
+    """
+    changed = git.changed_paths(repo_root, verification.BASE_DEFAULT)
+    if changed is None:
+        return None
+    prefixes = verification._relative_prefixes(repo_root, exclude)
+    return sorted(
+        path
+        for path in (*changed, *git.untracked_paths(repo_root))
+        if not verification._excluded(path, prefixes)
+    )
 
 
 def build_plan(
@@ -1225,6 +1316,63 @@ def run(
             record = state.stage(name)
             return not (record is not None and record.status == SUCCEEDED)
 
+        def record_skip(entry: StageSpec, reason: str) -> bool:
+            """Record a withheld stage and report it; always ``True`` (a skip is success).
+
+            The one publishing path both conditions use, so a path-scoped skip and an
+            evidence-withheld tick are indistinguishable in shape: ``record_skipped`` (a
+            ``skipped`` StageRecord carrying the agent and model the stage *would* have
+            run, the reason in ``SKIP_REASON_KEY``, ``error`` unset), one ``run.log`` line
+            and the stage block. No ``state.status``/``state.resume`` write — a skip is not
+            a failure.
+            """
+            record = record_skipped(
+                entry,
+                state=state,
+                directory=directory,
+                agents=agents,
+                reason=reason,
+            )
+            logger.info(f"stage {entry.name}: skipped — {reason}")
+            print_stage(record, repo_root=target.root, prefix=entry.id)
+            return True
+
+        def withhold_paths_stage(entry: StageSpec) -> bool:
+            """S1.1: withhold a ``WHEN_PATHS_CHANGED`` stage the change set proves unused.
+
+            The change set is computed here, at the stage's own position (after I1/I2 have
+            done their work), with the run's state root excluded — the same scope
+            :func:`roadmap_tick_evidence` uses, so both conditions read one change set. An
+            undeclared/empty ``when_paths`` and a change set that cannot be computed both
+            make :func:`paths_changed_reason` return ``None``, i.e. the stage runs: dropping
+            a stage that may be needed is never the fail-closed direction.
+
+            The **pure** decision comes first (#165): the declared prefixes are evaluated
+            with no I/O, and an empty (or unusable) set returns before the change set is ever
+            computed. The toolkit default — no declared paths — is statically unconditional,
+            so the three read-only ``git`` spawns :func:`change_set_paths` would perform are
+            pure waste on the most common path (AGENTS.md: git spawns dominate runtime).
+            """
+            if not _declared_prefixes(entry.when_paths):
+                return False
+            reason = paths_changed_reason(
+                change_set_paths(target.root, exclude=(workspace.state_root,)),
+                entry.when_paths,
+            )
+            return False if reason is None else record_skip(entry, reason)
+
+        def withhold_stage(entry: StageSpec) -> bool:
+            """Evaluate a carried ``when=`` token before ``run_stage`` (S1.1 req 5).
+
+            Both carried tokens dispatch here — ``paths-changed`` (I3, S1.1) and
+            ``evidence-green`` (I7, H3.2) — and both dispatch paths call *this*, never one
+            token's evaluator directly: the serial ``execute()`` and the ``--parallel``
+            member filter, which submits to the pool itself.
+            """
+            if entry.when == stage_registry.WHEN_PATHS_CHANGED:
+                return withhold_paths_stage(entry)
+            return withhold_tick(entry)
+
         def withhold_tick(entry: StageSpec) -> bool:
             """H3.2: evaluate I7's ``WHEN_EVIDENCE_GREEN`` **before** ``run_stage`` does.
 
@@ -1275,16 +1423,7 @@ def run(
                 if conclusion is None:
                     return False
                 reason = roadmap.unmet_conclusion_reason(conclusion)
-            record = record_skipped(
-                entry,
-                state=state,
-                directory=directory,
-                agents=agents,
-                reason=reason,
-            )
-            logger.info(f"stage {entry.name}: skipped — {reason}")
-            print_stage(record, repo_root=target.root, prefix=entry.id)
-            return True
+            return record_skip(entry, reason)
 
         def settle_tick(entry: StageSpec, record: StageRecord) -> None:
             """Apply I7's postcondition on both the serial and the parallel schedule (H3.1).
@@ -1311,7 +1450,7 @@ def run(
             if not should_run(index, entry.name):
                 print(f"stage:  {entry.id} {entry.name} [skipped]")
                 return True
-            if withhold_tick(entry):
+            if withhold_stage(entry):
                 return True
             record = run_stage(
                 entry,
@@ -1386,10 +1525,12 @@ def run(
                         print(f"stage:  {member.id} {member.name} [skipped]")
                 if not active:
                     continue
-                # H3.2: a group is a dispatch path in its own right, so the evidence check
-                # runs per member here too — before anything is submitted to the pool.
+                # H3.2/S1.1: a group is a dispatch path in its own right, so the carried
+                # `when=` check runs per member here too — before anything is submitted to
+                # the pool. A repo-declared group may legally name `update-traceability`
+                # (path-scoped, S1.1) as well as `update-roadmap`.
                 runnable = [
-                    member for member in active if not withhold_tick(member)
+                    member for member in active if not withhold_stage(member)
                 ]
                 if not runnable:
                     continue

@@ -121,6 +121,7 @@ merged element-wise, so a stage you omit is not inherited from the default.
 | `model` | string, non-empty | unset | Per-stage model override for this stage's invocation only (E4.6). It replaces the agent's `model` and never its `provider`: a value carrying the agent's own `provider/` prefix is qualified as-is, while a bare slug or another vendor-namespace slug (for example `meta/muse-spark-1.3` under `openrouter`) rides the agent's `--provider`. A provider change goes through `agent:` or `paths.agent_configs_dir`, not here. |
 | `thinking` | string | unset | Per-stage `thinking` level for this stage's invocation only, one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (design §5.1, E4.6). |
 | `timeout_seconds` | integer | unset | Per-stage wall-clock timeout for this stage's invocation only, a positive integer (design §5.1, E4.6). |
+| `when_paths` | list of strings | unset | The repo-relative path prefixes a stage whose registry definition carries `when=paths-changed` is gated on (S1.1, design §12.2). The stage runs only when the run's change set touches one of them (`path == prefix` or the path is inside the directory); a withheld stage is recorded `skipped` with the prefixes named, and the run succeeds. An **absent or empty** list means the stage is unconditional — the toolkit default, since a toolkit-hardcoded path set would be a product literal (§7.1). Canonicalised on load (`./docs/x`/`docs/x/` are one value, sorted and deduped); a non-list value and each bad entry (a non-string, an absolute path, `.`, `..` or empty) are an error naming the field or entry path and the bad value is dropped. Today `I3 update-traceability` is the stage that reads it. |
 
 **Precedence (E4.6).** For one stage's invocation: the per-stage override wins over an agent loaded from `paths.agent_configs_dir`, which wins over the toolkit's `agent-configs/` default. A per-stage `model`/`thinking`/`timeout_seconds` is applied to the resolved agent for that stage only and is **not** re-run through the design §5.4 independence check — that check runs on the loaded (shadowed) agent dict, while a per-stage override is an explicit operator choice recorded in the argv and the stage's `state.json` record. Repo-added stages honour the same three fields uniformly.
 
@@ -434,6 +435,9 @@ workflows:
         enabled: true
         prompt: aidw/prompts/update-traceability.md   # explicit path (D14)
         agent: implementer
+        when_paths:                   # S1.1: run only when the change set touches these
+          - docs/traceability
+          - docs/rules-coverage
       - id: architecture
         enabled: true
     parallel_groups:              # replaces the hard-coded safe pair

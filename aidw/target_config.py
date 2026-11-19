@@ -84,6 +84,13 @@ from packaging.version import InvalidVersion, Version
 # second literal tuple would let the two drift.
 from aidw.config import ERROR, THINKING_LEVELS, Issue, format_issues
 
+# S1.1: ``normalise_ignore`` is the one rule for "a repo-relative path prefix" — the gate
+# CLI's ``--ignore`` scope, ``tree_identity``'s declared scope and a stage's ``when_paths``
+# (design §12.2). Reusing it keeps the loader from restating the rule (a second copy would
+# let them disagree about `./x`, a trailing slash, `..` or an absolute path). The import is
+# a leaf direction: ``verification`` imports only ``aidw.git``/``aidw.state``.
+from aidw.verification import normalise_ignore
+
 #: Top-level keys of the §3.4 schema. ``max_revisions`` is design.md §12's key (also
 #: carried forward by L4.3); §3.4's YAML example omits it, so a loader that rejects it
 #: would reject a legitimate config.
@@ -128,6 +135,9 @@ STAGE_KEYS = (
     "model",
     "thinking",
     "timeout_seconds",
+    # S1.1 (design §12.2): the repo-declared path set a ``when=paths-changed`` stage is
+    # gated on. Optional, and the only stage field whose value is a list of path prefixes.
+    "when_paths",
 )
 
 GITHUB_KEYS = ("markers", "labels")
@@ -330,6 +340,12 @@ class StageConfig:
     model: str | None = None
     thinking: str | None = None
     timeout_seconds: int | None = None
+    #: S1.1's path-scoped stage condition (design §12.2): repo-relative prefixes the
+    #: change set must touch for a ``when=paths-changed`` stage to run. ``None`` when the
+    #: entry declared none (an absent declaration is never serialised), otherwise the
+    #: **normalised** list — sorted, deduped, ``verification.normalise_ignore``'s rule — so
+    #: an explicit empty list survives a round-trip and ``./docs/x``/``docs/x/`` are one value.
+    when_paths: list[str] | None = None
     _declared: frozenset[str] = field(
         default_factory=frozenset, compare=False, repr=False
     )
@@ -346,6 +362,10 @@ class StageConfig:
             value = getattr(self, name)
             if value is not None:
                 data[name] = value
+        # A list-valued field: ``None`` means "not declared" (never serialised), while a
+        # declared ``[]`` is a real declaration and must survive the round-trip.
+        if self.when_paths is not None:
+            data["when_paths"] = list(self.when_paths)
         return data
 
 
@@ -559,8 +579,72 @@ def _parse_stage(
         model=model,
         thinking=thinking,
         timeout_seconds=timeout_seconds,
+        when_paths=_parse_when_paths(raw, path, source, issues),
         _declared=_declared_keys(raw),
     )
+
+
+def _parse_when_paths(
+    raw: Mapping[str, Any], path: str, source: str, issues: list[Issue]
+) -> list[str] | None:
+    """S1.1's declared path set, canonicalised and fail-closed (design §12.1).
+
+    :func:`aidw.verification.normalise_ignore` owns what a valid repo-relative prefix is,
+    so this loader does not restate the rule: a **wrong-typed** value is one ``ERROR``
+    naming the dotted field and the field is dropped, and each **bad entry** (a non-string,
+    an absolute path, ``.``, ``..`` or empty) is one ``ERROR`` naming its own dotted entry
+    path and is dropped while parsing continues — the same per-entry discipline
+    :func:`_parse_parallel_groups` applies, so one typo never hides the rest. The surviving
+    entries are normalised, sorted and deduped by the same rule, so ``./docs/x`` and
+    ``docs/x/`` are one declaration and ordering never matters.
+
+    ``None`` means the entry declared no ``when_paths`` at all; an explicit ``[]`` is a
+    declaration and is preserved as one (both mean "unconditional" to the workflow).
+    """
+    key = "when_paths"
+    if key not in raw:
+        return None
+    field_path = _join(path, key)
+    value = raw[key]
+    if not isinstance(value, list):
+        issues.append(
+            Issue(
+                ERROR,
+                source,
+                f"`{field_path}` must be a list of repo-relative path prefixes, "
+                f"got {_type_name(value)}",
+            )
+        )
+        return None
+
+    entries: list[str] = []
+    for index, entry in enumerate(value):
+        entry_path = _join(field_path, index)
+        if not isinstance(entry, str):
+            issues.append(
+                Issue(
+                    ERROR,
+                    source,
+                    f"`{entry_path}` must be a string, got {_type_name(entry)}",
+                )
+            )
+            continue
+        try:
+            entries.extend(normalise_ignore([entry]))
+        except ValueError:
+            # The helper's own refusal names the bad value; this converts it to a config
+            # issue and never propagates it (a loader must not raise on a bad file).
+            issues.append(
+                Issue(
+                    ERROR,
+                    source,
+                    f"`{entry_path}` must be a repo-relative path prefix such as "
+                    f"docs/rules-coverage, got {entry!r}",
+                )
+            )
+    # Every surviving entry was already accepted above, so this pass only sorts and
+    # dedupes; it cannot raise.
+    return list(normalise_ignore(entries))
 
 
 def _parse_parallel_groups(

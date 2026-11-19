@@ -98,10 +98,16 @@ class StageSpec:
     #: :func:`aidw.stage_registry.expand` plans a conditional stage and puts its
     #: ``when`` here, so a **workflow** can read it and decide at run time
     #: (``spec.when == stage_registry.WHEN_EVIDENCE_GREEN`` — I7's tick, and H3.3's
-    #: reuse for ``fix``). Empty for a stage with no condition, which is every stage
-    #: today except I7. Additive: the field defaults empty, so a spec a workflow builds
-    #: itself (``aidw exec``) keeps today's unconditional behaviour.
+    #: reuse for ``fix``; or ``WHEN_PATHS_CHANGED`` — I3's path-scoped gate, S1.1). Empty
+    #: for a stage with no condition. Additive: the field defaults empty, so a spec a
+    #: workflow builds itself (``aidw exec``) keeps today's unconditional behaviour.
     when: str = ""
+    #: The repo-relative path prefixes a ``when=paths-changed`` stage is evaluated against
+    #: (S1.1, design §12.2), canonicalised by the loader and carried here from the stage's
+    #: declared entry. Empty is the toolkit default — such a stage is **unconditional** —
+    #: because a toolkit-hardcoded path set would be a product literal (design §7.1, §17
+    #: S1). A tuple so a caller cannot mutate the declaration through a result.
+    when_paths: tuple[str, ...] = ()
 
 
 #: Retry a clearly transient Pi invocation error once (design E6, §10). ``aidw
@@ -505,6 +511,27 @@ def _declared_stage_list(
     return list(resolved.value or [])
 
 
+def _declared_when_paths(
+    entry: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    """A declared entry's ``when_paths`` prefixes, or ``()`` when it declared none (S1.1).
+
+    Type-guarded rather than trusted, like :func:`_stage_metadata_overrides`: the loader
+    validates and normalises the list on the config path
+    (``target_config._parse_when_paths``), but ``plan_stages`` is also called directly
+    (``aidw exec``, tests) with plain dicts, and a wrong-typed value must degrade to "no
+    declared paths" — the unconditional default — instead of reaching the workflow's
+    matcher. Non-string and blank entries are dropped for the same reason; canonicalisation
+    stays the workflow's single call to ``verification.normalise_ignore``.
+    """
+    if entry is None:
+        return ()
+    value = entry.get("when_paths")
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item.strip())
+
+
 def _stage_metadata_overrides(
     entry: Mapping[str, Any] | None,
 ) -> tuple[str | None, str | None, int | None]:
@@ -569,6 +596,7 @@ def _spec_from_planned(
         thinking=thinking,
         timeout_seconds=timeout_seconds,
         when=stage.when,
+        when_paths=_declared_when_paths(entry),
     )
 
 

@@ -11,6 +11,7 @@ with real git, and never fakes git output; only the Pi seam (``run_stage``) is m
 
 from __future__ import annotations
 
+import builtins
 import dataclasses
 import random
 import subprocess
@@ -598,8 +599,17 @@ def test_dry_run_plans_locate_and_all_eight_stages(
     # workflow reads to decide at run time — and the dry run neither fails nor skips on
     # the evidence, because it returns before the condition is ever evaluated.
     assert tick.when == "evidence-green"
+    # S1.1: I3's carried token rides the same field, and the dry run evaluates no change
+    # set — the stage is planned, with its empty default path set, and never withheld.
+    traceability = next(
+        spec for spec in recorder.specs if spec.name == "update-traceability"
+    )
+    assert traceability.when == "paths-changed"
+    assert traceability.when_paths == ()
     assert all(
-        spec.when == "" for spec in recorder.specs if spec.name != "update-roadmap"
+        spec.when == ""
+        for spec in recorder.specs
+        if spec.name not in ("update-roadmap", "update-traceability")
     )
     out = capsys.readouterr().out
     command = (
@@ -3392,3 +3402,488 @@ def test_a_second_green_run_on_an_already_ticked_box_is_a_no_op(
     # Byte-identical: a no-op is a no-op, and the box was never ticked twice.
     assert (worktree / ROADMAP_REL).read_text(encoding="utf-8") == after_first
     assert after_first.count("- [x] **E4.1. A fixture task**") == 1
+
+
+# --------------------------------------------------------------------------- #
+# S1.1: I3 is path-scoped (`when=WHEN_PATHS_CHANGED` + the declared `when_paths`)
+# --------------------------------------------------------------------------- #
+
+#: Pinned property-test parameters (``hypothesis`` is not a dependency — AGENTS.md §15 —
+#: so the sweep is a fixed seed and an explicit run count).
+PATH_GATE_PROPERTY_SEED = 8_311
+PATH_GATE_PROPERTY_NUM_RUNS = 150
+
+
+def test_the_path_gate_rule_matches_exact_paths_and_directory_members() -> None:
+    """S1.1 req 7: ``path == prefix`` or ``path.startswith(prefix + "/")`` — nothing else.
+
+    One hand-calculated vector per behaviour path. ``None`` means *run*; a string is the
+    skip reason.
+    """
+    reason = implement_workflow.paths_changed_reason
+
+    # A declared file: only the exact path counts (a sibling name sharing its stem does not).
+    assert reason(["docs/rules.md"], ["docs/rules.md"]) is None
+    assert reason(["docs/rules.md.bak"], ["docs/rules.md"]) is not None
+    # A declared directory: any path inside it counts, the directory itself included.
+    assert reason(["docs/rules/a.py"], ["docs/rules"]) is None
+    assert reason(["docs/rules/deep/b.py"], ["docs/rules"]) is None
+    assert reason(["docs/rules"], ["docs/rules"]) is None
+    # A prefix is not a substring: the sibling `docs/rules-deep` is NOT inside `docs/rules`.
+    assert reason(["docs/rules-deep/a.py"], ["docs/rules"]) is not None
+    # No touch at all.
+    skipped = reason(["src/app.py"], ["docs/traceability", "docs/rules"])
+    assert skipped is not None
+    assert "docs/rules, docs/traceability" in skipped
+    # Empty declared set: the toolkit default, i.e. unconditional.
+    assert reason(["src/app.py"], []) is None
+    # An empty, successfully computed change set is different from an unknown one: it
+    # proves that no declared prefix was touched, so the stage is withheld.
+    assert reason([], ["docs/rules"]) is not None
+    # "Cannot prove" (unresolvable base) is never a skip.
+    assert reason(None, ["docs/rules"]) is None
+    # Normalisation of the declaration: `./x` and a trailing slash are the same prefix.
+    assert reason(["docs/rules/a.py"], ["./docs/rules/"]) is None
+    assert reason(["docs/rules/a.py"], ["docs/rules/"]) is None
+
+
+def test_the_path_gate_rule_is_pure() -> None:
+    """S1.1 req 7: same inputs, same answer, no mutation of either list."""
+    changed = ["docs/rules/a.py"]
+    declared = ["./docs/rules/"]
+    changed_before, declared_before = list(changed), list(declared)
+
+    first = implement_workflow.paths_changed_reason(changed, declared)
+    second = implement_workflow.paths_changed_reason(changed, declared)
+
+    assert first == second is None
+    assert changed == changed_before
+    assert declared == declared_before
+
+
+def test_the_path_gate_rule_performs_no_io(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S1.1 req 5/req 7: the decision is a pure rule; the change set is the caller's I/O."""
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("paths_changed_reason must perform no I/O")
+
+    monkeypatch.setattr(builtins, "open", _explode)
+    monkeypatch.setattr(Path, "read_text", _explode)
+    monkeypatch.setattr(Path, "write_text", _explode)
+    monkeypatch.setattr(implement_workflow.git, "changed_paths", _explode)
+    monkeypatch.setattr(implement_workflow.git, "untracked_paths", _explode)
+
+    assert implement_workflow.paths_changed_reason(["docs/a"], ["docs/a"]) is None
+
+
+def _random_path(rng: random.Random) -> str:
+    """A plausible repo-relative path from the sweep's alphabet (the seed's generator)."""
+    return "/".join(
+        rng.choice(["docs", "src", "rules", "a.py", "b.md", "tests"])
+        for _ in range(rng.randint(1, 3))
+    )
+
+
+def test_the_path_gate_property_holds_for_generated_change_sets() -> None:
+    """Property (seeded, ``numRuns`` pinned above): the rule and its monotonicity hold.
+
+    Invariants for every generated (change set, declaration): an empty declaration and an
+    unknown change set always run; otherwise "runs" is exactly "some changed path touches a
+    declared prefix"; a skip's reason names every canonical prefix; adding a changed path
+    never turns a run into a skip; and neither input is mutated. Both outcomes occur in the
+    sample, so the sweep is not vacuous. Same seed + same count => same cases everywhere.
+    """
+    rng = random.Random(PATH_GATE_PROPERTY_SEED)
+    skipped = ran = 0
+
+    for _ in range(PATH_GATE_PROPERTY_NUM_RUNS):
+        declared = rng.sample(
+            ["docs/a", "docs/b/c", "src/rules", "./tests/"], rng.randint(0, 3)
+        )
+        changed: list[str] | None = (
+            None
+            if rng.random() < 0.15
+            else [_random_path(rng) for _ in range(rng.randint(0, 6))]
+        )
+        declared_before = list(declared)
+        changed_before = None if changed is None else list(changed)
+
+        reason = implement_workflow.paths_changed_reason(changed, declared)
+
+        assert declared == declared_before
+        assert changed == changed_before
+
+        if changed is None or not declared:
+            assert reason is None
+            ran += 1
+            continue
+
+        prefixes = verification.normalise_ignore(declared)
+        touches = any(
+            path == prefix or path.startswith(f"{prefix}/")
+            for path in changed
+            for prefix in prefixes
+        )
+        assert (reason is None) is touches, (changed, declared)
+
+        if reason is None:
+            ran += 1
+            # Metamorphic: more changed paths can only ever add a touch, so a run stays one.
+            assert (
+                implement_workflow.paths_changed_reason(
+                    [*changed, _random_path(rng)], declared
+                )
+                is None
+            )
+        else:
+            skipped += 1
+            for prefix in prefixes:
+                assert prefix in reason, prefix
+
+    assert ran and skipped, (ran, skipped)
+
+
+def _declared_implement_stages_with_when_paths(
+    when_paths: list[str], parallel_group: list[str] | None = None
+) -> str:
+    """The full declared implement list, with I3 declaring ``when_paths`` (S1.1).
+
+    A declared list replaces the toolkit's wholesale (§3.4), so every id is named; only I3
+    carries the path set. ``parallel_group`` optionally declares one concurrency group.
+    """
+    lines = ["schema_version: 1", "workflows:", "  implement:", "    stages:"]
+    for stage_id in IMPLEMENT_STAGE_IDS:
+        lines.append(f"      - id: {stage_id}")
+        if stage_id == "I3":
+            lines.append("        when_paths:")
+            for path in when_paths:
+                lines.append(f'          - "{path}"')
+    if parallel_group is not None:
+        lines.append("    parallel_groups:")
+        lines.append("      - [" + ", ".join(parallel_group) + "]")
+    return "\n".join(lines) + "\n"
+
+
+def test_a_change_set_touching_no_declared_when_path_skips_i3(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Done-when: the stage is recorded ``skipped``, never dispatched, and the run succeeds.
+
+    The fixture's change set is the committed task prompt and roadmap file; a declaration
+    naming a directory it does not touch proves the skip. The reason names the declared
+    prefixes, ``error`` stays unset (a skip is not a failure) and ``state.status`` is
+    ``SUCCEEDED`` with no resume hint — while the rest of the chain, ``I7`` included, runs.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control, _declared_implement_stages_with_when_paths(["docs/traceability"])
+    )
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-traceability" not in recorder.names
+    # No agent was given the chance to run it: every other stage still did.
+    assert [name for name in recorder.names if name != "update-traceability"] == [
+        name for name in DEFAULT_ORDER if name != "update-traceability"
+    ]
+
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-traceability")
+    assert record.status == SKIPPED
+    assert record.agent == "implementer"
+    assert record.model == _AGENTS["implementer"].qualified_model
+    assert record.error is None
+    reason = record.artifacts[SKIP_REASON_KEY]
+    assert "docs/traceability" in reason
+    assert "no changed path matches the declared when_paths" in reason
+    # A cost-control skip, not a failure: the run succeeded and needs no resume.
+    assert state.status == SUCCEEDED
+    assert state.resume == {"next_stage": None}
+    # The tick still ran: the skip is I3's alone.
+    assert "update-roadmap" in recorder.names
+    assert state.pr.get("number") == 42
+    out = capsys.readouterr()
+    assert "I3 update-traceability [skipped]" in out.out
+    assert "stage update-traceability failed" not in out.err
+
+
+def test_the_run_state_root_is_excluded_from_the_path_change_set(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.1 req 6: the workflow's own state files cannot make I3 appear relevant.
+
+    Put the unignored state root inside the located worktree and declare that root as the
+    trigger. The run creates state files before I3 is evaluated; correct exclusion makes
+    this a genuine no-touch skip rather than a self-triggered dispatch.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    state_root = worktree / ".aidw-local-state"
+    _write_config(control, _declared_implement_stages_with_when_paths([state_root.name]))
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+    roots = _roots(control)
+    roots["workspace"] = WorkspacePaths.resolve(
+        TargetRepo.resolve(control), state_dir_override=state_root
+    )
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **roots, approve_all=True
+    )
+
+    assert code == 0
+    assert "update-traceability" not in recorder.names
+    state = implement_workflow.list_runs(roots["workspace"].state_root / "runs")[-1]
+    record = _stage_record(state, "update-traceability")
+    assert record.status == SKIPPED
+    assert state_root.name in record.artifacts[SKIP_REASON_KEY]
+
+
+def test_a_change_set_touching_a_declared_prefix_runs_i3(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Done-when: one touched prefix — here a directory prefix of a committed change — runs it."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control, _declared_implement_stages_with_when_paths(["docs/task-prompts"])
+    )
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-traceability" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-traceability")
+    assert record.status == SUCCEEDED
+    assert SKIP_REASON_KEY not in record.artifacts
+
+
+def test_an_untracked_change_under_a_declared_prefix_runs_i3(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.1 req 6: the change set is ``changed_paths`` **plus** ``untracked_paths``.
+
+    The touched file is never committed, so a change set built from ``git diff`` alone would
+    skip a stage the run does have work for.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control, _declared_implement_stages_with_when_paths(["docs/traceability"])
+    )
+    (worktree / "docs" / "traceability").mkdir(parents=True)
+    (worktree / "docs" / "traceability" / "notes.md").write_text(
+        "traceability notes\n", encoding="utf-8"
+    )
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-traceability" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-traceability").status == SUCCEEDED
+
+
+def test_an_undeclared_when_paths_runs_i3_unconditionally(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Done-when: a repo that declares no ``when_paths`` keeps today's behaviour.
+
+    The declared list carries every id but no path set, so the spec's empty default must
+    leave the stage unconditional — the toolkit ships no default path set (§7.1).
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_implement_stages())
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-traceability" in recorder.names
+    spec = next(spec for spec in recorder.specs if spec.name == "update-traceability")
+    assert spec.when == "paths-changed"
+    assert spec.when_paths == ()
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-traceability").status == SUCCEEDED
+
+
+def test_an_undeclared_when_paths_runs_i3_without_computing_the_change_set(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Done-when: the default run never pays the change set's git spawns (#165).
+
+    An undeclared ``when_paths`` is statically unconditional, so the pure decision
+    (:func:`paths_changed_reason` over an empty prefix set) is "run" for **every** change
+    set: computing one — three read-only ``git`` spawns — is I/O the answer never reads.
+    The exploding stub proves the workflow returns before :func:`change_set_paths` runs
+    (AGENTS.md: git spawns dominate runtime; none on the most common path).
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_implement_stages())
+    _patch(monkeypatch)
+
+    def _explode(*args, **kwargs):
+        raise AssertionError(
+            "an undeclared when_paths must not compute the change set"
+        )
+
+    monkeypatch.setattr(implement_workflow, "change_set_paths", _explode)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-traceability" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-traceability").status == SUCCEEDED
+
+
+def test_an_undeclared_when_paths_does_not_call_git_change_set_helpers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The unconditional default avoids both underlying change-set git reads (#165)."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_implement_stages())
+    _patch(monkeypatch)
+
+    def _explode(*args, **kwargs):
+        raise AssertionError(
+            "an undeclared when_paths must not call change-set git helpers"
+        )
+
+    monkeypatch.setattr(implement_workflow.git, "changed_paths", _explode)
+    monkeypatch.setattr(implement_workflow.git, "untracked_paths", _explode)
+    # Keep I7's independent evidence condition out of this I3 dispatch proof; otherwise
+    # its own tree-identity read would be the expected caller of ``changed_paths``.
+    monkeypatch.setattr(
+        implement_workflow,
+        "roadmap_tick_evidence",
+        lambda *args, **kwargs: implement_workflow.TickEvidence(
+            False, None, "test evidence withheld"
+        ),
+    )
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-traceability" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-traceability").status == SUCCEEDED
+
+
+def test_an_unresolvable_base_runs_i3_instead_of_skipping(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Done-when: ``changed_paths`` returning ``None`` is "cannot prove" — run, not skip.
+
+    The declared path set does not touch anything, so a workflow that treated ``None`` as an
+    empty change set would withhold a stage that should run. Only the base resolution is
+    faked; everything else is the real run path.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control, _declared_implement_stages_with_when_paths(["docs/traceability"])
+    )
+    _patch(monkeypatch)
+    monkeypatch.setattr(
+        implement_workflow.git, "changed_paths", lambda repo, base: None
+    )
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-traceability" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-traceability").status == SUCCEEDED
+
+
+def test_a_parallel_group_member_naming_i3_is_withheld_on_the_member_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.1 req 5's trap: group members bypass ``execute()``, so both paths must check.
+
+    A repo-declared group may legally name ``update-traceability``; a check only in
+    ``execute()`` would run I3 whenever the group was used.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        _declared_implement_stages_with_when_paths(
+            ["docs/traceability"], parallel_group=["test", "update-traceability"]
+        ),
+    )
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True, parallel=True
+    )
+
+    assert code == 0
+    assert "update-traceability" not in recorder.names
+    assert "test" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-traceability")
+    assert record.status == SKIPPED
+    assert "docs/traceability" in record.artifacts[SKIP_REASON_KEY]
+
+
+def test_dry_run_plans_i3_with_its_declared_paths_and_evaluates_nothing(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """S1.1 req 5: ``--dry-run`` plans the stage (with its path set) and skips nothing.
+
+    The dry-run path returns before the dispatch loop, so no change set is computed and no
+    stage is withheld even though the declared prefix matches nothing.
+    """
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control, _declared_implement_stages_with_when_paths(["docs/traceability"])
+    )
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 0
+    assert recorder.names == DEFAULT_ORDER
+    spec = next(spec for spec in recorder.specs if spec.name == "update-traceability")
+    assert spec.when == "paths-changed"
+    assert spec.when_paths == ("docs/traceability",)
+    out = capsys.readouterr().out
+    assert "I3 update-traceability [succeeded] (planned)" in out
+    assert "I3 update-traceability [skipped]" not in out
