@@ -68,6 +68,8 @@ MANIFEST = "artifacts/review-manifest.json"
 #: I7's two expansion fields (H3.1): the entry's own roadmap file and its task id.
 ROADMAP_FILE = "/repo/docs/tasks/03 - Extraction.md"
 CHECKBOX_ID = "E4.1"
+#: F1's closing-body path (05-P1.2): absolute, inside the run directory, one per iteration.
+CLOSING_BODY = "/state/runs/fix-1/artifacts/iter1-closing-body.md"
 
 
 # --------------------------------------------------------------------------- #
@@ -115,11 +117,14 @@ def _plan(
     """The run-path plan. I7's two expansion fields default here (H3.1/H3.3).
 
     ``include_post_loop`` is the one request that emits the post-loop half; a per-iteration
-    ``fix`` plan (the default) never carries it (H3.3 req 1/req 7).
+    ``fix`` plan (the default) never carries it (H3.3 req 1/req 7). F1's ``closing_body``
+    defaults here so a test names only the field it is discriminating (05-P1.2).
     """
     if workflow == "implement" or include_post_loop:
         fields.setdefault("roadmap_file", ROADMAP_FILE)
         fields.setdefault("checkbox_id", CHECKBOX_ID)
+    if workflow == "fix":
+        fields.setdefault("closing_body", CLOSING_BODY)
     return plan_stages(
         workflow,
         config=config if config is not None else _defaults(),
@@ -291,7 +296,16 @@ def test_fix_plan_is_the_approval_plus_one_iteration(tmp_path: Path) -> None:
     assert specs[4].extra == MANIFEST_EXTRA.format(
         manifest_path="artifacts/iter1-review-manifest.json"
     )
-    assert [spec.variables for spec in specs] == [[str(PR)], [str(PR)], [], [], [str(PR)]]
+    # F1 carries the PR and the absolute closing-body path (05-P1.2 req 4); nothing else has
+    # a positional variable here.
+    assert [spec.variables for spec in specs] == [
+        [str(PR)],
+        [str(PR), CLOSING_BODY],
+        [],
+        [],
+        [str(PR)],
+    ]
+    assert Path(specs[1].variables[1]).is_absolute()
     # The approval postcondition is workflow-side: the plan never carries one.
     assert all(spec.verify is None for spec in specs)
 
@@ -1136,6 +1150,7 @@ _FIELDS: dict[str, dict[str, object]] = {
         "round_index": 1,
         "iteration": 1,
         "manifest_path": "artifacts/iter1-review-manifest.json",
+        "closing_body": CLOSING_BODY,
     },
     "implement": {
         "prompt_rel": PROMPT_REL,

@@ -43,9 +43,14 @@ agent run identical code.
 
 ## What it does not do
 
-It never decides whether the code work is done. `fixed` is a separate, explicit
-call that an agent makes only after its own acceptance checks pass. Nothing is
-chained automatically.
+It never decides whether the code work is done. `fixed`/`close` are separate,
+explicit calls that a caller makes only after the work has met its acceptance
+checks. Nothing is chained automatically.
+
+Since 05-P1.2 a `fix` run does not close a follow-up issue while it fixes it: the
+issue stays open until the run's commit-and-push stage has pushed a tree
+containing the fix, and the workflow then calls `close` for each issue it
+recorded (design §8.4, §17 Z9).
 
 ## `review_followup.py`
 
@@ -58,8 +63,12 @@ scripts_dir="${AIDW_SCRIPTS_DIR:-/path/to/toolkit/prompts/scripts}"
 # Record the exact "Status: in progress" comment (idempotent)
 "$scripts_dir/review-followup/review_followup.py" start --pr 174 [--issue 176] [--dry-run]
 
-# Record the exact "Status: fixed" comment and close the issue
+# Record the exact "Status: fixed" comment and close the issue (in-stage form)
 "$scripts_dir/review-followup/review_followup.py" fixed --pr 174 --issue 176 --body-file ./close-body.md [--dry-run]
+
+# Deferred close: the same action for one named issue, no selection
+# (`aidw fix` runs this after the fix has been pushed)
+"$scripts_dir/review-followup/review_followup.py" close --pr 174 --issue 176 --body-file ./close-body.md [--dry-run]
 
 # Read-only: assert closed, marked fixed, labels intact
 "$scripts_dir/review-followup/review_followup.py" verify --pr 174 --issue 176
@@ -90,6 +99,16 @@ the "first available child in native `subIssues` order" rule, and it does not
 authorise a later untouched child. `verify` is exempt from the guard, because
 its main use is re-reading the child that was just closed.
 
+`close` is the second exception, and it **requires** `--issue`: by the time the
+fix has been pushed, the just-fixed child is in flight (`Status: in progress`),
+not first-available, so re-running `fixed`'s selection step would refuse every
+close after the first with exit `4`. `close` therefore resolves the child by
+`--issue` alone and never re-derives a selection; it closes exactly one issue per
+call. Its guards and its write are `fixed`'s own (`logic.close_plan` +
+`apply_close`): the `review-follow-up`/`approve-fix` label guard, refuse-to-reopen,
+a closing body that must not repeat `Status: fixed`, and post-close verification
+that returns `1` when the labels or the closed state did not survive.
+
 ## `publish_review_followups.py`
 
 ```bash
@@ -117,9 +136,10 @@ means usage, validation, or GitHub error.
 - `--issue` cannot skip ahead: an explicit child must either be the one
   native-order selection chose or be the workflow's in-flight child (open, with
   an exact `Status: in progress` comment).
-- `fixed` refuses to close an issue lacking `review-follow-up` or `approve-fix`,
-  refuses to reopen a closed issue, and refuses a closing body that begins with
-  `Status: fixed` (that exact comment is posted separately).
+- `fixed` and `close` share one rule (`logic.close_plan`): they refuse an issue
+  lacking `review-follow-up` or `approve-fix`, refuse to reopen a closed issue, and
+  refuse a closing body that begins with `Status: fixed` (that exact comment is
+  posted separately). Repeating a completed close is a no-op, not a conflict.
 - All external commands run through `subprocess` with argument arrays and no
   shell, so comment bodies, titles, and paths cannot be re-interpreted.
 
@@ -131,9 +151,10 @@ means usage, validation, or GitHub error.
 | `logic.py` | Pure selection logic, argument parsing, and manifest validation (unit tested) |
 | `proc.py` | Shell-free process helper |
 | `gh.py` | All `gh` access and JSON shapes |
-| `review_followup.py` | `select`/`start`/`fixed`/`verify`/`approve` CLI entry point |
+| `review_followup.py` | `select`/`start`/`fixed`/`close`/`verify`/`approve` CLI entry point |
 | `publish_review_followups.py` | Publisher CLI entry point |
-| `tests/test_logic.py` | Unit tests for selection logic |
+| `tests/test_logic.py` | Unit tests for selection and close-plan logic |
+| `tests/test_close.py` | Unit tests for the `close`/`fixed` CLI tail (no real `gh`) |
 | `tests/test_publish_logic.py` | Unit tests for manifest validation and publisher arguments |
 
 `constants.py` holds the label names, exact status and decision comment text,

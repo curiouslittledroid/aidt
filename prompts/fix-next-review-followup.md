@@ -5,11 +5,15 @@ argument-hint: "[PR number or URL]"
 
 # Fix the next available review follow-up task for a PR
 
-Use this prompt after review follow-up issues have been published and approved. Given a pull request number or URL, locate its review-follow-up parent issue, enumerate the parent’s native child issues, select the first available approved child, implement that issue against the current branch, verify the fix, record that it is fixed, and close the issue.
+Use this prompt after review follow-up issues have been published and approved. Given a pull request number or URL, locate its review-follow-up parent issue, enumerate the parent’s native child issues, select the first available approved child, implement that issue against the current branch, verify the fix, and write its closing comment body to the file this prompt hands you.
+
+**Do not post `Status: fixed` and do not close the issue.** A `fix` run closes its follow-up issues only after the change set has been committed and pushed, so the issue stays `OPEN` with the exact `Status: in progress` comment `start` posted; the workflow’s close step runs `review_followup.py close` once the push is verified. Closing it here would report work as landed before it reached the pull request.
 
 This prompt authorizes both repository code changes and GitHub issue updates. Every GitHub read or write goes through the `review-followup` script (which wraps `gh`), or through the GitHub CLI (`gh`) directly as a fallback. Do not edit the PR description, merge the PR, or create a new PR unless the user explicitly asks.
 
 The PR argument is `$1`. If it is missing, stop and ask for a PR number or URL.
+
+The closing-body path is `$2`: an **absolute** path inside this run's directory. Write section 7's body there — never to a `mktemp` file and never to a path relative to the repository.
 
 ## 0. Use the bookkeeping script
 
@@ -25,16 +29,17 @@ pr="<PR number or URL>"
 
 python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" select --pr "$pr"          # read-only
 python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" start  --pr "$pr"          # records "Status: in progress"
-python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" fixed  --pr "$pr" --issue <child> --body-file "$body"
 python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" verify --pr "$pr" --issue <child>   # read-only
 ```
+
+There is deliberately no `fixed` or `close` call in this prompt. `close --pr "$pr" --issue <child> --body-file <path>` is the workflow’s own step, run in Python after the commit-and-push stage has verified the push. It posts the exact `Status: fixed` comment (skipped if already present) and closes the issue with the body you wrote.
 
 Rules for using it:
 
 - Use the `python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py"` form above. It runs on any Python 3.9+ with no install step and no third-party dependencies, so it works in any repository these prompts are copied into.
 - Do **not** route the output through a wrapper or script alias when you need to read the JSON output — a wrapper can prefix its own banner to stdout and collapse every non-zero exit code to 1. Run the `python3` command above directly.
 - Read the exit code: `0` ok, `1` verification failed, `2` usage/GitHub error, `3` no available child, `4` workflow conflict. A non-zero code means stop and report — do not work around it.
-- The script never decides whether the *code* work is done. `fixed` is an explicit call you make only after section 5 passes. Never chain it to anything.
+- The script never decides whether the *code* work is done. It also never closes an issue on your behalf in this prompt: you write the closing body (section 7) and the workflow closes the issue once the fix is pushed.
 - Its `select` output is the authoritative parent/child resolution; use it for your final report rather than re-deriving values.
 
 If the script is unavailable, the manual equivalents in the Appendix are the fallback. Do not invent other command forms.
@@ -195,7 +200,7 @@ Asking again for the same key, command and scope against content that differs on
 
 and exits 0 **without re-running** — cite that line, with its origin (key, tree, stage, timestamp), as evidence rather than re-running the gate, and never transcribe a number you did not observe. `--force` re-runs when you doubt the outcome; a `failed:` line is never evidence — fix the failure and ask again.
 
-Also run focused tests for the selected issue: bare when the point is the red-before/green-after proof (section 5), or through `aidw gate run smoke $SCOPE -- <focused command>` when the result is evidence to record. Do not claim tests passed unless they actually passed. If a check cannot run because it requires unavailable credentials or external dependencies, report it clearly and do not close the issue unless the user explicitly accepts that limitation.
+Also run focused tests for the selected issue: bare when the point is the red-before/green-after proof (section 5), or through `aidw gate run smoke $SCOPE -- <focused command>` when the result is evidence to record. Do not claim tests passed unless they actually passed. If a check cannot run because it requires unavailable credentials or external dependencies, report it clearly and do not write a closing body that claims it passed unless the user explicitly accepts that limitation.
 
 Inspect the final diff and check for accidental changes:
 
@@ -210,18 +215,19 @@ git status --short --untracked-files=all
 
 If a broader check fails, reproduce that failure on the unmodified branch tip before attributing it to your change. Run that reproduction as a **bare command**, not through `aidw gate run`: the failure is expected there, and a recorded `failed` outcome is never cited. Report pre-existing failures and new failures separately, and never report a pre-existing failure as caused by your fix.
 
-“Verification fails” in this prompt means **the selected issue’s acceptance checks fail** — not an unrelated, pre-existing failure elsewhere in the repository. An unrelated failure does not by itself prevent closing a correctly fixed issue; it must be reported as a limitation instead.
+“Verification fails” in this prompt means **the selected issue’s acceptance checks fail** — not an unrelated, pre-existing failure elsewhere in the repository. An unrelated failure does not by itself make the fix wrong; it must be reported as a limitation in the closing body instead.
 
-If the selected issue’s own acceptance checks fail, leave the issue open, add a concise issue comment describing the failure, and stop. Do not label or close the issue as fixed.
+If the selected issue’s own acceptance checks fail, do not write a closing body, leave the issue `OPEN` and in progress, add a concise issue comment describing the failure, and stop. The workflow will not close it: a run that records no fixed issue closes nothing.
 
-## 7. Mark the issue fixed and close it
+## 7. Write the closing comment body — leave the issue open
 
 Only after implementation and acceptance checks pass.
 
-Write the closing comment body to a file first. Use a quoted heredoc so backticks, `$`, and apostrophes in the body stay inert:
+Write the closing comment body to the file the workflow supplied. It is `$2`: an **absolute** path inside the run directory (`<run_dir>/artifacts/iter<N>-closing-body.md`), so write to it exactly as given — never to a `mktemp` file, and never to a path relative to the repository, which would put the body in the worktree and pollute the diff the commit stage pushes. Use a quoted heredoc so backticks, `$`, and apostrophes in the body stay inert:
 
 ```bash
-body="$(mktemp -t review-followup-body.XXXXXX)"
+body="$2"
+: "${body:?the workflow supplies the closing-body path as $2}"
 cat > "$body" <<'BODY'
 Implemented on the current PR branch.
 
@@ -241,34 +247,28 @@ Implemented on the current PR branch.
 BODY
 ```
 
-The body must not begin with `Status: fixed`; that exact comment is posted separately so availability checks stay an exact-match test. The script enforces this.
+The body must not begin with `Status: fixed`; that exact comment is posted separately by the close step so availability checks stay an exact-match test, and the script refuses a body that repeats it.
 
-Then:
-
-```bash
-python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" fixed --pr "$pr" --issue <child> --body-file "$body"
-```
-
-This posts the exact comment `Status: fixed` (skipped if already present), closes the issue with your body, and reports whether the labels survived.
-
-The closing comment must include the real verification results and any remaining limitation, including pre-existing failures you did not fix. Do not write results you did not observe.
+The closing comment must include the real verification results and any remaining limitation, including pre-existing failures you did not fix. Do not write results you did not observe. If the file is missing, empty, or starts with `Status: fixed` when the close step runs, the close fails and the run fails — the issue is never closed on a bad body, so write it and confirm it exists before you finish.
 
 Preserve the child’s priority label and `review-follow-up` label. Do not remove `approve-fix` unless the repository workflow explicitly requires it. Do not use `Fixes #...` unless the user explicitly requests automatic PR linkage.
 
-## 8. Verify GitHub state
+## 8. Verify the issue is still open and in progress
 
 Re-read the selected issue:
 
 ```bash
-python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" verify --pr "$pr" --issue <child>
+python3 "$AIDW_SCRIPTS_DIR/review-followup/review_followup.py" select --pr "$pr"     # read-only
 ```
 
 Confirm from its output:
 
-- The selected issue is `CLOSED`.
-- It has an exact `Status: fixed` comment.
-- The fix verification results are recorded (a detail comment exists).
+- The selected issue is still `OPEN`.
+- It carries an exact `Status: in progress` comment (so the next `select` skips it instead of re-fixing it) and no `Status: fixed` comment.
 - The priority, `review-follow-up`, and `approve-fix` labels are intact.
+- The closing body exists at `$2` and is non-empty.
+
+The issue is **not** closed here, and `verify` reports it as not closed until the workflow’s close step has run — that is expected, not a failure.
 
 If any check fails, report the exact mismatch. Do not process a second child in the same run. This prompt fixes exactly one next available issue per invocation.
 
@@ -283,10 +283,10 @@ Report:
 - Files changed.
 - Exact verification commands and their real results, naming the origin (key, tree, stage,
   timestamp) of any outcome cited from `aidw gate` rather than run.
-- Confirmation that `Status: fixed` was recorded and the selected issue was closed.
+- The absolute closing-body path you wrote, and confirmation that the issue is still `OPEN` with `Status: in progress` — the workflow posts `Status: fixed` and closes it after the push.
 - Any remaining limitation or unverified check.
 
-Do not claim that the PR is approved, merged, or fully complete. This prompt fixes and closes one approved review follow-up issue only.
+Do not claim that the PR is approved, merged, or fully complete, and do not claim the issue is closed. This prompt fixes one approved review follow-up issue per invocation and defers its close to the commit stage.
 
 ## Appendix: manual equivalents
 
@@ -325,7 +325,7 @@ gh api --paginate --slurp "repos/$repo/issues/<child-number>/comments?per_page=1
                           fixed: any(. == "Status: fixed")}'
 ```
 
-Post a status comment from stdin, and close with a file-sourced body:
+The close step (run by the workflow after the push, not by this prompt) posts a status comment from stdin and closes with a file-sourced body:
 
 ```bash
 printf 'Status: fixed' | gh issue comment <child-number> --repo "$repo" --body-file -

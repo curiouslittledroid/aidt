@@ -5,16 +5,25 @@ Run with: uv run pytest prompts/scripts/review-followup/tests
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
+import logic
 from logic import (
+    CLOSE_ACTION_CLOSE,
+    CLOSE_ACTION_NOOP,
+    CLOSE_REFUSAL_MISSING_LABELS,
+    CLOSE_REFUSAL_NOT_OPEN,
     ApprovalPlan,
     ChildIssue,
+    ClosePlan,
     ParsedArgs,
     Selection,
     approval_plan,
     availability,
     can_override_selection,
+    close_plan,
     closing_body_repeats_status,
     has_exact_comment,
     is_approved,
@@ -263,6 +272,118 @@ def test_parses_an_approve_invocation() -> None:
     assert parse_args(["approve", "--pr", "174", "--dry-run"]) == ParsedArgs(
         command="approve", pr="174", dry_run=True
     )
+
+
+def test_parses_a_close_invocation() -> None:
+    """P1.2's `close` round-trips through the same parser as `fixed` (signature pinned)."""
+    expected = ParsedArgs(
+        command="close", issue=176, pr="174", body_file="/run/artifacts/body.md"
+    )
+    assert parse_args(
+        ["close", "--pr", "174", "--issue", "176", "--body-file", "/run/artifacts/body.md"]
+    ) == expected
+    assert parse_args(["close", "--pr", "174", "--issue", "176", "--dry-run"]).dry_run
+    # `close` is a real command, so an unknown-command error names it.
+    with pytest.raises(UsageError, match="close"):
+        parse_args(["closes"])
+
+
+# ── closePlan ────────────────────────────────────────────────────────────
+
+
+def test_close_plan_marks_an_open_approved_child_for_the_status_then_the_close() -> None:
+    plan = close_plan(child())
+    assert plan == ClosePlan(action=CLOSE_ACTION_CLOSE, status_comment=True)
+    assert plan.refusal == ""
+    assert plan.missing_labels == []
+
+
+def test_close_plan_does_not_re_post_an_existing_exact_marker() -> None:
+    plan = close_plan(child(comment_bodies=["Status: in progress", "Status: fixed"]))
+    assert (plan.action, plan.status_comment, plan.refusal) == (CLOSE_ACTION_CLOSE, False, "")
+
+
+def test_close_plan_treats_a_prose_mention_as_a_missing_marker() -> None:
+    """Strict equality (design §7.2): only the exact body counts."""
+    plan = close_plan(child(comment_bodies=["Status: fixed was recorded"]))
+    assert plan.status_comment is True
+
+
+def test_close_plan_reports_a_completed_close_as_a_no_op() -> None:
+    plan = close_plan(child(state="CLOSED", comment_bodies=["Status: fixed"]))
+    assert plan == ClosePlan(action=CLOSE_ACTION_NOOP, status_comment=False)
+
+
+def test_close_plan_refuses_a_child_missing_a_required_label() -> None:
+    plan = close_plan(child(labels=["review-follow-up", "must-fix"]))
+    assert plan.refusal == CLOSE_REFUSAL_MISSING_LABELS
+    assert plan.missing_labels == ["approve-fix"]
+
+
+def test_close_plan_refuses_to_reopen_a_closed_issue() -> None:
+    plan = close_plan(child(state="CLOSED", comment_bodies=["Status: in progress"]))
+    assert plan.refusal == CLOSE_REFUSAL_NOT_OPEN
+
+
+def test_close_plan_checks_the_labels_before_the_state() -> None:
+    """`fixed`'s long-standing order: a label problem is reported first."""
+    plan = close_plan(child(state="CLOSED", labels=["must-fix"], comment_bodies=[]))
+    assert plan.refusal == CLOSE_REFUSAL_MISSING_LABELS
+    assert plan.missing_labels == ["review-follow-up", "approve-fix"]
+
+
+#: Pinned seed and run count (AGENTS.md "Tests": pytest only, no ``hypothesis``).
+CLOSE_PROPERTY_SEED = 2591
+CLOSE_PROPERTY_RUNS = 64
+
+
+def test_close_plan_is_a_total_pure_rule_property() -> None:
+    """Seeded property run (seed/runs pinned above): the rule is total, pure, deterministic.
+
+    Every combination of state, labels and marker must land in exactly one of the four
+    outcomes; a close may only follow when the child is `OPEN` and carries both labels; the
+    status comment is planned exactly when the exact marker is absent and only on the close
+    path; and no input is mutated.
+    """
+    rng = random.Random(CLOSE_PROPERTY_SEED)
+    labels = ["review-follow-up", "must-fix", "approve-fix", "decision-pending"]
+    markers = ["Status: in progress", "Status: fixed", "Status: fixed (prose)"]
+
+    for case in range(CLOSE_PROPERTY_RUNS):
+        state = rng.choice(["OPEN", "CLOSED", "open"])
+        chosen = rng.sample(labels, rng.randint(0, len(labels)))
+        bodies = [marker for marker in markers if rng.random() < 0.5]
+        target = child(state=state, labels=list(chosen), comment_bodies=list(bodies))
+        before = (target.state, list(target.labels), list(target.comment_bodies))
+
+        first = close_plan(target)
+        second = close_plan(target)
+
+        assert first == second, case
+        assert (target.state, target.labels, target.comment_bodies) == before, case
+        assert isinstance(first, ClosePlan), case
+        outcomes = [
+            first.action == CLOSE_ACTION_NOOP,
+            first.refusal == CLOSE_REFUSAL_MISSING_LABELS,
+            first.refusal == CLOSE_REFUSAL_NOT_OPEN,
+            first.action == CLOSE_ACTION_CLOSE
+            and first.refusal == ""
+            and first.missing_labels == [],
+        ]
+        assert sum(outcomes) == 1, (case, first)
+        marked_fixed = "Status: fixed" in bodies
+        if first.action == CLOSE_ACTION_CLOSE and first.refusal == "":
+            assert state.upper() == "OPEN", case
+            assert "review-follow-up" in chosen and "approve-fix" in chosen, case
+            assert first.status_comment is (not marked_fixed), case
+        else:
+            assert first.status_comment is False, case
+        if first.refusal == CLOSE_REFUSAL_MISSING_LABELS:
+            assert first.missing_labels, case
+            # The no-op is checked first, so a label refusal never masks a completed close.
+            assert not (state.upper() != "OPEN" and marked_fixed), case
+        if first.action == CLOSE_ACTION_NOOP:
+            assert state.upper() != "OPEN" and marked_fixed, case
 
 
 # ── approvalPlan ──────────────────────────────────────────────────────────

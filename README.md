@@ -368,6 +368,7 @@ review → fix → re-review loop one approved child at a time:
    until no approved child remains, or --max-iterations is reached
 I7 update-roadmap          recorder      once, if this run's evidence is green
 F5 commit-and-push         pr-publisher  commits the change set and pushes the PR-head branch
+review_followup.py close   (Python)      one call per recorded issue, after the push
 ```
 
 ```bash
@@ -378,8 +379,8 @@ aidw fix --pr 42 --max-iterations 5     # live loop
 The re-review models must differ from the fixer model; `agents validate`/`aidw fix` warn
 when no distinct reviewer model exists (and `--strict` fails). `--max-iterations` (default
 10) bounds the loop; reaching it stops the run as blocked. All GitHub writes are performed
-by the bundled prompts/scripts (the fixer and approver agents); AIDT only reads
-(`gh pr view` and `review_followup.py select`).
+by the bundled prompts/scripts (the fixer and approver agents, and the deferred close); AIDT
+only reads `gh pr view` and `review_followup.py select` itself.
 
 A converged run **publishes its own work**: `F5 commit-and-push` commits the change set the run
 accumulated — the fixes plus the `I7` roadmap tick when it flipped — and pushes the PR-head
@@ -391,6 +392,14 @@ message naming the PR and the branch. A run that closed no issue publishes nothi
 records `state.pr["commit_skip_reason"]` and exits 0 rather than committing a stranger's dirt or
 an empty commit. `F5` never force-pushes, never merges, and refuses outright when the resolved PR
 head is the base branch; `commit`/`push` remain the `pr-publisher` agent's, never Python's.
+
+The fixer no longer closes the issue it fixed. Each `F1` writes its closing comment body to
+`<run_dir>/artifacts/iter{N}-closing-body.md` and leaves the issue `OPEN` with its exact
+`Status: in progress` comment; once `F5`'s push is verified, AIDT runs `review_followup.py
+close --issue <n> --body-file <path>` for each issue this run recorded, which posts the exact
+`Status: fixed` comment (idempotent) and closes the issue with that body. A close that fails —
+`close` exits non-zero, or a recorded fix has no verified push — fails the run instead of
+reporting the issue fixed, and a run that recorded no fix closes nothing.
 
 Approval flow: after `review` publishes children, review them on GitHub and record
 `Decision: approve-fix` / `accepted-risk` / `not-a-bug`, then run `aidw fix`. The

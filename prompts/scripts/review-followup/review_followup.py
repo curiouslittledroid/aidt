@@ -6,12 +6,19 @@ Subcommands:
   select   Read-only. PR -> parent issue -> first available child, as JSON.
   start    Post the exact ``Status: in progress`` comment (idempotent).
   fixed    Post the exact ``Status: fixed`` comment and close the issue.
+  close    The deferred close: the same action, for one named issue, no selection.
   verify   Assert closed, marked fixed, and labels intact.
   approve  Apply the human approval to every open child (idempotent).
 
-What this script does NOT do: decide whether the code work is done. ``fixed`` is
-a separate, explicit call that the agent makes only after its own acceptance
-checks pass. Nothing here is ever chained automatically.
+What this script does NOT do: decide whether the code work is done. ``fixed`` and
+``close`` are separate, explicit calls that a caller makes only after the work has
+met its acceptance checks. Nothing here is ever chained automatically.
+
+Since 05-P1.2 (design §8.4, §17 Z9) ``aidw fix`` does not close an issue while it
+fixes it: ``F5 commit-and-push`` must first push a tree containing the fix, and the
+workflow then runs ``close --issue N --body-file <path>`` for each issue it recorded.
+``fixed`` keeps its in-stage contract (selection plus the same close tail) for callers
+that are not the ``fix`` workflow.
 
 Run with any Python 3.9+, no install step (``AIDW_SCRIPTS_DIR`` is the toolkit's
 absolute ``prompts/scripts`` directory, set by ``aidw`` for every stage):
@@ -62,12 +69,17 @@ from gh import (
     resolve_repo,
 )
 from logic import (
+    CLOSE_ACTION_NOOP,
+    CLOSE_REFUSAL_MISSING_LABELS,
+    CLOSE_REFUSAL_NOT_OPEN,
     ApprovalPlan,
     ChildIssue,
+    ClosePlan,
     ParsedArgs,
     Selection,
     approval_plan,
     can_override_selection,
+    close_plan,
     closing_body_repeats_status,
     is_approved,
     parse_args,
@@ -346,6 +358,78 @@ def read_closing_body(args: ParsedArgs) -> str:
     return body
 
 
+def apply_close(
+    context: Context, target: ChildIssue, plan: ClosePlan, body: str, args: ParsedArgs
+) -> int:
+    """The one close tail shared by ``fixed`` and ``close`` (05-P1.2, design §8.4).
+
+    Both commands must answer the same questions exactly once: is this issue safe to
+    close, does it still need the exact ``Status: fixed`` marker, and did the write
+    survive? :func:`logic.close_plan` decides the first two; this applies them and
+    re-reads the issue afterwards, because an agent's (or a script's) exit code is not
+    evidence the write happened (the O1 precedent).
+
+    Sharing the tail is what lets P1.2 move *when* the close happens without moving
+    *what* it does: ``fixed`` closes in-stage, ``close`` is run by ``aidw fix`` after the
+    push, and both post the frozen exact-match marker (§7.2) and the same guards.
+    """
+    if plan.refusal == CLOSE_REFUSAL_MISSING_LABELS:
+        raise UsageError(
+            f"Issue #{target.number} is missing required label(s): "
+            f"{', '.join(plan.missing_labels)}. Refusing to close.",
+            EXIT_CONFLICT,
+        )
+    if plan.refusal == CLOSE_REFUSAL_NOT_OPEN:
+        raise UsageError(
+            f'Issue #{target.number} is {target.state} without an exact "{STATUS_FIXED}" '
+            "comment. Refusing to reopen or re-close it.",
+            EXIT_CONFLICT,
+        )
+    if plan.action == CLOSE_ACTION_NOOP:
+        emit(
+            {
+                "action": "none",
+                "reason": "ALREADY_CLOSED_AND_FIXED",
+                "issue": summarize(target),
+            }
+        )
+        return EXIT_OK
+
+    if args.dry_run:
+        emit(
+            {
+                "action": "dry-run",
+                "wouldComment": STATUS_FIXED if plan.status_comment else None,
+                "wouldClose": True,
+                "bodyFile": args.body_file,
+                "issue": summarize(target),
+            }
+        )
+        return EXIT_OK
+
+    if plan.status_comment:
+        add_comment(context.repo, target.number, STATUS_FIXED)
+    close_issue(context.repo, target.number, body)
+
+    after = get_issue(context.repo, target.number)
+    after_labels_intact = all(
+        label in after.labels for label in (LABEL_REVIEW_FOLLOW_UP, LABEL_APPROVE_FIX)
+    )
+    emit(
+        {
+            "action": "closed",
+            "statusCommentAdded": plan.status_comment,
+            "labelsIntact": after_labels_intact,
+            "issue": summarize(after),
+        }
+    )
+
+    if not after_labels_intact or after.state.upper() != "CLOSED":
+        sys.stderr.write("error: post-close verification failed; inspect the issue above.\n")
+        return EXIT_VERIFY_FAILED
+    return EXIT_OK
+
+
 def cmd_fixed(args: ParsedArgs) -> int:
     body = read_closing_body(args)
     context = resolve_context(require_pr(args))
@@ -357,75 +441,43 @@ def cmd_fixed(args: ParsedArgs) -> int:
     # Idempotent re-run: an explicit issue that is already closed *and* marked
     # fixed is a no-op, even though native-order selection has moved on to the
     # next child. Without this, rerunning `fixed` after a successful close would
-    # fail the selection-override guard below.
+    # fail the selection-override guard below. `close_plan` owns that rule, so
+    # this only has to ask before selection is consulted.
     if args.issue is not None:
         explicit = find_child(children, args.issue)
-        if explicit.state.upper() != "OPEN" and status_flags(explicit.comment_bodies).fixed:
-            emit(
-                {
-                    "action": "none",
-                    "reason": "ALREADY_CLOSED_AND_FIXED",
-                    "issue": summarize(explicit),
-                }
-            )
-            return EXIT_OK
+        plan = close_plan(explicit)
+        if plan.action == CLOSE_ACTION_NOOP:
+            return apply_close(context, explicit, plan, body, args)
 
     target = resolve_target(args, children, selection)
+    return apply_close(context, target, close_plan(target), body, args)
 
-    # Guard against closing something that is not an approved follow-up.
-    missing = [
-        label
-        for label in (LABEL_REVIEW_FOLLOW_UP, LABEL_APPROVE_FIX)
-        if label not in target.labels
-    ]
-    if missing:
+
+def cmd_close(args: ParsedArgs) -> int:
+    """Post the exact ``Status: fixed`` comment and close one **named** issue.
+
+    This is P1.2's deferred close: ``aidw fix`` runs it only after ``F5
+    commit-and-push`` has verified that the fix reached the PR (design §8.4, §17 Z9), so
+    a closed issue always means "pushed", never "the agent said so".
+
+    ``--issue`` is required and is the **only** selector. The just-fixed child is not
+    first-available — ``start`` left it carrying the exact ``Status: in progress``
+    comment — so reusing ``fixed``'s selection step would refuse every close after the
+    first with ``EXIT_CONFLICT``. The guards and the write are ``fixed``'s own, through
+    :func:`logic.close_plan` and :func:`apply_close`.
+    """
+    if args.issue is None:
         raise UsageError(
-            f"Issue #{target.number} is missing required label(s): {', '.join(missing)}. "
-            "Refusing to close.",
-            EXIT_CONFLICT,
+            "Missing --issue <number>. `close` closes exactly the issue that was recorded "
+            "as fixed; it never re-derives a selection."
         )
-
-    before = status_flags(target.comment_bodies)
-    if target.state.upper() != "OPEN":
-        raise UsageError(
-            f'Issue #{target.number} is {target.state} without an exact "{STATUS_FIXED}" '
-            "comment. Refusing to reopen or re-close it.",
-            EXIT_CONFLICT,
-        )
-
-    if args.dry_run:
-        emit(
-            {
-                "action": "dry-run",
-                "wouldComment": None if before.fixed else STATUS_FIXED,
-                "wouldClose": True,
-                "bodyFile": args.body_file,
-                "issue": summarize(target),
-            }
-        )
-        return EXIT_OK
-
-    if not before.fixed:
-        add_comment(context.repo, target.number, STATUS_FIXED)
-    close_issue(context.repo, target.number, body)
-
-    after = get_issue(context.repo, target.number)
-    after_labels_intact = all(
-        label in after.labels for label in (LABEL_REVIEW_FOLLOW_UP, LABEL_APPROVE_FIX)
-    )
-    emit(
-        {
-            "action": "closed",
-            "statusCommentAdded": not before.fixed,
-            "labelsIntact": after_labels_intact,
-            "issue": summarize(after),
-        }
-    )
-
-    if not after_labels_intact or after.state.upper() != "CLOSED":
-        sys.stderr.write("error: post-close verification failed; inspect the issue above.\n")
-        return EXIT_VERIFY_FAILED
-    return EXIT_OK
+    body = read_closing_body(args)
+    context = resolve_context(require_pr(args))
+    assert_processable(context, args.allow_branch_mismatch)
+    parent = find_single_parent(context.repo, context.pr.url)
+    children = load_children(context.repo, parent)
+    target = find_child(children, args.issue)
+    return apply_close(context, target, close_plan(target), body, args)
 
 
 # ── approve ───────────────────────────────────────────────────────────────
@@ -608,6 +660,7 @@ Usage:
   review_followup.py select  --pr <number-or-url> [--allow-branch-mismatch]
   review_followup.py start   --pr <number-or-url> [--issue <n>] [--dry-run]
   review_followup.py fixed   --pr <number-or-url> --body-file <path> [--issue <n>] [--dry-run]
+  review_followup.py close   --pr <number-or-url> --issue <n> --body-file <path> [--dry-run]
   review_followup.py verify  --pr <number-or-url> [--issue <n>]
   review_followup.py approve --pr <number-or-url> [--dry-run]
 
@@ -616,6 +669,11 @@ Notes:
   workflow's in-flight child (open, with an exact "Status: in progress"
   comment). It cannot bypass the "first available in native sub-issue order"
   rule.
+
+  `close` is the exception and requires --issue: it names exactly the issue the
+  fix workflow recorded as fixed, which is in flight rather than first available
+  by the time the fix has been pushed. `fixed` keeps selection for callers that
+  are not the fix workflow; both share the same guards and the same close.
 
 Exit codes: 0 ok, 1 verification failed, 2 usage/GitHub error,
             3 no available child, 4 workflow conflict.
@@ -633,6 +691,8 @@ def main(argv: list[str]) -> int:
         return cmd_start(args)
     if args.command == "fixed":
         return cmd_fixed(args)
+    if args.command == "close":
+        return cmd_close(args)
     if args.command == "verify":
         return cmd_verify(args)
     if args.command == "approve":

@@ -312,6 +312,7 @@ preflight (PR exists, targets main, the PR head's worktree is located)
      repeat until select reports no available child (or --max-iterations)
   → I7 update-roadmap                 recorder        if this run's evidence is green
   → F5 commit-and-push                pr-publisher    commits the change set and pushes the branch
+  → review_followup.py close          Python          one call per recorded issue, after F5
 ```
 
 ### `fix` — stage inventory
@@ -319,7 +320,7 @@ preflight (PR exists, targets main, the PR head's worktree is located)
 | Id | Runtime name | Agent | Prompt | Variables | Runs when | Context |
 |---|---|---|---|---|---|---|
 | `A1` | `round{round_index}-approve-review-followups` | `review-approver` | `approve-review-followups.md` | `{pr}` | — | — |
-| `F1` | `iter{iteration}-fix-next-review-followup` | `fixer` | `fix-next-review-followup.md` | `{pr}` | — | — |
+| `F1` | `iter{iteration}-fix-next-review-followup` | `fixer` | `fix-next-review-followup.md` | `{pr}`, `{closing_body}` | — | — |
 | `F2` | `iter{iteration}-test` | `tester` | `test.md` | — | — | `stage context` |
 | `F3` | `iter{iteration}-code-review` | `code-reviewer` | `code-review.md` | — | — | — |
 | `F4` | `iter{iteration}-review-findings-to-github` | `review-publisher` | `review-findings-to-github.md` | `{pr}` | `findings` | `manifest pointer` |
@@ -330,6 +331,11 @@ The `A1` row is the **static** half and `I7`/`F5` are the **post-loop** half: bo
 once per run, after the loop, and never per iteration — `I7` first, then `F5`. `F1`–`F4` are the
 loop's head and body.
 
+The close in the flow block is **not a stage**: it has no id, no agent and no prompt, because
+Python runs the bundled `review_followup.py close` for each issue this run recorded, only after
+`F5`'s push is verified (design §8.4, §17 Z9). It therefore never appears in `state.json`'s
+stage list or in a dry-run plan.
+
 ### What each stage does
 
 - **`A1` approve-review-followups** — the only place AIDT writes `approve-fix` and removes
@@ -338,9 +344,13 @@ loop's head and body.
   (`github.verify_approvals`), because an agent that reports success is not evidence the GitHub
   writes happened. `fix` runs one approval round at entry and another after every round that
   published new findings.
-- **`F1` fix-next-review-followup** — fixes exactly **one** approved child issue and closes it.
-  "Available" is always re-derived from `review_followup.py select`, never by counting, so the
-  loop is driven by real GitHub state.
+- **`F1` fix-next-review-followup** — fixes exactly **one** approved child issue and writes its
+  closing comment body to the absolute path `{closing_body}` (`<run_dir>/artifacts/
+  iter{N}-closing-body.md`). It does **not** post `Status: fixed` and does **not** close the
+  issue: the issue stays `OPEN` with the exact `Status: in progress` comment `start` posted until
+  the close step runs after `F5`. "Available" is always re-derived from
+  `review_followup.py select`, never by counting, so the loop is driven by real GitHub state — and
+  `Status: in progress` is what keeps the just-fixed child out of the next `select`.
 - **`F2` test** — re-verifies that one fix against its acceptance criteria. It does not fix
   implementation code: a real defect is reported `Fail` and handed back to `F1`.
 - **`F3` code-review** — read-only re-review of the fix, verdict `Approve` / `Request changes` /
@@ -362,12 +372,12 @@ loop's head and body.
   converged run whose tick was withheld still lands its fixes. The `pr-publisher` agent commits
   the accumulated change set (the fix edits plus the tick when it flipped) and pushes the PR-head
   branch — never the base branch, never a force-push. AIDT picks the case, then verifies the
-  result: a dirty tree with at least one issue closed this run commits and pushes and records the
-  verified remote head as `state.pr["head_sha"]`; a dirty tree with nothing closed, and a clean
-  tree with nothing closed, are recorded **skips** with `state.pr["commit_skip_reason"]` and exit
-  0 (unowned dirt is not this run's to publish, and a no-op run creates no empty commit); a clean
-  tree with at least one issue closed fails closed, because issues were closed and there is
-  nothing to push. A stage record alone is not evidence the push landed: AIDT requires `HEAD` to
+  result: a dirty tree with at least one issue recorded as fixed this run (close-pending)
+  commits and pushes and records the verified remote head as `state.pr["head_sha"]`; a dirty tree
+  with nothing recorded, and a clean tree with nothing recorded, are recorded **skips** with
+  `state.pr["commit_skip_reason"]` and exit 0 (unowned dirt is not this run's to publish, and a
+  no-op run creates no empty commit); a clean tree with a recorded fix fails closed, because
+  there is a fix to publish and nothing to push. A stage record alone is not evidence the push landed: AIDT requires `HEAD` to
   have **moved** since before the stage (a stage that stashes or cleans the change set instead of
   committing it would otherwise satisfy every other check), then re-reads `HEAD` and
   `origin/<branch>` and fails the run (naming the PR and branch) when they differ or cannot be
@@ -378,6 +388,17 @@ loop's head and body.
 the fix and tick edits reach the PR instead of staying in the worktree (design §8.4, §13, §17
 Z9). A stopped loop still commits nothing: every stop path records both post-loop stages as
 skipped with the stop as the reason.
+
+### The deferred close (after `F5`)
+
+Once `run_commit` has proved the push (`HEAD` moved, `HEAD == origin/<branch>`, a clean tree,
+`state.pr["head_sha"]` written), AIDT closes exactly the issues this run recorded in
+`closed_issues`, one `review_followup.py close --issue <n> --body-file <path>` call each — never a
+batch and never a count re-derived from `Status: fixed` comments. A non-zero `close` exit fails
+the run (exit 1) naming the PR, the branch and the issue. A run that recorded no entry closes
+nothing and keeps D3's skip contract (exit 0); one that recorded an entry with no verified push
+fails closed and closes nothing, because "reported fixed" without a push is the untruthful state
+the ordering removes.
 
 ## `aidw approve-followups` — record the approval decision only
 
