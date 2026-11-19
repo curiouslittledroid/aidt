@@ -15,6 +15,7 @@ preflight (PR exists, targets main, the PR head's worktree is located)
      repeat until no approved child remains
   → I7 update-roadmap               (agent recorder, fresh)     once per run, if green
   → F5 commit-and-push              (agent pr-publisher, fresh)  once per run, and publishes
+  → review_followup.py close        (Python, not an agent)       per recorded issue, after F5
 ```
 
 Selection is always re-derived from ``review_followup.py select`` (never by counting), so
@@ -52,8 +53,20 @@ and pushes the PR-head branch, and this module only decides *whether* it may (D3
 four-case table) and verifies what landed (D6's head comparison). Python never commits and
 never pushes.
 
+Since 05-P1.2 (design §8.4, §17 Z9's close-after-push half) the **close is not the fixer's
+job**. ``F1`` leaves each issue ``OPEN`` with the exact ``Status: in progress`` comment that
+``start`` posted, and writes its closing comment body to ``<run_dir>/artifacts/
+iter{N}-closing-body.md`` — the absolute path rendered into the prompt as ``{closing_body}``.
+After the loop, and only once :func:`run_commit` has proved the push (`HEAD` moved,
+`HEAD == origin/<branch>`, clean tree, ``state.pr["head_sha"]`` written), Python runs
+``review_followup.py close --issue <n> --body-file <path>`` for each ``closed_issues`` entry
+this run recorded. A non-zero ``close`` fails the run (exit 1) naming the PR, the branch and
+the issue; an issue is therefore never reported fixed before its work reached the PR. The
+loop stays one fix per iteration, and the close stays one issue per entry — never a batch.
+
 All GitHub writes are performed by AIDT's bundled prompts/scripts (the fixer and approver
-agents). AIDT only reads: ``gh pr view`` and ``review_followup.py select``.
+agents, and — for the deferred close — this module, through the same script). AIDT only
+reads: ``gh pr view`` and ``review_followup.py select``.
 
 The run lock (``aidw.lock``, EXTRACTION.md §3.2/§3.10) is keyed on the **re-resolved
 PR-head worktree**, acquired immediately before ``create_run`` and released on every exit
@@ -177,6 +190,15 @@ COMMIT_FAIL_NOTHING_TO_PUSH = (
 #: template rather than a second spelling of it.
 _TEST_STAGE_PREFIX = "iter"
 _TEST_STAGE_SUFFIX = "-test"
+
+#: Why a recorded close never ran: this run recorded at least one fixed issue, but no
+#: verified push followed (05-P1.2 req 5). It is defence in depth — D3's table already
+#: fails clean-with-closed and skips only when nothing was closed — and it is the guard that
+#: makes "reported fixed without a push" unrepresentable rather than merely unlikely.
+CLOSE_FAIL_NO_VERIFIED_PUSH = (
+    "the run recorded this issue as fixed, but no commit-and-push verified a push, so it "
+    "stays open"
+)
 
 
 def is_test_stage(name: str) -> bool:
@@ -303,6 +325,59 @@ def commit_decision(
             COMMIT_ACTION_FAIL, COMMIT_FAIL_NOTHING_TO_PUSH.format(closed=closed)
         )
     return CommitDecision(COMMIT_ACTION_COMMIT)
+
+
+def closing_body_path(directory: Path, iteration: int) -> Path:
+    """The **absolute** path ``F1`` writes its closing comment body to (P1.2 req 4).
+
+    One per iteration, inside the run directory — never a ``mktemp`` file and never relative.
+    Absolute for the same reason ``_planned_iteration`` passes an absolute ``manifest_path``:
+    ``F1`` runs with the target repo as its cwd, so a relative path would write the body into
+    the repo tree and pollute the very diff ``F5`` pushes. It is run state (design §9.1), so
+    it lives with the run, not in the worktree.
+    """
+    return Path(directory) / f"artifacts/iter{iteration}-closing-body.md"
+
+
+def close_failure_message(
+    pr: int, branch: str | None, issue: Any, detail: str
+) -> str:
+    """The one shape of a deferred-close failure: PR, branch **and** issue (P1.2 req 3).
+
+    An operator reading stderr must know which issue is in an untruthful state — recorded as
+    fixed, still open — so the issue number is part of the message rather than left to the
+    surrounding output. Pure.
+    """
+    return (
+        "close failed for PR #{pr} on branch `{branch}`: issue #{issue} — {detail}"
+    ).format(pr=pr, branch=branch or "(unresolved)", issue=issue, detail=detail)
+
+
+def run_close(
+    entry: Mapping[str, Any],
+    *,
+    aidt: Path,
+    repo: Path,
+    pr: int,
+    config: ResolvedConfig,
+) -> github.ScriptResult:
+    """Run the bundled ``review_followup.py close`` for one recorded issue (req 2/req 3).
+
+    ``entry`` is one of this run's own ``closed_issues`` records: it carries the issue
+    ``number`` and the absolute ``closing_body`` path ``F1`` wrote. The script posts the
+    exact ``Status: fixed`` comment if it is absent and closes the issue with that body; its
+    guards (labels, refuse-to-reopen, a body that repeats the status marker) run again here,
+    so a bad body fails the close before any close action.
+    """
+    script = github.script_path(aidt, github.FOLLOWUP_SCRIPT)
+    argv = github.build_followup_argv(
+        script,
+        "close",
+        pr,
+        issue=entry.get("number"),
+        body_file=entry.get("closing_body"),
+    )
+    return github.run_script(argv, repo, config=config)
 
 
 def commit_failure_message(pr: int, branch: str | None, detail: str) -> str:
@@ -515,6 +590,7 @@ def _post_loop_specs(
         round_index=round_index,
         iteration=iteration,
         manifest_path=str(directory / f"artifacts/iter{iteration}-review-manifest.json"),
+        closing_body=str(closing_body_path(directory, iteration)),
         include_post_loop=True,
         roadmap_file=str(target.roadmap_file) if target.roadmap_file else "",
         checkbox_id=target.task,
@@ -550,6 +626,9 @@ def _planned_iteration(
     directory ``directory`` — the value the registry renders into F4's pointer — so the dry
     run and a real run plan the same ``extra``. It is absolute for the same reason
     ``review.py`` passes an absolute path: F4 runs with the target repo as its cwd.
+    ``closing_body`` is F1's counterpart (05-P1.2 req 4): the absolute path the fixer writes
+    its closing comment body to and the close step reads back after the push
+    (:func:`closing_body_path`).
 
     Deliberately **no** ``include_post_loop``: this is the per-iteration expansion, and the
     roadmap tick and ``F5`` run once per run, after the loop (H3.3 req 1/req 7; 05-P1.1
@@ -564,6 +643,7 @@ def _planned_iteration(
         round_index=round_index,
         iteration=iteration,
         manifest_path=str(directory / f"artifacts/iter{iteration}-review-manifest.json"),
+        closing_body=str(closing_body_path(directory, iteration)),
     )
     return {spec.name: spec for spec in planned}
 
@@ -958,6 +1038,9 @@ def run(
             branch=branch,
         )
         directory = run_dir(runs_root, state.run_id)
+        # F1 writes its closing comment body here (P1.2 req 4), inside the run directory and
+        # never in the PR-head worktree. Created once so no stage has to guess a directory.
+        (directory / "artifacts").mkdir(parents=True, exist_ok=True)
         logger = RunLogger(directory, stream=stream)
         print(f"run:    {state.run_id}")
         print(f"pr:     #{pr}" + (f" {pr_info['url']}" if pr_info.get("url") else ""))
@@ -1157,6 +1240,42 @@ def run(
             state.pr[PR_HEAD_SHA] = pushed
             state.pr.pop(PR_COMMIT_SKIP_REASON, None)
             logger.info(f"stage {record.name}: pushed `{pushed}` to `origin/{branch}`")
+            return 0
+
+        def run_closes(issues: Sequence[Mapping[str, Any]]) -> int:
+            """Close exactly the issues this run recorded, one script call each (req 3/req 6).
+
+            Called only after :func:`run_commit` returned 0 **and** ``state.pr[PR_HEAD_SHA]``
+            is present, i.e. after D6's equality proved the push landed, so no issue is
+            reported fixed before its fix reached the PR. One entry, one ``close`` call, one
+            issue: never a batch and never a re-derived count (req 6), because a batch that
+            failed halfway could strand an issue half-closed.
+            """
+            for entry in issues:
+                result = run_close(
+                    entry, aidt=aidt.root, repo=repo.root, pr=pr, config=resolved_config
+                )
+                if result.exit_code != 0:
+                    detail = (result.stderr or result.stdout).strip()[:300]
+                    print(
+                        close_failure_message(
+                            pr,
+                            branch,
+                            entry.get("number"),
+                            f"`close` exited {result.exit_code}"
+                            + (f": {detail}" if detail else ""),
+                        ),
+                        file=sys.stderr,
+                    )
+                    return 1
+                logger.info(
+                    f"close: #{entry.get('number')} marked fixed and closed "
+                    f"({entry.get('closing_body')})"
+                )
+                print(
+                    f"close:  #{entry.get('number')} marked `Status: fixed` and closed "
+                    f"after the push"
+                )
             return 0
 
         def run_post_loop(*, iteration: int, latest_verdict: str | None) -> int:
@@ -1458,7 +1577,10 @@ def run(
             # This iteration's F1–F4, expanded from the registry once per iteration
             # (E4.3): the stage names carry the iteration count and F2/F4 carry the
             # registry-rendered context and manifest pointer. The loop is re-derived from
-            # GitHub state each iteration, so nothing here is pre-planned.
+            # GitHub state each iteration, so nothing here is pre-planned. F1 also carries
+            # the close-deferral's body path (P1.2 req 4), and it is the same value this
+            # iteration's `closed_issues` entry records below.
+            closing_body = str(closing_body_path(directory, iterations))
             planned = _planned_iteration(
                 pr=pr,
                 round_index=round_index,
@@ -1667,7 +1789,11 @@ def run(
                     file=sys.stderr,
                 )
                 return 3
-            closed_issues.append(selected)
+            # P1.2 req 4: the entry carries the absolute body path F1 wrote, so the close
+            # step passes it back as `--body-file` after the push. `closed_issues` still
+            # means "fixed, close-pending" — `commit_decision` reads it as "≥1 fix to
+            # publish" (Z9 D3) and is deliberately unchanged.
+            closed_issues.append({**selected, "closing_body": closing_body})
 
         # --- the post-loop half, once per run (H3.3 req 1/req 7; 05-P1.1 req 1-5) -- #
         # The loop only reaches here through its `break` on `select` exit
@@ -1700,6 +1826,31 @@ def run(
                 "latest_verdict": latest_verdict,
             }
         )
+
+        # --- the deferred close, after the push (05-P1.2 req 1/req 3/req 5/req 6) ------- #
+        # The loop only records an issue as fixed; the close waits for `run_commit`'s proof
+        # that the fix reached the PR (D6). A run that recorded no entry keeps D3's skip
+        # contract: nothing to close, exit 0. A run that recorded one but has no verified
+        # push (a skip, a failure, an absent commit stage) fails closed here and closes
+        # nothing — "reported fixed" without a push is exactly the untruthful state this
+        # task removes.
+        if closed_issues and PR_HEAD_SHA not in state.pr:
+            for entry in closed_issues:
+                print(
+                    close_failure_message(
+                        pr, branch, entry.get("number"), CLOSE_FAIL_NO_VERIFIED_PUSH
+                    ),
+                    file=sys.stderr,
+                )
+            state.status = FAILED
+            save(directory, state)
+            return 1
+        close_code = run_closes(closed_issues)
+        if close_code != 0:
+            state.status = FAILED
+            save(directory, state)
+            return close_code
+
         state.status = SUCCEEDED
         save(directory, state)
         print("fix workflow complete")

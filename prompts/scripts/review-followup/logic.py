@@ -15,6 +15,7 @@ from constants import (
     DECISION_APPROVE_FIX,
     LABEL_APPROVE_FIX,
     LABEL_DECISION_PENDING,
+    LABEL_REVIEW_FOLLOW_UP,
     PRIORITY_LABELS,
     STATUS_FIXED,
     STATUS_IN_PROGRESS,
@@ -221,13 +222,76 @@ def closing_body_repeats_status(body: str) -> bool:
     for line in body.split("\n"):
         stripped = line.strip()
         if stripped:
-            return stripped == STATUS_FIXED
+            return stripped.startswith(STATUS_FIXED)
     return False
+
+
+# ── Closing an issue (P1.2, design §8.4/§17 Z9) ───────────────────────────
+
+#: One close action: post the exact ``Status: fixed`` comment if absent, then close.
+CLOSE_ACTION_CLOSE = "close"
+#: Closed **and** already carrying the exact ``Status: fixed`` comment: repeating the call
+#: is a no-op, not a conflict. Without it a resumable workflow could never re-run a close it
+#: already completed (native-order selection has moved on by then).
+CLOSE_ACTION_NOOP = "noop"
+
+#: Refusals, kept as tokens so ``close`` and ``fixed`` cannot drift apart in wording or
+#: ordering: a missing label is reported before the state, exactly as ``fixed`` always has.
+CLOSE_REFUSAL_MISSING_LABELS = "MISSING_LABELS"
+CLOSE_REFUSAL_NOT_OPEN = "NOT_OPEN"
+
+
+@dataclass
+class ClosePlan:
+    """What one close must do to a child, or why it must refuse (design §7.2/§8.4).
+
+    ``action`` is :data:`CLOSE_ACTION_CLOSE` or :data:`CLOSE_ACTION_NOOP`.
+    ``status_comment`` is true exactly when the exact ``Status: fixed`` comment is still
+    absent, so the marker is posted once and never duplicated. ``refusal`` is empty when
+    the call may proceed; otherwise it is one of the ``CLOSE_REFUSAL_*`` tokens and
+    ``missing_labels`` names the labels the child lacks.
+    """
+
+    action: str = CLOSE_ACTION_CLOSE
+    status_comment: bool = False
+    missing_labels: list[str] = field(default_factory=list)
+    refusal: str = ""
+
+
+def close_plan(child: ChildIssue) -> ClosePlan:
+    """**The rule**: may this child be closed, and does it still need the status marker?
+
+    P1.2 moved the close behind the push, but the closing *guards* are unchanged and are
+    now shared by two commands — ``fixed`` (in-stage, kept for compatibility) and ``close``
+    (the deferred close ``aidw fix`` runs after ``F5 commit-and-push`` verifies the push).
+    One rule, so the two commands cannot disagree about what is safe to close:
+
+    1. closed **and** already marked fixed → :data:`CLOSE_ACTION_NOOP` (idempotent re-run);
+    2. missing ``review-follow-up`` or ``approve-fix`` → refuse (§7.2's label guard);
+    3. not ``OPEN`` without that marker → refuse to reopen or re-close;
+    4. otherwise close, posting the exact ``Status: fixed`` comment only when it is absent.
+
+    The ordering matters: the no-op is checked first (a completed close is closed *and*
+    marked), then the labels, then the state. Purity: no I/O, no mutation, deterministic.
+    """
+    flags = status_flags(child.comment_bodies)
+    if child.state.upper() != "OPEN" and flags.fixed:
+        return ClosePlan(action=CLOSE_ACTION_NOOP, status_comment=False)
+    missing = [
+        label
+        for label in (LABEL_REVIEW_FOLLOW_UP, LABEL_APPROVE_FIX)
+        if label not in child.labels
+    ]
+    if missing:
+        return ClosePlan(missing_labels=missing, refusal=CLOSE_REFUSAL_MISSING_LABELS)
+    if child.state.upper() != "OPEN":
+        return ClosePlan(refusal=CLOSE_REFUSAL_NOT_OPEN)
+    return ClosePlan(status_comment=not flags.fixed)
 
 
 # ── Argument parsing: fix-next CLI ────────────────────────────────────────
 
-COMMANDS = ("select", "start", "fixed", "verify", "approve")
+COMMANDS = ("select", "start", "fixed", "close", "verify", "approve")
 
 
 @dataclass

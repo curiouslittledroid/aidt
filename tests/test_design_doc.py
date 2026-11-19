@@ -183,6 +183,49 @@ def test_section_17_has_one_z9_row_recording_the_reversal() -> None:
         assert decision in z9, decision
 
 
+def test_section_17_z9_row_records_the_close_after_push_as_implemented() -> None:
+    """05-P1.2: the close-after-push half is appended to the **same** Z9 row.
+
+    The row exists because one reversal (no stage of `fix` committed) has one close:
+    ordering the close behind the new push. A second row would split that decision, so the
+    pin is that Z9 alone carries P1.2's prompt-fixed decisions — and that they are recorded
+    as implemented, not as a plan.
+    """
+    section = _section(_design_md(), "## 17. Resolved decisions", "## 18. Risks")
+
+    rows = [line for line in section.splitlines() if line.startswith("| Z9 |")]
+    assert len(rows) == 1, f"expected exactly one §17 Z9 row, found {len(rows)}"
+    z9 = rows[0]
+    assert "P1.2's prompt-fixed decisions" in z9
+    for decision in ("(P1.2a)", "(P1.2b)", "(P1.2c)", "(P1.2d)", "(P1.2e)", "(P1.2f)"):
+        assert decision in z9, decision
+    # The four facts the code implements, named in the row that records them.
+    assert "review_followup.py close" in z9
+    assert "{closing_body}" in z9
+    assert "head_sha" in z9
+    assert "no verified push" in z9
+    assert "agents/fixer/AGENTS.md" in z9
+
+
+def test_section_84_documents_the_deferred_close() -> None:
+    """05-P1.2: §8.4 says when the close happens, and that F1 no longer does it.
+
+    Without this the design would still read as "F1 closes the issue in-stage" — the exact
+    sentence P1.2 removes — and case 4 of D3's table would keep claiming P1.2 fixes it
+    "later".
+    """
+    block = _section_84_block(_design_md())
+
+    assert "The deferred close" in block
+    assert "review_followup.py close" in block
+    assert "{closing_body}" in block
+    # The ordering rule, and the flag that it is no longer a future change.
+    assert "only **after** `F5` has pushed" in block
+    assert "unrepresentable later" not in block
+    # The fixer no longer posts the marker or closes in-stage.
+    assert "`F1` no longer posts the marker and no longer closes in-stage" in block
+
+
 def test_section_18_row_is_no_longer_contradictory() -> None:
     """05-P1.1: the risk row is resolved with the F5 boundary, not left asserting the old rule."""
     design = _design_md()

@@ -798,12 +798,16 @@ _FIX = WorkflowDefinition(
         id="F",
         kind=LOOP_FIX_ITERATIONS,
         head=(
+            # 05-P1.2 (Z9's close-after-push half): ``{closing_body}`` is the absolute path
+            # the fixer writes its closing comment body to and the workflow reads back as
+            # ``close --body-file`` once ``F5`` has proved the push. F1 therefore records the
+            # fix and writes the body; it never posts ``Status: fixed`` and never closes.
             StageDefinition(
                 "F1",
                 "iter{iteration}-fix-next-review-followup",
                 "fixer",
                 "fix-next-review-followup.md",
-                ("{pr}",),
+                ("{pr}", "{closing_body}"),
             ),
             StageDefinition(
                 "F2",
@@ -1352,10 +1356,11 @@ def expand(
       (one :class:`FixBatch` per fixing round, in order).
     * ``review`` — ``pr``, ``manifest_path``, ``findings`` (``True``/``False``; ``False``
       omits R2).
-    * ``fix`` — ``pr``, ``round_index``, ``iteration``, ``manifest_path``, plus
-      ``roadmap_file`` and ``checkbox_id`` **for the post-loop half only** (H3.3 req 1:
-      the shared ``I7`` renders them, and it is emitted only when ``include_post_loop`` is
-      true; 05-P1.1's ``F5`` renders ``{pr}`` and needs nothing new).
+    * ``fix`` — ``pr``, ``round_index``, ``iteration``, ``manifest_path``,
+      ``closing_body`` (05-P1.2: F1's absolute closing-body path), plus ``roadmap_file`` and
+      ``checkbox_id`` **for the post-loop half only** (H3.3 req 1: the shared ``I7`` renders
+      them, and it is emitted only when ``include_post_loop`` is true; 05-P1.1's ``F5``
+      renders ``{pr}`` and 05-P1.2's close step renders no prompt at all).
     * ``approve`` — ``pr``.
 
     ``include_post_loop`` (H3.3 req 1) appends :attr:`WorkflowDefinition.post_loop` after

@@ -63,6 +63,8 @@ ROADMAP_FILE = "/repo/docs/tasks/03 - Extraction.md"
 CHECKBOX_ID = "E4.1"
 REL = "docs/task-prompts/03-E4.1-prompt.md"
 PR = 17
+#: F1's closing-body path (05-P1.2): absolute, inside the run directory.
+CLOSING_BODY = "/state/runs/fix-1/artifacts/iter1-closing-body.md"
 
 
 def _finding(priority: str, n: int) -> ParsedFinding:
@@ -901,6 +903,7 @@ def test_fix_expansion_reproduces_the_dry_run_plan() -> None:
         round_index=1,
         iteration=1,
         manifest_path="artifacts/iter1-review-manifest.json",
+        closing_body=CLOSING_BODY,
     )
     assert [
         (stage.name, stage.agent, stage.prompt_file, list(stage.variables), stage.extra)
@@ -909,7 +912,7 @@ def test_fix_expansion_reproduces_the_dry_run_plan() -> None:
         ("round1-approve-review-followups", "review-approver",
          "approve-review-followups.md", [str(PR)], ""),
         ("iter1-fix-next-review-followup", "fixer",
-         "fix-next-review-followup.md", [str(PR)], ""),
+         "fix-next-review-followup.md", [str(PR), CLOSING_BODY], ""),
         ("iter1-test", "tester", "test.md", [],
          registry.FIX_TEST_CONTEXT_EXTRA.format(pr=PR, iteration=1)),
         ("iter1-code-review", "code-reviewer", "code-review.md", [], ""),
@@ -970,13 +973,21 @@ def test_expand_emits_the_post_loop_stage_only_on_request() -> None:
     The tick is emitted once, last, and only under ``include_post_loop`` (which is why the
     flag exists: an unconditional emission would plan and dry-run print it per iteration).
     """
-    iteration = expand("fix", pr=PR, round_index=1, iteration=1, manifest_path="m.json")
+    iteration = expand(
+        "fix",
+        pr=PR,
+        round_index=1,
+        iteration=1,
+        manifest_path="m.json",
+        closing_body=CLOSING_BODY,
+    )
     post = expand(
         "fix",
         pr=PR,
         round_index=1,
         iteration=1,
         manifest_path="m.json",
+        closing_body=CLOSING_BODY,
         include_post_loop=True,
         roadmap_file=ROADMAP_FILE,
         checkbox_id=CHECKBOX_ID,
@@ -1009,9 +1020,16 @@ def test_the_post_loop_expansion_needs_its_two_fields() -> None:
             round_index=1,
             iteration=1,
             manifest_path="m.json",
+            closing_body=CLOSING_BODY,
             include_post_loop=True,
         )
     assert "roadmap_file" in str(missing.value)
+
+    # 05-P1.2: F1's closing-body path is required on the per-iteration expansion too, so a
+    # caller that forgets it fails here rather than writing the body into the target tree.
+    with pytest.raises(StageFieldError) as no_body:
+        expand("fix", pr=PR, round_index=1, iteration=1, manifest_path="m.json")
+    assert "closing_body" in str(no_body.value)
 
 
 def test_expand_never_emits_a_post_loop_stage_for_a_workflow_without_one() -> None:
@@ -1110,7 +1128,13 @@ def test_the_post_loop_expansion_does_no_io(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(Path, "is_file", _explode)
     monkeypatch.setattr(Path, "exists", _explode)
 
-    fields = dict(pr=PR, round_index=1, iteration=1, manifest_path="m.json")
+    fields = dict(
+        pr=PR,
+        round_index=1,
+        iteration=1,
+        manifest_path="m.json",
+        closing_body=CLOSING_BODY,
+    )
     first = expand(
         "fix",
         include_post_loop=True,
@@ -1129,7 +1153,13 @@ def test_the_post_loop_expansion_does_no_io(monkeypatch: pytest.MonkeyPatch) -> 
     assert first == second
     assert first is not second
     assert repr(DEFAULTS) == before
-    assert fields == dict(pr=PR, round_index=1, iteration=1, manifest_path="m.json")
+    assert fields == dict(
+        pr=PR,
+        round_index=1,
+        iteration=1,
+        manifest_path="m.json",
+        closing_body=CLOSING_BODY,
+    )
 
 
 def test_fix_iteration_is_part_of_the_stage_names() -> None:
@@ -1139,6 +1169,7 @@ def test_fix_iteration_is_part_of_the_stage_names() -> None:
         round_index=2,
         iteration=3,
         manifest_path="artifacts/iter3-review-manifest.json",
+        closing_body="/state/runs/fix-1/artifacts/iter3-closing-body.md",
     )
     assert [stage.name for stage in stages] == [
         "round2-approve-review-followups",

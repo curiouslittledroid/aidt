@@ -64,15 +64,19 @@ from aidw.target_config import (
 
 # --------------------------------------------------------------------------- #
 # The five files §4.2 lists as bucket (ii), each with the positional variables the
-# workflow passes it. `test.md` takes none; the other four take exactly one (§6 E7.2
-# "keep their `$1` arity"): the fix prompt its PR, the record prompt its optional branch
-# override, the pr prompt its task id, the implement prompt its task-prompt file.
+# workflow passes it. `test.md` takes none; the record prompt its optional branch override,
+# the pr prompt its task id, the implement prompt its task-prompt file. The fix prompt keeps
+# its `$1` PR (§6 E7.2) and gained `$2`, the absolute closing-body path, when 05-P1.2 moved
+# the close behind the push — so it takes two here, which is what the F1 stage passes.
 # --------------------------------------------------------------------------- #
 
 VARIABLES: Mapping[str, tuple[str, ...]] = {
     "test.md": (),
     "pr.md": ("07-E9.9",),
-    "fix-next-review-followup.md": ("https://example.test/pull/1",),
+    "fix-next-review-followup.md": (
+        "https://example.test/pull/1",
+        "/state/runs/fix-1/artifacts/iter1-closing-body.md",
+    ),
     "record-implementation-results.md": ("07-E9.9",),
     "impliment-task.md": ("07-E9.9-prompt.md",),
 }
@@ -267,25 +271,26 @@ def _neutral_config() -> ResolvedConfig:
 
 @pytest.mark.parametrize("name", sorted(VARIABLES))
 def test_each_prompt_declares_exactly_the_arity_its_stage_passes(name: str) -> None:
-    """``test.md`` takes none; the other four take exactly one (§6 E7.2).
+    """``test.md`` takes none; each other prompt exactly the variables its stage passes.
 
-    Both directions are pinned: the template's highest positional index is 1 for the four
-    (so rendering with no variables raises), and none for ``test.md`` (so it renders
-    without one). Rendering leaves no ``$<digit>`` behind, which is what proves the text
-    the agent receives has no unfilled placeholder.
+    Both directions are pinned: the template's positional indices are exactly ``1..n`` for a
+    prompt with ``n`` variables (so rendering with fewer raises), and there are none for
+    ``test.md`` (so it renders without any). Rendering leaves no ``$<digit>`` behind, which
+    is what proves the text the agent receives has no unfilled placeholder.
     """
     text = load_prompt_file(_path(name))
     expected = VARIABLES[name]
     indices = {int(match) for match in _POSITIONAL.findall(text)}
 
-    assert indices == ({1} if expected else set()), name
+    assert indices == set(range(1, len(expected) + 1)), name
 
     rendered = render(text, expected)
     assert not _POSITIONAL.search(rendered), name
+    for index, value in enumerate(expected):
+        assert value in rendered, (name, index + 1)
     if expected:
-        assert expected[0] in rendered, name
         with pytest.raises(PromptError):
-            render(text, [])
+            render(text, list(expected[:-1]))
 
 
 # --------------------------------------------------------------------------- #

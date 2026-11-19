@@ -3,6 +3,12 @@
 The post-loop roadmap tick (`H3.3`) is exercised with fake ``select`` payloads and the fake
 ``run_stage`` below — never a real Pi model (design §15). Its three skip reasons, its
 task-id resolution and its once-per-run position are all asserted from run state.
+
+Since 05-P1.2 the run also closes its follow-up issues, **after** the commit-and-push stage
+has proved the push. That close is not an agent stage — ``fix.py`` runs the bundled
+``review_followup.py close`` itself — so the fakes model it as a Python-side script call
+(``_FakeStages.close_script``, installed over ``github.run_script``) and keep one ordered
+timeline of what happened, which is what proves the issue was still ``OPEN`` at the push.
 """
 
 from __future__ import annotations
@@ -13,6 +19,8 @@ import subprocess
 import threading
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from aidw import git, github, lock
 from aidw.config import ERROR, WARNING, AgentConfig, Issue, SystemPrompt
@@ -147,6 +155,13 @@ class _FakeStages:
     network, no fake git. ``push=False``, ``commit=False``, ``leave_dirty=True`` and
     ``discard=True`` model the failure modes without inventing a signal the workflow does
     not read.
+
+    Since 05-P1.2 it also models the **deferred close**, which is *not* an agent stage: the
+    workflow runs the bundled ``review_followup.py close`` itself, so :meth:`close_script` is
+    installed as the fake ``github.run_script``. ``F1`` writes its closing comment body to
+    the ``{closing_body}`` variable it was given, ``events`` records the push and the close in
+    one timeline (so a test can prove the order), and ``issues`` is the fake GitHub state the
+    close flips — ``OPEN`` when the push happened, ``CLOSED`` only afterwards.
     """
 
     def __init__(
@@ -158,6 +173,9 @@ class _FakeStages:
         commit: bool = True,
         leave_dirty: bool = False,
         discard: bool = False,
+        write_closing_body: bool = True,
+        close_exit_code: int = 0,
+        issues: dict[int, str] | None = None,
     ) -> None:
         self.names: list[str] = []
         self.specs: list = []
@@ -168,6 +186,15 @@ class _FakeStages:
         self.commit = commit
         self.leave_dirty = leave_dirty
         self.discard = discard
+        self.write_closing_body = write_closing_body
+        self.close_exit_code = close_exit_code
+        self.issues: dict[int, str] = dict(issues or {})
+        #: One ordered timeline of what the run did: ``("stage", name)``, ``("push", state)``
+        #: and ``("close", issue)``. The state snapshot at push time is *copied*, so the
+        #: assertion "the issue was still OPEN before the push" cannot pass by accident.
+        self.events: list[tuple[str, object]] = []
+        #: Every ``close`` call the workflow made, in order.
+        self.closes: list[dict] = []
 
     @staticmethod
     def _apply_fix_edit(spec, repo_root: Path) -> None:
@@ -175,6 +202,52 @@ class _FakeStages:
         path = repo_root / "fix-edits" / f"{spec.name}.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("fixed", encoding="utf-8")
+
+    def _write_closing_body(self, spec) -> None:
+        """Play the fixer's other part: write the body to ``{closing_body}`` (P1.2 req 4)."""
+        if not self.write_closing_body or len(spec.variables) < 2:
+            return
+        path = Path(spec.variables[1])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("Implemented on the current PR branch.\n", encoding="utf-8")
+
+    def close_script(self, argv: list[str], repo_root: Path) -> github.ScriptResult:
+        """Model ``review_followup.py close`` as the workflow invokes it (P1.2 req 2/3).
+
+        The one guard modelled here is the body check, because it is what the workflow
+        depends on: a missing or empty ``--body-file`` must fail the close before any close
+        action. The real script's label/state guards and its ``EXIT_VERIFY_FAILED`` are
+        covered by ``prompts/scripts/review-followup/tests``.
+        """
+        command = argv[2]
+        issue = int(argv[argv.index("--issue") + 1])
+        body_file = (
+            argv[argv.index("--body-file") + 1] if "--body-file" in argv else ""
+        )
+        self.closes.append(
+            {
+                "command": command,
+                "issue": issue,
+                "body_file": body_file,
+                "argv": list(argv),
+                "repo_root": repo_root,
+            }
+        )
+        self.events.append(("close", issue))
+        if self.close_exit_code:
+            return github.ScriptResult(
+                list(argv), self.close_exit_code, "", "error: close refused"
+            )
+        path = Path(body_file) if body_file else None
+        if path is None or not path.is_file() or not path.read_text(encoding="utf-8").strip():
+            return github.ScriptResult(
+                list(argv),
+                github.EXIT_ERROR,
+                "",
+                f"error: --body-file not usable: {body_file or '(missing)'}",
+            )
+        self.issues[issue] = "CLOSED"
+        return github.ScriptResult(list(argv), github.EXIT_OK, "{}", "")
 
     def _apply_commit(self, repo_root: Path) -> None:
         """Play ``F5``'s part: commit the change set and move ``origin/<branch>`` to it."""
@@ -192,6 +265,9 @@ class _FakeStages:
         if self.push:
             branch = git.current_branch(repo_root)
             _git_run(repo_root, "update-ref", f"refs/remotes/origin/{branch}", "HEAD")
+            # The snapshot the deferred close is ordered against (P1.2 req 1/req 3): every
+            # recorded issue is still open at the moment the push landed.
+            self.events.append(("push", dict(self.issues)))
         if self.leave_dirty:
             (repo_root / "left-behind.txt").write_text("dirty", encoding="utf-8")
 
@@ -214,6 +290,7 @@ class _FakeStages:
         self.names.append(spec.name)
         self.specs.append(spec)
         self.repo_roots.append(kwargs["repo_root"])
+        self.events.append(("stage", spec.name))
         if not kwargs.get("dry_run"):
             if spec.name == "update-roadmap":
                 self._apply_tick(spec)
@@ -221,6 +298,7 @@ class _FakeStages:
                 self._apply_commit(kwargs["repo_root"])
             elif spec.name.endswith("fix-next-review-followup"):
                 self._apply_fix_edit(spec, kwargs["repo_root"])
+                self._write_closing_body(spec)
         directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
@@ -261,6 +339,21 @@ def _patch(monkeypatch, *, branch="03-E4.1", select_impl=None, view=None, gh=Tru
               "baseRefName": "main", "headRefName": branch},
     )
     monkeypatch.setattr(github, "select_followups", select_impl or _select_seq([]))
+
+    def _run_script(argv, repo, timeout=600, *, config=None):
+        """Route the bundled ``close`` call to the fake stage object (05-P1.2).
+
+        ``_patch`` runs before a test constructs its ``_FakeStages``, so this resolves the
+        fake lazily from the ``run_stage`` seam the test installs — one object then owns the
+        whole timeline (stage, push, close). Without it the workflow would spawn the real
+        script, which is neither network-free nor what these tests are proving.
+        """
+        close = getattr(fix_workflow.run_stage, "close_script", None)
+        if close is None:  # pragma: no cover - every close test installs a fake
+            return github.ScriptResult(list(argv), github.EXIT_OK, "{}", "")
+        return close(list(argv), repo)
+
+    monkeypatch.setattr(github, "run_script", _run_script)
 
 
 def test_dry_run_lists_child_and_plans(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -1905,6 +1998,257 @@ def test_a_failed_tick_leaves_no_commit_record(tmp_path: Path, monkeypatch) -> N
     assert PR_HEAD_SHA not in state.pr
     assert fix_workflow.PR_COMMIT_SKIP_REASON not in state.pr
     assert _tick_records(state)[0].status == FAILED
+
+
+# --------------------------------------------------------------------------- #
+# The deferred close (05-P1.2, design §8.4/§17 Z9's close-after-push half)
+# --------------------------------------------------------------------------- #
+
+#: Pinned seed and run count for the property run below (AGENTS.md "Tests": pytest only, no
+#: ``hypothesis``, so a reproducible sample is the generator and there is no shrinking).
+
+
+def _closing_bodies(control: Path) -> list[Path]:
+    """Every closing-body file this run's iterations wrote, in iteration order."""
+    directory = _runs_root(control) / _state_of(control).run_id
+    return sorted((directory / "artifacts").glob("iter*-closing-body.md"))
+
+
+def test_a_converged_run_closes_the_recorded_issue_after_the_push(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The happy path: fix, push, **then** the exact marker and the close (P1.2 req 1-4).
+
+    Three facts are asserted together, because any one alone would pass a broken ordering:
+    the issue was still ``OPEN`` at the moment ``F5`` pushed; the close call came after that
+    push; and the path it passed back is the absolute body path ``F1`` was given. The run
+    ends at exit 0 with ``head_sha`` recorded and the issue closed.
+    """
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages(issues={101: "OPEN"})
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
+
+    # The issue was open when the push landed, and closed only after it.
+    assert ("push", {101: "OPEN"}) in stages.events
+    push_at = stages.events.index(("push", {101: "OPEN"}))
+    close_at = stages.events.index(("close", 101))
+    assert close_at > push_at
+    assert stages.issues == {101: "CLOSED"}
+
+    # One close, one issue, one script call — never a batch, never an agent stage.
+    assert [call["command"] for call in stages.closes] == ["close"]
+    assert [call["issue"] for call in stages.closes] == [101]
+    assert "close" not in stages.names
+    assert [call["repo_root"] for call in stages.closes] == [worktree]
+
+    # The body path is absolute, lives in the run directory, and is exactly the value F1
+    # rendered and the run recorded.
+    recorded = stages.closes[0]["body_file"]
+    body = Path(recorded)
+    assert body.is_absolute()
+    assert body == _closing_bodies(control)[0]
+    f1 = next(spec for spec in stages.specs if spec.name.startswith("iter1-fix"))
+    assert f1.variables == ["7", recorded]
+    state = _state_of(control)
+    assert state.pr["closed_issues"][0]["number"] == 101
+    assert state.pr["closed_issues"][0]["closing_body"] == recorded
+    payload = json.loads(
+        (
+            _runs_root(control) / state.run_id / "artifacts" / "fix.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert payload["closed_issues"][0]["closing_body"] == recorded
+    assert state.pr[PR_HEAD_SHA] == _head(worktree)
+    assert state.status == SUCCEEDED
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {"commit": False},
+        {"push": False},
+        {"leave_dirty": True},
+        {"discard": True},
+    ],
+    ids=["no-commit", "no-push", "dirty-after", "discarded-change-set"],
+)
+def test_a_pending_close_with_no_verified_push_fails_closed(
+    tmp_path: Path, monkeypatch, capsys, failure: dict
+) -> None:
+    """Req 5: a recorded fix with a failed push closes nothing, exits 1, stays open.
+
+    Each mode is one of ``F5``'s own failure proofs; the deferred close must not run for
+    any of them, because closing here is exactly the "reported fixed" state P1.2 removes.
+    """
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages(issues={101: "OPEN"}, **failure)
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    assert stages.closes == []
+    assert stages.issues == {101: "OPEN"}
+    assert PR_HEAD_SHA not in _state_of(control).pr
+    assert _state_of(control).status == FAILED
+    err = capsys.readouterr().err
+    assert "#7" in err and "03-H3.3" in err
+
+
+def test_a_close_stage_that_is_skipped_never_closes_a_pending_issue(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 5: "the commit stage is absent/skipped" — a skipped commit also closes nothing.
+
+    D3's table cannot produce this combination today (clean + ≥ 1 closed fails instead), so
+    the guard is forced here: the point is that the close is gated on a *verified* push, not
+    on the table being well formed.
+    """
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages(issues={101: "OPEN"})
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+    monkeypatch.setattr(
+        fix_workflow,
+        "commit_decision",
+        lambda **_kwargs: fix_workflow.CommitDecision(
+            fix_workflow.COMMIT_ACTION_SKIP, "forced skip for this test"
+        ),
+    )
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    assert stages.closes == []
+    assert stages.issues == {101: "OPEN"}
+    err = capsys.readouterr().err
+    assert "#7" in err and "03-H3.3" in err and "#101" in err
+    assert "no commit-and-push verified a push" in err
+    state = _state_of(control)
+    assert PR_HEAD_SHA not in state.pr
+    assert state.status == FAILED
+
+
+def test_a_non_zero_close_exit_fails_the_run_naming_the_issue(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 3: the close's own failure fails the run, after the push has already landed."""
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages(issues={101: "OPEN"}, close_exit_code=1)
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    assert len(stages.closes) == 1
+    # The push did land, so its proof stays recorded — only the close failed.
+    assert _state_of(control).pr[PR_HEAD_SHA] == _head(worktree)
+    assert stages.issues == {101: "OPEN"}
+    err = capsys.readouterr().err
+    assert "#7" in err and "03-H3.3" in err and "#101" in err
+    assert "close" in err and "exited 1" in err
+    assert _state_of(control).status == FAILED
+
+
+def test_a_missing_closing_body_fails_the_close_and_so_the_run(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 4: the body is the fixer's, so an unwritten one fails before any close action."""
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_converging_select())
+    stages = _FakeStages(issues={101: "OPEN"}, write_closing_body=False)
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    assert _closing_bodies(control) == []
+    assert stages.issues == {101: "OPEN"}
+    err = capsys.readouterr().err
+    assert "#101" in err and "--body-file not usable" in err
+
+
+def test_an_empty_run_attempts_no_close(tmp_path: Path, monkeypatch) -> None:
+    """Req 5: `select` found nothing, so there is no close to run — exit 0, no call."""
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _patch(monkeypatch, branch="03-H3.3", select_impl=_select_seq([_select_none()]))
+    stages = _FakeStages(issues={101: "OPEN"})
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
+
+    assert stages.closes == []
+    assert stages.issues == {101: "OPEN"}
+    assert PR_HEAD_SHA not in _state_of(control).pr
+    assert _state_of(control).status == SUCCEEDED
+
+
+def test_two_iterations_close_one_issue_each_in_order(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 6: one close per recorded entry, each with its own iteration's body file."""
+    control, worktree = _fix_layout(tmp_path, branch="03-H3.3")
+    _write_roadmap(worktree)
+    _patch(
+        monkeypatch,
+        branch="03-H3.3",
+        select_impl=_select_seq(
+            [
+                _select_ok(),
+                _select_ok(number=101),
+                _select_ok(number=102, title="Fix the second loop"),
+                _select_none(),
+            ]
+        ),
+    )
+    stages = _FakeStages(issues={101: "OPEN", 102: "OPEN"})
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
+
+    assert [call["issue"] for call in stages.closes] == [101, 102]
+    bodies = [Path(call["body_file"]).name for call in stages.closes]
+    assert bodies == ["iter1-closing-body.md", "iter2-closing-body.md"]
+    # Both closes still come after the single post-loop push.
+    push_at = stages.events.index(("push", {101: "OPEN", 102: "OPEN"}))
+    assert stages.events.index(("close", 101)) > push_at
+    assert stages.events.index(("close", 102)) > push_at
+    assert stages.issues == {101: "CLOSED", 102: "CLOSED"}
+    assert [entry["number"] for entry in _state_of(control).pr["closed_issues"]] == [
+        101,
+        102,
+    ]
+
+
+def test_closing_body_path_is_absolute_and_per_iteration(tmp_path: Path) -> None:
+    """Purity: the path is derived, absolute, and never shares a file across iterations."""
+    first = fix_workflow.closing_body_path(tmp_path / "run", 1)
+    second = fix_workflow.closing_body_path(tmp_path / "run", 2)
+
+    assert first.is_absolute(), first
+    assert first == tmp_path / "run" / "artifacts" / "iter1-closing-body.md"
+    assert first.name != second.name
+    assert fix_workflow.closing_body_path(tmp_path / "run", 1) == first
+
+
+def test_close_failure_message_names_the_pr_the_branch_and_the_issue() -> None:
+    """Req 3: one message shape, and it names the issue as well as the PR and branch."""
+    message = fix_workflow.close_failure_message(42, "03-H3.3", 101, "`close` exited 1")
+
+    assert message.startswith("close failed for PR #42 on branch `03-H3.3`")
+    assert "issue #101" in message
+    assert "`close` exited 1" in message
+    assert "(unresolved)" in fix_workflow.close_failure_message(42, None, 7, "why")
 
 
 # --------------------------------------------------------------------------- #
