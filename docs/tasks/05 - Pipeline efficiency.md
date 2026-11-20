@@ -118,7 +118,7 @@ expensive authoring stage.
   - Tests: `tests/test_findings.py`, `tests/test_prompt_workflow.py`, `tests/test_design_doc.py`.
   - Notes: The block mechanism already exists in §8.1 (the author reports `blocked:`); this adds it at the review layer so the run fails fast on a spec gap instead of burning the fix/reconcile loop "fixing" prose for a gap only the spec can close. An unclassified finding must fail closed, like §18's other malformed-verdict rules.
 
-- [ ] **G1.2. Check task feasibility before the authoring stage** (Design 8.1)
+- [x] **G1.2. Check task feasibility before the authoring stage** (Design 8.1)
   - Done when: the `prompt` workflow runs a cheap Python preflight (no Pi model) before `P1 task-prompt` that verifies the roadmap entry's cited spec sections exist and are non-empty and the task's prerequisites are ticked, and refuses (exit 2 or 3) naming the gaps instead of spending a full authoring run that later reports `blocked:`; the author-side feasibility check inside the `task-prompt` prompt remains as the semantic backstop; design §8.1 is updated; and the five gates above are green.
   - Deliverable: `aidw/workflows/prompt.py` (the preflight), design.md §8.1, and the tests below.
   - Tests: `tests/test_prompt_workflow.py`, `tests/test_design_doc.py`.
