@@ -204,6 +204,91 @@ def test_s1_2_design_sections_and_next_free_decision_row_are_recorded() -> None:
     assert len(rows) == 1, f"expected exactly one S1.2 decision row, found {len(rows)}"
 
 
+def _section_73_block(design: str) -> str:
+    """The §7.3 ``Prompt rendering`` block: its heading up to the §7.4 heading."""
+    start = design.index("### 7.3 Prompt rendering")
+    end = design.index("### 7.4 ", start)
+    return design[start:end]
+
+
+def test_c1_1_section_7_3_drops_the_agents_md_append_and_keeps_conventions() -> None:
+    """C1.1: §7.3 step 4 states the new default and the marker that restores the old one.
+
+    The design is what the next reader builds from: leaving step 4 saying the root
+    ``AGENTS.md`` is appended would keep the duplication C1.1 removes, and omitting the
+    marker would strand a repo whose agents set ``no_context_files: true`` (§5.5) with no
+    ``AGENTS.md`` at all.
+    """
+    # Whitespace-flattened: the step is hard-wrapped, and the pinned sentences span lines.
+    block = " ".join(_section_73_block(_design_md()).split())
+
+    # The kept half: the source Pi does not provide, appended where a prompt takes it.
+    assert "`aidw/conventions.md`" in block
+    # The dropped half, with its reason (§5.5) and the opt-in that restores it.
+    assert "The root `AGENTS.md` is **not** appended" in block
+    assert "project context at `cwd` = target root (§5.5)" in block
+    assert "`append_agents_md: true`" in block
+    assert "`no_context_files: true`" in block
+    assert "resolved prompt path" in block
+    assert "YAML boolean `true`" in block
+    # The read channel is explicitly left alone, because `_gate_block` depends on it.
+    assert "read_conventions_sources" in block
+    assert "`CONVENTIONS_SOURCES`" in block
+    assert "`aidw/workflows/prompt.py:_gate_block`" in block
+    # The pre-C1.1 claim that step 4 appends both sources is gone.
+    assert "root `AGENTS.md` plus optional" not in block
+    assert "`AGENTS.md` plus optional `<target>/aidw/conventions.md`" not in block
+
+
+def test_c1_1_decision_row_records_the_agents_md_append_split() -> None:
+    """C1.1: one §17 row records the split, its marker lever and its prompt-fixed choices.
+
+    Matched by task id + wording, never by a hardcoded ``Z`` number: the roadmap's stale
+    "recorded as Z12" collides with S1.2's row, and ``aidw/conventions.md`` forbids reusing
+    or renumbering an id, so the row takes the next free id and this pin must not pin it.
+    """
+    design = _design_md()
+    decisions = _section(design, "## 17. Resolved decisions", "## 18. Risks")
+
+    rows = [
+        line
+        for line in decisions.splitlines()
+        if re.match(r"^\| Z\d+ \|", line)
+        and "C1.1" in line
+        and "append_agents_md" in line
+    ]
+    assert len(rows) == 1, f"expected exactly one C1.1 decision row, found {len(rows)}"
+    row = rows[0]
+    # The behaviour the code implements: AGENTS.md dropped, conventions.md kept, marker opt-in.
+    assert "AGENTS.md" in row and "`aidw/conventions.md`" in row
+    assert "`append_agents_md: true`" in row
+    assert "§7.3" in row and "§5.5" in row
+    assert "appends_target_agents_md" in row
+    assert "include_agents_md" in row
+    # The read channel it must not move is named, so C1.2 cannot quietly lose its source.
+    assert "read_conventions_sources" in row
+    assert "CONVENTIONS_SOURCES" in row
+    assert "_gate_block" in row
+    # The prompt-fixed decisions travel with the row (Z2/Z9/Z11's precedent).
+    assert "Prompt-fixed decisions" in row
+    for decision in ("(a)", "(b)", "(c)", "(d)", "(e)"):
+        assert decision in row, decision
+    # No §17 id is reused: every Z id appears exactly once (``aidw/conventions.md``).
+    ids = re.findall(r"^\| (Z\d+) \|", decisions, re.M)
+    duplicates = sorted({identifier for identifier in ids if ids.count(identifier) > 1})
+    assert duplicates == [], f"reused §17 decision ids: {duplicates}"
+    # And C1.1 is not S1.2's Z12 row.
+    assert not row.startswith("| Z12 |")
+    # The touched set is named, so a later reader can find the contract tests.
+    for path in (
+        "aidw/prompts.py",
+        "design.md",
+        "tests/test_conventions_injection.py",
+        "tests/test_design_doc.py",
+    ):
+        assert path in row, path
+
+
 def _section_83_block(design: str) -> str:
     """The §8.3 ``aidw review`` block: its heading up to the §8.4 heading."""
     start = design.index("### 8.3 `aidw review --pr <n>`")

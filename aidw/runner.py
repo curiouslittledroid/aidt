@@ -754,11 +754,13 @@ def run_stage(
     rendered = render_prompt_file(spec.prompt, spec.variables)
     if spec.extra:
         rendered = f"{rendered}\n\n{spec.extra}"
-    # E7.3/D16: the *target* repo's conventions (root ``AGENTS.md`` then optional
-    # ``aidw/conventions.md``) reach exactly the five EXTRACTION.md §3.8/Z13 prompts, keyed
-    # by the resolved prompt basename rather than the stage id (``test.md`` runs as both
-    # ``test`` and ``iter{n}-test``; ``update-traceability.md`` is Z13's fifth). Applied
-    # last — after ``spec.extra`` — so the agent
+    # E7.3/D16: the *target* repo's conventions reach exactly the five EXTRACTION.md
+    # §3.8/Z13 prompts, keyed by the resolved prompt basename rather than the stage id
+    # (``test.md`` runs as both ``test`` and ``iter{n}-test``; ``update-traceability.md`` is
+    # Z13's fifth). Since C1.1 the appended block is ``aidw/conventions.md`` only, because
+    # Pi already delivers the root ``AGENTS.md`` as project context (§5.5); a prompt whose
+    # resolved file declares ``append_agents_md: true`` in its frontmatter opts back in
+    # (design §17 Z15). Applied last — after ``spec.extra`` — so the agent
     # reads prompt body → stage extra → repo conventions, and both the written
     # ``.rendered.md`` below and the stdin payload to Pi carry the same text. A repo with
     # no conventions and a prompt outside the five both return the text unchanged, so this

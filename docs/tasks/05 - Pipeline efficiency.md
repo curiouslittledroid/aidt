@@ -87,7 +87,7 @@ context, and gate commands — deliberately "never inlined" — are re-derived b
 misreported as `unavailable` by the evidence bundle when the target repo uses a non-canonical
 heading. This epic removes the duplication and makes gate commands resolve once, correctly.
 
-- [ ] **C1.1. Stop appending the target `AGENTS.md` to rendered prompts** (Design 7.3, Design 5.5)
+- [x] **C1.1. Stop appending the target `AGENTS.md` to rendered prompts** (Design 7.3, Design 5.5)
   - Done when: `aidw/prompts.py` no longer appends the root `AGENTS.md` body to the rendered prompt for the prompts that already receive it via Pi's project-instructions channel, while the `aidw/conventions.md` append (which Pi does not provide) is preserved; a config flag or per-prompt marker keeps the old append for a repo that needs it; design §7.3 is updated and the decision recorded as Z12; and the five gates above are green.
   - Deliverable: `aidw/prompts.py` (`inject_repo_conventions` split), design.md §§7.3, 17 (row Z12), and the tests below.
   - Tests: `tests/test_prompts.py` (or the rendering test that covers `inject_repo_conventions`), `tests/test_inventory.py`, `tests/test_design_doc.py`.
