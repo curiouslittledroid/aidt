@@ -3,7 +3,7 @@
 **Branch:** `05-C1.2`
 **Date:** 2026-11-20
 **Spec:** `design.md` §7.3 (prompt rendering, decision D2 — step 4, the gate-block read channel), §8.1 (`aidw prompt`, the P2 evidence bundle's gate-commands element), §17 (resolved decisions, row Z16); roadmap entry C1.2 in `docs/tasks/05 - Pipeline efficiency.md`; `docs/task-prompts/05-C1.2-prompt.md`; `docs/target-repo-config.md` (config contract); `aidw/conventions.md` (traceability artefacts)
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** #173 — https://github.com/curiouslittledroid/aidt/pull/173
 
 ## Summary
 
