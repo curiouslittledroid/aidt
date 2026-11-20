@@ -36,8 +36,10 @@
   so it cannot tell those two apart; keep the invariant by not creating `aidw/` until you have a
   `config.yaml`.
 - `conventions.md` is optional repo-stack material (gates, package manager, placement rules)
-  injected into the `task-prompt`, `impliment-task`, `test` and `record-implementation-results`
-  prompts (§3.8/D16). It is not a config key; `paths.*` does not point at it.
+  injected into the `task-prompt`, `impliment-task`, `test`, `record-implementation-results` and
+  `update-traceability` prompts (§3.8/D16; `update-traceability` added by W1.1, design §17 Z13).
+  It is also where a repo declares its **traceability artefacts**, including "none" (design
+  §12.1). It is not a config key; `paths.*` does not point at it.
 - `prompts/` is optional and holds prompt overrides **by filename** — the second step of the
   prompt-resolution order below. Nothing in it is a config key either.
 - `AGENTS.md` at the repo root is read by Pi itself; `aidw/` config does not replace it.

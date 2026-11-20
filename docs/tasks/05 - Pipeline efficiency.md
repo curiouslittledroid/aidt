@@ -151,7 +151,7 @@ gaps: a stage rewrote a file another stage owns byte-exclusively, and a preview 
 a later `--resume` then adopted. Both are silent — every gate stayed green, and the only symptom
 was a missing PR.
 
-- [ ] **W1.1. `update-traceability` (I3) must not edit the roadmap** (Design 8.2, Design 12.1, Design 17)
+- [x] **W1.1. `update-traceability` (I3) must not edit the roadmap** (Design 8.2, Design 12.1, Design 17)
   - Done when: an `implement` run whose change set leaves `I3` no plausible artefact reports "none" and leaves `paths.roadmap_dir` **byte-identical**, so `I7`'s byte-exact tick postcondition stays satisfiable in the same run; a repo can declare its traceability artefacts (including "none") in `aidw/conventions.md` and `I3` reads that declaration; and a test fails if the exclusion or the conventions channel stops reaching `I3`.
   - Deliverable: `prompts/update-traceability.md` (the hard rule), `aidw/prompts.py` (`CONVENTIONS_PROMPTS`, so the target-repo conventions reach `I3`), `aidw/conventions.md` (this repo's declaration, drafted on this branch), design.md §12.1 and a §17 row, and the tests below.
   - Tests: `tests/test_prompt_workflow.py` (the conventions set and its injection), `tests/test_prompt_neutrality.py`, `tests/test_implement_workflow.py`.

@@ -1,11 +1,15 @@
 """Contract and property tests for the repo-conventions injection (E7.3, EXTRACTION.md §3.8/D16).
 
-The channel this module pins is deliberately narrow: **exactly four** prompts
+The channel this module pins is deliberately narrow: **exactly five** prompts
 (``task-prompt.md``, ``impliment-task.md``, ``test.md``,
-``record-implementation-results.md``) receive the *target* repo's root ``AGENTS.md`` and
-its optional ``aidw/conventions.md``, in that order, verbatim, keyed by the **resolved
-prompt basename** rather than by stage id — and everything else is byte-identical. The
-four traps the task prompt names each get their own test rather than a comment:
+``record-implementation-results.md``, ``update-traceability.md``) receive the *target*
+repo's root ``AGENTS.md`` and its optional ``aidw/conventions.md``, in that order,
+verbatim, keyed by the **resolved prompt basename** rather than by stage id — and
+everything else is byte-identical. ``update-traceability.md`` is W1.1's fifth (design §17
+Z13): ``I3`` must never edit ``paths.roadmap_dir``, and a repo can only declare its
+traceability artefacts — including "none" — to ``I3`` if the conventions channel reaches
+that prompt. The four traps the task prompt names each get their own test rather than a
+comment:
 
 1. **Two roots.** The fixture's ``AGENTS.md`` carries :data:`AGENTS_SENTINEL`, which the
    toolkit's own ``AGENTS.md`` cannot contain, and the assertions also require a
@@ -89,14 +93,15 @@ target-fixture lint && target-fixture test
 {CONVENTIONS_SENTINEL}
 """
 
-#: The four prompts §3.8/D16 names, each with the positional variables its stage passes
-#: (``task-prompt`` takes phase/epic/task, ``impliment-task`` the prompt path,
-#: ``test`` none, ``record-implementation-results`` the branch).
-FOUR_PROMPTS: dict[str, list[str]] = {
+#: The five prompts §3.8/D16 and W1.1/Z13 cover, each with the positional variables its
+#: stage passes (``task-prompt`` takes phase/epic/task, ``impliment-task`` the prompt path,
+#: ``test`` none, ``record-implementation-results`` and ``update-traceability`` the branch).
+FIVE_PROMPTS: dict[str, list[str]] = {
     "task-prompt.md": ["03", "E7", "E7.3"],
     "impliment-task.md": ["docs/task-prompts/00-E7.3-prompt.md"],
     "test.md": [],
     "record-implementation-results.md": ["00-E7.3"],
+    "update-traceability.md": ["00-E7.3"],
 }
 
 
@@ -171,12 +176,12 @@ def _dry_run(
 
 
 # --------------------------------------------------------------------------- #
-# The four prompts receive both sources, AGENTS.md first (§3.8, D16)
+# The five prompts receive both sources, AGENTS.md first (§3.8, D16; W1.1/Z13)
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("basename", sorted(FOUR_PROMPTS))
-def test_each_of_the_four_prompts_receives_both_sources_in_d16_order(
+@pytest.mark.parametrize("basename", sorted(FIVE_PROMPTS))
+def test_each_of_the_five_prompts_receives_both_sources_in_d16_order(
     tmp_path: Path, basename: str
 ) -> None:
     """Hand-calculated example: the rendered prompt carries both files, in D16 order."""
@@ -188,7 +193,7 @@ def test_each_of_the_four_prompts_receives_both_sources_in_d16_order(
         target,
         name=basename.removesuffix(".md"),
         prompt=prompt,
-        variables=FOUR_PROMPTS[basename],
+        variables=FIVE_PROMPTS[basename],
     )
 
     assert AGENTS_SENTINEL in rendered
@@ -207,14 +212,20 @@ def test_each_of_the_four_prompts_receives_both_sources_in_d16_order(
     assert '"status": "succeeded"' in state_json
 
 
-def test_the_four_prompts_are_exactly_the_section_3_8_set() -> None:
-    """The frozen set is §3.8's list — not a superset a later prompt could join silently."""
+def test_the_five_prompts_are_exactly_the_injection_set() -> None:
+    """The frozen set is §3.8's four plus W1.1/Z13's fifth — no silent superset.
+
+    Dropping ``update-traceability.md`` from :data:`CONVENTIONS_PROMPTS` fails this
+    assertion, which is the regression W1.1 exists to prevent: ``I3`` would go back to
+    being unable to hear a repo's "the roadmap is not yours" declaration.
+    """
     assert CONVENTIONS_PROMPTS == frozenset(
         {
             "task-prompt.md",
             "impliment-task.md",
             "test.md",
             "record-implementation-results.md",
+            "update-traceability.md",
         }
     )
     assert CONVENTIONS_SOURCES == ("AGENTS.md", "aidw/conventions.md")
@@ -237,7 +248,7 @@ def test_missing_conventions_md_contributes_nothing_and_the_run_succeeds(
         target,
         name="impliment-task",
         prompt=prompt,
-        variables=FOUR_PROMPTS["impliment-task.md"],
+        variables=FIVE_PROMPTS["impliment-task.md"],
     )
 
     assert AGENTS_SENTINEL in rendered
@@ -421,6 +432,48 @@ def test_receives_repo_conventions_keys_on_the_resolved_basename(
     assert receives_repo_conventions(toolkit_root() / "prompts" / "code-review.md") is False
 
 
+def test_the_traceability_prompt_is_injected_by_basename_not_by_stage_id(
+    tmp_path: Path,
+) -> None:
+    """W1.1/Z13: ``I3``'s prompt is keyed by its file, so a repo shadow is injected too.
+
+    The stage id and the toolkit default's basename coincide (``update-traceability``), so
+    a name-based key would pass by luck. The two halves separate them: the repo's shadowed
+    ``aidw/prompts/update-traceability.md`` (D14 precedence 2) is injected under a stage
+    name that is *not* the basename, and a stage actually named ``update-traceability``
+    rendering another file receives nothing.
+    """
+    target = _target(tmp_path)
+    shadow = target / "aidw" / "prompts" / "update-traceability.md"
+    shadow.parent.mkdir(parents=True)
+    shadow.write_text("# repo traceability rules\n", encoding="utf-8")
+
+    resolved = resolve_prompt(toolkit_root(), target, "update-traceability")
+    assert resolved == shadow
+    rendered, _state = _dry_run(
+        tmp_path,
+        target,
+        name="traceability-shadow",
+        prompt=resolved,
+        variables=FIVE_PROMPTS["update-traceability.md"],
+    )
+
+    assert "# repo traceability rules" in rendered
+    assert AGENTS_SENTINEL in rendered
+    assert CONVENTIONS_SENTINEL in rendered
+
+    # The mirror: the stage name alone proves nothing — the file decides.
+    rendered, _state = _dry_run(
+        tmp_path,
+        target,
+        name="update-traceability",
+        prompt=toolkit_root() / "tests" / "fixtures" / "noop.md",
+    )
+
+    assert AGENTS_SENTINEL not in rendered
+    assert CONVENTIONS_SENTINEL not in rendered
+
+
 # --------------------------------------------------------------------------- #
 # Two roots: ``repo_root`` is the target, never ``toolkit_root()``
 # --------------------------------------------------------------------------- #
@@ -437,7 +490,7 @@ def test_the_target_root_is_the_read_source_not_the_toolkit_root(
         target,
         name="impliment-task",
         prompt=toolkit_root() / "prompts" / "impliment-task.md",
-        variables=FOUR_PROMPTS["impliment-task.md"],
+        variables=FIVE_PROMPTS["impliment-task.md"],
     )
 
     assert AGENTS_SENTINEL in rendered
@@ -481,7 +534,7 @@ def test_injection_does_not_mutate_the_prompt_file_or_the_variables(
     target = _target(tmp_path)
     prompt = toolkit_root() / "prompts" / "task-prompt.md"
     before = prompt.read_bytes()
-    variables = list(FOUR_PROMPTS["task-prompt.md"])
+    variables = list(FIVE_PROMPTS["task-prompt.md"])
     snapshot = list(variables)
 
     injected = inject_repo_conventions("rendered body\n", prompt, target)
@@ -579,7 +632,7 @@ def test_an_empty_source_contributes_no_dangling_header(tmp_path: Path) -> None:
 
 #: The property seed and run count, pinned so the sample is reproducible. Series 1: every
 #: prompt file the toolkit ships, sorted — ``seed = PROMPT_SEED``, ``numRuns =
-#: PROMPT_NUM_RUNS``. The claim it sweeps is the whole allowlist: exactly the four §3.8
+#: PROMPT_NUM_RUNS``. The claim it sweeps is the whole allowlist: exactly the five §3.8/Z13
 #: basenames are injected and every other shipped prompt is unchanged.
 PROMPT_SEED: tuple[str, ...] = tuple(
     sorted(path.name for path in (toolkit_root() / "prompts").glob("*.md"))
@@ -605,10 +658,10 @@ def test_the_property_seeds_are_the_pinned_sample() -> None:
 
 
 @pytest.mark.parametrize("basename", PROMPT_SEED)
-def test_property_exactly_the_four_shipped_prompts_are_injected(
+def test_property_exactly_the_five_shipped_prompts_are_injected(
     tmp_path: Path, basename: str
 ) -> None:
-    """Sweep 1 over every shipped prompt: injected iff its basename is one of the four."""
+    """Sweep 1 over every shipped prompt: injected iff its basename is one of the five."""
     target = _target(tmp_path)
     prompt = toolkit_root() / "prompts" / basename
     body = "rendered body\n"

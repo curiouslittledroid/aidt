@@ -29,7 +29,22 @@ stage to update. Do not invent an artefact, a status vocabulary or a generated f
 something to change.
 
 Do **not** touch implementation code, unit tests, integration suites, specs, the build-results
-document (`paths.implementation_results_dir`), or the architecture documents.
+document (`paths.implementation_results_dir`), the architecture documents, or anything under
+`paths.roadmap_dir`.
+
+### The roadmap belongs to `/update-roadmap`
+
+`paths.roadmap_dir` is owned **byte-exclusively** by the `/update-roadmap` stage. Never edit
+anything under it: not this task's own checkbox, and not an entry's `Done when`, `Deliverable`,
+`Tests` or `Notes`. That stage's postcondition allows exactly one `- [ ]` → `- [x]` substitution
+on exactly one line, with every other byte of the file unchanged, so an edit made here cannot be
+reconciled with it — it fails the run after every gate has already passed. A task entry is fixed
+at authoring time, and a correction discovered mid-implementation belongs in the task prompt or
+the repo's decision record, never in a roadmap entry.
+
+When the roadmap is the only candidate traceability artefact this repo has, the correct outcome is
+to report **None for traceability** (step 7). "None" is a valid result, never a licence to adopt
+the roadmap as a traceability artefact.
 
 ## Instructions
 
@@ -58,7 +73,9 @@ document (`paths.implementation_results_dir`), or the architecture documents.
    one. Recording a status the evidence does not support is the failure mode this stage exists to
    prevent — it is never a way to make a checker pass.
 7. If this change is out of scope for an artefact the repo maintains, record that conclusion and
-   its reason rather than silently omitting the entry.
+   its reason rather than silently omitting the entry. A repo with no traceability artefact at
+   all — including one whose only candidate is the roadmap — reports **None for traceability**
+   and stops there.
 8. Run the repo's traceability checks and report their real outcomes. Run each through
    `aidw gate run <key> -- <command>`, with the gates named as `pr.md` names them and the same
    `--ignore` scope `pr.md` declares, so the outcome is recorded against the tree it gated and
@@ -77,6 +94,8 @@ document (`paths.implementation_results_dir`), or the architecture documents.
   `/record-implementation-results` stage owns that.
 - Do **not** edit specs, or any artefact entry unrelated to this task's requirements.
 - Do **not** change a status to make a checker pass.
+- Do **not** edit anything under `paths.roadmap_dir`, not even this task's own checkbox — the
+  `/update-roadmap` stage owns that file byte-exclusively.
 
 ## Done when
 

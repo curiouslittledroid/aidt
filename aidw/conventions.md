@@ -17,7 +17,9 @@ actually changes:
 | `docs/target-repo-config.md` | The `<target>/aidw/config.yaml` contract. | `tests/test_target_repo_config_doc.py`, drift-checked against `aidw/target_config.py` |
 
 There is **no** generated traceability matrix, coverage table or report in this repo, and none is
-expected. "No artefact to update" is a valid `I3` outcome and is reported as such.
+expected. "No artefact to update" — reported by the stage as "None for traceability" — is a valid
+`I3` outcome and is reported as such. The roadmap is never one of these artefacts and is never
+added to this table: a repo whose only candidate is the roadmap has "no artefact to update".
 
 ## `docs/tasks/` belongs to `update-roadmap`, not `update-traceability`
 

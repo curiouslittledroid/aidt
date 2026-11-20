@@ -628,11 +628,15 @@ RETAINED_DEFAULTS: Mapping[str, tuple[str, ...]] = {
 #: precisely the failure these three were rewritten to remove.
 RETAINED_KEYS: Mapping[str, tuple[str, ...]] = {
     "task-prompt.md": ("roadmap_dir", "task_prompts_dir"),
-    # H3.1 moved the roadmap checkbox to the core ``/update-roadmap`` stage, so I3 no
-    # longer names ``roadmap_dir`` at all.
+    # W1.1/Z13 reverses the H3.1 note that used to live here. H3.1 moved the roadmap
+    # *tick* to the core ``/update-roadmap`` stage, but I3 must still name ``roadmap_dir``:
+    # it now names the tree it may never edit, and naming the config key is what keeps that
+    # prohibition free of the ``docs/tasks`` product literal. Leaving the old comment would
+    # assert the opposite of the prompt and make this coverage pin nothing.
     "update-traceability.md": (
         "task_prompts_dir",
         "implementation_results_dir",
+        "roadmap_dir",
     ),
     "update-architecture.md": ("architecture_dir",),
 }
@@ -669,3 +673,23 @@ def test_retained_defaults_name_config_keys_that_resolve_under_both_configs(
             resolved = config[f"paths.{key}"]
             assert resolved.value is not None, (name, key)
             assert resolved.source in (SOURCE_DEFAULT, SOURCE_CONFIG), (name, key)
+
+
+def test_the_traceability_default_states_the_roadmap_ownership_rule() -> None:
+    """W1.1/Z13: the prompt names the key and the owning stage, and forbids the edit.
+
+    The vocabulary sweep proves no ``docs/tasks`` literal came back; this proves the rule the
+    literal was replaced *by* is in the rendered text, so a later neutralisation cannot drop
+    the ownership sentence and stay green by naming the key in a heading alone.
+    """
+    rendered = " ".join(
+        render_prompt_file(
+            _path("update-traceability.md"), RETAINED_DEFAULTS["update-traceability.md"]
+        ).split()
+    )
+
+    assert "paths.roadmap_dir" in rendered
+    assert "/update-roadmap" in rendered
+    assert "None for traceability" in rendered
+    assert "Never edit anything under it" in rendered
+    assert "docs/tasks" not in rendered

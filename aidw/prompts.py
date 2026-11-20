@@ -11,7 +11,7 @@ template expansion, which does not run for CLI invocations (design §7.3).
 
 The module also owns the **repo-conventions channel** (EXTRACTION.md §3.8, D16; task
 E7.3): :func:`read_conventions_sources` reads the *target* repo's root ``AGENTS.md`` and
-its optional ``aidw/conventions.md`` in D16 order, and both consumers — the four-prompt
+its optional ``aidw/conventions.md`` in D16 order, and both consumers — the five-prompt
 injection the runner applies and the prompt workflow's evidence bundle
 (``aidw.workflows.prompt._gate_block``) — read through it, so there is one channel, not
 two.
@@ -82,17 +82,21 @@ def render_prompt_file(
 # Repo conventions injection (EXTRACTION.md §3.8 / D16; task E7.3)
 # --------------------------------------------------------------------------- #
 
-#: The four prompts that receive the target repo's conventions, keyed by the **resolved
-#: prompt file's basename** (§3.8, D16) — never by stage id. ``test.md`` runs under two
-#: stage names (``test`` in ``_IMPLEMENT``, ``iter{iteration}-test`` in ``_FIX``,
-#: ``aidw/stage_registry.py``), and a repo-shadowed prompt (§3.6 precedence 2/3) keeps its
-#: basename, so keying on the file is what makes both cases work.
+#: The five prompts that receive the target repo's conventions, keyed by the **resolved
+#: prompt file's basename** (§3.8, D16; ``update-traceability.md`` added by W1.1, design §17
+#: Z13) — never by stage id. ``test.md`` runs under two stage names (``test`` in
+#: ``_IMPLEMENT``, ``iter{iteration}-test`` in ``_FIX``, ``aidw/stage_registry.py``), and a
+#: repo-shadowed prompt (§3.6 precedence 2/3) keeps its basename, so keying on the file is
+#: what makes both cases work. ``update-traceability.md`` is the fifth because the roadmap
+#: tick's owner (``I7``) can only be protected if the repo can declare its artefact list —
+#: including "none" — to ``I3``; Z13 records why the rule cannot live in conventions alone.
 CONVENTIONS_PROMPTS: frozenset[str] = frozenset(
     {
         "task-prompt.md",
         "impliment-task.md",
         "test.md",
         "record-implementation-results.md",
+        "update-traceability.md",
     }
 )
 
@@ -116,7 +120,7 @@ def read_conventions_sources(repo_root: Path) -> tuple[tuple[str, str], ...]:
     unreadable or empty file is simply not returned, so "a repo with no conventions yet"
     (§3.4) contributes nothing rather than a placeholder or a raise.
 
-    This is the single conventions channel: the four-prompt injection
+    This is the single conventions channel: the five-prompt injection
     (:func:`inject_repo_conventions`) and the prompt workflow's evidence bundle
     (``aidw.workflows.prompt._gate_block``) both read through it.
 
@@ -158,7 +162,7 @@ def render_repo_conventions(repo_root: Path) -> str:
 
 
 def receives_repo_conventions(prompt: Path) -> bool:
-    """Whether ``prompt`` is one of the four §3.8 prompts, by resolved basename.
+    """Whether ``prompt`` is one of the five §3.8/Z13 prompts, by resolved basename.
 
     ``prompt`` is the *resolved* path (``spec.prompt``), so a repo shadow (§3.6
     precedence 2) and a declared explicit path (precedence 1) are keyed exactly like the
