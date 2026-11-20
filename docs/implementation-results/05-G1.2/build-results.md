@@ -3,7 +3,7 @@
 **Branch:** `05-G1.2`
 **Date:** 2026-11-20
 **Spec:** `design.md` §§8.1, 14, 17 (row Z19); `docs/roadmap-format.md` §§8, 10
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** #176 — https://github.com/curiouslittledroid/aidt/pull/176
 
 ## Summary
 
