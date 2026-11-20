@@ -474,12 +474,30 @@ def _check_architecture_trigger(root: Path) -> Check:
     has no write-target to justify one, and an absent ``when_paths`` keeps the default, so
     neither warns. A non-empty declaration is the operator's own trigger set and needs no
     advice. Read-only: one config load, nothing written (§3.1).
+
+    Undeclared is not disabled (review follow-up #168, PR #166): a repo with **no declared
+    ``workflows.implement.stages`` list** — no config file at all, or an ``implement``
+    mapping without the key — runs the registry expansion, where ``I4`` is repo-optional
+    (:data:`aidw.stage_registry.REPO_OPTIONAL_IDS`) with default ``enabled: true``, so the
+    toolkit default ``docs/architecture`` trigger is in force and the check says so.
+    "Not enabled" stays reserved for the only cases where it is true: a declared list
+    that omits ``I4`` (the whole-list override, §3.4) or an entry with ``enabled: false``.
+    Declared-ness is read from ``WorkflowConfig._declared`` — the same key set the config
+    round-trip and the resolution merge use — never from stage-list truthiness, because a
+    declared ``stages: []`` is a declaration the validator owns and an undeclared list
+    leaves ``workflow.stages`` empty either way.
     """
     declared = load_target_config(root / "aidw" / "config.yaml")
     workflow = declared.workflows.get("implement")
     entry = None
     if workflow is not None:
         entry = next((stage for stage in workflow.stages if stage.id == "I4"), None)
+    if workflow is None or "stages" not in workflow._declared:
+        return Check(
+            "architecture trigger",
+            OK,
+            "I4 update-architecture uses the toolkit default docs/architecture",
+        )
     if entry is None or not entry.enabled:
         return Check("architecture trigger", OK, "I4 update-architecture not enabled")
     if entry.when_paths is None:

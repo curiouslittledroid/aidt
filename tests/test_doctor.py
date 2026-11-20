@@ -804,6 +804,95 @@ def test_doctor_warns_only_for_enabled_i4_with_an_empty_effective_path_set(
         assert "diagram-input" in detail
 
 
+#: Review follow-up #168 (PR #166): the two OK details for the architecture-trigger
+#: check. An *undeclared* ``workflows.implement.stages`` list runs the registry
+#: expansion, where I4 is repo-optional with default ``enabled: true``, so the toolkit
+#: default ``docs/architecture`` trigger is in force; "not enabled" is only true when a
+#: *declared* list omits I4 (whole-list override, §3.4) or disables it.
+_I4_DEFAULT_DETAIL = "I4 update-architecture uses the toolkit default docs/architecture"
+_I4_NOT_ENABLED_DETAIL = "I4 update-architecture not enabled"
+
+
+@pytest.mark.parametrize(
+    ("config_text", "expected_detail"),
+    [
+        pytest.param("", _I4_DEFAULT_DETAIL, id="no-config"),
+        pytest.param(
+            "schema_version: 1\n",
+            _I4_DEFAULT_DETAIL,
+            id="config-without-workflows",
+        ),
+        pytest.param(
+            "schema_version: 1\nworkflows:\n  implement: {}\n",
+            _I4_DEFAULT_DETAIL,
+            id="implement-without-stages-key",
+        ),
+        pytest.param(
+            "schema_version: 1\n"
+            "workflows:\n"
+            "  implement:\n"
+            "    parallel_groups:\n"
+            "      - [I3, I4]\n",
+            _I4_DEFAULT_DETAIL,
+            id="parallel-groups-declared-stages-not",
+        ),
+        pytest.param(
+            "schema_version: 1\n"
+            "workflows:\n"
+            "  implement:\n"
+            "    stages:\n"
+            "      - id: I1\n"
+            "      - id: I2\n"
+            "      - id: I5\n"
+            "      - id: I8\n"
+            "      - id: I9\n"
+            "      - id: I7\n"
+            "      - id: I6\n",
+            _I4_NOT_ENABLED_DETAIL,
+            id="declared-list-omits-i4",
+        ),
+        pytest.param(
+            "schema_version: 1\n"
+            "workflows:\n"
+            "  implement:\n"
+            "    stages: []\n",
+            _I4_NOT_ENABLED_DETAIL,
+            id="declared-empty-list",
+        ),
+        pytest.param(
+            "schema_version: 1\n"
+            "workflows:\n"
+            "  implement:\n"
+            "    stages:\n"
+            "      - id: I4\n"
+            "        enabled: false\n",
+            _I4_NOT_ENABLED_DETAIL,
+            id="declared-disabled",
+        ),
+    ],
+)
+def test_doctor_architecture_trigger_distinguishes_undeclared_from_disabled(
+    tmp_path: Path,
+    fake_external_clis: None,  # noqa: ARG001
+    config_text: str,
+    expected_detail: str,
+) -> None:
+    """Review follow-up #168 (PR #166): an undeclared stages list is not a disabled I4.
+
+    The declared-list-omits-I4 case keeps only the *core* ids (the repo-optional I3
+    omitted too), so the entry list is one a repo could really ship after disabling the
+    path-scoped stages wholesale.
+    """
+    _bare, control = _make_supported(tmp_path)
+    if config_text:
+        _write_target_config(control, config_text)
+
+    check = _named(collect_checks(explicit=control), "architecture trigger")
+
+    assert check.status == OK
+    assert check.detail == expected_detail
+
+
 def test_missing_target_config_reports_defaults(
     tmp_path: Path, fake_external_clis: None  # noqa: ARG001
 ) -> None:
