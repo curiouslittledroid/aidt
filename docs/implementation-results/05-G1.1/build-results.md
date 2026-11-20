@@ -3,7 +3,7 @@
 **Branch:** `05-G1.1`
 **Date:** 2026-11-20
 **Spec:** `design.md` §8.1, §8.3, §17 (row Z18), §18
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** #175 — https://github.com/curiouslittledroid/aidt/pull/175
 
 ## Summary
 
