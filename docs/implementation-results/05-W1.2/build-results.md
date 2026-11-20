@@ -3,7 +3,7 @@
 **Branch:** `05-W1.2`
 **Date:** 2026-11-20
 **Spec:** `design.md` §8.2 (`aidw implement` dry-run planning), §9.1/§9.4 (run lock and resumability), §17 row `Z14`, §19 items 8–10 (dry-run "no run state" acceptance criteria); roadmap entry W1.2 in `docs/tasks/05 - Pipeline efficiency.md`; `docs/task-prompts/05-W1.2-prompt.md` (including the owner-resolved points c1–c3)
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** #171 — https://github.com/curiouslittledroid/aidt/pull/171
 
 ## Summary
 
