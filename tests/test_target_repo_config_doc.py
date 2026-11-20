@@ -106,6 +106,9 @@ EXPECTED_DEFAULTS: dict[str, str] = {
     "schema_version": "unset",
     "requires_toolkit": "unset",
     "max_revisions": f"`{DEFAULT_MAX_REVISIONS}`",
+    # C1.2's heading pointer has no toolkit default: unset means the two built-in
+    # headings only, and the doc must not present it as defaulting to one of them.
+    "gates_heading": "unset",
     "repo": "unset",
     "paths": "unset",
     "workflows": "unset",

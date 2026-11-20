@@ -98,6 +98,10 @@ TOP_LEVEL_KEYS = (
     "schema_version",
     "requires_toolkit",
     "max_revisions",
+    # C1.2 (design §7.3 step 4): the full ``## ``-prefixed heading line that introduces
+    # the target's gate commands, recognised in addition to ``## Gates``/
+    # ``## Gate commands``. Optional and unset by default; no toolkit default exists.
+    "gates_heading",
     "repo",
     "paths",
     "workflows",
@@ -483,6 +487,10 @@ class TargetConfig:
     schema_version: int | None = None
     requires_toolkit: str | None = None
     max_revisions: int | None = None
+    #: C1.2: the extra gate-commands heading, as the **full heading line including its
+    #: ``## `` prefix** (``## Verification gates``). ``None`` when unset; the loader
+    #: rejects an empty string, because ``line.startswith("")`` would match every line.
+    gates_heading: str | None = None
     repo: RepoConfig | None = None
     paths: PathsConfig | None = None
     workflows: dict[str, WorkflowConfig] = field(default_factory=dict)
@@ -509,6 +517,8 @@ class TargetConfig:
             data["requires_toolkit"] = self.requires_toolkit
         if self.max_revisions is not None:
             data["max_revisions"] = self.max_revisions
+        if self.gates_heading is not None:
+            data["gates_heading"] = self.gates_heading
         if self.repo is not None:
             data["repo"] = self.repo.to_dict()
         if self.paths is not None:
@@ -875,12 +885,24 @@ def _parse_target_config(
         else None
     )
 
+    # C1.2: ``_read_str`` passes an optional key's ``""`` through (the `model`/
+    # `paths.roadmap_glob` precedent), but an empty heading would make the shared
+    # ``startswith`` recognition match every line, so it is one ERROR naming the field and
+    # the value is dropped.
+    gates_heading = _read_str(raw, "gates_heading", "", source, issues)
+    if gates_heading is not None and not gates_heading:
+        issues.append(
+            Issue(ERROR, source, "`gates_heading` must be a non-empty string, got ''")
+        )
+        gates_heading = None
+
     return TargetConfig(
         schema_version=_read_int(
             raw, "schema_version", "", source, issues, required=True
         ),
         requires_toolkit=_read_str(raw, "requires_toolkit", "", source, issues),
         max_revisions=_read_int(raw, "max_revisions", "", source, issues),
+        gates_heading=gates_heading,
         repo=repo,
         paths=paths,
         workflows=workflows,

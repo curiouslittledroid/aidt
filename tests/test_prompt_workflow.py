@@ -3020,6 +3020,42 @@ conventions-repo-only gate --strict
 This heading ends the conventions gate section and must not be copied.
 """
 
+#: C1.2: the alias heading. ``## Gate commands`` is the second recognised heading, so a repo
+#: that publishes its gates under that name must supply the commands instead of degrading.
+GATE_COMMANDS_EVIDENCE_FIXTURE = """# Repo conventions
+
+Intro prose.
+
+## Gate commands
+
+```bash
+gate-commands-repo-only gate --check
+```
+
+## Tests
+
+This heading ends the gate-commands section and must not be copied.
+"""
+
+#: C1.2: a target-declared heading. The value is the **full** ``## ``-prefixed line; a bare
+#: title is a different string and must not match.
+CONFIGURED_GATES_HEADING = "## Verification gates"
+
+CONFIGURED_HEADING_FIXTURE = """# Repo conventions
+
+Intro prose.
+
+## Verification gates
+
+```bash
+declared-heading gate --check
+```
+
+## Tests
+
+This heading ends the declared gate section and must not be copied.
+"""
+
 EXTRACTION_EVIDENCE_FIXTURE = """# Extraction
 
 ## 3.8 Task-prompt format and repo conventions (D16)
@@ -3485,6 +3521,149 @@ def test_e73_no_source_still_degrades_the_gate_block(tmp_path: Path) -> None:
     repo = TargetRepo(root=plain, git_dir=plain / ".git", common_dir=plain / ".git")
 
     assert prompt_workflow._gate_block(repo) == prompt_workflow._EVIDENCE_UNAVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# C1.2 — two recognised gate headings, a declared one, and the diagnose-not-fail rule
+# ---------------------------------------------------------------------------
+
+
+def test_c12_gate_commands_heading_supplies_the_bundle_gate_commands(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A ``## Gate commands`` conventions source contributes its commands, not ``unavailable``.
+
+    The pre-C1.2 reader recognised only ``## Gates``, so this repo's list vanished from the
+    evidence bundle. Asserted through a real run's rendered bundle, because that is the
+    element the reviewer receives.
+    """
+    _evidence_repo(
+        tmp_path,
+        monkeypatch,
+        agents_md=None,
+        conventions_md=GATE_COMMANDS_EVIDENCE_FIXTURE,
+    )
+    _seen, fake = _fake_stages(TASK_REVIEW_CHANGES, approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        allow_incomplete_prereqs=True,
+    )
+
+    assert code == 0
+    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
+    bundle = _evidence_path(tmp_path, run_id, "task-review-1").read_text(
+        encoding="utf-8"
+    )
+    gate_section = bundle.split("## Gate commands", 1)[1].split("## Base-branch", 1)[0]
+    assert "gate-commands-repo-only gate --check" in gate_section
+    assert "unavailable" not in gate_section
+    assert "This heading ends the gate-commands section" not in gate_section
+
+
+def test_c12_gate_commands_heading_alone_supplies_the_block(tmp_path: Path) -> None:
+    """The section renderer alone, so the recognition is proved without a git fixture."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "aidw").mkdir()
+    (plain / "aidw" / "conventions.md").write_text(
+        GATE_COMMANDS_EVIDENCE_FIXTURE, encoding="utf-8"
+    )
+    repo = TargetRepo(root=plain, git_dir=plain / ".git", common_dir=plain / ".git")
+
+    block = prompt_workflow._gate_block(repo)
+
+    assert block.startswith("## Gate commands")
+    assert "gate-commands-repo-only gate --check" in block
+    assert "unavailable" not in block
+
+
+def test_c12_configured_heading_is_a_full_prefixed_line_passed_in() -> None:
+    """A configured ``## ``-prefixed line is recognised; the bare title is not.
+
+    The value format is prompt-fixed: the loader stores the full heading line, and the
+    matcher applies the same ``startswith`` rule as the built-in headings — so verifying
+    that a bare title does *not* match pins the format, not just the happy path.
+    """
+    block = prompt_workflow._gates_section(
+        CONFIGURED_HEADING_FIXTURE, CONFIGURED_GATES_HEADING
+    )
+
+    assert block == (
+        "## Verification gates\n\n```bash\ndeclared-heading gate --check\n```"
+    )
+    assert (
+        prompt_workflow._gates_section(CONFIGURED_HEADING_FIXTURE, "Verification gates")
+        is None
+    )
+
+
+def test_c12_gate_block_loads_the_declared_heading_from_the_target_config(
+    tmp_path: Path,
+) -> None:
+    """The config is read from ``repo.root``, never the toolkit root (AGENTS.md "Two roots").
+
+    The toolkit's own config declares no ``gates_heading``, so a wrong-root load would find
+    nothing and leave the section ``unavailable`` here — a self-hosted run would still pass.
+    """
+    plain = tmp_path / "target"
+    (plain / "aidw").mkdir(parents=True)
+    (plain / "aidw" / "config.yaml").write_text(
+        'schema_version: 1\ngates_heading: "## Verification gates"\n',
+        encoding="utf-8",
+    )
+    (plain / "aidw" / "conventions.md").write_text(
+        CONFIGURED_HEADING_FIXTURE, encoding="utf-8"
+    )
+    repo = TargetRepo(root=plain, git_dir=plain / ".git", common_dir=plain / ".git")
+
+    block = prompt_workflow._gate_block(repo)
+
+    assert block.startswith("## Verification gates")
+    assert "declared-heading gate --check" in block
+    assert "unavailable" not in block
+
+
+def test_c12_unrecognised_gates_like_heading_still_degrades(tmp_path: Path) -> None:
+    """Case is deliberate: ``## Gate Commands`` (capital C) is not ``## Gate commands``.
+
+    The spec fixes the two literal strings, and the degrade contract (L2.4 requirement 4)
+    still holds for a heading nothing recognises — the doctor WARN is the diagnosis, not a
+    run failure.
+    """
+    plain = tmp_path / "plain"
+    (plain / "aidw").mkdir(parents=True)
+    (plain / "aidw" / "conventions.md").write_text(
+        "# Conventions\n\n## Gate Commands\n\ncapital-c gate --check\n",
+        encoding="utf-8",
+    )
+    repo = TargetRepo(root=plain, git_dir=plain / ".git", common_dir=plain / ".git")
+
+    assert prompt_workflow._gate_block(repo) == prompt_workflow._EVIDENCE_UNAVAILABLE
+
+
+def test_c12_gates_section_is_pure(monkeypatch) -> None:
+    """No I/O and no mutation: the function only reads the text it was handed."""
+    text = CONFIGURED_HEADING_FIXTURE
+    before = str(text)
+
+    def _no_io(*_args, **_kwargs):
+        raise AssertionError("`_gates_section` must not perform I/O")
+
+    monkeypatch.setattr(Path, "read_text", _no_io)
+    monkeypatch.setattr(Path, "write_text", _no_io)
+    monkeypatch.setattr("builtins.open", _no_io)
+
+    block = prompt_workflow._gates_section(text, CONFIGURED_GATES_HEADING)
+
+    assert block is not None and "declared-heading gate --check" in block
+    assert text == before
 
 
 # ---------------------------------------------------------------------------

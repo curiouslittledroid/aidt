@@ -41,6 +41,11 @@ from aidw.paths import (
     WorkspacePaths,
     toolkit_root,
 )
+from aidw.prompts import (
+    is_gates_like_heading,
+    is_recognised_gates_heading,
+    read_conventions_sources,
+)
 from aidw.target_config import (
     ERROR,
     TargetConfig,
@@ -521,6 +526,55 @@ def _check_architecture_trigger(root: Path) -> Check:
     )
 
 
+def _check_gates_heading(root: Path) -> Check:
+    """Warn when a conventions source publishes a gates-like heading nothing recognises.
+
+    C1.2 (design §8.1): the evidence bundle reads gate commands from a ``## Gates`` or
+    ``## Gate commands`` section (:func:`aidw.prompts.GATES_HEADINGS`, matched by prefix)
+    plus the target's configured top-level ``gates_heading``. A repo that writes
+    ``## Gate Commands`` (capital C) or ``## Verification gates`` and declares nothing gets
+    an ``unavailable`` gate section in the bundle — a normal degraded state, never a failed
+    run. This check is the diagnosis: it names the source file and the heading, so the
+    operator can rename it or declare it, instead of wondering why the bundle is empty.
+
+    ``WARN``, never ``FAIL`` and never an exit-code decision: a non-standard heading still
+    works (the bundle degrades), so this is advice, not a broken prerequisite. Recognition
+    is the bundle reader's own predicate with the same ``startswith`` prefix rule
+    (:func:`aidw.prompts.is_recognised_gates_heading`), never ``==`` — otherwise the
+    toolkit's own suffixed ``## Gates — run exactly these, and only these`` would warn while
+    every bare-heading test stayed green.
+
+    The configured ``gates_heading`` is loaded from this ``root`` (the target, never the
+    toolkit root) **before** deciding a heading is unrecognised, so a repo that declares its
+    heading is not warned. A missing/unreadable config and a missing/unreadable source both
+    degrade to "nothing to report": :func:`aidw.target_config.load_target_config` returns
+    an unset field for those, and :func:`aidw.prompts.read_conventions_sources` skips the
+    source. Read-only: one config load and the conventions reads, nothing written (§3.1).
+    """
+    declared = load_target_config(root / "aidw" / "config.yaml")
+    configured = declared.gates_heading
+
+    findings: list[str] = []
+    for relative, text in read_conventions_sources(root):
+        for line in text.splitlines():
+            if not is_gates_like_heading(line):
+                continue
+            if is_recognised_gates_heading(line, configured):
+                continue
+            findings.append(f"`{relative}`: `{line.strip()}`")
+
+    if not findings:
+        return Check("gates heading", OK, "every gates-like heading is recognised")
+    return Check(
+        "gates heading",
+        WARN,
+        "unrecognised gate heading(s): "
+        + "; ".join(findings)
+        + " — rename to `## Gates` or `## Gate commands`, or declare the heading "
+        "verbatim (including the `## ` prefix) as the top-level `gates_heading` key.",
+    )
+
+
 def _check_prompts(aidt: Path) -> Check:
     # Toolkit defaults only (E7.5 requirement 7): the resolved-per-target half lives in
     # ``aidw prompts check``, which knows the target; doctor stays toolkit-side.
@@ -690,6 +744,8 @@ def collect_checks(explicit: Path | None = None) -> list[Check]:
     checks.append(_check_target_config(target.root))
     checks.append(_check_compat(target.root))
     checks.append(_check_architecture_trigger(target.root))
+    # C1.2: advisory only — the bundle degrades, so an unrecognised heading is a WARN.
+    checks.append(_check_gates_heading(target.root))
 
     aidt = toolkit_root()
     checks.append(_check_prompts(aidt))

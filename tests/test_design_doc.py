@@ -289,6 +289,72 @@ def test_c1_1_decision_row_records_the_agents_md_append_split() -> None:
         assert path in row, path
 
 
+def _section_81_block(design: str) -> str:
+    """The §8.1 ``aidw prompt`` block: its heading up to the §8.2 heading."""
+    start = design.index("### 8.1 `aidw prompt <phase> <epic> <task>`")
+    end = design.index("### 8.2 ", start)
+    return design[start:end]
+
+
+def test_c1_2_sections_and_decision_row_record_the_gate_heading_contract() -> None:
+    """C1.2: §7.3, §8.1 and one §17 row state the two headings, the declaration and the WARN.
+
+    The row is matched by task id + wording, never by a hardcoded ``Z`` number
+    (``aidw/conventions.md`` forbids reusing or renumbering an id). C1.1's injection claims
+    must survive: C1.2 changes only the read channel.
+    """
+    design = _design_md()
+
+    block73 = " ".join(_section_73_block(design).split())
+    assert "`## Gate commands`" in block73
+    assert "`gates_heading`" in block73
+    # The prefix rule, not exact equality, so the suffixed canonical heading still matches.
+    assert "`startswith`" in block73
+    assert "GATES_HEADINGS" in block73
+    assert "is_gates_like_heading" in block73
+    assert "is_recognised_gates_heading" in block73
+    # C1.1's split is not undone by this task.
+    assert "The root `AGENTS.md` is **not** appended" in block73
+    assert "`append_agents_md: true`" in block73
+
+    block81 = " ".join(_section_81_block(design).split())
+    assert "`## Gate commands`" in block81
+    assert "`gates_heading`" in block81
+    assert "`gates heading`" in block81
+    assert "WARN" in block81 and "never a FAIL" in block81
+
+    decisions = _section(design, "## 17. Resolved decisions", "## 18. Risks")
+    rows = [
+        line
+        for line in decisions.splitlines()
+        if re.match(r"^\| Z\d+ \|", line)
+        and "C1.2" in line
+        and "gates_heading" in line
+        and "is_recognised_gates_heading" in line
+    ]
+    assert len(rows) == 1, f"expected exactly one C1.2 decision row, found {len(rows)}"
+    row = rows[0]
+    assert "§7.3" in row and "§8.1" in row
+    for decision in ("(a)", "(b)", "(c)"):
+        assert decision in row, decision
+    assert "Prompt-fixed decisions" in row
+    # The touched set is named, so a later reader can find the contract tests.
+    for path in (
+        "aidw/prompts.py",
+        "aidw/workflows/prompt.py",
+        "aidw/doctor.py",
+        "aidw/target_config.py",
+        "docs/target-repo-config.md",
+        "docs/schema/aidw-config.schema.json",
+        "tests/test_prompt_workflow.py",
+        "tests/test_doctor.py",
+        "tests/test_target_config.py",
+        "tests/test_design_doc.py",
+    ):
+        assert path in row, path
+    assert not row.startswith("| Z15 |")
+
+
 def _section_83_block(design: str) -> str:
     """The §8.3 ``aidw review`` block: its heading up to the §8.4 heading."""
     start = design.index("### 8.3 `aidw review --pr <n>`")

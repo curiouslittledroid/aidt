@@ -115,7 +115,7 @@ CONVENTIONS_PROMPTS: frozenset[str] = frozenset(
 
 #: The root source's repo-relative path. Named once because the injection treats it
 #: differently from the second source (C1.1: dropped unless the prompt opts in), while the
-#: read channel keeps both (``_gate_block`` reads the ``## Gates`` section through it).
+#: read channel keeps both (``_gate_block`` reads the gate-commands section through it).
 AGENTS_MD_SOURCE = "AGENTS.md"
 
 #: The D16 sources, relative to the **target** repo root and in D16 order: the root
@@ -123,8 +123,46 @@ AGENTS_MD_SOURCE = "AGENTS.md"
 #: It is a fixed pair of paths, deliberately not a ``paths.*`` config entry (D16). Both
 #: stay here in C1.1 even though the injection only appends the second by default: the
 #: sources list is the *channel*, and ``aidw/workflows/prompt.py:_gate_block`` still needs
-#: the root ``AGENTS.md``'s ``## Gates`` section (C1.2/C1.3 depend on it).
+#: the root ``AGENTS.md``'s gate-commands section (C1.2/C1.3 depend on it).
 CONVENTIONS_SOURCES: tuple[str, ...] = (AGENTS_MD_SOURCE, "aidw/conventions.md")
+
+#: The recognised heading set for a gate-commands list (C1.2, design §7.3 step 4): the
+#: canonical ``## Gates`` plus its ``## Gate commands`` alias. One tuple, defined here and
+#: imported by both readers — ``aidw/workflows/prompt.py:_gates_section`` (as
+#: ``_GATES_HEADING``) and ``aidw/doctor.py``'s ``gates heading`` check — so the bundle
+#: reader and the diagnosis cannot drift on what a recognised heading is. Matched with
+#: :func:`is_recognised_gates_heading`, never ``==``: a suffixed canonical heading such as
+#: the toolkit's own ``## Gates — run exactly these, and only these`` stays recognised.
+#: Case is deliberate: ``## Gate Commands`` is not ``## Gate commands`` and is not
+#: recognised (design §7.3/§8.1 fix the two literal strings).
+GATES_HEADINGS: tuple[str, ...] = ("## Gates", "## Gate commands")
+
+
+def is_gates_like_heading(line: str) -> bool:
+    """Whether a ``## ``-level heading *looks* like it introduces gate commands (C1.2).
+
+    The heuristic ``aidw doctor`` uses to decide what to diagnose: a ``## `` heading whose
+    text contains "gate", case-insensitive. It is deliberately broader than
+    :func:`is_recognised_gates_heading` — its whole job is to catch the headings the
+    bundle reader does not recognise, so ``## Gate Commands`` (capital C) and
+    ``## Verification gates`` are both reported. Pure.
+    """
+    return line.startswith("## ") and "gate" in line.lower()
+
+
+def is_recognised_gates_heading(line: str, extra: str | None = None) -> bool:
+    """Whether ``line`` is a heading the gate-commands reader recognises (C1.2).
+
+    One ``startswith`` test against :data:`GATES_HEADINGS` plus an optional configured
+    heading, never ``==``, so a suffixed canonical heading still matches. ``extra`` is the
+    target's ``gates_heading`` value **verbatim — the full heading line including its
+    ``## `` prefix** (``## Verification gates``); the loader rejects an empty value, so
+    ``line.startswith("")`` can never match every line. This is the single definition of
+    the rule: :func:`aidw.workflows.prompt._gates_section` and ``aidw.doctor``'s
+    ``gates heading`` check both route their recognition through it. Pure.
+    """
+    headings = GATES_HEADINGS if not extra else (*GATES_HEADINGS, extra)
+    return line.startswith(headings)
 
 #: The opt-in frontmatter marker on the **resolved** prompt file that restores the root
 #: ``AGENTS.md`` append (C1.1; design §7.3 step 4). Only the YAML boolean ``True`` counts.
@@ -147,7 +185,9 @@ def read_conventions_sources(repo_root: Path) -> tuple[tuple[str, str], ...]:
 
     This is the single conventions channel: the five-prompt injection
     (:func:`inject_repo_conventions`) and the prompt workflow's evidence bundle
-    (``aidw.workflows.prompt._gate_block``) both read through it.
+    (``aidw.workflows.prompt._gate_block``) both read through it. The bundle finds each
+    source's gate list under a heading from :data:`GATES_HEADINGS` (or the target's
+    configured ``gates_heading``) via :func:`is_recognised_gates_heading` (C1.2).
 
     ``repo_root`` is the **target** repo root, never :func:`aidw.paths.toolkit_root`: in
     a self-hosted run the two coincide, so a wrong-root read passes every test here and
