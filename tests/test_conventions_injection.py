@@ -1,15 +1,24 @@
-"""Contract and property tests for the repo-conventions injection (E7.3, EXTRACTION.md §3.8/D16).
+"""Contract and property tests for the repo-conventions injection (E7.3, C1.1; §3.8/D16).
 
 The channel this module pins is deliberately narrow: **exactly five** prompts
 (``task-prompt.md``, ``impliment-task.md``, ``test.md``,
 ``record-implementation-results.md``, ``update-traceability.md``) receive the *target*
-repo's root ``AGENTS.md`` and its optional ``aidw/conventions.md``, in that order,
-verbatim, keyed by the **resolved prompt basename** rather than by stage id — and
-everything else is byte-identical. ``update-traceability.md`` is W1.1's fifth (design §17
-Z13): ``I3`` must never edit ``paths.roadmap_dir``, and a repo can only declare its
-traceability artefacts — including "none" — to ``I3`` if the conventions channel reaches
-that prompt. The four traps the task prompt names each get their own test rather than a
-comment:
+repo's conventions, verbatim, keyed by the **resolved prompt basename** rather than by
+stage id — and everything else is byte-identical. ``update-traceability.md`` is W1.1's
+fifth (design §17 Z13): ``I3`` must never edit ``paths.roadmap_dir``, and a repo can only
+declare its traceability artefacts — including "none" — to ``I3`` if the conventions
+channel reaches that prompt.
+
+C1.1 (design §7.3 step 4, §17) narrows **what** is appended: only
+``<target>/aidw/conventions.md``, the file Pi does not provide. The root ``AGENTS.md`` is
+dropped from the render because Pi already loads it as project context at ``cwd`` =
+target root (§5.5). A frontmatter marker — ``append_agents_md: true`` on the *resolved*
+prompt file — restores the old two-source append for a repo whose agents set
+``no_context_files: true``. ``read_conventions_sources``/``CONVENTIONS_SOURCES`` are
+deliberately unchanged: that is the read channel ``aidw/workflows/prompt.py:_gate_block``
+takes gate commands from (C1.2/C1.3 depend on it), and the split is injection-only.
+
+The four traps each get their own test rather than a comment:
 
 1. **Two roots.** The fixture's ``AGENTS.md`` carries :data:`AGENTS_SENTINEL`, which the
    toolkit's own ``AGENTS.md`` cannot contain, and the assertions also require a
@@ -20,15 +29,15 @@ comment:
    fix-loop stage name with ``test.md`` *is* injected, and a stage named ``test`` with a
    non-conventions prompt file is *not*.
 3. **Resolved path.** ``spec.prompt`` is already resolved through §3.6, so a shadowed or
-   explicitly declared file keeps its basename; :func:`receives_repo_conventions` takes the
-   resolved path, never a "came from the toolkit default" flag.
-4. **Absence = nothing.** A missing ``aidw/conventions.md`` contributes nothing: no
-   placeholder note, no raise, ``record.status == SUCCEEDED``, and the render is exactly
-   the un-injected text.
+   explicitly declared file keeps its basename, and the ``append_agents_md`` marker is
+   read from that file — never from the toolkit default or a stage id.
+4. **Absence = nothing.** A missing source contributes nothing: no placeholder note, no
+   raise, ``record.status == SUCCEEDED``, and the render is exactly the un-injected text.
 
-The property sweep at the bottom is the repo's pytest-only substitute for ``hypothesis``
-(AGENTS.md "Tests": no new dependencies): the seed is the enumerated prompt-basename list
-and the source-presence matrix, and ``numRuns`` is their pinned length.
+The property sweeps at the bottom are this repo's pytest-only substitute for
+``hypothesis`` (AGENTS.md "Tests": no new dependencies): each seed is an enumerated
+variation matrix (shipped prompt names, source presence × include flag, the five
+basenames × frontmatter marker variants) and ``numRuns`` is its pinned length.
 """
 
 from __future__ import annotations
@@ -47,6 +56,7 @@ from aidw.pi import PiResult, Usage
 from aidw.prompts import (
     CONVENTIONS_PROMPTS,
     CONVENTIONS_SOURCES,
+    appends_target_agents_md,
     inject_repo_conventions,
     read_conventions_sources,
     receives_repo_conventions,
@@ -132,6 +142,27 @@ def _target(
     return target
 
 
+def _prompt_with(
+    tmp_path: Path,
+    basename: str,
+    frontmatter: str | None = None,
+    body: str = "# shadow prompt\n",
+) -> Path:
+    """A resolved prompt file with the requested frontmatter, outside the toolkit.
+
+    Used for the C1.1 ``append_agents_md`` lever: the marker is read from the *resolved*
+    prompt file, so a target shadow (or any declared path) with one of the five basenames
+    is the fixture — not a toolkit prompt, whose frontmatter must not be edited for a test.
+    """
+    path = tmp_path / "prompts" / basename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if frontmatter is None:
+        path.write_text(body, encoding="utf-8")
+    else:
+        path.write_text(f"---\n{frontmatter}\n---\n{body}", encoding="utf-8")
+    return path
+
+
 def _render_text(
     prompt: Path,
     variables: list[str] | None = None,
@@ -200,15 +231,21 @@ def _dry_run(
 
 
 # --------------------------------------------------------------------------- #
-# The five prompts receive both sources, AGENTS.md first (§3.8, D16; W1.1/Z13)
+# The five prompts receive conventions.md only — AGENTS.md is Pi's (C1.1, §5.5)
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.parametrize("basename", sorted(FIVE_PROMPTS))
-def test_each_of_the_five_prompts_receives_both_sources_in_d16_order(
+def test_each_of_the_five_prompts_receives_conventions_md_but_not_agents_md(
     tmp_path: Path, basename: str
 ) -> None:
-    """Hand-calculated example: the rendered prompt carries both files, in D16 order."""
+    """Hand-calculated example: conventions.md is appended, AGENTS.md is not.
+
+    Pi already loads the target's root ``AGENTS.md`` as project context at ``cwd`` = target
+    root (§5.5, decision C1.1), so the render must not carry a second copy of the same
+    file. The source Pi does *not* provide — ``aidw/conventions.md`` — is still appended,
+    verbatim and whole, under its own header.
+    """
     target = _target(tmp_path)
     prompt = toolkit_root() / "prompts" / basename
 
@@ -220,19 +257,19 @@ def test_each_of_the_five_prompts_receives_both_sources_in_d16_order(
         variables=FIVE_PROMPTS[basename],
     )
 
-    assert AGENTS_SENTINEL in rendered
+    # Dropped: the root AGENTS.md body, its header and its sentinel are all absent even
+    # though the target repo has one.
+    assert AGENTS_SENTINEL not in rendered
+    assert "## Repo conventions (AGENTS.md)" not in rendered
+    assert AGENTS_MD not in rendered
+    assert "Intro prose that belongs to the target repo." not in rendered
+    # Kept: the source Pi does not provide, identifiable by its header and whole.
     assert CONVENTIONS_SENTINEL in rendered
-    # D16 order: root AGENTS.md first, then aidw/conventions.md.
-    assert rendered.index(AGENTS_SENTINEL) < rendered.index(CONVENTIONS_SENTINEL)
-    # Each source is identifiable by its own header, and its content is whole.
-    assert "## Repo conventions (AGENTS.md)" in rendered
     assert "## Repo conventions (aidw/conventions.md)" in rendered
-    assert AGENTS_MD in rendered
     assert CONVENTIONS_MD in rendered
-    assert "Intro prose that belongs to the target repo." in rendered
     assert "Stack rules the toolkit must not inline." in rendered
     # Injected after the prompt body, never before it.
-    assert rendered.index("## Repo conventions (AGENTS.md)") > 0
+    assert rendered.index("## Repo conventions (aidw/conventions.md)") > 0
     assert record.status == SUCCEEDED
 
 
@@ -241,7 +278,9 @@ def test_the_five_prompts_are_exactly_the_injection_set() -> None:
 
     Dropping ``update-traceability.md`` from :data:`CONVENTIONS_PROMPTS` fails this
     assertion, which is the regression W1.1 exists to prevent: ``I3`` would go back to
-    being unable to hear a repo's "the roadmap is not yours" declaration.
+    being unable to hear a repo's "the roadmap is not yours" declaration. The sources
+    tuple is C1.1's *read* channel and must keep both entries in D16 order, because
+    ``_gate_block`` reads gate commands from the root ``AGENTS.md`` (C1.2/C1.3).
     """
     assert CONVENTIONS_PROMPTS == frozenset(
         {
@@ -256,6 +295,188 @@ def test_the_five_prompts_are_exactly_the_injection_set() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# The C1.1 lever: the `append_agents_md: true` marker on the resolved prompt
+# --------------------------------------------------------------------------- #
+
+
+def test_the_append_agents_md_marker_restores_the_agents_md_block(
+    tmp_path: Path,
+) -> None:
+    """Hand-calculated example: the opt-in restores both sources, in D16 order.
+
+    A repo whose agents set ``no_context_files: true`` (§5.5) gets no ``AGENTS.md`` from
+    Pi, so its prompt may declare the marker and the renderer must append both files
+    again — root ``AGENTS.md`` first, then ``aidw/conventions.md``.
+    """
+    target = _target(tmp_path)
+    prompt = _prompt_with(tmp_path, "impliment-task.md", "append_agents_md: true")
+
+    assert appends_target_agents_md(prompt) is True
+    rendered, record = _dry_run(
+        tmp_path, target, name="impliment-task", prompt=prompt
+    )
+
+    assert AGENTS_SENTINEL in rendered
+    assert "## Repo conventions (AGENTS.md)" in rendered
+    assert AGENTS_MD in rendered
+    assert CONVENTIONS_SENTINEL in rendered
+    assert "## Repo conventions (aidw/conventions.md)" in rendered
+    # D16 order survives when both halves are present, and both come after the body.
+    assert rendered.index(AGENTS_SENTINEL) < rendered.index(CONVENTIONS_SENTINEL)
+    assert rendered.index("# shadow prompt") < rendered.index(
+        "## Repo conventions (AGENTS.md)"
+    )
+    assert record.status == SUCCEEDED
+
+
+def test_the_marker_is_read_from_the_resolved_prompt_not_the_toolkit_default(
+    tmp_path: Path,
+) -> None:
+    """A target shadow carrying the marker opts in; the toolkit default does not.
+
+    The lever is keyed to ``spec.prompt`` — a repo shadow keeps its basename and its own
+    frontmatter — so reading the toolkit default instead would silently ignore the repo's
+    opt-in (and a stage id would not name a file at all).
+    """
+    target = _target(tmp_path)
+    shadow = _prompt_with(tmp_path, "test.md", "append_agents_md: true")
+
+    assert appends_target_agents_md(shadow) is True
+    assert appends_target_agents_md(toolkit_root() / "prompts" / "test.md") is False
+    assert AGENTS_SENTINEL in inject_repo_conventions("body\n", shadow, target)
+
+
+def test_a_resolved_shadow_with_marker_restores_agents_in_the_runner_path(
+    tmp_path: Path,
+) -> None:
+    """The runner's resolved shadow, not merely a direct helper call, controls the opt-in."""
+    target = _target(tmp_path)
+    shadow = target / "aidw" / "prompts" / "test.md"
+    shadow.parent.mkdir(parents=True, exist_ok=True)
+    shadow.write_text(
+        "---\nappend_agents_md: true\n---\n# target shadow\n", encoding="utf-8"
+    )
+
+    resolved = resolve_prompt(toolkit_root(), target, "test")
+    assert resolved == shadow.resolve()
+    rendered, record = _dry_run(tmp_path, target, name="shadow-test", prompt=resolved)
+
+    assert record.status == SUCCEEDED
+    assert "# target shadow" in rendered
+    assert AGENTS_SENTINEL in rendered
+    assert CONVENTIONS_SENTINEL in rendered
+
+
+#: Frontmatter blocks that must **not** restore the append. Each is a different way to be
+#: "not the YAML boolean ``true``", so the fail-closed direction is pinned on all of them.
+NON_RESTORING_FRONTMATTER: dict[str, str] = {
+    "absent": "description: no marker here",
+    "false": "append_agents_md: false",
+    "quoted-string": 'append_agents_md: "true"',
+    "non-boolean-scalar": "append_agents_md: maybe",
+    "integer": "append_agents_md: 1",
+    "nested-key": "stage:\n  append_agents_md: true",
+    "malformed-yaml": "append_agents_md: [unclosed",
+}
+
+
+@pytest.mark.parametrize(
+    "frontmatter",
+    NON_RESTORING_FRONTMATTER.values(),
+    ids=NON_RESTORING_FRONTMATTER.keys(),
+)
+def test_a_marker_that_is_not_the_yaml_boolean_renders_as_if_absent(
+    tmp_path: Path, frontmatter: str
+) -> None:
+    """Only YAML boolean ``true`` restores: absent/false/string/nested/malformed do not."""
+    target = _target(tmp_path)
+    prompt = _prompt_with(tmp_path, "impliment-task.md", frontmatter)
+
+    assert appends_target_agents_md(prompt) is False
+    rendered = inject_repo_conventions("body\n", prompt, target)
+
+    assert rendered.startswith("body\n")
+    assert CONVENTIONS_SENTINEL in rendered
+    assert AGENTS_SENTINEL not in rendered
+    assert "## Repo conventions (AGENTS.md)" not in rendered
+
+
+def test_uppercase_true_is_the_same_yaml_boolean(tmp_path: Path) -> None:
+    """``TRUE`` is a YAML boolean ``true``, so it restores the append too."""
+    target = _target(tmp_path)
+    prompt = _prompt_with(tmp_path, "impliment-task.md", "append_agents_md: TRUE")
+
+    assert appends_target_agents_md(prompt) is True
+    assert AGENTS_SENTINEL in inject_repo_conventions("body\n", prompt, target)
+
+
+def test_a_frontmatter_less_prompt_drops_the_append_with_no_raise(
+    tmp_path: Path,
+) -> None:
+    """Most prompts have no frontmatter at all: that is the default, not an error."""
+    target = _target(tmp_path)
+    # ``prompts/impliment-task.md`` ships without frontmatter; pin that, so this test cannot
+    # silently become a marker test if the prompt gains one.
+    prompt = toolkit_root() / "prompts" / "impliment-task.md"
+    assert not prompt.read_text(encoding="utf-8").startswith("---")
+
+    assert appends_target_agents_md(prompt) is False
+    rendered = inject_repo_conventions("body\n", prompt, target)
+
+    assert rendered.startswith("body\n")
+    assert CONVENTIONS_SENTINEL in rendered
+    assert AGENTS_SENTINEL not in rendered
+
+
+def test_a_missing_prompt_file_drops_the_append_with_no_raise(
+    tmp_path: Path,
+) -> None:
+    """A missing (or unreadable) prompt file means dropped — the peek never raises."""
+    target = _target(tmp_path)
+    missing = tmp_path / "no-such-dir" / "impliment-task.md"
+
+    assert not missing.exists()
+    assert appends_target_agents_md(missing) is False
+    # A directory where the file should be is an ``IsADirectoryError`` (an ``OSError``).
+    assert appends_target_agents_md(tmp_path) is False
+
+    rendered = inject_repo_conventions("body\n", missing, target)
+
+    assert rendered.startswith("body\n")
+    assert CONVENTIONS_SENTINEL in rendered
+    assert AGENTS_SENTINEL not in rendered
+
+
+def test_a_non_utf8_prompt_drops_the_append_with_no_raise(tmp_path: Path) -> None:
+    """A non-UTF-8 prompt file is a ``UnicodeDecodeError``, not a crash.
+
+    ``UnicodeDecodeError`` is a ``ValueError``, so it needs its own catch beside
+    ``OSError`` (the same issue #113 precedent as ``read_conventions_sources``).
+    """
+    target = _target(tmp_path)
+    prompt = tmp_path / "prompts" / "impliment-task.md"
+    prompt.parent.mkdir(parents=True)
+    prompt.write_bytes(b"---\nappend_agents_md: true\n\xff\xfe\n---\nbody\n")
+
+    assert appends_target_agents_md(prompt) is False
+    assert AGENTS_SENTINEL not in inject_repo_conventions("body\n", prompt, target)
+
+
+def test_a_malformed_frontmatter_prompt_still_renders_and_appends_conventions(
+    tmp_path: Path,
+) -> None:
+    """Fail-closed on the marker never blocks the append of the source Pi lacks."""
+    target = _target(tmp_path)
+    prompt = _prompt_with(tmp_path, "test.md", "append_agents_md: [unclosed")
+
+    rendered = inject_repo_conventions("body\n", prompt, target)
+
+    assert rendered.startswith("body\n")
+    assert CONVENTIONS_SENTINEL in rendered
+    assert AGENTS_SENTINEL not in rendered
+
+
+# --------------------------------------------------------------------------- #
 # Absence is never an error (requirement 3)
 # --------------------------------------------------------------------------- #
 
@@ -263,9 +484,15 @@ def test_the_five_prompts_are_exactly_the_injection_set() -> None:
 def test_missing_conventions_md_contributes_nothing_and_the_run_succeeds(
     tmp_path: Path,
 ) -> None:
-    """The repository has no ``aidw/conventions.md`` yet (§3.4) — no note, no failure."""
+    """The repository has no ``aidw/conventions.md`` yet (§3.4) — no note, no failure.
+
+    The root ``AGENTS.md`` is present but is Pi's to deliver (C1.1), so the rendered
+    prompt is byte-identical to the un-injected one: no header, no placeholder.
+    """
     target = _target(tmp_path, conventions_md=None)
     prompt = toolkit_root() / "prompts" / "impliment-task.md"
+    # The read channel still sees the source the injection drops.
+    assert [name for name, _ in read_conventions_sources(target)] == ["AGENTS.md"]
 
     rendered, _state = _dry_run(
         tmp_path,
@@ -275,9 +502,10 @@ def test_missing_conventions_md_contributes_nothing_and_the_run_succeeds(
         variables=FIVE_PROMPTS["impliment-task.md"],
     )
 
-    assert AGENTS_SENTINEL in rendered
+    assert rendered == render_prompt_file(prompt, FIVE_PROMPTS["impliment-task.md"])
+    assert AGENTS_SENTINEL not in rendered
     assert CONVENTIONS_SENTINEL not in rendered
-    assert "## Repo conventions (aidw/conventions.md)" not in rendered
+    assert "## Repo conventions (" not in rendered
     # Not an "unavailable" placeholder either: absence is silent.
     assert "unavailable" not in rendered.lower()
 
@@ -299,6 +527,17 @@ def test_a_repo_with_neither_source_leaves_the_prompt_byte_identical(
     assert "## Repo conventions (" not in rendered
 
 
+def test_an_opted_in_prompt_with_no_agents_md_still_renders_nothing(
+    tmp_path: Path,
+) -> None:
+    """The marker cannot fabricate a source: no files, no block, byte-identical text."""
+    target = _target(tmp_path, agents_md=None, conventions_md=None)
+    prompt = _prompt_with(tmp_path, "test.md", "append_agents_md: true")
+
+    assert appends_target_agents_md(prompt) is True
+    assert inject_repo_conventions("body\n", prompt, target) == "body\n"
+
+
 # --------------------------------------------------------------------------- #
 # Keying: the resolved prompt basename, never the stage id (requirement 1)
 # --------------------------------------------------------------------------- #
@@ -318,8 +557,8 @@ def test_a_resolved_shadow_prompt_still_receives_the_injection(tmp_path: Path) -
     )
 
     assert "# target shadow" in rendered
-    assert AGENTS_SENTINEL in rendered
     assert CONVENTIONS_SENTINEL in rendered
+    assert AGENTS_SENTINEL not in rendered
 
 
 def test_written_render_and_pi_stdin_receive_the_same_injection(
@@ -377,6 +616,8 @@ def test_written_render_and_pi_stdin_receive_the_same_injection(
     # is pinned to the real-run file, so the two compositions cannot drift.
     assert _render_text(toolkit_root() / "prompts" / "test.md", [], "", target) == written
     assert CONVENTIONS_SENTINEL in captured["prompt"]
+    # C1.1: the written prompt and the stdin payload both drop the AGENTS.md duplicate.
+    assert AGENTS_SENTINEL not in captured["prompt"]
 
 
 def test_injection_is_after_the_stage_extra(tmp_path: Path) -> None:
@@ -391,7 +632,7 @@ def test_injection_is_after_the_stage_extra(tmp_path: Path) -> None:
     )
 
     assert rendered.index("E7.3-STAGE-EXTRA-SENTINEL") < rendered.index(
-        "## Repo conventions (AGENTS.md)"
+        "## Repo conventions (aidw/conventions.md)"
     )
 
 
@@ -410,8 +651,8 @@ def test_a_fix_loop_stage_name_still_receives_the_injection(tmp_path: Path) -> N
         prompt=toolkit_root() / "prompts" / "test.md",
     )
 
-    assert AGENTS_SENTINEL in rendered
     assert CONVENTIONS_SENTINEL in rendered
+    assert AGENTS_SENTINEL not in rendered
 
 
 def test_a_conventions_stage_name_with_another_prompt_is_not_injected(
@@ -487,8 +728,8 @@ def test_the_traceability_prompt_is_injected_by_basename_not_by_stage_id(
     )
 
     assert "# repo traceability rules" in rendered
-    assert AGENTS_SENTINEL in rendered
     assert CONVENTIONS_SENTINEL in rendered
+    assert AGENTS_SENTINEL not in rendered
 
     # The mirror: the stage name alone proves nothing — the file decides.
     rendered, _state = _dry_run(
@@ -512,14 +753,10 @@ def test_the_target_root_is_the_read_source_not_the_toolkit_root(
 ) -> None:
     """A ``toolkit_root()`` read would pass self-hosted and break after extraction."""
     target = _target(tmp_path)
+    # The marker makes the AGENTS.md half visible again, which is what this test observes.
+    prompt = _prompt_with(tmp_path, "impliment-task.md", "append_agents_md: true")
 
-    rendered, _state = _dry_run(
-        tmp_path,
-        target,
-        name="impliment-task",
-        prompt=toolkit_root() / "prompts" / "impliment-task.md",
-        variables=FIVE_PROMPTS["impliment-task.md"],
-    )
+    rendered = inject_repo_conventions("body\n", prompt, target)
 
     assert AGENTS_SENTINEL in rendered
     # The negative assertion is non-vacuous: the toolkit's own AGENTS.md really carries the
@@ -528,6 +765,16 @@ def test_the_target_root_is_the_read_source_not_the_toolkit_root(
         encoding="utf-8"
     )
     assert TOOLKIT_ONLY_PHRASE not in rendered
+
+    # The read channel ``_gate_block`` uses is two-rooted in the same way.
+    sources = dict(read_conventions_sources(target))
+    assert [name for name, _ in read_conventions_sources(target)] == [
+        "AGENTS.md",
+        "aidw/conventions.md",
+    ]
+    assert AGENTS_SENTINEL in sources["AGENTS.md"]
+    assert TOOLKIT_ONLY_PHRASE not in sources["AGENTS.md"]
+    assert CONVENTIONS_SENTINEL in sources["aidw/conventions.md"]
 
 
 # --------------------------------------------------------------------------- #
@@ -548,7 +795,12 @@ def test_reading_conventions_writes_nothing_and_leaves_the_sources_identical(
     block = render_repo_conventions(target)
 
     assert [name for name, _ in sources] == ["AGENTS.md"]
-    assert block.startswith("## Repo conventions (AGENTS.md)\n\n")
+    # The default injectable block excludes the root AGENTS.md (C1.1); the opt-in restores
+    # today's D16 block, and neither touches the file.
+    assert block == ""
+    assert render_repo_conventions(target, include_agents_md=True).startswith(
+        "## Repo conventions (AGENTS.md)\n\n"
+    )
     assert agents_path.read_bytes() == before
     assert agents_path.stat().st_mtime_ns == before_stat.st_mtime_ns
     # The absent source is not created by reading it.
@@ -568,6 +820,8 @@ def test_injection_does_not_mutate_the_prompt_file_or_the_variables(
     injected = inject_repo_conventions("rendered body\n", prompt, target)
 
     assert injected.startswith("rendered body\n")
+    assert CONVENTIONS_SENTINEL in injected
+    assert AGENTS_SENTINEL not in injected
     assert prompt.read_bytes() == before
     assert variables == snapshot
 
@@ -587,10 +841,13 @@ def test_an_unreadable_source_degrades_to_nothing_instead_of_raising(
 
     sources = read_conventions_sources(target)
     block = render_repo_conventions(target)
+    opted_in = render_repo_conventions(target, include_agents_md=True)
 
     assert [name for name, _ in sources] == ["AGENTS.md"]
-    assert CONVENTIONS_SENTINEL not in block
-    assert AGENTS_SENTINEL in block
+    # The only included source for the default block is the unreadable one, so it is empty.
+    assert block == ""
+    assert CONVENTIONS_SENTINEL not in opted_in
+    assert AGENTS_SENTINEL in opted_in
 
 
 def test_a_non_utf8_source_degrades_to_nothing_instead_of_raising(
@@ -610,10 +867,14 @@ def test_a_non_utf8_source_degrades_to_nothing_instead_of_raising(
 
     sources = read_conventions_sources(target)
     block = render_repo_conventions(target)
+    opted_in = render_repo_conventions(target, include_agents_md=True)
 
     assert [name for name, _ in sources] == ["aidw/conventions.md"]
+    assert AGENTS_SENTINEL not in opted_in
+    assert CONVENTIONS_SENTINEL in opted_in
+    # The default block is the conventions.md source alone and still starts with its header.
+    assert block.startswith("## Repo conventions (aidw/conventions.md)\n\n")
     assert AGENTS_SENTINEL not in block
-    assert CONVENTIONS_SENTINEL in block
 
 
 def test_a_non_utf8_conventions_file_does_not_fail_a_dry_run(
@@ -622,20 +883,17 @@ def test_a_non_utf8_conventions_file_does_not_fail_a_dry_run(
     """The stage boundary also degrades when the optional second source is malformed.
 
     The shared reader is used by ``run_stage`` rather than only by its direct renderer;
-    this proves the user-visible dry-run still succeeds and retains the valid AGENTS.md
-    source when ``aidw/conventions.md`` cannot be decoded.
+    this proves the user-visible dry-run still succeeds and renders the un-injected text
+    when the only source Pi lacks cannot be decoded.
     """
     target = _target(tmp_path)
     (target / "aidw" / "conventions.md").write_bytes(b"\xff invalid utf8")
+    prompt = toolkit_root() / "prompts" / "test.md"
 
-    rendered, record = _dry_run(
-        tmp_path,
-        target,
-        name="test",
-        prompt=toolkit_root() / "prompts" / "test.md",
-    )
+    rendered, record = _dry_run(tmp_path, target, name="test", prompt=prompt)
 
-    assert AGENTS_SENTINEL in rendered
+    assert rendered == render_prompt_file(prompt, [])
+    assert AGENTS_SENTINEL not in rendered
     assert CONVENTIONS_SENTINEL not in rendered
     # An unreadable conventions file degrades; the stage still plans successfully.
     assert record.status == SUCCEEDED
@@ -656,24 +914,54 @@ def test_an_empty_source_contributes_no_dangling_header(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Property sweep (pytest only: no hypothesis dependency, AGENTS.md "Tests")
+# Property sweeps (pytest only: no hypothesis dependency, AGENTS.md "Tests")
 # --------------------------------------------------------------------------- #
 
 #: The property seed and run count, pinned so the sample is reproducible. Series 1: every
 #: prompt file the toolkit ships, sorted — ``seed = PROMPT_SEED``, ``numRuns =
 #: PROMPT_NUM_RUNS``. The claim it sweeps is the whole allowlist: exactly the five §3.8/Z13
-#: basenames are injected and every other shipped prompt is unchanged.
+#: basenames are injected, and every other shipped prompt is unchanged.
 PROMPT_SEED: tuple[str, ...] = tuple(
     sorted(path.name for path in (toolkit_root() / "prompts").glob("*.md"))
 )
 PROMPT_NUM_RUNS = len(PROMPT_SEED)
 
-#: Series 2's seed: the source-presence matrix ``(AGENTS.md, aidw/conventions.md)``, in the
-#: four combinations; ``numRuns = SOURCE_NUM_RUNS``. The claim it sweeps is the
-#: order/absence rule: the block is empty iff no source has content, and otherwise it lists
-#: exactly the present sources in D16 order.
+#: Series 2's seed: the source-presence matrix ``(AGENTS.md, aidw/conventions.md)`` crossed
+#: with the ``include_agents_md`` opt-in, in the eight combinations; ``numRuns =
+#: BLOCK_NUM_RUNS``. The claim it sweeps is the order/absence rule: the block is empty iff
+#: no *included* source has content, and otherwise it lists exactly the included sources in
+#: D16 order.
 SOURCE_SEED: tuple[tuple[bool, bool], ...] = tuple(product((True, False), repeat=2))
-SOURCE_NUM_RUNS = len(SOURCE_SEED)
+INCLUDE_SEED: tuple[bool, ...] = (False, True)
+BLOCK_SEED: tuple[tuple[bool, bool, bool], ...] = tuple(
+    (agents_present, conventions_present, include_agents_md)
+    for (agents_present, conventions_present), include_agents_md in product(
+        SOURCE_SEED, INCLUDE_SEED
+    )
+)
+BLOCK_NUM_RUNS = len(BLOCK_SEED)
+
+#: Series 3's seed: the five injected basenames crossed with the frontmatter marker
+#: variants; ``numRuns = MARKER_NUM_RUNS``. The claim it sweeps is C1.1's fail-closed lever:
+#: the append is restored **iff** the frontmatter parses to the YAML boolean ``True``.
+MARKER_VARIANTS: tuple[tuple[str, str], ...] = (
+    ("absent", "description: no marker here"),
+    ("true", "append_agents_md: true"),
+    ("true-upper", "append_agents_md: TRUE"),
+    ("false", "append_agents_md: false"),
+    ("quoted-string", 'append_agents_md: "true"'),
+    ("non-boolean", "append_agents_md: maybe"),
+    ("integer", "append_agents_md: 1"),
+    ("nested", "stage:\n  append_agents_md: true"),
+    ("malformed-yaml", "append_agents_md: [unclosed"),
+)
+RESTORING_VARIANTS = frozenset({"true", "true-upper"})
+MARKER_SEED: tuple[tuple[str, str, str], ...] = tuple(
+    (basename, variant, frontmatter)
+    for basename in sorted(CONVENTIONS_PROMPTS)
+    for variant, frontmatter in MARKER_VARIANTS
+)
+MARKER_NUM_RUNS = len(MARKER_SEED)
 
 
 def test_the_property_seeds_are_the_pinned_sample() -> None:
@@ -683,7 +971,17 @@ def test_the_property_seeds_are_the_pinned_sample() -> None:
     assert {name for name in PROMPT_SEED if name in CONVENTIONS_PROMPTS} == set(
         CONVENTIONS_PROMPTS
     )
-    assert SOURCE_NUM_RUNS == 4 == len(SOURCE_SEED)
+    # Sweep 1's claim (conventions.md only, never the AGENTS.md body) depends on no shipped
+    # prompt opting in: a toolkit marker would make a parametrisation disagree with it.
+    assert [
+        name
+        for name in PROMPT_SEED
+        if appends_target_agents_md(toolkit_root() / "prompts" / name)
+    ] == []
+    assert BLOCK_NUM_RUNS == 8 == len(BLOCK_SEED)
+    assert MARKER_NUM_RUNS == len(MARKER_SEED) == (
+        len(CONVENTIONS_PROMPTS) * len(MARKER_VARIANTS)
+    )
 
 
 @pytest.mark.parametrize("basename", PROMPT_SEED)
@@ -699,38 +997,68 @@ def test_property_exactly_the_five_shipped_prompts_are_injected(
 
     if basename in CONVENTIONS_PROMPTS:
         assert injected.startswith(body)
-        assert AGENTS_SENTINEL in injected
         assert CONVENTIONS_SENTINEL in injected
+        # C1.1: no shipped prompt carries the marker, so AGENTS.md is never appended.
+        assert AGENTS_SENTINEL not in injected
     else:
         assert injected == body
 
 
-@pytest.mark.parametrize(("agents_present", "conventions_present"), SOURCE_SEED)
+@pytest.mark.parametrize(
+    ("agents_present", "conventions_present", "include_agents_md"), BLOCK_SEED
+)
 def test_property_source_presence_matches_the_d16_order_rule(
-    tmp_path: Path, agents_present: bool, conventions_present: bool
+    tmp_path: Path,
+    agents_present: bool,
+    conventions_present: bool,
+    include_agents_md: bool,
 ) -> None:
-    """Sweep 2: the block is empty iff no source has content, else D16 order of what exists."""
+    """Sweep 2: the block is empty iff no included source has content, else D16 order."""
     target = _target(
         tmp_path,
         agents_md=AGENTS_MD if agents_present else None,
         conventions_md=CONVENTIONS_MD if conventions_present else None,
     )
 
-    block = render_repo_conventions(target)
+    block = render_repo_conventions(target, include_agents_md=include_agents_md)
 
-    if not agents_present and not conventions_present:
+    agents_included = agents_present and include_agents_md
+    if not agents_included and not conventions_present:
         assert block == ""
         return
     assert block != ""
-    if agents_present:
+    if agents_included:
         assert AGENTS_SENTINEL in block
         assert block.startswith("## Repo conventions (AGENTS.md)")
     else:
         assert AGENTS_SENTINEL not in block
-        assert block.startswith("## Repo conventions (aidw/conventions.md)")
     if conventions_present:
         assert CONVENTIONS_SENTINEL in block
-        if agents_present:
+        assert "## Repo conventions (aidw/conventions.md)" in block
+        if agents_included:
             assert block.index(AGENTS_SENTINEL) < block.index(CONVENTIONS_SENTINEL)
+        else:
+            assert block.startswith("## Repo conventions (aidw/conventions.md)")
     else:
         assert CONVENTIONS_SENTINEL not in block
+        assert block.startswith("## Repo conventions (AGENTS.md)")
+
+
+@pytest.mark.parametrize(("basename", "variant", "frontmatter"), MARKER_SEED)
+def test_property_only_the_yaml_boolean_marker_restores_the_append(
+    tmp_path: Path, basename: str, variant: str, frontmatter: str
+) -> None:
+    """Sweep 3: the five basenames × every marker variant, restore iff YAML ``true``."""
+    target = _target(tmp_path)
+    prompt = _prompt_with(tmp_path, basename, frontmatter)
+    restored = variant in RESTORING_VARIANTS
+
+    assert appends_target_agents_md(prompt) is restored
+    rendered = inject_repo_conventions("body\n", prompt, target)
+
+    # The basename gate and the conventions.md append hold in every combination...
+    assert rendered.startswith("body\n")
+    assert CONVENTIONS_SENTINEL in rendered
+    # ... and only the YAML boolean switches the root AGENTS.md half on.
+    assert (AGENTS_SENTINEL in rendered) is restored
+    assert ("## Repo conventions (AGENTS.md)" in rendered) is restored

@@ -15,6 +15,15 @@ its optional ``aidw/conventions.md`` in D16 order, and both consumers — the fi
 injection the runner applies and the prompt workflow's evidence bundle
 (``aidw.workflows.prompt._gate_block``) — read through it, so there is one channel, not
 two.
+
+**The injection appends only ``aidw/conventions.md`` by default** (task C1.1, design §7.3
+step 4 / §17): Pi already loads the target repo's ``AGENTS.md`` as project context at
+``cwd`` = target root (§5.5), so appending it again duplicated the same file in every §3.8
+stage. A prompt whose *resolved* file declares the frontmatter marker
+``append_agents_md: true`` opts that prompt back in — the escape hatch for a repo whose
+agents set ``no_context_files: true`` and would otherwise lose ``AGENTS.md`` entirely. The
+read channel keeps both sources (``CONVENTIONS_SOURCES``) because ``_gate_block`` takes the
+gate commands from the root ``AGENTS.md``; only the injection was narrowed.
 """
 
 from __future__ import annotations
@@ -22,8 +31,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import yaml
+
 _POSITIONAL = re.compile(r"\$(\d+)")
-_FRONTMATTER = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.DOTALL)
+# The capture group is the *inner* frontmatter text: :func:`strip_frontmatter` ignores it,
+# while :func:`appends_target_agents_md` parses exactly that slice as YAML (C1.1).
+_FRONTMATTER = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
 
 
 class PromptError(RuntimeError):
@@ -100,10 +113,22 @@ CONVENTIONS_PROMPTS: frozenset[str] = frozenset(
     }
 )
 
+#: The root source's repo-relative path. Named once because the injection treats it
+#: differently from the second source (C1.1: dropped unless the prompt opts in), while the
+#: read channel keeps both (``_gate_block`` reads the ``## Gates`` section through it).
+AGENTS_MD_SOURCE = "AGENTS.md"
+
 #: The D16 sources, relative to the **target** repo root and in D16 order: the root
 #: ``AGENTS.md`` first, then the optional ``aidw/conventions.md`` (EXTRACTION.md §3.4/§3.8).
-#: It is a fixed pair of paths, deliberately not a ``paths.*`` config entry (D16).
-CONVENTIONS_SOURCES: tuple[str, ...] = ("AGENTS.md", "aidw/conventions.md")
+#: It is a fixed pair of paths, deliberately not a ``paths.*`` config entry (D16). Both
+#: stay here in C1.1 even though the injection only appends the second by default: the
+#: sources list is the *channel*, and ``aidw/workflows/prompt.py:_gate_block`` still needs
+#: the root ``AGENTS.md``'s ``## Gates`` section (C1.2/C1.3 depend on it).
+CONVENTIONS_SOURCES: tuple[str, ...] = (AGENTS_MD_SOURCE, "aidw/conventions.md")
+
+#: The opt-in frontmatter marker on the **resolved** prompt file that restores the root
+#: ``AGENTS.md`` append (C1.1; design §7.3 step 4). Only the YAML boolean ``True`` counts.
+AGENTS_MD_MARKER = "append_agents_md"
 
 #: One-line header per injected source, naming the file the content came from (§3.8: repo
 #: stack rules are injected with their origin identifiable; the wording itself is not
@@ -145,19 +170,66 @@ def read_conventions_sources(repo_root: Path) -> tuple[tuple[str, str], ...]:
     return tuple(sources)
 
 
-def render_repo_conventions(repo_root: Path) -> str:
+def appends_target_agents_md(prompt: Path) -> bool:
+    """Whether ``prompt`` opts in to the root ``AGENTS.md`` append, by frontmatter marker.
+
+    C1.1's lever: the *resolved* prompt file (``spec.prompt``, so a repo shadow or an
+    explicitly declared prompt is read, never the toolkit default a stage id would name)
+    may carry ``append_agents_md: true`` in its frontmatter. That restores
+    :func:`render_repo_conventions`'s ``AGENTS.md`` half for a repo whose agents set
+    ``no_context_files: true`` (§5.5) and would otherwise lose ``AGENTS.md`` entirely.
+
+    Fail-closed to ``False`` — the default — on every edge, with **no raise**: an absent
+    marker, a value that is not the YAML boolean ``True`` (``false``, a quoted ``"true"``
+    string, ``maybe``, a nested key), malformed YAML in the frontmatter block, a
+    frontmatter-less prompt, and a missing/unreadable/non-UTF-8 file. That is the same
+    degrade-never-error contract as :func:`read_conventions_sources`: a marker typo must
+    not fail a stage, and guessing an opt-in would re-introduce the duplication C1.1
+    removes. Pure: the prompt file is only read.
+    """
+    try:
+        text = Path(prompt).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    match = _FRONTMATTER.match(text)
+    if match is None:
+        return False
+    try:
+        # ``yaml.safe_load`` on the inner slice, not the whole block: the block's closing
+        # ``---`` would start a second document and raise a ComposerError.
+        metadata = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    # ``is True`` (not truthiness): YAML parses ``true``/``TRUE`` to the boolean, and a
+    # quoted ``"true"`` or a non-zero integer must not switch the append on.
+    return metadata.get(AGENTS_MD_MARKER) is True
+
+
+def render_repo_conventions(
+    repo_root: Path, *, include_agents_md: bool = False
+) -> str:
     """The target repo's conventions as one injectable block, ``""`` when it has none.
 
-    Each source's content is copied verbatim and whole under a one-line header naming the
-    file it came from, joined in D16 order (``AGENTS.md`` before ``aidw/conventions.md``).
-    A repo with neither file — or with an empty one — gets the empty string, so the
+    By default only ``aidw/conventions.md`` is included — the file Pi does not provide
+    (C1.1): the root ``AGENTS.md`` already reaches the agent as project context (§5.5), so
+    appending it here duplicated the same file. ``include_agents_md=True`` restores the
+    pre-C1.1 block: both sources, each copied verbatim and whole under a one-line header
+    naming the file it came from, joined in D16 order (``AGENTS.md`` before
+    ``aidw/conventions.md``).
+
+    A repo with no included source — or with an empty one — gets the empty string, so the
     rendered prompt is exactly what it would have been: no "unavailable" note, no raise
     (§3.4's "a repo with no conventions yet", task E7.3 requirement 3). Pure: no input is
     mutated and nothing is written.
     """
+    sources = read_conventions_sources(repo_root)
+    if not include_agents_md:
+        sources = tuple(pair for pair in sources if pair[0] != AGENTS_MD_SOURCE)
     return "\n\n".join(
         f"{CONVENTIONS_HEADER.format(source=source)}\n\n{text}"
-        for source, text in read_conventions_sources(repo_root)
+        for source, text in sources
     )
 
 
@@ -177,14 +249,21 @@ def inject_repo_conventions(prompt_text: str, prompt: Path, repo_root: Path) -> 
     Called by :func:`aidw.runner.run_stage` **after** the prompt body is rendered and
     after the stage's ``extra`` is appended, so the agent reads prompt body → stage extra
     → repo conventions, and both the written ``.rendered.md`` and the stdin payload to Pi
-    carry the same text. A prompt outside :data:`CONVENTIONS_PROMPTS` and a repo with no
-    conventions both return ``prompt_text`` **byte-identically** (task E7.3 requirements
-    3 and 5). Pure: the prompt files and ``spec.variables`` are never touched
-    (``tests/test_prompt_neutrality.py`` asserts rendering stays pure).
+    carry the same text.
+
+    The appended block is ``aidw/conventions.md`` only unless the resolved prompt file
+    carries the ``append_agents_md: true`` marker (:func:`appends_target_agents_md`; C1.1,
+    design §7.3 step 4): Pi already delivers the root ``AGENTS.md`` (§5.5). A prompt
+    outside :data:`CONVENTIONS_PROMPTS`, a repo with no conventions, and an opting-in
+    prompt whose repo has no ``AGENTS.md`` all return ``prompt_text`` **byte-identically**
+    (task E7.3 requirements 3 and 5). Pure: the prompt files and ``spec.variables`` are
+    never touched (``tests/test_prompt_neutrality.py`` asserts rendering stays pure).
     """
     if not receives_repo_conventions(prompt):
         return prompt_text
-    block = render_repo_conventions(repo_root)
+    block = render_repo_conventions(
+        repo_root, include_agents_md=appends_target_agents_md(prompt)
+    )
     if not block:
         return prompt_text
     return f"{prompt_text}\n\n{block}"

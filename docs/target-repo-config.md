@@ -479,5 +479,9 @@ declared it).
 - `docs/migration/EXTRACTION.md` §3.4 (this contract), §3.5 (stage model), §3.9 (the D5 freeze),
   §3.11 (the D10 refusal), §3.12 (repo layout).
 - `design.md` §12 (`max_revisions`), §5 (agent configs), §11 (roadmap).
-- `<target>/AGENTS.md` and the optional `<target>/aidw/conventions.md` — repo conventions
-  injected into prompts (D16/§3.8).
+- `<target>/AGENTS.md` — the project's system prompt, loaded by Pi as project context, and the
+  first of the two D16 sources the prompt workflow's gate list reads
+  (`aidw/workflows/prompt.py:_gate_block`). It is **not** appended to rendered prompts (C1.1,
+  design §7.3/§17 Z15).
+- The optional `<target>/aidw/conventions.md` — repo conventions injected into rendered prompts
+  (D16/§3.8).
