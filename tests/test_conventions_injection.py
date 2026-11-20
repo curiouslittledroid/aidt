@@ -56,12 +56,18 @@ from aidw.pi import PiResult, Usage
 from aidw.prompts import (
     CONVENTIONS_PROMPTS,
     CONVENTIONS_SOURCES,
+    GATE_BLOCK_HEADER,
+    GATE_BLOCK_SOURCES,
+    GATE_PROMPTS,
     appends_target_agents_md,
+    inject_gate_block,
     inject_repo_conventions,
     read_conventions_sources,
+    receives_gate_block,
     receives_repo_conventions,
     render_prompt_file,
     render_repo_conventions,
+    resolved_gate_block,
 )
 from aidw.runner import StageSpec, resolve_prompt, run_stage
 from aidw.state import SUCCEEDED, create_run, run_dir
@@ -77,6 +83,11 @@ CONVENTIONS_SENTINEL = "E7.3-FIXTURE-SENTINEL-FROM-TARGET-CONVENTIONS-MD"
 #: itself``). Its absence proves the target root, not the toolkit root, was read.
 TOOLKIT_ONLY_PHRASE = "developing `aidt` itself"
 
+#: The whole-file sentinels live in their own ``## Notes`` section, *outside* the gate
+#: section: C1.3 injects the gate section itself into the five gate prompts, so a sentinel
+#: inside it would stop distinguishing "the whole file was appended" from "its commands were
+#: resolved". The section also ends ``_gates_section``'s capture, exactly as a real
+#: ``## Tests`` heading would.
 AGENTS_MD = f"""# Target repo conventions
 
 Intro prose that belongs to the target repo.
@@ -86,6 +97,8 @@ Intro prose that belongs to the target repo.
 ```bash
 target-fixture gate --check
 ```
+
+## Notes
 
 {AGENTS_SENTINEL}
 """
@@ -99,6 +112,8 @@ Stack rules the toolkit must not inline.
 ```bash
 target-fixture lint && target-fixture test
 ```
+
+## Notes
 
 {CONVENTIONS_SENTINEL}
 """
@@ -172,8 +187,9 @@ def _render_text(
     """The text ``run_stage`` renders on the real-run path (W1.2).
 
     A ``--dry-run`` writes no ``prompts/<stage>.rendered.md``, so this module computes the
-    text with the same two pure calls the runner applies, in the same order: the prompt and
-    its positional variables, then ``spec.extra``, then the target repo's conventions last.
+    text with the same pure calls the runner applies, in the same order: the prompt and
+    its positional variables, then ``spec.extra``, then the target repo's conventions, then
+    the resolved gate block (C1.3).
     ``test_written_render_and_pi_stdin_receive_the_same_injection`` pins it against the file
     (and Pi stdin payload) a **real** run produces, so the two cannot drift.
     """
@@ -182,6 +198,10 @@ def _render_text(
         rendered = f"{rendered}\n\n{extra}"
     if repo_root is not None:
         rendered = inject_repo_conventions(rendered, prompt, repo_root)
+        # C1.3 applies the resolved gate block after the conventions block, in the same order
+        # ``run_stage`` does — ``test_written_render_and_pi_stdin_receive_the_same_injection``
+        # pins this helper against a real run's written file.
+        rendered = inject_gate_block(rendered, prompt, repo_root)
     return rendered
 
 
@@ -502,10 +522,14 @@ def test_missing_conventions_md_contributes_nothing_and_the_run_succeeds(
         variables=FIVE_PROMPTS["impliment-task.md"],
     )
 
-    assert rendered == render_prompt_file(prompt, FIVE_PROMPTS["impliment-task.md"])
+    # The missing *conventions* source contributes nothing (no header, no sentinel)...
     assert AGENTS_SENTINEL not in rendered
     assert CONVENTIONS_SENTINEL not in rendered
     assert "## Repo conventions (" not in rendered
+    # ...but the AGENTS.md gate section written before it still resolves, so C1.3 appends it
+    # once under its own header. That block is not a "Repo conventions" placeholder.
+    assert rendered.count(GATE_BLOCK_HEADER.format(sources=GATE_BLOCK_SOURCES)) == 1
+    assert "target-fixture gate --check" in rendered
     # Not an "unavailable" placeholder either: absence is silent.
     assert "unavailable" not in rendered.lower()
 
@@ -669,22 +693,34 @@ def test_a_conventions_stage_name_with_another_prompt_is_not_injected(
     assert rendered.strip() == "Reply with exactly the token PONG and nothing else."
 
 
-@pytest.mark.parametrize("basename", ["code-review.md", "noop.md"])
+@pytest.mark.parametrize("basename", ["pr.md", "noop.md"])
 def test_no_other_prompt_is_injected(tmp_path: Path, basename: str) -> None:
-    """Requirement 5: every other prompt is untouched even when both sources exist."""
+    """Requirement 5: every other prompt is untouched even when both sources exist.
+
+    ``code-review.md`` was this test's shipped-prompt case until C1.3 added it to
+    :data:`GATE_PROMPTS`; ``pr.md`` is outside both channels, so it carries the same claim.
+    """
     target = _target(tmp_path)
     prompt = (
         toolkit_root() / "prompts" / basename
-        if basename == "code-review.md"
+        if basename == "pr.md"
         else toolkit_root() / "tests" / "fixtures" / "noop.md"
     )
 
     rendered, _state = _dry_run(
-        tmp_path, target, name=basename.removesuffix(".md"), prompt=prompt
+        tmp_path,
+        target,
+        name=basename.removesuffix(".md"),
+        prompt=prompt,
+        variables=["01-A1.1"] if basename == "pr.md" else [],
     )
 
     assert AGENTS_SENTINEL not in rendered
     assert CONVENTIONS_SENTINEL not in rendered
+    # C1.3's channel is closed here too: neither the repo-conventions header nor the
+    # resolved gate block's header is appended.
+    assert "## Repo conventions (" not in rendered
+    assert GATE_HEADER not in rendered
     assert "## Repo conventions (" not in rendered
 
 
@@ -742,6 +778,260 @@ def test_the_traceability_prompt_is_injected_by_basename_not_by_stage_id(
     assert AGENTS_SENTINEL not in rendered
     assert CONVENTIONS_SENTINEL not in rendered
 
+
+# --------------------------------------------------------------------------- #
+# C1.3: the resolved gate commands are inlined into the five gate prompts
+# --------------------------------------------------------------------------- #
+
+#: A target whose ``AGENTS.md`` publishes its gates under a **suffixed** canonical heading
+#: (the toolkit's own shape) with two commands, and whose ``aidw/conventions.md`` uses the
+#: ``## Gate commands`` alias with one. Two sources, two recognised headings, different
+#: section lengths — everything the D16-ordered verbatim join must handle.
+GATE_AGENTS_MD = """# Gate fixture
+
+Intro prose outside the gate section.
+
+## Gates — run exactly these, and only these
+
+```bash
+target gate one --check
+target gate two --check
+```
+
+C1.3-AGENTS-GATE-SENTINEL
+"""
+
+GATE_CONVENTIONS_MD = """# Conventions
+
+## Gate commands
+
+```bash
+target gate three --check
+```
+
+C1.3-CONVENTIONS-GATE-SENTINEL
+"""
+
+#: The hand-calculated join: each section verbatim, bounded at the next ``## `` heading,
+#: ``AGENTS.md`` first (D16 order), joined by one blank line.
+EXPECTED_GATE_BLOCK = (
+    "## Gates — run exactly these, and only these\n"
+    "\n"
+    "```bash\n"
+    "target gate one --check\n"
+    "target gate two --check\n"
+    "```\n"
+    "\n"
+    "C1.3-AGENTS-GATE-SENTINEL\n"
+    "\n"
+    "## Gate commands\n"
+    "\n"
+    "```bash\n"
+    "target gate three --check\n"
+    "```\n"
+    "\n"
+    "C1.3-CONVENTIONS-GATE-SENTINEL"
+)
+
+#: The one header the injected block sits under (C1.3 mirrors ``CONVENTIONS_HEADER``'s
+#: source-labelled shape).
+GATE_HEADER = GATE_BLOCK_HEADER.format(sources=GATE_BLOCK_SOURCES)
+
+#: The five C1.3 gate prompts — **not** ``CONVENTIONS_PROMPTS``: the fix and code-review
+#: prompts record their own gate outcomes, while ``task-prompt.md`` and
+#: ``update-traceability.md`` do not.
+GATE_FIVE = (
+    "impliment-task.md",
+    "test.md",
+    "fix-next-review-followup.md",
+    "record-implementation-results.md",
+    "code-review.md",
+)
+
+
+def _gate_target(tmp_path: Path) -> Path:
+    return _target(
+        tmp_path, agents_md=GATE_AGENTS_MD, conventions_md=GATE_CONVENTIONS_MD
+    )
+
+
+def test_c13_the_gate_prompt_set_is_exactly_the_five_and_not_the_conventions_set() -> None:
+    """The two sets are deliberately different; the roadmap fixes both memberships."""
+    assert GATE_PROMPTS == frozenset(GATE_FIVE)
+    assert len(GATE_PROMPTS) == 5
+    # The two members the sets do not share, in both directions.
+    assert {"fix-next-review-followup.md", "code-review.md"} <= GATE_PROMPTS
+    assert GATE_PROMPTS - CONVENTIONS_PROMPTS == {
+        "fix-next-review-followup.md",
+        "code-review.md",
+    }
+    assert CONVENTIONS_PROMPTS - GATE_PROMPTS == {
+        "task-prompt.md",
+        "update-traceability.md",
+    }
+
+
+def test_c13_resolved_gate_block_joins_the_sections_verbatim_in_d16_order(
+    tmp_path: Path,
+) -> None:
+    """Hand-calculated example: two sources, two headings, one D16-ordered block."""
+    target = _gate_target(tmp_path)
+
+    assert resolved_gate_block(target) == EXPECTED_GATE_BLOCK
+
+
+@pytest.mark.parametrize("basename", GATE_FIVE)
+def test_c13_each_gate_prompt_receives_the_block_under_its_header(
+    tmp_path: Path, basename: str
+) -> None:
+    """Each of the five appends the block verbatim under one source-labelled header."""
+    target = _gate_target(tmp_path)
+    body = "rendered body\n"
+
+    injected = inject_gate_block(body, toolkit_root() / "prompts" / basename, target)
+
+    assert injected == f"{body}\n\n{GATE_HEADER}\n\n{EXPECTED_GATE_BLOCK}"
+
+
+@pytest.mark.parametrize(
+    "basename", ["pr.md", "task-prompt.md", "update-traceability.md"]
+)
+def test_c13_prompts_outside_the_five_stay_byte_identical(
+    tmp_path: Path, basename: str
+) -> None:
+    """The pointer behaviour survives for every prompt C1.3 does not cover."""
+    target = _gate_target(tmp_path)
+    body = "rendered body\n"
+    prompt = toolkit_root() / "prompts" / basename
+
+    assert inject_gate_block(body, prompt, target) == body
+    assert receives_gate_block(prompt) is False
+
+
+def test_c13_a_repo_shadow_is_injected_by_basename_not_stage_id(tmp_path: Path) -> None:
+    """``spec.prompt`` is the key, so a repo-shadowed ``test.md`` is injected too."""
+    target = _gate_target(tmp_path)
+    shadow = target / "aidw" / "prompts" / "test.md"
+    shadow.parent.mkdir(parents=True)
+    shadow.write_text("# target shadow\n", encoding="utf-8")
+
+    assert receives_gate_block(shadow) is True
+    assert inject_gate_block("body\n", shadow, target).startswith("body\n\n")
+    # The mirror: a non-gate file at a gate-looking stage name receives nothing.
+    assert receives_gate_block(toolkit_root() / "tests" / "fixtures" / "noop.md") is False
+
+
+def test_c13_a_repo_with_no_source_resolves_none_and_renders_identically(
+    tmp_path: Path,
+) -> None:
+    """No-resolution is byte-identity, never an injected ``unavailable`` note."""
+    target = _target(tmp_path, agents_md=None, conventions_md=None)
+    body = "rendered body\n"
+
+    assert resolved_gate_block(target) is None
+    for basename in GATE_FIVE:
+        prompt = toolkit_root() / "prompts" / basename
+        assert inject_gate_block(body, prompt, target) == body
+        assert "unavailable" not in inject_gate_block(body, prompt, target).lower()
+
+
+def test_c13_a_source_without_a_recognised_heading_resolves_none(tmp_path: Path) -> None:
+    """A conventions file with no gate section is the same as no source."""
+    target = _target(
+        tmp_path,
+        agents_md="# Conventions\n\nStack rules only, no gate list.\n",
+        conventions_md=None,
+    )
+
+    assert resolved_gate_block(target) is None
+    assert (
+        inject_gate_block("body\n", toolkit_root() / "prompts" / "test.md", target)
+        == "body\n"
+    )
+
+
+def test_c13_the_gate_block_reads_the_target_root_not_the_toolkit_root(
+    tmp_path: Path,
+) -> None:
+    """A ``toolkit_root()`` read would pass self-hosted and break after extraction."""
+    target = _gate_target(tmp_path)
+
+    block = resolved_gate_block(target)
+
+    assert block is not None
+    # Both target sources contribute, in D16 order.
+    assert block.index("C1.3-AGENTS-GATE-SENTINEL") < block.index(
+        "C1.3-CONVENTIONS-GATE-SENTINEL"
+    )
+    # The negative is non-vacuous: the toolkit's own AGENTS.md really carries this command,
+    # so a toolkit-root read would put it in the block.
+    toolkit_agents = (toolkit_root() / "AGENTS.md").read_text(encoding="utf-8")
+    assert "uv sync --frozen" in toolkit_agents
+    assert "uv sync --frozen" not in block
+
+
+def test_c13_resolution_and_injection_write_nothing_and_mutate_no_input(
+    tmp_path: Path,
+) -> None:
+    """Pure: the sources and the prompt are read only, and no file is created."""
+    target = _gate_target(tmp_path)
+    agents_path = target / "AGENTS.md"
+    conventions_path = target / "aidw" / "conventions.md"
+    prompt = toolkit_root() / "prompts" / "impliment-task.md"
+    watched = (agents_path, conventions_path, prompt)
+    before = {path: path.read_bytes() for path in watched}
+    mtimes = {path: path.stat().st_mtime_ns for path in watched}
+    listing_before = sorted(str(path) for path in target.rglob("*"))
+    text = "rendered body\n"
+
+    block = resolved_gate_block(target)
+    injected = inject_gate_block(text, prompt, target)
+
+    assert block == EXPECTED_GATE_BLOCK
+    assert injected.startswith(text)
+    # No input was mutated and no output was written anywhere the fixture can see.
+    assert text == "rendered body\n"
+    assert {path: path.read_bytes() for path in watched} == before
+    assert {path: path.stat().st_mtime_ns for path in watched} == mtimes
+    assert sorted(str(path) for path in target.rglob("*")) == listing_before
+
+
+def test_c13_the_dry_run_render_carries_the_block_exactly_once(tmp_path: Path) -> None:
+    """The runner's seam: the block lands after the body and the conventions append.
+
+    ``impliment-task.md`` is in both sets, so this is also the duplication corner's pinned
+    shape: the focused gate block is the authoritative *resolved gate commands*
+    presentation, and its header appears exactly once even though ``aidw/conventions.md`` is
+    appended whole as repo conventions as well.
+    """
+    target = _gate_target(tmp_path)
+    prompt = toolkit_root() / "prompts" / "impliment-task.md"
+
+    rendered, record = _dry_run(
+        tmp_path,
+        target,
+        name="impliment-task",
+        prompt=prompt,
+        variables=FIVE_PROMPTS["impliment-task.md"],
+    )
+
+    assert record.status == SUCCEEDED
+    assert rendered.count(GATE_HEADER) == 1
+    # The AGENTS.md gate section appears only in the injected block (the conventions append
+    # is conventions.md only, C1.1), so it is the block's own copy.
+    assert rendered.count("## Gates — run exactly these, and only these") == 1
+    assert "target gate one --check" in rendered
+    # Ordering: body → repo conventions → resolved gate commands.
+    assert rendered.index("## Repo conventions (aidw/conventions.md)") < rendered.index(
+        GATE_HEADER
+    )
+    # ``pr.md`` is outside the five: its render is unchanged by C1.3.
+    pr_rendered = inject_gate_block(
+        render_prompt_file(toolkit_root() / "prompts" / "pr.md", ["01-A1.1"]),
+        toolkit_root() / "prompts" / "pr.md",
+        target,
+    )
+    assert GATE_HEADER not in pr_rendered
 
 # --------------------------------------------------------------------------- #
 # Two roots: ``repo_root`` is the target, never ``toolkit_root()``
@@ -892,9 +1182,14 @@ def test_a_non_utf8_conventions_file_does_not_fail_a_dry_run(
 
     rendered, record = _dry_run(tmp_path, target, name="test", prompt=prompt)
 
-    assert rendered == render_prompt_file(prompt, [])
+    # The conventions source Pi lacks degrades to nothing; the AGENTS.md gate section still
+    # resolves and is injected once (C1.3), so only the *conventions* half is byte-identical.
+    assert "## Repo conventions (" not in rendered
     assert AGENTS_SENTINEL not in rendered
     assert CONVENTIONS_SENTINEL not in rendered
+    assert rendered.startswith(render_prompt_file(prompt, []))
+    assert rendered.count(GATE_BLOCK_HEADER.format(sources=GATE_BLOCK_SOURCES)) == 1
+    assert "target-fixture gate --check" in rendered
     # An unreadable conventions file degrades; the stage still plans successfully.
     assert record.status == SUCCEEDED
 
@@ -1062,3 +1357,57 @@ def test_property_only_the_yaml_boolean_marker_restores_the_append(
     # ... and only the YAML boolean switches the root AGENTS.md half on.
     assert (AGENTS_SENTINEL in rendered) is restored
     assert ("## Repo conventions (AGENTS.md)" in rendered) is restored
+
+#: Series 4's seed: the gate-prompt allowlist crossed with the source-presence/heading matrix;
+#: ``numRuns = GATE_NUM_RUNS``. The claim it sweeps is C1.3's two-sided rule: a prompt receives
+#: the resolved block **iff** its basename is in :data:`GATE_PROMPTS` *and* the target resolves
+#: one, and the text is byte-identical in every other combination (the pointer behaviour).
+GATE_SOURCE_SEED: tuple[tuple[str | None, str | None], ...] = (
+    (GATE_AGENTS_MD, GATE_CONVENTIONS_MD),
+    (GATE_AGENTS_MD, None),
+    (None, GATE_CONVENTIONS_MD),
+    (None, None),
+    ("# Conventions\n\nStack rules only, no gate list.\n", None),
+)
+GATE_BASENAMES: tuple[str, ...] = (
+    *sorted(GATE_PROMPTS),
+    "pr.md",
+    "task-prompt.md",
+    "update-traceability.md",
+)
+GATE_SEED: tuple[tuple[str, tuple[str | None, str | None]], ...] = tuple(
+    (basename, sources)
+    for basename in GATE_BASENAMES
+    for sources in GATE_SOURCE_SEED
+)
+GATE_NUM_RUNS = len(GATE_SEED)
+
+
+def test_the_gate_property_seed_is_the_pinned_sample() -> None:
+    """The sample covers both sides of the allowlist and shrinks only deliberately."""
+    assert GATE_NUM_RUNS == len(GATE_SEED) == len(GATE_BASENAMES) * len(GATE_SOURCE_SEED)
+    assert GATE_NUM_RUNS == 8 * 5 == 40
+    assert set(GATE_PROMPTS) < set(GATE_BASENAMES)
+    assert len(GATE_PROMPTS & CONVENTIONS_PROMPTS) == 3
+
+
+@pytest.mark.parametrize(("basename", "sources"), GATE_SEED)
+def test_property_the_gate_block_is_injected_iff_the_prompt_and_repo_resolve(
+    tmp_path: Path,
+    basename: str,
+    sources: tuple[str | None, str | None],
+) -> None:
+    """Sweep 4: injection iff (prompt in the five) and (the target resolves a block)."""
+    target = _target(tmp_path, agents_md=sources[0], conventions_md=sources[1])
+    prompt = toolkit_root() / "prompts" / basename
+    body = "rendered body\n"
+
+    block = resolved_gate_block(target)
+    injected = inject_gate_block(body, prompt, target)
+    expected = block is not None and basename in GATE_PROMPTS
+
+    if expected:
+        assert injected == f"{body}\n\n{GATE_HEADER}\n\n{block}"
+    else:
+        # Byte-identity is the contract: no header, no block, no "unavailable" note.
+        assert injected == body

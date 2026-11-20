@@ -11,10 +11,13 @@ template expansion, which does not run for CLI invocations (design §7.3).
 
 The module also owns the **repo-conventions channel** (EXTRACTION.md §3.8, D16; task
 E7.3): :func:`read_conventions_sources` reads the *target* repo's root ``AGENTS.md`` and
-its optional ``aidw/conventions.md`` in D16 order, and both consumers — the five-prompt
-injection the runner applies and the prompt workflow's evidence bundle
+its optional ``aidw/conventions.md`` in D16 order, and the consumers — the five-prompt
+injection the runner applies, the **resolved gate commands** both the runner injects into
+the gate-recording prompts and the prompt workflow's evidence bundle renders
 (``aidw.workflows.prompt._gate_block``) — read through it, so there is one channel, not
-two.
+two. Since C1.3 the gate-block *resolution* lives here too (:func:`resolved_gate_block`,
+:func:`gates_section`) and is injected by :func:`inject_gate_block`, so the bundle and the
+stage prompts cannot resolve two different gate lists.
 
 **The injection appends only ``aidw/conventions.md`` by default** (task C1.1, design §7.3
 step 4 / §17): Pi already loads the target repo's ``AGENTS.md`` as project context at
@@ -32,6 +35,12 @@ import re
 from pathlib import Path
 
 import yaml
+
+# ``load_target_config`` is the one target-config loader (``gates_heading`` is read from the
+# **target's** ``<repo_root>/aidw/config.yaml``, never the toolkit root — AGENTS.md "Two roots").
+# ``aidw.target_config`` imports ``aidw.config``/``aidw.verification`` only, so there is no
+# cycle back into this module.
+from aidw.target_config import load_target_config
 
 _POSITIONAL = re.compile(r"\$(\d+)")
 # The capture group is the *inner* frontmatter text: :func:`strip_frontmatter` ignores it,
@@ -118,19 +127,37 @@ CONVENTIONS_PROMPTS: frozenset[str] = frozenset(
 #: read channel keeps both (``_gate_block`` reads the gate-commands section through it).
 AGENTS_MD_SOURCE = "AGENTS.md"
 
+#: The five prompts that receive the target repo's **resolved gate commands** (C1.3, design
+#: §7.3 step 5), keyed by the resolved prompt file's basename exactly like
+#: :data:`CONVENTIONS_PROMPTS` so a repo shadow keeps working. It is deliberately **not** the
+#: same set: ``fix-next-review-followup.md`` and ``code-review.md`` are in (they record gate
+#: outcomes on their own), while ``task-prompt.md`` and ``update-traceability.md`` are out —
+#: the roadmap fixes exactly these five.
+GATE_PROMPTS: frozenset[str] = frozenset(
+    {
+        "impliment-task.md",
+        "test.md",
+        "fix-next-review-followup.md",
+        "record-implementation-results.md",
+        "code-review.md",
+    }
+)
+
 #: The D16 sources, relative to the **target** repo root and in D16 order: the root
 #: ``AGENTS.md`` first, then the optional ``aidw/conventions.md`` (EXTRACTION.md §3.4/§3.8).
 #: It is a fixed pair of paths, deliberately not a ``paths.*`` config entry (D16). Both
-#: stay here in C1.1 even though the injection only appends the second by default: the
-#: sources list is the *channel*, and ``aidw/workflows/prompt.py:_gate_block`` still needs
-#: the root ``AGENTS.md``'s gate-commands section (C1.2/C1.3 depend on it).
+#: stay here even though C1.1's default injection only appends the second: the sources list
+#: is the *channel*, and :func:`resolved_gate_block` needs the root ``AGENTS.md``'s
+#: gate-commands section (C1.2/C1.3 depend on it — the evidence bundle and the stage-prompt
+#: injection both read it).
 CONVENTIONS_SOURCES: tuple[str, ...] = (AGENTS_MD_SOURCE, "aidw/conventions.md")
 
 #: The recognised heading set for a gate-commands list (C1.2, design §7.3 step 4): the
 #: canonical ``## Gates`` plus its ``## Gate commands`` alias. One tuple, defined here and
-#: imported by both readers — ``aidw/workflows/prompt.py:_gates_section`` (as
-#: ``_GATES_HEADING``) and ``aidw/doctor.py``'s ``gates heading`` check — so the bundle
-#: reader and the diagnosis cannot drift on what a recognised heading is. Matched with
+#: consumed by :func:`gates_section` (used by both the resolved gate block and the re-exported
+#: ``aidw/workflows/prompt.py:_gates_section``) and ``aidw/doctor.py``'s ``gates heading``
+#: check, so the resolution, the bundle reader and the diagnosis cannot drift on what a
+#: recognised heading is. Matched with
 #: :func:`is_recognised_gates_heading`, never ``==``: a suffixed canonical heading such as
 #: the toolkit's own ``## Gates — run exactly these, and only these`` stays recognised.
 #: Case is deliberate: ``## Gate Commands`` is not ``## Gate commands`` and is not
@@ -158,11 +185,50 @@ def is_recognised_gates_heading(line: str, extra: str | None = None) -> bool:
     target's ``gates_heading`` value **verbatim — the full heading line including its
     ``## `` prefix** (``## Verification gates``); the loader rejects an empty value, so
     ``line.startswith("")`` can never match every line. This is the single definition of
-    the rule: :func:`aidw.workflows.prompt._gates_section` and ``aidw.doctor``'s
-    ``gates heading`` check both route their recognition through it. Pure.
+    the rule: :func:`gates_section` (and its re-export
+    :func:`aidw.workflows.prompt._gates_section`) and ``aidw.doctor``'s ``gates heading``
+    check both route their recognition through it. Pure.
     """
     headings = GATES_HEADINGS if not extra else (*GATES_HEADINGS, extra)
     return line.startswith(headings)
+
+
+def gates_section(text: str, extra_heading: str | None = None) -> str | None:
+    """One conventions source's gate-commands section verbatim, or ``None`` (C1.2/C1.3).
+
+    Recognises either heading in :data:`GATES_HEADINGS` (``## Gates`` or ``## Gate
+    commands``) plus ``extra_heading``, the target's configured ``gates_heading`` passed in
+    verbatim as a full ``## ``-prefixed line (design §7.3 step 4). Recognition is
+    :func:`is_recognised_gates_heading`'s ``startswith`` rule — the same one ``aidw doctor``
+    uses — so a suffixed canonical heading still matches and the heading set has exactly one
+    definition. The extra heading is passed in, never loaded here: this function stays pure.
+
+    The section runs from the heading to the next ``## `` heading, so a later section
+    (``## Tests``) is never copied into the gate list. Pure — no I/O, and the input text is
+    only read.
+
+    Moved here from ``aidw/workflows/prompt.py`` by C1.3 so the resolved-gate-commands
+    *resolution* (:func:`resolved_gate_block`) and the prompt *injection*
+    (:func:`inject_gate_block`) share one definition with the evidence bundle; the workflow
+    module re-exports it as ``_gates_section``.
+    """
+    lines = text.splitlines()
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if is_recognised_gates_heading(line, extra_heading)
+        ),
+        None,
+    )
+    if start is None:
+        return None
+    block = [lines[start]]
+    for line in lines[start + 1 :]:
+        if line.startswith("## "):
+            break
+        block.append(line)
+    return "\n".join(block).rstrip()
 
 #: The opt-in frontmatter marker on the **resolved** prompt file that restores the root
 #: ``AGENTS.md`` append (C1.1; design §7.3 step 4). Only the YAML boolean ``True`` counts.
@@ -208,6 +274,42 @@ def read_conventions_sources(repo_root: Path) -> tuple[tuple[str, str], ...]:
         if text.strip():
             sources.append((relative, text))
     return tuple(sources)
+
+
+def resolved_gate_block(repo_root: Path) -> str | None:
+    """The target repo's resolved gate commands, or ``None`` when nothing resolves (C1.3).
+
+    The single resolution path (design §7.3 steps 4–5). Sources are read through
+    :func:`read_conventions_sources` — the one conventions channel — in D16 order (the root
+    ``AGENTS.md``, then the optional ``aidw/conventions.md``). Each source contributes the
+    section :func:`gates_section` extracts under a heading from :data:`GATES_HEADINGS` or the
+    target's configured ``gates_heading``; the sections are joined verbatim in that order.
+
+    The ``gates_heading`` value is loaded from **this target's** ``<repo_root>/aidw/config.yaml``
+    (never the toolkit root — in a self-hosted run the two coincide, so a wrong-root read would
+    pass every test here and break only after extraction, AGENTS.md "Two roots"). A missing or
+    malformed config simply contributes no declared heading, so the bundle never fails on it
+    (L2.4 requirement 4).
+
+    Returns ``None`` — deliberately **not** a sentinel string — when no source exists or none
+    carries a recognised heading. The two consumers differ on purpose: the evidence bundle maps
+    ``None`` to its ``unavailable`` note (L2.4's degrade contract), while the prompt injection
+    leaves the text byte-identically unchanged (there is no stage prompt degrade note — that is
+    a different consumer). Pure: the sources and the config are only read.
+    """
+    declared = load_target_config(Path(repo_root) / "aidw" / "config.yaml")
+    extra_heading = declared.gates_heading
+    blocks = [
+        block
+        for block in (
+            gates_section(text, extra_heading)
+            for _, text in read_conventions_sources(repo_root)
+        )
+        if block is not None
+    ]
+    if not blocks:
+        return None
+    return "\n\n".join(blocks)
 
 
 def appends_target_agents_md(prompt: Path) -> bool:
@@ -281,6 +383,49 @@ def receives_repo_conventions(prompt: Path) -> bool:
     toolkit default — the basename is what D16 names, not where the file was found.
     """
     return Path(prompt).name in CONVENTIONS_PROMPTS
+
+
+#: One-line header for the injected resolved gate block (C1.3), mirroring
+#: :data:`CONVENTIONS_HEADER`'s source-labelled shape. ``{sources}`` is the D16 channel rather
+#: than the file a section happened to come from: the block is joined from both sources and the
+#: header names where the commands are read from.
+GATE_BLOCK_SOURCES = " + ".join(CONVENTIONS_SOURCES)
+GATE_BLOCK_HEADER = "## Resolved gate commands ({sources})"
+
+
+def receives_gate_block(prompt: Path) -> bool:
+    """Whether ``prompt`` is one of the five C1.3 gate prompts, by resolved basename.
+
+    ``prompt`` is the *resolved* path (``spec.prompt``), so a repo shadow (§3.6 precedence 2)
+    and a declared explicit path (precedence 1) are keyed exactly like the toolkit default.
+    """
+    return Path(prompt).name in GATE_PROMPTS
+
+
+def inject_gate_block(prompt_text: str, prompt: Path, repo_root: Path) -> str:
+    """``prompt_text`` with the target's resolved gate commands appended, or unchanged.
+
+    Called by :func:`aidw.runner.run_stage` **after** :func:`inject_repo_conventions` and
+    ``spec.extra``, so the agent reads prompt body → stage extra → repo conventions → resolved
+    gate commands, and both the written ``.rendered.md`` and the stdin payload to Pi carry the
+    same text (C1.3, design §7.3 step 5).
+
+    For a prompt in :data:`GATE_PROMPTS` whose repo resolves a block, the block is appended
+    **verbatim** under :data:`GATE_BLOCK_HEADER`, which names the conventions channel the
+    commands were read from. Every other case — a prompt outside the five, a repo with no
+    source or no recognised heading — returns ``prompt_text`` **byte-identically**, so the
+    prompt's own pointer wording stays exactly what the repo would have rendered before this
+    injection existed. ``None`` from :func:`resolved_gate_block` never becomes an
+    ``unavailable`` note here: that degrade belongs to the evidence bundle, a different
+    consumer. Pure: nothing is written and no input is mutated.
+    """
+    if not receives_gate_block(prompt):
+        return prompt_text
+    block = resolved_gate_block(repo_root)
+    if block is None:
+        return prompt_text
+    header = GATE_BLOCK_HEADER.format(sources=GATE_BLOCK_SOURCES)
+    return f"{prompt_text}\n\n{header}\n\n{block}"
 
 
 def inject_repo_conventions(prompt_text: str, prompt: Path, repo_root: Path) -> str:

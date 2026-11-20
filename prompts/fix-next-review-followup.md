@@ -173,7 +173,7 @@ These two invocations stay **bare commands** — deliberately *not* `aidw gate r
 
 ## 6. Verify the fix
 
-Run the narrowest meaningful checks first, then broader checks required by the affected package or issue. Use the repo's own gate commands, taken by name from its `aidw/conventions.md`, its root `AGENTS.md`, or the issue — never inlined here — and report the real commands and outcomes.
+Run the narrowest meaningful checks first, then broader checks required by the affected package or issue. Use the repo's own gate commands. When this prompt carries a **resolved gate commands** block, that block is the authoritative source: the repo's own gate commands, taken verbatim from its `aidw/conventions.md` and/or its root `AGENTS.md` and injected by the renderer. When no such block is present, take them by name from its `aidw/conventions.md`, its root `AGENTS.md`, or the issue. Report the real commands and outcomes.
 
 Run each command through `aidw gate run <key> $SCOPE -- <command>`, so its outcome is recorded against the exact tree it verified and a later stage of this run cites it instead of buying the same run twice. At minimum, where applicable:
 

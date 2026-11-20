@@ -51,9 +51,11 @@ If an instruction conflicts with the repo (a gate that would go red, a validator
   - the property or metamorphic test the repo's property-test policy requires for every new module it covers, with an explicit pinned `seed` + `numRuns`.
   These tests are the executable specification of the module and the evidence the traceability
   stage cites — they belong with the code, not in a separate stage.
-- Run a **package-scoped smoke check** on the package(s) you touched, using the repo's own commands
-  — taken by name from its `aidw/conventions.md`, its root `AGENTS.md`, or the task prompt, never
-  inlined here:
+- Run a **package-scoped smoke check** on the package(s) you touched, using the repo's own commands.
+  When this prompt carries a **resolved gate commands** block, that block is the authoritative
+  source: the target repo's own gate commands, taken verbatim from its root `AGENTS.md` and/or its
+  `aidw/conventions.md` and injected by the renderer. When no such block is present, take the
+  commands by name from the repo's `aidw/conventions.md`, its root `AGENTS.md`, or the task prompt.
   ```bash
   <the repo's package-scoped lint command>
   <the repo's package-scoped build command>

@@ -146,13 +146,14 @@ from aidw.findings import (
 from aidw.gates import GateOutcome, decide
 from aidw.log import NullLogger, RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
-# ``_GATES_HEADING`` is the shared recognised-heading tuple from its single definition in
-# ``aidw.prompts`` (C1.2, design §7.3 step 4), so this reader and ``aidw doctor`` cannot
-# drift on the heading set or the comparison.
+# ``_gates_section`` and ``resolved_gate_block`` are the single gate-list definitions in
+# ``aidw.prompts`` (C1.2/C1.3, design §7.3 steps 4-5), so this reader, the stage-prompt
+# injection and ``aidw doctor`` cannot drift on the heading set, the resolution order or the
+# comparison. ``_gates_section`` is a re-exported shim: the symbol moved to ``aidw.prompts``
+# and existing callers/tests keep importing it from here.
 from aidw.prompts import (
-    GATES_HEADINGS as _GATES_HEADING,
-    is_recognised_gates_heading,
-    read_conventions_sources,
+    gates_section as _gates_section,
+    resolved_gate_block,
 )
 from aidw.report import empty_final_message_error, print_stage
 from aidw.roadmap import DONE_RE, TASK_RE, RoadmapTask, find_task, load_tasks
@@ -172,7 +173,6 @@ from aidw.target_config import (
     ResolvedConfig,
     agent_configs_override,
     config_identity,
-    load_target_config,
     resolve_workflow_config,
     validate_paths,
 )
@@ -523,77 +523,29 @@ def _render_prerequisites(entries: list[RoadmapTask], entry: RoadmapTask) -> str
     )
 
 
-def _gates_section(text: str, extra_heading: str | None = None) -> str | None:
-    """One conventions source's gate-commands section verbatim, or ``None`` (C1.2).
-
-    Recognises either heading in :data:`_GATES_HEADING` (``## Gates`` or
-    ``## Gate commands``) plus ``extra_heading``, the target's configured ``gates_heading``
-    passed in verbatim as a full ``## ``-prefixed line (design §7.3 step 4). Recognition is
-    :func:`aidw.prompts.is_recognised_gates_heading`'s ``startswith`` rule — the same one
-    ``aidw doctor`` uses — so a suffixed canonical heading still matches and the heading
-    set has exactly one definition. The extra heading is passed in, never loaded here:
-    this function stays pure.
-
-    The section runs from the heading to the next ``## `` heading, so a later section
-    (``## Tests``) is never copied into the gate list. Pure — no I/O, and the input text is
-    only read.
-    """
-    lines = text.splitlines()
-    start = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if is_recognised_gates_heading(line, extra_heading)
-        ),
-        None,
-    )
-    if start is None:
-        return None
-    block = [lines[start]]
-    for line in lines[start + 1 :]:
-        if line.startswith("## "):
-            break
-        block.append(line)
-    return "\n".join(block).rstrip()
-
-
 def _gate_block(repo: TargetRepo) -> str:
-    """The target repo's gate commands, from every conventions source (L2.4, D16/E7.3).
+    """The target repo's gate commands, degrading to the bundle's unavailable note (L2.4).
+
+    C1.3 moved the resolution to :func:`aidw.prompts.resolved_gate_block` — one path shared
+    with the stage-prompt injection (:func:`aidw.prompts.inject_gate_block`) — and this is
+    the evidence bundle's thin wrapper. The only difference is the **consumer's** contract:
+    the bundle needs an explicit ``_EVIDENCE_UNAVAILABLE`` note where the resolver returns
+    ``None`` (L2.4 requirement 4, unchanged), while a stage prompt must stay byte-identical.
 
     Sources are read through :func:`aidw.prompts.read_conventions_sources` — the same
     single conventions channel the five-prompt injection uses — in D16 order: the root
-    ``AGENTS.md``, then the optional ``aidw/conventions.md``. Each source is passed through
-    :func:`_gates_section` unchanged, contributing its ``## Gates``/``## Gate commands``
-    section verbatim, joined in that order, so a repo that publishes its gates in either
-    file is honoured rather than silently ignoring the one R14 names for new commands.
-
-    The target's optional ``gates_heading`` is loaded from **this target's**
-    ``<repo.root>/aidw/config.yaml`` (never the toolkit root) and passed to
-    :func:`_gates_section` as the additional recognised heading. A config-less repo gets
-    ``None``; a malformed or unreadable config degrades the same way, so the bundle never
-    fails on it (L2.4 requirement 4).
-
-    When no source exists, or none carries a recognised heading, the section degrades to
-    ``_EVIDENCE_UNAVAILABLE`` — a normal state, never an error (L2.4 requirement 4). The
-    ``gates heading`` doctor WARN (design §8.1) is the diagnosis, not a run failure.
+    ``AGENTS.md``, then the optional ``aidw/conventions.md``. Each source contributes its
+    ``## Gates``/``## Gate commands`` section verbatim, joined in that order, so a repo that
+    publishes its gates in either file is honoured rather than silently ignoring the one R14
+    names for new commands. The target's optional ``gates_heading`` is loaded from **this
+    target's** ``<repo.root>/aidw/config.yaml``, never the toolkit root.
 
     ``repo.root`` is the *target* root, never the toolkit root or a cwd-relative path. In
     a self-hosted run the two roots coincide, so a wrong-root read would pass every test
     here and break only after extraction (AGENTS.md "Two roots").
     """
-    declared = load_target_config(repo.root / "aidw" / "config.yaml")
-    extra_heading = declared.gates_heading
-    blocks = [
-        block
-        for block in (
-            _gates_section(text, extra_heading)
-            for _, text in read_conventions_sources(repo.root)
-        )
-        if block is not None
-    ]
-    if not blocks:
-        return _EVIDENCE_UNAVAILABLE
-    return "\n\n".join(blocks)
+    block = resolved_gate_block(repo.root)
+    return _EVIDENCE_UNAVAILABLE if block is None else block
 
 
 def _render_base_branch(repo: TargetRepo) -> str:
