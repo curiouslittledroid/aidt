@@ -3,7 +3,7 @@
 **Branch:** `05-C1.1`
 **Date:** 2026-11-20
 **Spec:** `design.md` §7.3 (prompt rendering, decision D2), §5.5 (system prompt and context files), §17 (resolved decisions); roadmap entry C1.1 in `docs/tasks/05 - Pipeline efficiency.md`; `docs/task-prompts/05-C1.1-prompt.md`; `aidw/conventions.md` (traceability artefacts)
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** [#172](https://github.com/curiouslittledroid/aidt/pull/172)
 
 ## Summary
 
