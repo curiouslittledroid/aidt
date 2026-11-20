@@ -48,6 +48,7 @@ import pytest
 from aidw import stage_registry
 from aidw.findings import MANIFEST_EXTRA, ParsedFinding
 from aidw.log import RunLogger
+from aidw.prompts import inject_repo_conventions, render_prompt_file
 from aidw.paths import ToolkitPaths
 from aidw.runner import (
     StageSpec,
@@ -621,9 +622,16 @@ def test_declared_prompt_override_is_rendered_by_a_dry_run_stage(
     )
 
     assert record.status == "succeeded"
-    rendered = (run_dir(runs_root, state.run_id) / "prompts" / "update-traceability.rendered.md").read_text(
-        encoding="utf-8"
-    )
+    # W1.2: a dry run writes no ``prompts/<stage>.rendered.md``; the text is the one
+    # ``run_stage`` would write (no conventions sources exist under this temp target, so
+    # the injection is a no-op).
+    rendered = render_prompt_file(spec.prompt, list(spec.variables))
+    if spec.extra:
+        rendered = f"{rendered}\n\n{spec.extra}"
+    rendered = inject_repo_conventions(rendered, spec.prompt, root)
+    assert not (
+        run_dir(runs_root, state.run_id) / "prompts" / "update-traceability.rendered.md"
+    ).exists()
     assert rendered == "# explicit prompt\n"
 
 

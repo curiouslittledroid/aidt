@@ -17,7 +17,13 @@ import pytest
 
 from aidw import git, github, lock
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
-from aidw.state import FAILED, SUCCEEDED, StageRecord, run_dir
+from aidw.state import (
+    PLANNED_RUN_DIR_TEXT,
+    FAILED,
+    SUCCEEDED,
+    StageRecord,
+    run_dir,
+)
 from aidw.workflows import review as review_workflow
 
 #: ``worktree_repo`` checks the task branch out in ``<workspace>/task`` (§3.2).
@@ -76,6 +82,13 @@ class _FakeStages:
         self.names.append(spec.name)
         self.specs.append(spec)
         self.repo_roots.append(kwargs["repo_root"])
+        if kwargs.get("dry_run"):
+            return StageRecord(
+                name=spec.name,
+                agent=spec.agent_id,
+                model="test/model",
+                status=SUCCEEDED,
+            )
         directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
@@ -306,7 +319,16 @@ def test_dry_run_plans_both_stages(worktree_repo, monkeypatch, capsys) -> None:
     assert code == 0
     assert stages.names == ["code-review", "review-findings-to-github"]
     assert stages.repo_roots == [worktree_repo.task, worktree_repo.task]
-    assert f"worktree (planned): {worktree_repo.task}" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert f"worktree (planned): {worktree_repo.task}" in out
+    # W1.2 (c3): the manifest pointer is *named*, never fabricated — one placeholder root,
+    # and the same value reaches the publisher argv R2 is planned with.
+    planned_manifest = f"{PLANNED_RUN_DIR_TEXT}/artifacts/review-manifest.json"
+    assert f"manifest: {planned_manifest}" in out
+    assert "publisher argv: " in out and planned_manifest in out
+    _no_run_state(worktree_repo.control)
+    # `<run dir>` is relative, so a stray write would land in the working tree, not `runs/`.
+    assert not Path(PLANNED_RUN_DIR_TEXT).exists()
 
 
 def test_blocked_does_not_publish(worktree_repo, monkeypatch) -> None:

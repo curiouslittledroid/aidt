@@ -25,6 +25,7 @@ from aidw import git, lock, roadmap, verification
 from aidw.config import ERROR, Issue
 from aidw.gates import GateOutcome
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
+from aidw.prompts import inject_repo_conventions, render_prompt_file
 from aidw.state import (
     BLOCKED,
     FAILED,
@@ -223,6 +224,13 @@ class _Recorder:
             # The workflow re-reads the file after the stage; a fake stage that did not
             # edit it would (correctly) fail the postcondition.
             self._flip_roadmap(spec)
+        if kwargs.get("dry_run"):
+            return StageRecord(
+                name=spec.name,
+                agent=spec.agent_id,
+                model="test/model",
+                status=SUCCEEDED,
+            )
         directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
@@ -705,8 +713,8 @@ def test_dry_run_renders_a_repo_declared_prompt_override(
     assert recorder.specs[1].explicit_prompt is None
 
 
-def test_dry_run_writes_runs_under_the_state_root(tmp_path: Path, monkeypatch) -> None:
-    """E1.4: a run lives under the state root, never under ``repo/aidt/runs``."""
+def test_dry_run_leaves_the_runs_tree_unchanged(tmp_path: Path, monkeypatch) -> None:
+    """W1.2: planning does not mint a run or any stage artifacts."""
     control, prompt = _layout(tmp_path)
     _patch(monkeypatch)
     monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
@@ -717,10 +725,44 @@ def test_dry_run_writes_runs_under_the_state_root(tmp_path: Path, monkeypatch) -
 
     assert code == 0
     runs_root = _runs_root(control)
-    run_dirs = list(runs_root.iterdir())
-    assert len(run_dirs) == 1
-    assert (run_dirs[0] / "state.json").is_file()
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
     assert not (control / "aidt" / "runs").exists()
+
+
+def test_dry_run_with_or_without_resume_preserves_existing_runs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """W1.2: dry runs do not become a resume target or mutate a real run."""
+    control, prompt = _layout(tmp_path)
+    _patch(monkeypatch)
+    monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
+    roots = _roots(control)
+
+    assert implement_workflow.run(task_prompt_path=prompt, **roots, dry_run=True) == 0
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+    existing = create_run(runs_root, control, "implement", label="real", branch="03-E4.1")
+    existing.status = SUCCEEDED
+    save(run_dir(runs_root, existing.run_id), existing)
+    before = {
+        path.relative_to(runs_root): path.read_bytes()
+        for path in runs_root.rglob("*")
+        if path.is_file()
+    }
+
+    assert (
+        implement_workflow.run(
+            task_prompt_path=prompt, **roots, dry_run=True, resume=True
+        )
+        == 0
+    )
+    after = {
+        path.relative_to(runs_root): path.read_bytes()
+        for path in runs_root.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
 
 
 # --------------------------------------------------------------------------- #
@@ -2316,7 +2358,7 @@ def test_a_held_worktree_lock_is_refused_before_any_run_state(
 
 
 def test_the_dry_run_takes_the_same_worktree_lock(tmp_path: Path, monkeypatch) -> None:
-    """A dry run reaches ``create_run``, so it holds and releases the same key."""
+    """A dry run still holds the worktree lock, but creates no run state."""
     control, worktree, prompt = _located_layout(tmp_path)
     _patch(monkeypatch)
     monkeypatch.setattr(implement_workflow, "run_stage", _Recorder())
@@ -4088,7 +4130,7 @@ I3_CONVENTIONS_SENTINEL = "W1.1-FIXTURE-SENTINEL-FROM-TARGET-CONVENTIONS-MD"
 
 
 def test_a_target_conventions_declaration_reaches_the_rendered_i3_prompt(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """W1.1/Z13: the channel works end-to-end through ``implement``, not only at ``inject_repo_conventions``.
 
@@ -4115,17 +4157,37 @@ def test_a_target_conventions_declaration_reaches_the_rendered_i3_prompt(
         encoding="utf-8",
     )
 
-    # No monkeypatch: the real ``run_stage`` (not ``_Recorder``) is the renderer under test.
+    # The real workflow plans I3 (no ``_Recorder``); the spy only records the spec the
+    # workflow resolved and delegates to the real ``run_stage``.
+    recorded: list = []
+    real_run_stage = implement_workflow.run_stage
+
+    def spy(spec, **kwargs):
+        recorded.append((spec, kwargs))
+        return real_run_stage(spec, **kwargs)
+
+    monkeypatch.setattr(implement_workflow, "run_stage", spy)
     code = implement_workflow.run(
         task_prompt_path=prompt, **_roots(control), dry_run=True
     )
 
     assert code == 0
-    run_dirs = list(_runs_root(control).iterdir())
-    assert len(run_dirs) == 1
-    rendered = (run_dirs[0] / "prompts" / "update-traceability.rendered.md").read_text(
-        encoding="utf-8"
+    # W1.2: a dry run writes no ``prompts/<stage>.rendered.md``, so the content is
+    # asserted through the same two pure calls ``run_stage`` applies, on the spec the
+    # workflow actually resolved (render body/variables, then inject the repo's
+    # conventions last).
+    spec, kwargs = next(
+        (spec, kw)
+        for spec, kw in recorded
+        if spec.name == "update-traceability"
     )
+    rendered = inject_repo_conventions(
+        render_prompt_file(spec.prompt, spec.variables),
+        spec.prompt,
+        kwargs["repo_root"],
+    )
+    # And the plan really wrote nothing: no run directory exists to read back.
+    assert not _runs_root(control).exists() or list(_runs_root(control).iterdir()) == []
 
     # The repo's own declaration arrived through the conventions channel, identifiable by
     # its source header (D16 order: the target has no root AGENTS.md, so this is the only

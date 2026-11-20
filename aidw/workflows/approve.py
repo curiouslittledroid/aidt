@@ -27,16 +27,23 @@ from pathlib import Path
 from aidw import __version__, git, github, lock, stage_registry
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
-from aidw.log import RunLogger
+from aidw.log import NullLogger, RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
-from aidw.runner import StageSpec, declared_stage_issues, plan_stages, run_stage
+from aidw.runner import (
+    StageSpec,
+    declared_stage_issues,
+    plan_stages,
+    run_stage,
+)
 from aidw.state import (
     BLOCKED,
     FAILED,
     SUCCEEDED,
     GateRecord,
     create_run,
+    PLANNED_RUN_DIR_TEXT,
+    planned_run,
     run_dir,
     save,
     utcnow_iso,
@@ -215,7 +222,8 @@ def run(
     # stay locked until process exit. It lives in the state root, never in a target
     # repo or worktree (§3.1), and it is neither ``_STATE_LOCK`` (in-process, per
     # ``state.json`` write) nor ``--parallel`` (concurrent stages inside one run).
-    # A dry run reaches ``create_run`` too, so it holds and releases the same lock.
+    # A dry run acquires the same lock, so a peer run in this worktree is refused
+    # (exit 4, §19 item 8) before any plan output; it is released on every exit path.
     try:
         run_lock = lock.acquire(workspace.state_root, repo.root)
     except lock.LockHeldError as exc:
@@ -224,7 +232,9 @@ def run(
 
     try:
         config_schema_version, config_hash = config_identity(resolved_config)
-        state = create_run(
+        # W1.2: a plan creates no run — `planned_run` is `create_run` under the
+        # never-saved PLANNED_RUN_ID (identical signature, no write).
+        state = (planned_run if dry_run else create_run)(
             runs_root,
             repo.root,
             "approve",
@@ -241,9 +251,13 @@ def run(
             config_schema_version=config_schema_version,
             config_hash=config_hash,
         )
-        directory = run_dir(runs_root, state.run_id)
-        logger = RunLogger(directory, stream=stream)
-        print(f"run:    {state.run_id}")
+        if dry_run:
+            directory = Path(PLANNED_RUN_DIR_TEXT)
+            logger = NullLogger(stream=stream)
+        else:
+            directory = run_dir(runs_root, state.run_id)
+            logger = RunLogger(directory, stream=stream)
+            print(f"run:    {state.run_id}")
         print(f"pr:     #{pr}" + (f" {pr_info['url']}" if pr_info.get("url") else ""))
 
         if dry_run:
@@ -294,8 +308,6 @@ def run(
                     f"agent={record.agent} model={record.model}"
                 )
             print(f"gate (planned): {GATE}")
-            state.status = SUCCEEDED
-            save(directory, state)
             print("dry-run complete; Pi not invoked, no GitHub state written")
             return 0
 

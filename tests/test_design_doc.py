@@ -619,6 +619,32 @@ def test_late_sections_are_post_extraction_and_use_current_test_paths() -> None:
     assert "aidt/tests/" not in acceptance
 
 
+def test_w12_dry_run_decision_and_acceptance_wording_are_recorded() -> None:
+    """W1.2: the design records one uniform no-run rule and its acceptance wording."""
+    design = _design_md()
+    decisions = _section(design, "## 17. Resolved decisions", "## 18. Risks")
+    rows = [
+        line
+        for line in decisions.splitlines()
+        if line.startswith("|") and "05-W1.2" in line and "dry-run" in line
+    ]
+    assert len(rows) == 1
+    assert "not resumable" in rows[0]
+    assert "no run" in rows[0]
+
+    acceptance = design[design.index("## 19. Acceptance criteria") :]
+    criteria = acceptance.splitlines()
+    starts = [
+        index
+        for index, line in enumerate(criteria)
+        if re.match(r"^(?:8|9|10)\. ", line)
+    ]
+    assert len(starts) == 3
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(criteria)
+        assert "no run state" in " ".join(criteria[start:end])
+
+
 def test_section_17_keeps_rewritten_extraction_decisions_traceable() -> None:
     """D1–D24 and R1–R18 must remain findable in the design-of-record section."""
     design = _design_md()

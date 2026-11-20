@@ -500,6 +500,56 @@ def _load_if_present(directory: Path) -> "RunState | None":
     return load(directory)
 
 
+#: The run id a ``--dry-run`` plans under (W1.2, design §9.4). A dry run creates no run, so it
+#: mints no id either: the literal makes a plan's ``StageRecord.session_id`` deterministic
+#: (``aidw-<planned>-<agent>-<stage>``), so two dry runs print identical output and a test can
+#: pin it without stubbing the clock. Nothing is ever persisted under it — ``run_dir(runs_root,
+#: PLANNED_RUN_ID)`` is a path no code creates.
+PLANNED_RUN_ID = "<planned>"
+
+#: The run-directory text a ``--dry-run`` plan renders where a real run's directory would go
+#: (W1.2, design §9.4): ``review``'s manifest pointer, its publisher argv and ``fix``'s
+#: per-iteration manifest / ``{closing_body}`` paths. A planned path is *named*, never
+#: fabricated — a real-looking run id would name a run that does not exist. Real runs keep the
+#: absolute ``run_dir(...)`` path (E7.3's PR 110), and because this text is relative, a stray
+#: write would land in the working tree, which is why the tests assert none appears.
+PLANNED_RUN_DIR_TEXT = "<run dir>"
+
+
+def _new_run_state(
+    run_id: str,
+    repo_root: Path,
+    workflow: str,
+    *,
+    task: dict[str, Any] | None,
+    pr: dict[str, Any] | None,
+    strict: bool,
+    branch: str | None,
+    toolkit_version: str | None,
+    config_schema_version: int | None,
+    config_hash: str | None,
+) -> RunState:
+    """The one run-record construction ``create_run`` and :func:`planned_run` share.
+
+    Private and keyword-only so a new ``RunState`` field reaches a real run and a dry-run
+    plan in the same edit; the two callers differ only in the run id they pass and whether
+    they publish.
+    """
+    return RunState(
+        run_id=run_id,
+        workflow=workflow,
+        created_at=utcnow_iso(),
+        repo_root=str(repo_root),
+        toolkit_version=toolkit_version,
+        config_schema_version=config_schema_version,
+        config_hash=config_hash,
+        strict=strict,
+        task=task or {},
+        pr=pr or {},
+        git={"branch": branch} if branch else {},
+    )
+
+
 def create_run(
     runs_root: Path,
     repo_root: Path,
@@ -514,21 +564,58 @@ def create_run(
     config_schema_version: int | None = None,
     config_hash: str | None = None,
 ) -> RunState:
-    state = RunState(
-        run_id=new_run_id(label, workflow),
-        workflow=workflow,
-        created_at=utcnow_iso(),
-        repo_root=str(repo_root),
+    state = _new_run_state(
+        new_run_id(label, workflow),
+        repo_root,
+        workflow,
+        task=task,
+        pr=pr,
+        strict=strict,
+        branch=branch,
         toolkit_version=toolkit_version,
         config_schema_version=config_schema_version,
         config_hash=config_hash,
-        strict=strict,
-        task=task or {},
-        pr=pr or {},
-        git={"branch": branch} if branch else {},
     )
     save(run_dir(runs_root, state.run_id), state)
     return state
+
+
+def planned_run(
+    runs_root: Path,
+    repo_root: Path,
+    workflow: str,
+    *,
+    label: str,
+    task: dict[str, Any] | None = None,
+    pr: dict[str, Any] | None = None,
+    strict: bool = False,
+    branch: str | None = None,
+    toolkit_version: str | None = None,
+    config_schema_version: int | None = None,
+    config_hash: str | None = None,
+) -> RunState:
+    """A ``--dry-run``'s run record: ``create_run``'s exact arguments, with **no run** (W1.2).
+
+    It returns the same :class:`RunState` under :data:`PLANNED_RUN_ID` and writes nothing —
+    no run directory, no ``state.json`` — so a plan can never become a ``--resume`` target
+    (design §9.4). The signature is deliberately identical to :func:`create_run`, argument
+    for argument, so a caller picks one with ``planned_run if dry_run else create_run`` and
+    the two cannot disagree about what a run records. ``runs_root`` and ``label`` are
+    accepted and unused: they are the two inputs only a real run needs (its published path
+    and its id), and dropping them would make the two calls differ at every call site.
+    """
+    return _new_run_state(
+        PLANNED_RUN_ID,
+        repo_root,
+        workflow,
+        task=task,
+        pr=pr,
+        strict=strict,
+        branch=branch,
+        toolkit_version=toolkit_version,
+        config_schema_version=config_schema_version,
+        config_hash=config_hash,
+    )
 
 
 def save(directory: Path, state: RunState) -> None:

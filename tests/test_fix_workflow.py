@@ -26,6 +26,7 @@ from aidw import git, github, lock
 from aidw.config import ERROR, WARNING, AgentConfig, Issue, SystemPrompt
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.state import (
+    PLANNED_RUN_DIR_TEXT,
     FAILED,
     SKIP_REASON_KEY,
     SKIPPED,
@@ -299,6 +300,13 @@ class _FakeStages:
             elif spec.name.endswith("fix-next-review-followup"):
                 self._apply_fix_edit(spec, kwargs["repo_root"])
                 self._write_closing_body(spec)
+        if kwargs.get("dry_run"):
+            return StageRecord(
+                name=spec.name,
+                agent=spec.agent_id,
+                model="test/model",
+                status=SUCCEEDED,
+            )
         directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
@@ -373,6 +381,20 @@ def test_dry_run_lists_child_and_plans(tmp_path: Path, monkeypatch, capsys) -> N
     assert f"worktree (planned): {worktree}" in out
     assert stages.names[0] == "round1-approve-review-followups"
     assert stages.repo_roots and all(root == worktree for root in stages.repo_roots)
+    # W1.2 (c3): the paths F1 and F4 render are *named*, never fabricated — one
+    # placeholder root in place of the run directory, and the field shapes are unchanged.
+    fixup = next(
+        spec for spec in stages.specs if spec.name.endswith("fix-next-review-followup")
+    )
+    assert fixup.variables[-1] == (
+        f"{PLANNED_RUN_DIR_TEXT}/artifacts/iter1-closing-body.md"
+    )
+    manifest = f"{PLANNED_RUN_DIR_TEXT}/artifacts/iter1-review-manifest.json"
+    assert any(manifest in spec.extra for spec in stages.specs)
+    # `<run dir>` is relative, so a stray write would land in the working tree, not `runs/`.
+    assert not Path(PLANNED_RUN_DIR_TEXT).exists()
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
 
 
 def test_no_available_child_is_success(tmp_path: Path, monkeypatch) -> None:
@@ -1537,8 +1559,9 @@ def test_the_dry_run_plans_the_tick_once_in_the_final_position(
     assert out.index("update-roadmap [") < out.index("commit-and-push [")
     # Nothing ran and nothing was evaluated: the roadmap is untouched.
     assert roadmap_file.read_bytes() == before
-    assert _state_of(control).pr.get("roadmap_ticked") is None
-    assert fix_workflow.PR_HEAD_SHA not in _state_of(control).pr
+    # W1.2: a dry run records no run at all, so the plan is the only place the tick
+    # appears — there is no `state.pr` to read back.
+    assert not _runs_root(control).exists() or list(_runs_root(control).iterdir()) == []
 
 
 def test_the_dry_run_reports_an_unresolvable_target_as_the_skip_it_would_record(
@@ -1554,13 +1577,16 @@ def test_the_dry_run_reports_an_unresolvable_target_as_the_skip_it_would_record(
     code = fix_workflow.run(pr=7, **_roots(control), dry_run=True)
 
     assert code == 0
-    assert capsys.readouterr().out.count("update-roadmap") == 1
+    out = capsys.readouterr().out
+    assert out.count("update-roadmap") == 1
     assert "update-roadmap" not in stages.names
     # D10: an unresolvable target withholds no commit stage in a dry run.
     assert "commit-and-push" in stages.names
-    state = _state_of(control)
-    assert _tick_records(state)[0].status == SKIPPED
-    assert state.pr["roadmap_ticked"] is False
+    # H3.3 req 7: the plan shows the tick once, as the skip a real run would record.
+    assert "stage:  update-roadmap [skipped]" in out
+    assert "skipped:" in out
+    # W1.2: the skip exists only in the printed plan — a dry run writes no run state.
+    assert not _runs_root(control).exists() or list(_runs_root(control).iterdir()) == []
 
 
 # --------------------------------------------------------------------------- #

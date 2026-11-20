@@ -20,10 +20,47 @@ from aidw.state import (
     list_runs,
     load,
     new_run_id,
+    planned_run,
     sanitize_label,
     save,
     session_id,
 )
+
+
+def test_planned_run_mints_no_id_and_writes_nothing(tmp_path: Path) -> None:
+    """W1.2 (c1/c2): a plan's record is the literal id, and nothing is published.
+
+    Hand-checked against ``create_run``: same arguments, same record fields, but the run id
+    is :data:`state.PLANNED_RUN_ID` instead of a timestamped one, no ``state.json`` is
+    written, and the planned stage's session id is therefore deterministic — the reason a
+    dry run prints byte-identical output twice. ``create_run`` itself is unchanged: it still
+    mints an id and still publishes.
+    """
+    planned = planned_run(
+        tmp_path,
+        tmp_path,
+        "implement",
+        label="03-E4.1",
+        task={"phase": "03", "task": "E4.1"},
+        branch="03-E4.1",
+    )
+
+    assert planned.run_id == state.PLANNED_RUN_ID == "<planned>"
+    assert planned.workflow == "implement"
+    assert planned.task == {"phase": "03", "task": "E4.1"}
+    assert planned.git == {"branch": "03-E4.1"}
+    assert list(tmp_path.iterdir()) == []  # no run directory, no state.json
+    assert session_id(planned.run_id, "implementer", "impliment-task", shared=False) == (
+        "aidw-<planned>-implementer-impliment-task"
+    )
+    # Two plans are byte-identical in the fields the dry-run plan prints.
+    again = planned_run(tmp_path, tmp_path, "implement", label="03-E4.1")
+    assert again.run_id == planned.run_id
+    assert list(tmp_path.iterdir()) == []
+
+    real = create_run(tmp_path, tmp_path, "implement", label="03-E4.1")
+    assert real.run_id != planned.run_id
+    assert (tmp_path / real.run_id / "state.json").is_file()
 
 
 def test_sanitize_label() -> None:

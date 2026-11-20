@@ -92,11 +92,7 @@ def test_prompt_workflow_dry_run(tmp_path: Path, monkeypatch, capsys) -> None:
         dry_run=True,
     )
     assert code == 0
-    latest = state.list_runs(_runs_root(tmp_path))[-1]
-    assert latest.run_id.endswith("-pytest-prompt")
-    assert latest.workflow == "prompt"
-    assert [s.name for s in latest.stages] == ["task-prompt", "task-review-1"]
-    assert all(s.status == state.SUCCEEDED for s in latest.stages)
+    assert not _runs_root(tmp_path).exists()
     # L5.3 is post-author only; a dry-run never produces a prompt to measure.
     out = capsys.readouterr().out
     assert "budget:" not in out
@@ -107,13 +103,13 @@ def test_prompt_workflow_dry_run(tmp_path: Path, monkeypatch, capsys) -> None:
     assert not _task_worktree(tmp_path).exists()
 
 
-def test_prompt_workflow_dry_run_records_run_identity(
+def test_prompt_workflow_real_run_records_run_identity(
     tmp_path: Path, monkeypatch
 ) -> None:
     """E8.2/EXTRACTION.md §3.11: every run's ``state.json`` explains what produced it.
 
-    Asserted on the dry-run seam because it reaches ``create_run`` without invoking Pi: the
-    record carries ``toolkit_version == aidw.__version__`` plus the identity of the
+    Asserted on a real fake-stage run: dry-run planning creates no state, while a
+    recorded run carries ``toolkit_version == aidw.__version__`` plus the identity of the
     **resolved** target config this run used — the same two values
     :func:`aidw.target_config.config_identity` computes for the same fixture here, so a
     workflow that recorded a different config (or only the declared one) fails.
@@ -123,16 +119,18 @@ def test_prompt_workflow_dry_run_records_run_identity(
         monkeypatch,
         config_text="schema_version: 1\nmax_revisions: 2\n",
     )
-    monkeypatch.setattr(git, "current_branch", lambda repo: "feature-branch")
+    monkeypatch.setattr(git, "current_branch", lambda repo: "main")
     repo = _roots(tmp_path)["repo"]
 
+    _seen, fake = _fake_stages("## Verdict\n\n**Approve**\n", approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
     code = prompt_workflow.run(
         phase="03",
         epic="E4",
         task="E4.1",
         **_roots(tmp_path),
         label=RUN_LABEL,
-        dry_run=True,
+        approve_all=True,
     )
 
     assert code == 0
@@ -404,11 +402,7 @@ def _fake_stages(
         repo = kwargs["repo_root"]
         repo_roots.append(repo)
         state = kwargs["state"]
-        directory = run_dir(kwargs["runs_root"], state.run_id)
-        stages = directory / "stages"
-        stages.mkdir(parents=True, exist_ok=True)
-
-        if spec.name == "task-prompt":
+        if spec.name == "task-prompt" and not kwargs.get("dry_run"):
             created = repo / "docs" / "task-prompts" / "03-E4.1-prompt.md"
             created.parent.mkdir(parents=True, exist_ok=True)
             created.write_text(prompt_body, encoding="utf-8")
@@ -440,6 +434,16 @@ def _fake_stages(
             status = fix_status
         if spec.name.startswith("task-review-reconcile") and reconcile_status != SUCCEEDED:
             status = reconcile_status
+        if kwargs.get("dry_run"):
+            return StageRecord(
+                name=spec.name,
+                agent=spec.agent_id,
+                model="test-model",
+                status=SUCCEEDED,
+            )
+        directory = run_dir(kwargs["runs_root"], state.run_id)
+        stages = directory / "stages"
+        stages.mkdir(parents=True, exist_ok=True)
         out = stages / f"{spec.name}.out.txt"
         out.write_text(body, encoding="utf-8")
         record = StageRecord(
@@ -3239,7 +3243,7 @@ def test_l24_evidence_bundle_re_reads_the_configured_roadmap_dir(
 
 
 def test_l24_dry_run_writes_no_evidence_bundle(tmp_path: Path, monkeypatch) -> None:
-    """The dry-run path returns before the loop: no evidence file, no pointer."""
+    """W1.2: the dry-run path writes no run directory or evidence bundle."""
     _evidence_repo(tmp_path, monkeypatch)
 
     code = prompt_workflow.run(
@@ -3247,8 +3251,7 @@ def test_l24_dry_run_writes_no_evidence_bundle(tmp_path: Path, monkeypatch) -> N
     )
 
     assert code == 0
-    run_id = state.list_runs(_runs_root(tmp_path))[-1].run_id
-    assert not _evidence_path(tmp_path, run_id, "task-review-1").exists()
+    assert not _runs_root(tmp_path).exists()
 
 
 def test_l24_unwritable_bundle_degrades_without_a_dangling_pointer(
@@ -5685,8 +5688,12 @@ def test_a_repo_added_stage_is_accepted_warned_about_and_never_run(
     assert "workflow `prompt` stage `repo-added-review`" in captured.err
     assert "repo-added" in captured.err
     # The name-keyed consumer plans the registry's stages only: the entry never executes.
-    latest = state.list_runs(_runs_root(tmp_path))[-1]
-    assert [stage.name for stage in latest.stages] == ["task-prompt", "task-review-1"]
+    # W1.2: a dry run records no run, so the printed plan is the evidence — the author and
+    # the first review are planned, and the repo-added id appears only in the warning.
+    assert "stage:  task-prompt" in captured.out
+    assert "stage:  task-review-1" in captured.out
+    assert "repo-added-review" not in captured.out
+    assert not _runs_root(tmp_path).exists()
 
 
 def test_a_repo_added_stage_with_a_missing_prompt_is_refused(
@@ -6391,7 +6398,7 @@ def test_a_plain_dry_run_plans_the_author_and_first_review(
     assert "branch-setup (planned)" in out
 
 
-def test_dry_run_with_resume_plans_the_fresh_baseline_and_mints_a_new_run(
+def test_dry_run_with_resume_plans_the_fresh_baseline_without_minting_a_run(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     """H1.2 req 8: a dry run is always the fresh plan — no takeover, no locate, no confirm."""
@@ -6417,7 +6424,7 @@ def test_dry_run_with_resume_plans_the_fresh_baseline_and_mints_a_new_run(
     assert "completed stages:" not in out
     assert f"resume: {failed.run_id}" not in out
     run_ids = {run.run_id for run in state.list_runs(_runs_root(tmp_path))}
-    assert len(run_ids) == 2 and failed.run_id in run_ids  # never a takeover
+    assert run_ids == {failed.run_id}
 
 
 def test_dry_run_with_resume_over_a_review_loop_block_plans_fresh(
@@ -6449,7 +6456,7 @@ def test_dry_run_with_resume_over_a_review_loop_block_plans_fresh(
     assert "completed stages:" not in out
     assert f"resume: {blocked.run_id}" not in out
     run_ids = {run.run_id for run in state.list_runs(_runs_root(tmp_path))}
-    assert len(run_ids) == 2 and blocked.run_id in run_ids  # never a takeover
+    assert run_ids == {blocked.run_id}
     blocked_after = next(
         run
         for run in state.list_runs(_runs_root(tmp_path))
@@ -6527,7 +6534,7 @@ def test_dry_run_over_a_running_record_still_plans_fresh(
 
     assert code == 0
     run_ids = {run.run_id for run in state.list_runs(runs_dir)}
-    assert len(run_ids) == 2 and running.run_id in run_ids
+    assert run_ids == {running.run_id}
 
 
 def test_dry_run_validates_from_without_minting_a_run(
@@ -6575,7 +6582,7 @@ def test_dry_run_from_prompt_plans_fresh_and_copies_nothing(
     assert "completed stages:" not in out
     assert prompt.read_bytes() == before_bytes
     run_ids = {run.run_id for run in state.list_runs(_runs_root(tmp_path))}
-    assert len(run_ids) == 2 and blocked.run_id in run_ids
+    assert run_ids == {blocked.run_id}
     blocked_after = next(
         run
         for run in state.list_runs(_runs_root(tmp_path))

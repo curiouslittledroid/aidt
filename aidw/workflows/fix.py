@@ -89,7 +89,7 @@ from aidw import __version__, findings as findings_mod
 from aidw import git, github, lock, roadmap, stage_registry
 from aidw.config import ERROR, WARNING, Issue, format_issues, load_all
 from aidw.gates import decide
-from aidw.log import RunLogger
+from aidw.log import NullLogger, RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import empty_final_message_error, print_stage
 from aidw.runner import (
@@ -109,6 +109,8 @@ from aidw.state import (
     StageRecord,
     create_run,
     list_runs,
+    PLANNED_RUN_DIR_TEXT,
+    planned_run,
     run_dir,
     save,
     utcnow_iso,
@@ -1010,7 +1012,8 @@ def run(
     # stay locked until process exit. It lives in the state root, never in a target
     # repo or worktree (§3.1), and it is neither ``_STATE_LOCK`` (in-process, per
     # ``state.json`` write) nor ``--parallel`` (concurrent stages inside one run).
-    # A dry run reaches ``create_run`` too, so it holds and releases the same lock.
+    # A dry run acquires the same lock, so a peer run in this worktree is refused
+    # (exit 4, §19 item 8) before any plan output; it is released on every exit path.
     try:
         run_lock = lock.acquire(workspace.state_root, repo.root)
     except lock.LockHeldError as exc:
@@ -1021,7 +1024,9 @@ def run(
         # EXTRACTION.md §3.11 (E8.2): what produced this run. One helper so the
         # five workflows cannot record different values for one config.
         config_schema_version, config_hash = config_identity(resolved_config)
-        state = create_run(
+        # W1.2: a plan creates no run — `planned_run` is `create_run` under the
+        # never-saved PLANNED_RUN_ID (identical signature, no write).
+        state = (planned_run if dry_run else create_run)(
             runs_root,
             repo.root,
             "fix",
@@ -1037,12 +1042,20 @@ def run(
             config_hash=config_hash,
             branch=branch,
         )
-        directory = run_dir(runs_root, state.run_id)
-        # F1 writes its closing comment body here (P1.2 req 4), inside the run directory and
-        # never in the PR-head worktree. Created once so no stage has to guess a directory.
-        (directory / "artifacts").mkdir(parents=True, exist_ok=True)
-        logger = RunLogger(directory, stream=stream)
-        print(f"run:    {state.run_id}")
+        # A dry run has no run directory, so the paths it renders (F1's ``{closing_body}``,
+        # F4's manifest) are *planned* ones: the `<run dir>` placeholder names where a real
+        # run would write, and never a fabricated id.
+        if dry_run:
+            directory = Path(PLANNED_RUN_DIR_TEXT)
+            logger = NullLogger(stream=stream)
+        else:
+            directory = run_dir(runs_root, state.run_id)
+            # F1 writes its closing comment body here (P1.2 req 4), inside the run directory
+            # and never in the PR-head worktree. Created once so no stage has to guess a
+            # directory; a plan creates nothing (§19 item 10).
+            (directory / "artifacts").mkdir(parents=True, exist_ok=True)
+            logger = RunLogger(directory, stream=stream)
+            print(f"run:    {state.run_id}")
         print(f"pr:     #{pr}" + (f" {pr_info['url']}" if pr_info.get("url") else ""))
 
         # --- the post-loop half: the tick, then the commit (design §8.4) --------- #
@@ -1073,6 +1086,9 @@ def run(
                 directory=directory,
                 agents=agents,
                 reason=reason,
+                # W1.2: the dry run plans the same withheld tick a real run would record,
+                # with the same reason, but a plan persists nothing.
+                dry_run=dry_run,
             )
             state.pr[PR_ROADMAP_TICKED] = False
             state.pr[PR_ROADMAP_TICK_SKIP_REASON] = reason
@@ -1096,6 +1112,7 @@ def run(
                 directory=directory,
                 agents=agents,
                 reason=reason,
+                dry_run=dry_run,
             )
             state.pr[PR_COMMIT_SKIP_REASON] = reason
             logger.info(f"stage {spec.name}: skipped — {reason}")
@@ -1502,8 +1519,6 @@ def run(
             )
             print("gates (planned): approve-followups, approve-fix-pr")
             print(f"loop: bounded by --max-iterations={max_iterations}")
-            state.status = SUCCEEDED
-            save(directory, state)
             print("dry-run complete; Pi not invoked, no GitHub state written")
             return 0
 
