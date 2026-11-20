@@ -4076,3 +4076,67 @@ def test_dry_run_plans_i3_with_its_declared_paths_and_evaluates_nothing(
     out = capsys.readouterr().out
     assert "I3 update-traceability [succeeded] (planned)" in out
     assert "I3 update-traceability [skipped]" not in out
+
+
+# --------------------------------------------------------------------------- #
+# The repo-conventions channel reaches I3 (W1.1, Z13)
+# --------------------------------------------------------------------------- #
+
+#: A marker that exists only in this fixture's ``aidw/conventions.md``, so seeing it in the
+#: rendered ``I3`` prompt proves the *target* repo's declaration travelled the channel.
+I3_CONVENTIONS_SENTINEL = "W1.1-FIXTURE-SENTINEL-FROM-TARGET-CONVENTIONS-MD"
+
+
+def test_a_target_conventions_declaration_reaches_the_rendered_i3_prompt(
+    tmp_path: Path,
+) -> None:
+    """W1.1/Z13: the channel works end-to-end through ``implement``, not only at ``inject_repo_conventions``.
+
+    Before W1.1 the conventions channel stopped short of ``I3``: ``CONVENTIONS_PROMPTS``
+    named four prompts, so a repo's ``aidw/conventions.md`` — the only place it can declare
+    its traceability artefacts, including "none" — never reached ``update-traceability``.
+    This drives the real render path: ``implement --dry-run`` with the genuine
+    ``run_stage`` (no fake), which renders and writes
+    ``prompts/update-traceability.rendered.md`` exactly as a live run would. Pi is never
+    invoked, so the test obeys AGENTS.md's "no test may invoke a real Pi model".
+    """
+    control, prompt = _layout(tmp_path)
+    conventions = control / "aidw" / "conventions.md"
+    conventions.parent.mkdir(parents=True, exist_ok=True)
+    conventions.write_text(
+        "# Repo conventions\n"
+        "\n"
+        "## Traceability artefacts\n"
+        "\n"
+        "This repo keeps them in `design.md` §17 and `docs/workflow-stages.md`.\n"
+        "The roadmap is not one of them; `/update-roadmap` owns it.\n"
+        "\n"
+        f"{I3_CONVENTIONS_SENTINEL}\n",
+        encoding="utf-8",
+    )
+
+    # No monkeypatch: the real ``run_stage`` (not ``_Recorder``) is the renderer under test.
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), dry_run=True
+    )
+
+    assert code == 0
+    run_dirs = list(_runs_root(control).iterdir())
+    assert len(run_dirs) == 1
+    rendered = (run_dirs[0] / "prompts" / "update-traceability.rendered.md").read_text(
+        encoding="utf-8"
+    )
+
+    # The repo's own declaration arrived through the conventions channel, identifiable by
+    # its source header (D16 order: the target has no root AGENTS.md, so this is the only
+    # source).
+    assert I3_CONVENTIONS_SENTINEL in rendered
+    assert "## Repo conventions (aidw/conventions.md)" in rendered
+    # The toolkit default text the declaration is appended to carries the ownership rule
+    # W1.1 added — so the channel and the rule are in the same prompt the agent receives.
+    assert "paths.roadmap_dir" in rendered
+    assert "/update-roadmap" in rendered
+    assert "None for traceability" in rendered
+    # I3's ``$1`` branch variable still renders (the rule did not disturb the arity).
+    assert "03-E4.1" in rendered
+    assert "$1" not in rendered

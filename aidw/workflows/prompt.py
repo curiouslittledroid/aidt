@@ -539,7 +539,7 @@ def _gate_block(repo: TargetRepo) -> str:
     """The target repo's gate commands, from every conventions source (L2.4, D16/E7.3).
 
     Sources are read through :func:`aidw.prompts.read_conventions_sources` — the same
-    single conventions channel the four-prompt injection uses — in D16 order: the root
+    single conventions channel the five-prompt injection uses — in D16 order: the root
     ``AGENTS.md``, then the optional ``aidw/conventions.md``. Each source contributes its
     ``## Gates`` section verbatim (:func:`_gates_section`), joined in that order, so a repo
     that publishes its gates in either file is honoured rather than silently ignoring the
