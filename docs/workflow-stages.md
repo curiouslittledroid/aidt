@@ -90,7 +90,7 @@ shape there (static ids first, post-loop ids last, in that order).
 | `blocking` | One stage per blocking (`must-fix`/`should-fix`) finding of the preceding review. | `expand()`, from the parsed findings. |
 | `could-fix` | One **combined** stage carrying every non-blocking `could-fix` finding. | `expand()`, from the parsed findings. |
 | `unparseable` | One fallback stage carrying the whole review verbatim, used when the review did not parse into findings (or a block was malformed). | `expand()`, from the parse result. |
-| `paths-changed` | The stage runs only when the run's **change set touches one of the stage's declared paths** (S1.1). The paths are the repo's declaration — the optional per-stage `when_paths` list of repo-relative prefixes (`docs/target-repo-config.md`) — never a toolkit default: an **absent or empty** list means the stage is unconditional, which is the toolkit default and today's behaviour. Like `evidence-green` the token is *carried*, never expanded away: `plan_stages`, `build_plan` and `--dry-run` plan the stage in position and the workflow decides before `run_stage`. A withheld stage is recorded `skipped` with the declared prefixes named, and the run still succeeds; a change set that cannot be computed (an unresolvable base) **runs** the stage rather than skipping it, because dropping a stage that may be needed is not fail-closed. | The workflow, from the run's change set (`git.changed_paths` against `BASE_DEFAULT` plus untracked paths, the run's state root excluded) — see `I3` in [implement](#aidw-implement--implement-a-task-prompt-and-open-the-pr). |
+| `paths-changed` | The stage runs only when the run's **change set touches one of the stage's declared paths** (S1.1/S1.2). The paths are the repo's declaration — the optional per-stage `when_paths` list of repo-relative prefixes (`docs/target-repo-config.md`) — plus an optional product-neutral registry default: `I3` has none, `I4` defaults to the literal `docs/architecture`. A repo-declared list **replaces** the default, never merges with it; an **absent** declaration keeps the default, and an **empty** effective set means the stage is unconditional. Like `evidence-green` the token is *carried*, never expanded away: `plan_stages`, `build_plan` and `--dry-run` plan the stage in position and the workflow decides before `run_stage`. A withheld stage is recorded `skipped` with the declared prefixes named, and the run still succeeds; a change set that cannot be computed (an unresolvable base) **runs** the stage rather than skipping it, because dropping a stage that may be needed is not fail-closed. | The workflow, from the run's change set (`git.changed_paths` against `BASE_DEFAULT` plus untracked paths, the run's state root excluded) — see `I3`/`I4` in [implement](#aidw-implement--implement-a-task-prompt-and-open-the-pr). |
 | `evidence-green` | The stage runs only when **the workflow's own evidence** says so. The token is *carried*, never expanded away: `plan_stages`, `build_plan` and `--dry-run` plan the stage in its position, and the workflow decides before `run_stage`, so no agent can ever run a stage this condition withheld. A withheld stage is recorded as `skipped` with its reason, and the run still succeeds. | The workflow, from state no expansion can see (see `I7` in [implement](#aidw-implement--implement-a-task-prompt-and-open-the-pr) and [fix](#aidw-fix--fix-approved-review-follow-ups)). |
 
 ### Context blocks
@@ -198,6 +198,10 @@ preflight (target config, declared stage list, worktree located, no other run ac
   …  any repo-added stages the repo declared, in the declared position
 ```
 
+`I3` and `I4` carry `when=paths-changed`. `I4`'s registry default is the literal
+`docs/architecture`; a repo-declared `when_paths` replaces it, and an explicit `when_paths: []`
+makes `I4` unconditional and makes `aidw doctor` warn about it.
+
 ### `implement` — stage inventory
 
 | Id | Runtime name | Agent | Prompt | Variables | Runs when | Context |
@@ -205,7 +209,7 @@ preflight (target config, declared stage list, worktree located, no other run ac
 | `I1` | `impliment-task` | `implementer` | `impliment-task.md` | `{prompt_rel}` | — | — |
 | `I2` | `test` | `tester` | `test.md` | — | — | `stage context` |
 | `I3` | `update-traceability` | `implementer` | `update-traceability.md` | `{branch}` | `paths-changed` | — |
-| `I4` | `update-architecture` | `implementer` | `update-architecture.md` | `{branch}`, `{base_branch}` | — | — |
+| `I4` | `update-architecture` | `implementer` | `update-architecture.md` | `{branch}`, `{base_branch}` | `paths-changed` | — |
 | `I5` | `record-implementation-results` | `recorder` | `record-implementation-results.md` | `{branch}` | — | — |
 | `I8` | `summarize-implementation-results` | `recorder` | `summarize-implementation-results.md` | `{branch}` | — | — |
 | `I9` | `write-integration-test-guide` | `recorder` | `write-integration-test-guide.md` | `{branch}` | — | — |
@@ -225,7 +229,13 @@ preflight (target config, declared stage list, worktree located, no other run ac
   `skipped` naming them. No `when_paths` means unconditional, which is the toolkit default.
 - **`I4` update-architecture** — updates the repo's architecture documents. Disjoint from `I2`'s
   file set, which is why `test` + `update-architecture` is the default `parallel_groups` pair.
-  **Repo-optional.**
+  **Repo-optional.** It carries `when=paths-changed` (S1.2) with the registry default
+  `docs/architecture` (D17's literal `architecture_dir` default, not the repo's resolved one).
+  A repo-declared `when_paths` **replaces** that default; a repo naming diagram inputs should
+  re-list `docs/architecture` itself to keep the output directory watched, and a repo with a
+  custom `paths.architecture_dir` must declare it. An explicit `when_paths: []` makes the
+  stage unconditional and `aidw doctor` warns about it; absent keeps the default, and a
+  withheld stage is skipped exactly like `I3`'s.
 - **`I5` record-implementation-results** — the mandatory **sync point**: it runs the repo's full
   verification gates over the fully merged tree and writes
   `<implementation_results_dir>/<branch>/build-results.md` from the configured template,
@@ -521,9 +531,11 @@ workflows:
   stage entry the list does not carry keeps the registry's own agent and no overrides, which is
   why the practical shape is: declare every core id, and put `prompt`/`agent`/`model`/`thinking`/
   `timeout_seconds`/`when_paths` on the entries you want to change.
-- `when_paths` is the per-stage path set a `paths-changed` stage is gated on (S1.1). Because a
-  declared list replaces the whole chain, setting it means declaring the full list; leaving the
-  key off an entry keeps the stage unconditional.
+- `when_paths` is the per-stage path set a `paths-changed` stage is gated on (S1.1/S1.2).
+  Because a declared list replaces the whole chain, setting it means declaring the full list.
+  Leaving the key off `I3` keeps it unconditional; leaving it off `I4` keeps the registry
+  default `docs/architecture`, while an explicit `[]` on `I4` replaces that default and makes
+  the stage unconditional (and `aidw doctor` warns about it).
 - `parallel_groups` members are stage **runtime names** of that workflow's static chain, not ids.
 - Unknown ids are refused; a malformed list is a refusal (exit 2) before any run state exists.
 - **Repo-added stages run in `implement`, `review` and `approve`, not in `prompt` or `fix`.**

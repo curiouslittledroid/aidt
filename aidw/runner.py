@@ -103,9 +103,11 @@ class StageSpec:
     #: workflow builds itself (``aidw exec``) keeps today's unconditional behaviour.
     when: str = ""
     #: The repo-relative path prefixes a ``when=paths-changed`` stage is evaluated against
-    #: (S1.1, design §12.2), canonicalised by the loader and carried here from the stage's
-    #: declared entry. Empty is the toolkit default — such a stage is **unconditional** —
-    #: because a toolkit-hardcoded path set would be a product literal (design §7.1, §17
+    #: (S1.1/S1.2, design §12.2), canonicalised by the loader. A declared list **replaces**
+    #: the registry's default (:attr:`aidw.stage_registry.StageDefinition.when_paths`) — the
+    #: two are never merged — so an explicit ``when_paths: []`` stays empty. Empty is
+    #: **unconditional**: either the repo deliberately cleared the set or the stage has no
+    #: default, never because a toolkit-hardcoded path set was dropped in (design §7.1, §17
     #: S1). A tuple so a caller cannot mutate the declaration through a result.
     when_paths: tuple[str, ...] = ()
 
@@ -532,6 +534,24 @@ def _declared_when_paths(
     return tuple(item for item in value if isinstance(item, str) and item.strip())
 
 
+def _declared_when_paths_or_none(
+    entry: Mapping[str, Any] | None,
+) -> tuple[str, ...] | None:
+    """The entry's declared prefixes, or ``None`` when it declared no ``when_paths`` (S1.2).
+
+    Preserves the loader's absent-vs-empty distinction (``target_config._parse_when_paths``
+    returns ``None`` for an absent key and ``[]`` for an explicit one) because the two have
+    different contracts on the run path: absent lets the registry default apply (``I4``'s
+    ``docs/architecture``), while an explicit empty list **replaces** it and makes the stage
+    unconditional. A present-but-unusable value still degrades to ``()`` — the direct-dict
+    seam's fail-closed direction — never to ``None``, so a typo cannot silently re-enable a
+    registry default.
+    """
+    if entry is None or "when_paths" not in entry:
+        return None
+    return _declared_when_paths(entry)
+
+
 def _stage_metadata_overrides(
     entry: Mapping[str, Any] | None,
 ) -> tuple[str | None, str | None, int | None]:
@@ -596,7 +616,13 @@ def _spec_from_planned(
         thinking=thinking,
         timeout_seconds=timeout_seconds,
         when=stage.when,
-        when_paths=_declared_when_paths(entry),
+        # The repo's declaration replaces the registry default; only an absent key falls
+        # back to it (S1.2 req 3), so ``when_paths: []`` survives as empty/unconditional.
+        when_paths=(
+            stage.when_paths
+            if (declared_paths := _declared_when_paths_or_none(entry)) is None
+            else declared_paths
+        ),
     )
 
 

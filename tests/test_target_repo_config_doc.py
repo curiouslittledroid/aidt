@@ -533,6 +533,18 @@ def test_when_paths_is_documented_as_a_stage_field_and_loads(tmp_path: Path) -> 
     }
 
 
+def test_when_paths_documentation_covers_i4_default_and_repo_override_rules() -> None:
+    """S1.2: config docs explain I4's literal default and override obligations."""
+    doc = _doc()
+    rows = _inventory_rows()
+
+    assert "when_paths" in rows
+    assert "I4" in rows["when_paths"][2]
+    assert "docs/architecture" in doc
+    assert "re-list" in doc or "relist" in doc
+    assert "custom" in doc and "architecture_dir" in doc
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [

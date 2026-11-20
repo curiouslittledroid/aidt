@@ -276,6 +276,17 @@ def _write_config(control: Path, body: str) -> None:
     config.write_text(body, encoding="utf-8")
 
 
+def _declare_i4_unconditional(control: Path) -> None:
+    """S1.2 re-baseline: keep ``I4`` unconditional in fixtures that do not touch docs/architecture.
+
+    ``I4`` now carries ``when=paths-changed`` with the ``docs/architecture`` registry default,
+    so an unrelated change set (these fixtures change only the prompt and roadmap) skips it.
+    A test about another stage, a parallel group or a resume path still wants ``I4`` in the
+    chain; an explicit ``when_paths: []`` replaces the default and says so.
+    """
+    _write_config(control, _declared_implement_stages())
+
+
 #: The four resolved document write-targets, hand-written from H3.2 req 3's prompt-fixed
 #: scope rather than read from the workflow: the fake evidence has to carry the *canonical*
 #: scope, so a workflow that resolved a different one matches nothing and the test fails
@@ -606,10 +617,18 @@ def test_dry_run_plans_locate_and_all_eight_stages(
     )
     assert traceability.when == "paths-changed"
     assert traceability.when_paths == ()
+    # S1.2: I4 is carried in the dry-run plan too; no path evaluation may withhold it.
+    architecture = next(
+        spec for spec in recorder.specs if spec.name == "update-architecture"
+    )
+    assert architecture.when == "paths-changed"
+    assert architecture.when_paths == ("docs/architecture",)
     assert all(
         spec.when == ""
         for spec in recorder.specs
-        if spec.name not in ("update-roadmap", "update-traceability")
+        if spec.name not in (
+            "update-roadmap", "update-traceability", "update-architecture"
+        )
     )
     out = capsys.readouterr().out
     command = (
@@ -772,6 +791,7 @@ def test_base_branch_flows_through_the_whole_run(tmp_path: Path, monkeypatch) ->
 
     roots = _roots(control)
     roots["repo"] = dataclasses.replace(roots["repo"], base_branch="develop")
+    _declare_i4_unconditional(control)
     _patch(monkeypatch)
     recorder = _Recorder()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
@@ -1650,6 +1670,7 @@ def test_a_resumed_run_with_a_lost_out_txt_fails_closed(
 
 def test_resume_skips_succeeded_stages(tmp_path: Path, monkeypatch) -> None:
     control, _worktree, prompt = _located_layout(tmp_path)
+    _declare_i4_unconditional(control)
     _patch(monkeypatch)
     runs_dir = _runs_root(control)
 
@@ -1841,6 +1862,7 @@ def test_parallel_runs_test_and_architecture_concurrently(
     tmp_path: Path, monkeypatch
 ) -> None:
     control, _worktree, prompt = _located_layout(tmp_path)
+    _declare_i4_unconditional(control)
     _patch(monkeypatch)
     recorder = _TrackingStages()
     monkeypatch.setattr(implement_workflow, "run_stage", recorder)
@@ -1902,10 +1924,8 @@ def test_parallel_runs_a_configured_group_instead_of_the_default_pair(
     control, _worktree, prompt = _located_layout(tmp_path)
     _write_config(
         control,
-        "schema_version: 1\n"
-        "workflows:\n"
-        "  implement:\n"
-        "    parallel_groups:\n"
+        _declared_implement_stages()
+        + "    parallel_groups:\n"
         "      - [test, record-implementation-results]\n",
     )
     _patch(monkeypatch)
@@ -1946,10 +1966,8 @@ def test_parallel_group_runs_at_its_earliest_member_not_its_first_listed(
     control, _worktree, prompt = _located_layout(tmp_path)
     _write_config(
         control,
-        "schema_version: 1\n"
-        "workflows:\n"
-        "  implement:\n"
-        "    parallel_groups:\n"
+        _declared_implement_stages()
+        + "    parallel_groups:\n"
         "      - [update-architecture, test]\n",
     )
     _patch(monkeypatch)
@@ -1984,10 +2002,7 @@ def test_parallel_with_an_explicit_empty_group_list_runs_serially(
     control, _worktree, prompt = _located_layout(tmp_path)
     _write_config(
         control,
-        "schema_version: 1\n"
-        "workflows:\n"
-        "  implement:\n"
-        "    parallel_groups: []\n",
+        _declared_implement_stages() + "    parallel_groups: []\n",
     )
     _patch(monkeypatch)
     recorder = _TrackingStages()
@@ -2010,10 +2025,8 @@ def test_a_group_naming_the_pr_stage_leaves_pr_in_its_post_gate_slot(
     control, _worktree, prompt = _located_layout(tmp_path)
     _write_config(
         control,
-        "schema_version: 1\n"
-        "workflows:\n"
-        "  implement:\n"
-        "    parallel_groups:\n"
+        _declared_implement_stages()
+        + "    parallel_groups:\n"
         "      - [test, pr]\n",
     )
     _patch(monkeypatch)
@@ -2033,6 +2046,7 @@ def test_a_group_member_failure_stops_the_run_with_a_resume_hint(
     tmp_path: Path, monkeypatch
 ) -> None:
     control, _worktree, prompt = _located_layout(tmp_path)
+    _declare_i4_unconditional(control)
     _patch(monkeypatch)
     recorder = _TrackingStages()
     recorder.fail = {"update-architecture"}
@@ -2360,12 +2374,17 @@ def _declared_implement_stages(disabled: set[str] | None = None) -> str:
 
     The full list is not optional: §3.4's declared list **replaces** the toolkit's
     wholesale, so a minimal list would trip E4.5a's removal rule instead of the rule a
-    test is about.
+    test is about. ``I4`` explicitly clears its S1.2 registry default: these tests are
+    not about the path gate and their fixture change set does not touch
+    ``docs/architecture``, so leaving the default on would silently remove ``I4`` from the
+    chain they assert.
     """
     disabled = disabled or set()
     lines = ["schema_version: 1", "workflows:", "  implement:", "    stages:"]
     for stage_id in IMPLEMENT_STAGE_IDS:
         lines.append(f"      - id: {stage_id}")
+        if stage_id == "I4":
+            lines.append("        when_paths: []")
         if stage_id in disabled:
             lines.append("        enabled: false")
     return "\n".join(lines) + "\n"
@@ -2442,9 +2461,14 @@ def _declared_stages(entries: list[dict[str, object]]) -> str:
 
 
 def _stages_with_repo_added(position: int) -> list[dict[str, object]]:
-    """Every core/optional implement id in registry order, plus ``X9`` after ``position``."""
+    """Every core/optional implement id in registry order, plus ``X9`` after ``position``.
+
+    ``I4`` carries an explicit empty ``when_paths`` (S1.2) so these scheduling tests keep
+    it in the chain; ``str([])`` renders ``[]``, which the loader reads as an empty list.
+    """
     entries: list[dict[str, object]] = [
-        {"id": stage_id} for stage_id in IMPLEMENT_STAGE_IDS
+        {"id": stage_id, "when_paths": []} if stage_id == "I4" else {"id": stage_id}
+        for stage_id in IMPLEMENT_STAGE_IDS
     ]
     entries.insert(
         position, {"id": "X9", "agent": "implementer", "prompt": REPO_ADDED_PROMPT}
@@ -3549,7 +3573,9 @@ def _declared_implement_stages_with_when_paths(
     """The full declared implement list, with I3 declaring ``when_paths`` (S1.1).
 
     A declared list replaces the toolkit's wholesale (§3.4), so every id is named; only I3
-    carries the path set. ``parallel_group`` optionally declares one concurrency group.
+    carries the path set. ``I4`` explicitly clears its S1.2 ``docs/architecture`` default so
+    these S1.1 tests keep it in the chain they assert. ``parallel_group`` optionally declares
+    one concurrency group.
     """
     lines = ["schema_version: 1", "workflows:", "  implement:", "    stages:"]
     for stage_id in IMPLEMENT_STAGE_IDS:
@@ -3558,6 +3584,8 @@ def _declared_implement_stages_with_when_paths(
             lines.append("        when_paths:")
             for path in when_paths:
                 lines.append(f'          - "{path}"')
+        if stage_id == "I4":
+            lines.append("        when_paths: []")
     if parallel_group is not None:
         lines.append("    parallel_groups:")
         lines.append("      - [" + ", ".join(parallel_group) + "]")
@@ -3857,6 +3885,167 @@ def test_a_parallel_group_member_naming_i3_is_withheld_on_the_member_path(
     record = _stage_record(state, "update-traceability")
     assert record.status == SKIPPED
     assert "docs/traceability" in record.artifacts[SKIP_REASON_KEY]
+
+
+def _declared_implement_stages_with_i4_when_paths(
+    when_paths: list[str], parallel_group: list[str] | None = None
+) -> str:
+    """The full implement declaration with S1.2's I4 path set."""
+    lines = ["schema_version: 1", "workflows:", "  implement:", "    stages:"]
+    for stage_id in IMPLEMENT_STAGE_IDS:
+        lines.append(f"      - id: {stage_id}")
+        if stage_id == "I4":
+            if when_paths:
+                lines.append("        when_paths:")
+                lines.extend(f'          - "{path}"' for path in when_paths)
+            else:
+                lines.append("        when_paths: []")
+    if parallel_group is not None:
+        lines.append("    parallel_groups:")
+        lines.append("      - [" + ", ".join(parallel_group) + "]")
+    return "\n".join(lines) + "\n"
+
+
+def test_i4_default_skips_an_unrelated_change_and_records_a_cost_control_skip(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2: the registry default skips I4 when architecture is untouched."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-architecture" not in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    record = _stage_record(state, "update-architecture")
+    assert record.status == SKIPPED
+    assert record.error is None
+    assert "docs/architecture" in record.artifacts[SKIP_REASON_KEY]
+    assert state.status == SUCCEEDED
+    assert state.resume == {"next_stage": None}
+
+
+def test_i4_default_runs_when_architecture_is_touched(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2: the literal D17 architecture prefix includes files below the directory."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    architecture_file = worktree / "docs" / "architecture" / "ARCHITECTURE.md"
+    architecture_file.parent.mkdir(parents=True)
+    architecture_file.write_text("# architecture\n", encoding="utf-8")
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-architecture" in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-architecture").status == SUCCEEDED
+
+
+def test_i4_declared_diagram_input_replaces_default_and_runs_on_that_input(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2 proposed (b): a declared input prefix is sufficient to run I4."""
+    control, worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        _declared_implement_stages_with_i4_when_paths(["docs/diagrams"]),
+    )
+    diagram = worktree / "docs" / "diagrams" / "system.mmd"
+    diagram.parent.mkdir(parents=True)
+    diagram.write_text("flowchart LR\n", encoding="utf-8")
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-architecture" in recorder.names
+    spec = next(spec for spec in recorder.specs if spec.name == "update-architecture")
+    assert spec.when_paths == ("docs/diagrams",)
+
+
+def test_i4_explicit_empty_paths_runs_unconditionally(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2: explicit ``when_paths: []`` overrides the registry default."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _write_config(control, _declared_implement_stages_with_i4_when_paths([]))
+    _patch(monkeypatch)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-architecture" in recorder.names
+    spec = next(spec for spec in recorder.specs if spec.name == "update-architecture")
+    assert spec.when_paths == ()
+
+
+def test_i4_runs_when_the_change_set_cannot_be_resolved(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2 fail-closed rule: ``changed_paths() is None`` never withholds I4."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        _declared_implement_stages_with_i4_when_paths(["docs/diagrams"]),
+    )
+    _patch(monkeypatch)
+    monkeypatch.setattr(implement_workflow.git, "changed_paths", lambda repo, base: None)
+    recorder = _Recorder()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt, **_roots(control), approve_all=True
+    )
+
+    assert code == 0
+    assert "update-architecture" in recorder.names
+
+
+def test_i4_is_withheld_on_the_parallel_member_dispatch_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """S1.2: ``--parallel`` must apply the path condition before dispatching I4."""
+    control, _worktree, prompt = _located_layout(tmp_path)
+    _write_config(
+        control,
+        _declared_implement_stages_with_i4_when_paths(
+            ["docs/diagrams"], parallel_group=["test", "update-architecture"]
+        ),
+    )
+    _patch(monkeypatch)
+    recorder = _GateEvidenceStages()
+    monkeypatch.setattr(implement_workflow, "run_stage", recorder)
+
+    code = implement_workflow.run(
+        task_prompt_path=prompt,
+        **_roots(control),
+        approve_all=True,
+        parallel=True,
+    )
+
+    assert code == 0
+    assert "update-architecture" not in recorder.names
+    state = implement_workflow.list_runs(_runs_root(control))[-1]
+    assert _stage_record(state, "update-architecture").status == SKIPPED
 
 
 def test_dry_run_plans_i3_with_its_declared_paths_and_evaluates_nothing(

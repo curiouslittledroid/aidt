@@ -74,7 +74,7 @@ condition beside the existing `WHEN_EVIDENCE_GREEN`, so a repo can skip them che
   - Tests: `tests/test_stage_registry.py`, `tests/test_plan_stages.py`, `tests/test_implement_workflow.py`, `tests/test_design_doc.py`.
   - Notes: The change set is the gated tree identity the `I7` condition already computes. A skip is a success, never a failure, and must leave the roadmap byte-identical — mirror `WHEN_EVIDENCE_GREEN`'s `record_skipped` shape.
 
-- [ ] **S1.2. Gate `update-architecture` (I4) on the path condition** (Design 8.2, Design 12.2)
+- [x] **S1.2. Gate `update-architecture` (I4) on the path condition** (Design 8.2, Design 12.2)
   - Done when: `I4 update-architecture` skips (records `skipped` with a reason) when the gated tree's change set touches no path in the repo-declared architecture trigger set, and runs otherwise; the trigger set is repo-declared (a config key, defaulting to `docs/architecture/**` plus any diagram-input paths the repo names); when `I4` is enabled but the repo declares no trigger set, `aidw doctor` warns instead of silently running the stage unconditionally; design §§8.2, 12.2 are updated; and the five gates above are green.
   - Deliverable: `aidw/stage_registry.py` (attach the condition to `I4`), the config key and `docs/target-repo-config.md`, `aidw/doctor.py` (the warning), design.md §§8.2, 12.2, and the tests below.
   - Tests: `tests/test_stage_registry.py`, `tests/test_plan_stages.py`, `tests/test_implement_workflow.py`, `tests/test_doctor.py` (or its equivalent).

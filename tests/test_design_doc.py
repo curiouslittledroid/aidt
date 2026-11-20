@@ -184,6 +184,26 @@ def test_section_17_has_one_z11_row_recording_the_path_scoped_condition() -> Non
         assert path in z11, path
 
 
+def test_s1_2_design_sections_and_next_free_decision_row_are_recorded() -> None:
+    """S1.2: design records I4's contract without hardcoding a future Z number."""
+    design = _design_md()
+    block = " ".join(_section_82_block(design).split())
+    assert "I4" in block and "WHEN_PATHS_CHANGED" in block
+    assert "docs/architecture" in block
+    assert "doctor" in block
+
+    section = _section(design, "### 12.2 Stage registry", "### 12.3 Prompt resolution")
+    assert "I4" in section and "paths-changed" in section
+
+    decisions = _section(design, "## 17. Resolved decisions", "## 18. Risks")
+    rows = [
+        line
+        for line in decisions.splitlines()
+        if re.match(r"^\| Z\d+ \|", line) and "S1.2" in line and "I4" in line
+    ]
+    assert len(rows) == 1, f"expected exactly one S1.2 decision row, found {len(rows)}"
+
+
 def _section_83_block(design: str) -> str:
     """The §8.3 ``aidw review`` block: its heading up to the §8.4 heading."""
     start = design.index("### 8.3 `aidw review --pr <n>`")
