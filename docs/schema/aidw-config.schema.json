@@ -18,6 +18,11 @@
       "type": "integer",
       "description": "Revision budget for the prompt workflow (design.md §12). The toolkit's default is applied by E3.2."
     },
+    "gates_heading": {
+      "type": "string",
+      "minLength": 1,
+      "description": "C1.2 (design §7.3 step 4): the extra heading line that introduces the target's gate commands in AGENTS.md or aidw/conventions.md, in addition to `## Gates` and `## Gate commands`. The value is the full heading line including its `## ` prefix, matched verbatim by prefix — for example `## Verification gates`. Optional and unset by default; an empty string is an error."
+    },
     "repo": {
       "type": "object",
       "description": "Repository and branch conventions.",

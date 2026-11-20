@@ -39,6 +39,7 @@ from aidw.doctor import (
     WARN,
     _check_compat,
     _check_dependencies,
+    _check_gates_heading,
     _check_gh_version,
     _check_git_version,
     _check_pi,
@@ -891,6 +892,117 @@ def test_doctor_architecture_trigger_distinguishes_undeclared_from_disabled(
 
     assert check.status == OK
     assert check.detail == expected_detail
+
+
+# ---------------------------------------------------------------------------
+# C1.2 — the advisory ``gates heading`` WARN
+# ---------------------------------------------------------------------------
+
+
+def _gates_heading_check(tmp_path: Path, *, heading: str, source: str = "AGENTS.md") -> doctor.Check:
+    """The check over a supported layout whose chosen conventions source carries ``heading``."""
+    _bare, control = _make_supported(tmp_path)
+    path = control / source
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"# Conventions\n\n{heading}\n\ncommands here\n", encoding="utf-8")
+    return _check_gates_heading(control)
+
+
+@pytest.mark.parametrize(
+    "heading",
+    ["## Gate Commands", "## Verification gates"],
+    ids=["capital-c", "verification-gates"],
+)
+def test_c12_unrecognised_gates_like_heading_is_a_warn_naming_file_and_heading(
+    tmp_path: Path, heading: str
+) -> None:
+    """Both shapes a natural reader writes: reported with the source and the heading."""
+    check = _gates_heading_check(tmp_path, heading=heading)
+
+    assert check.status == WARN
+    assert "AGENTS.md" in check.detail
+    assert heading in check.detail
+    # The two fixes are named, so the operator can act on the WARN.
+    assert "`## Gates`" in check.detail and "`## Gate commands`" in check.detail
+    assert "gates_heading" in check.detail
+
+
+@pytest.mark.parametrize(
+    ("heading", "source", "config_text"),
+    [
+        ("## Gates", "AGENTS.md", None),
+        ("## Gate commands", "aidw/conventions.md", None),
+        # The toolkit's own shape: prefix matching, never `==`, keeps this silent.
+        ("## Gates — run exactly these", "AGENTS.md", None),
+        (
+            "## Verification gates",
+            "aidw/conventions.md",
+            'schema_version: 1\ngates_heading: "## Verification gates"\n',
+        ),
+    ],
+    ids=["bare-gates", "gate-commands", "suffixed-canonical", "declared-heading"],
+)
+def test_c12_recognised_or_declared_heading_is_silent(
+    tmp_path: Path,
+    heading: str,
+    source: str,
+    config_text: str | None,
+) -> None:
+    """Every recognised route is OK: bare, alias, suffixed canonical, and declared."""
+    _bare, control = _make_supported(tmp_path)
+    path = control / source
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"# Conventions\n\n{heading}\n\ncommands here\n", encoding="utf-8")
+    if config_text is not None:
+        _write_target_config(control, config_text)
+
+    check = _check_gates_heading(control)
+
+    assert check.status == OK
+    assert "unrecognised" not in check.detail
+
+
+def test_c12_missing_config_and_missing_sources_degrade_to_nothing_to_report(
+    tmp_path: Path,
+) -> None:
+    """A config-less, conventions-less repo is OK, and no crash on an unreadable config."""
+    _bare, control = _make_supported(tmp_path)
+
+    check = _check_gates_heading(control)
+
+    assert check.status == OK
+    assert not (control / "aidw" / "config.yaml").exists()
+
+    # Unreadable (non-UTF-8) config: the loader degrades, the check still reports a WARN
+    # for a heading nothing recognises rather than crashing or staying silent.
+    _write_target_config(control, b"schema_version: 1\ngates_heading: caf\xe9\n")
+    (control / "AGENTS.md").write_text(
+        "# Conventions\n\n## Gate Commands\n\ncommands here\n", encoding="utf-8"
+    )
+
+    warn = _check_gates_heading(control)
+
+    assert warn.status == WARN
+    assert "## Gate Commands" in warn.detail
+
+
+def test_c12_gates_heading_warn_never_fails_the_doctor(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """The WARN is advisory: a repo that only degrades still exits 0 (§8.1)."""
+    _bare, control = _make_supported(tmp_path)
+    (control / "AGENTS.md").write_text(
+        "# Conventions\n\n## Gate Commands\n\ncommands here\n", encoding="utf-8"
+    )
+
+    checks = collect_checks(explicit=control)
+    check = _named(checks, "gates heading")
+
+    assert check.status == WARN
+    assert not [item for item in checks if item.status == FAIL], [
+        (item.name, item.detail) for item in checks if item.status == FAIL
+    ]
+    assert run_doctor(explicit=control) == 0
 
 
 def test_missing_target_config_reports_defaults(

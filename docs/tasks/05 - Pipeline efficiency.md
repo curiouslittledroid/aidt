@@ -93,7 +93,7 @@ heading. This epic removes the duplication and makes gate commands resolve once,
   - Tests: `tests/test_prompts.py` (or the rendering test that covers `inject_repo_conventions`), `tests/test_inventory.py`, `tests/test_design_doc.py`.
   - Notes: Observed duplication: the `impliment-task` rendered prompt was 28.5KB of which 16.9KB was `AGENTS.md`, while the system prompt already carried the same file as `project_context` (17KB). Drop the renderer's copy, not Pi's; keep the conventions channel, which the gate block (C1.2/C1.3) still reads from.
 
-- [ ] **C1.2. Resolve gate commands from the target's actual gates heading, and diagnose misses** (Design 8.1, Design 7.3)
+- [x] **C1.2. Resolve gate commands from the target's actual gates heading, and diagnose misses** (Design 8.1, Design 7.3)
   - Done when: `_gate_block` recognises the gate section under the heading the target repo actually uses — the canonical `## Gates` plus the common `## Gate commands` alias (or a config-declared heading) — instead of degrading to `unavailable — could not be read`; when a conventions source carries a gates-like heading the parser did not recognise, `aidw doctor` (or the evidence bundle) reports it rather than silently degrading; the evidence bundle for a repo whose conventions use `## Gate commands` renders the gate commands; and the five gates above are green.
   - Deliverable: `aidw/workflows/prompt.py` (`_GATES_HEADING` / `_gates_section`), `aidw/prompts.py`, `aidw/doctor.py`, `docs/target-repo-config.md`, design.md §8.1, and the tests below.
   - Tests: `tests/test_prompt_workflow.py`, `tests/test_doctor.py`.

@@ -39,7 +39,11 @@
   injected into the `task-prompt`, `impliment-task`, `test`, `record-implementation-results` and
   `update-traceability` prompts (§3.8/D16; `update-traceability` added by W1.1, design §17 Z13).
   It is also where a repo declares its **traceability artefacts**, including "none" (design
-  §12.1). It is not a config key; `paths.*` does not point at it.
+  §12.1). It is not a config key; `paths.*` does not point at it. Its gate commands (like
+  `AGENTS.md`'s) are read only under a `## Gates` or `## Gate commands` heading, or under the
+  heading named verbatim by the top-level `gates_heading` key (C1.2, design §7.3 step 4); any
+  other gates-like heading leaves the evidence bundle's list `unavailable` and is reported by
+  `aidw doctor` as a `gates heading` WARN.
 - `prompts/` is optional and holds prompt overrides **by filename** — the second step of the
   prompt-resolution order below. Nothing in it is a config key either.
 - `AGENTS.md` at the repo root is read by Pi itself; `aidw/` config does not replace it.
@@ -70,6 +74,7 @@ In the tables below:
 | `schema_version` | integer | unset | The version of this schema the file is written against. Required whenever the file exists. A value **greater than** the toolkit's `SUPPORTED_SCHEMA_VERSION` (`1`) is refused (D10, §3.11): upgrade `aidt`, or lower the value. |
 | `requires_toolkit` | string | unset | An optional minimum toolkit version as a PEP 440 specifier (`">=1.0.0"`), compared with `packaging`; the toolkit refuses to run when its own version does not satisfy it, or when the specifier is not valid PEP 440 (D10, §3.11). |
 | `max_revisions` | integer | `3` | The revision budget of the `prompt` workflow (design §12): how many author→review→fix rounds run before the run blocks. `aidw prompt --max-revisions` overrides it; see the precedence section. |
+| `gates_heading` | string | unset | An additional heading that introduces the target's gate commands, recognised beside the two built-in headings `## Gates` and `## Gate commands` (C1.2, design §7.3 step 4). The value is the **full heading line including its `## ` prefix** — for example `gates_heading: "## Verification gates"` — matched verbatim by the same prefix rule, never a bare title the code prefixes. It is read by the prompt workflow's evidence-bundle gate list (`aidw/workflows/prompt.py:_gate_block`) from `<target>/AGENTS.md` and `<target>/aidw/conventions.md`; an empty string is an error naming the field. A non-standard heading that is neither built-in nor declared leaves the bundle's gate list `unavailable` (a normal degraded state) and `aidw doctor` reports it as a `gates heading` WARN. |
 | `repo` | mapping | unset | Repository and branch conventions (two fields below). |
 | `paths` | mapping | unset | Per-repo path conventions (seven fields below). |
 | `workflows` | mapping, open | unset | Workflow overrides keyed by workflow name. An open map, so a repo may add its own workflow as well as override `prompt`/`implement` (D12). |
@@ -398,8 +403,9 @@ Resolves to exactly the same **values** as Minimal. Only the provenance differs:
 
 ### Full — every field declared
 
-§3.4's own example, with `max_revisions` added — a loader-accepted top-level key that §3.4's
-snippet omits. `github.markers` and `github.labels` carry Mythical Forge's frozen D5 literals:
+§3.4's own example, with `max_revisions` and C1.2's `gates_heading` added — loader-accepted
+top-level keys that §3.4's snippet omits. `github.markers` and `github.labels` carry Mythical
+Forge's frozen D5 literals:
 declaring them pins them in the file, so `aidw config show` reports them `config` instead of
 `default`. The values are identical either way — that is the point of the freeze.
 
@@ -408,6 +414,7 @@ schema_version: 1
 requires_toolkit: ">=1.0.0"        # optional
 
 max_revisions: 3
+gates_heading: "## Verification gates"  # extra gate-commands heading, full `## ` line (C1.2)
 
 repo:
   base_branch: main                # PR base and branch point

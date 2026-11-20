@@ -101,6 +101,9 @@ FULL_CONFIG: dict[str, Any] = {
     "schema_version": 1,
     "requires_toolkit": ">=1.0.0",
     "max_revisions": 3,
+    # C1.2's declared heading: the full ``## ``-prefixed line, verbatim, so the round-trip
+    # proves the value format the gate reader matches with ``startswith``.
+    "gates_heading": "## Verification gates",
     "repo": {
         "base_branch": "main",
         "branch_pattern": "{phase}-{task}",
@@ -183,6 +186,7 @@ TOP_LEVEL_CONFIG_KEYS = {
     "schema_version",
     "requires_toolkit",
     "max_revisions",
+    "gates_heading",
     "repo",
     "paths",
     "workflows",
@@ -235,6 +239,7 @@ def test_full_section_3_4_config_loads_with_every_field_populated(tmp_path: Path
     assert config.schema_version == 1
     assert config.requires_toolkit == ">=1.0.0"
     assert config.max_revisions == 3
+    assert config.gates_heading == "## Verification gates"
     assert config.source_path == path
 
     assert config.repo == RepoConfig(
@@ -297,6 +302,8 @@ def test_schema_version_only_config_loads_without_error(tmp_path: Path) -> None:
     assert config.paths is None
     assert config.github is None
     assert config.workflows == {}
+    # C1.2: the key defaults to unset, and an absent value injects no ``null``/``""``.
+    assert config.gates_heading is None
     assert config.to_dict() == {"schema_version": 1}
 
 
@@ -738,6 +745,11 @@ WRONG_TYPE_CASES = [
         id="max-revisions-str",
     ),
     pytest.param(
+        {"schema_version": 1, "gates_heading": 7},
+        "gates_heading",
+        id="gates-heading-int",
+    ),
+    pytest.param(
         {"schema_version": 1, "repo": {"base_branch": 7}},
         "repo.base_branch",
         id="repo-base-branch-int",
@@ -951,8 +963,42 @@ def test_full_config_round_trip_is_exact_and_lossless(tmp_path: Path) -> None:
     assert load_target_config(_write_config(tmp_path / "again", dumped)) == config
 
 
+def test_gates_heading_round_trips_verbatim_with_its_markdown_prefix(tmp_path: Path) -> None:
+    """C1.2: the value is the full ``## ``-prefixed heading line, kept exactly as written.
+
+    The gate reader matches it with ``startswith``, so a stripped title or a prefixed bare
+    title would both stop working; the loader is therefore a verbatim carrier.
+    """
+    declared = {"schema_version": 1, "gates_heading": "## Verification gates"}
+
+    config = _load(tmp_path, declared)
+
+    assert config.issues == []
+    assert config.gates_heading == "## Verification gates"
+    assert config.to_dict() == declared
+    assert load_target_config(_write_config(tmp_path / "again", config.to_dict())) == config
+
+
+def test_empty_gates_heading_is_one_error_naming_the_field_and_dropped(
+    tmp_path: Path,
+) -> None:
+    """C1.2: ``""`` is one ERROR, and the value is dropped (``startswith("")`` matches all)."""
+    config = _load(tmp_path, {"schema_version": 1, "gates_heading": ""})
+
+    errors = _errors(config)
+    assert len(errors) == 1, format_issues(config.issues)
+    assert "gates_heading" in errors[0]
+    assert "non-empty" in errors[0]
+    assert config.gates_heading is None
+    assert "gates_heading" not in config.to_dict()
+
+
 ROUND_TRIP_CASES = [
     pytest.param({"schema_version": 1}, id="minimal"),
+    pytest.param(
+        {"schema_version": 1, "gates_heading": "## Verification gates"},
+        id="declared-gates-heading",
+    ),
     pytest.param(
         {"schema_version": 1, "repo": {}},
         id="empty-repo-container",
