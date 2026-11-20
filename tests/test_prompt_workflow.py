@@ -217,6 +217,7 @@ The prompt's assumptions hold.
 ```text
 Priority: Should fix
 Confidence: 4
+Kind: prompt-gap
 What I found: The deliverable leaves a stale path reference.
 Why it matters: A reviewer lands on a missing file.
 Trigger and effect: After the rename the pointer is dead.
@@ -227,6 +228,7 @@ Suggested fix: Add the path update to the deliverables.
 ```text
 Priority: Should fix
 Confidence: 4
+Kind: prompt-gap
 What I found: The prompt is silent on matrix coverage.
 Why it matters: A convention-mandated check is skipped silently.
 Trigger and effect: The implementer omits the matrix review.
@@ -237,6 +239,7 @@ Suggested fix: Add one line recording the out-of-scope decision.
 ```text
 Priority: Could fix
 Confidence: 3
+Kind: prompt-gap
 What I found: The annotations contradict the import strategy.
 Why it matters: Minor compile churn or diff noise.
 Trigger and effect: The implementer picks either strategy.
@@ -252,6 +255,7 @@ Request changes — two should-fix items remain.
 TASK_REVIEW_UNPARSEABLE = """\
 Priority: Urgent
 Confidence: 4
+Kind: prompt-gap
 What I found: Something is wrong.
 Why it matters: It matters.
 Trigger and effect: Always.
@@ -269,6 +273,7 @@ TASK_REVIEW_BOLD = """\
 
 **Priority: Should fix**
 **Confidence: 5**
+**Kind: prompt-gap**
 
 **What I found:** The importer enumeration omits a real fourth importer.
 **Why it matters:** Literal compliance produces a non-building PR.
@@ -278,6 +283,7 @@ TASK_REVIEW_BOLD = """\
 
 **Priority: Could fix**
 **Confidence:** 3
+**Kind:** prompt-gap
 
 **What I found:** The annotations contradict the import strategy.
 **Why it matters:** Minor diff noise.
@@ -683,6 +689,7 @@ TASK_REVIEW_MULTI_COULD = """\
 ```text
 Priority: Must fix
 Confidence: 5
+Kind: prompt-gap
 What I found: The survey function name is wrong.
 Why it matters: Callers cannot compile.
 Trigger and effect: Any implementation.
@@ -693,6 +700,7 @@ Suggested fix: Use the real exported name.
 ```text
 Priority: Could fix
 Confidence: 3
+Kind: prompt-gap
 What I found: The prose is repetitive.
 Why it matters: Slightly harder to read.
 Trigger and effect: None.
@@ -703,6 +711,7 @@ Suggested fix: Tighten the paragraph.
 ```text
 Priority: Could fix
 Confidence: 3
+Kind: prompt-gap
 What I found: The example path is stale.
 Why it matters: Minor confusion.
 Trigger and effect: None.
@@ -996,6 +1005,7 @@ TASK_REVIEW_BLOCKED = """\
 ```text
 Priority: Must fix
 Confidence: 5
+Kind: prompt-gap
 What I found: A material ambiguity the prompt cannot settle.
 Why it matters: An implementer would have to guess a schema decision.
 Trigger and effect: Always.
@@ -1020,6 +1030,7 @@ The prompt depends on a task whose implementation is not on the base branch.
 ```text
 Priority: Could fix
 Confidence: 4
+Kind: prompt-gap
 What I found: The dependency's shape is unmerged and the roadmap summary disagrees with it.
 Why it matters: Prescribing one shape would settle the conflict without authority.
 Trigger and effect: The implementer follows a prescription the dependency branch does not support.
@@ -1679,6 +1690,311 @@ def test_blocked_without_findings_does_not_run_fallback_fix(
     assert (
         git.status_short(_task_worktree(tmp_path), paths=["docs/task-prompts/03-E4.1-prompt.md"]) != ""
     )
+
+
+# --------------------------------------------------------------------------- #
+# G1.1: the prompt review's `Kind:` classification (design §8.1, row Z18)
+# --------------------------------------------------------------------------- #
+
+#: A prompt-review finding whose defect only the cited spec or roadmap can close (G1.1):
+#: editing the prompt cannot make the requirement true, so no fix batch may take it.
+TASK_REVIEW_SPEC_GAP = """\
+## Findings
+
+```text
+Priority: Must fix
+Confidence: 5
+Kind: spec-gap
+What I found: The prompt requires a field the cited spec never defines.
+Why it matters: The implementer would have to invent a schema decision.
+Trigger and effect: Any implementation follows the invented field.
+Where: docs/task-prompts/03-E4.1-prompt.md, requirement 4; the cited spec section.
+Suggested fix: Add the field to the spec first; the prompt cannot settle it.
+```
+
+## Verdict
+
+Request changes — the spec must define the field before the prompt can.
+"""
+
+
+def _finding_block(*, priority: str, kind: str | None, what: str) -> str:
+    """One reviewer finding block, with a `Kind:` line only when ``kind`` is not None."""
+    lines = ["```text", f"Priority: {priority}", "Confidence: 4"]
+    if kind is not None:
+        lines.append(f"Kind: {kind}")
+    lines += [
+        f"What I found: {what}",
+        "Why it matters: It matters.",
+        "Trigger and effect: Always.",
+        "Where: docs/task-prompts/03-E4.1-prompt.md.",
+        "Suggested fix: Fix it.",
+        "```",
+    ]
+    return "\n".join(lines)
+
+
+def _two_finding_review(*kinds: str | None) -> str:
+    """A two-finding review whose findings carry the given kinds (``None`` = absent)."""
+    blocks = [
+        _finding_block(
+            priority="Must fix" if index == 0 else "Could fix",
+            kind=kind,
+            what=f"Finding {index + 1} text.",
+        )
+        for index, kind in enumerate(kinds)
+    ]
+    return "## Findings\n\n" + "\n\n".join(blocks) + "\n\n## Verdict\n\nRequest changes\n"
+
+
+def test_g11_spec_gap_review_stops_before_any_fix(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A `spec-gap` finding ends the run blocked, surfaced, with no fixer or reconcile."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_SPEC_GAP, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 3
+    names = [name for name, _, _ in seen]
+    assert names == ["task-prompt", "task-review-1"]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    assert latest.resume == {}
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    assert gate.mechanism == "spec-gap"
+    # The finding is surfaced in the reviewer's own block form, classification included.
+    err = capsys.readouterr().err
+    assert "spec-gap" in err
+    assert "Kind: spec-gap" in err
+    assert "What I found: The prompt requires a field the cited spec never defines." in err
+    # No approve path ran, so the prompt stays uncommitted for a human.
+    assert (
+        git.status_short(
+            _task_worktree(tmp_path), paths=["docs/task-prompts/03-E4.1-prompt.md"]
+        )
+        != ""
+    )
+
+
+@pytest.mark.parametrize(
+    "kind_line",
+    ["", "Kind:", "Kind: nope"],
+    ids=["missing", "empty", "unrecognised"],
+)
+def test_g11_unclassified_review_fails_closed(
+    tmp_path: Path, monkeypatch, capsys, kind_line: str
+) -> None:
+    """A missing or unrecognised `Kind:` stops the run instead of reaching the fixer."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    body = TASK_REVIEW_SPEC_GAP.replace("Kind: spec-gap\n", f"{kind_line}\n" if kind_line else "")
+    seen, fake = _fake_stages(body, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 3
+    names = [name for name, _, _ in seen]
+    assert names == ["task-prompt", "task-review-1"]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    assert latest.status == state.BLOCKED
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    assert gate.mechanism == "unclassified"
+    err = capsys.readouterr().err
+    assert "unclassified" in err
+    assert "What I found: The prompt requires a field the cited spec never defines." in err
+    assert (
+        git.status_short(
+            _task_worktree(tmp_path), paths=["docs/task-prompts/03-E4.1-prompt.md"]
+        )
+        != ""
+    )
+
+
+def test_g11_unclassified_precedes_the_unparseable_fallback(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Classification is checked before malformed priority takes the old fallback path."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    body = TASK_REVIEW_SPEC_GAP.replace("Priority: Must fix", "Priority: Urgent").replace(
+        "Kind: spec-gap", "Kind: nope"
+    )
+    seen, fake = _fake_stages(body, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 3
+    assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
+    gate = [g for g in state.list_runs(_runs_root(tmp_path))[-1].gates if g.name == "approve-task-prompt"][-1]
+    assert gate.mechanism == "unclassified"
+    err = capsys.readouterr().err
+    assert "unclassified" in err
+    assert "What I found: The prompt requires a field the cited spec never defines." in err
+
+
+def test_g11_an_unclassified_finding_wins_over_a_spec_gap(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Ordering: a review whose classification cannot be trusted stops as unclassified."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    body = _two_finding_review("spec-gap", "nope")
+    seen, fake = _fake_stages(body, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 3
+    assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
+    gate = [g for g in state.list_runs(_runs_root(tmp_path))[-1].gates if g.name == "approve-task-prompt"][-1]
+    assert gate.mechanism == "unclassified"
+    err = capsys.readouterr().err
+    assert "unclassified" in err
+    assert "Finding 2 text." in err
+
+
+def test_g11_a_spec_gap_wins_over_an_approve_verdict(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Classification is checked before M2's approve branch: a spec-gap is not approved."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    body = TASK_REVIEW_CHANGES.replace("Kind: prompt-gap", "Kind: spec-gap")
+    seen, fake = _fake_stages(body + "\n**Verdict: Approve**\n", approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 3
+    assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
+    gate = [g for g in state.list_runs(_runs_root(tmp_path))[-1].gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "denied"
+    assert gate.mechanism == "spec-gap"
+    # The M2 branch would also be denied, but with `review-loop`; this proves precedence.
+    assert "verdict=Approve" in gate.detail
+
+
+def test_g11_a_spec_gap_wins_over_a_blocked_verdict(tmp_path: Path, monkeypatch) -> None:
+    """A spec-gap is the more actionable stop even when the reviewer said `Blocked`."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    body = TASK_REVIEW_BLOCKED_DEPENDENCY.replace("Kind: prompt-gap", "Kind: spec-gap")
+    seen, fake = _fake_stages(body, approve_review=None)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=False
+    )
+
+    assert code == 3
+    assert [name for name, _, _ in seen] == ["task-prompt", "task-review-1"]
+    gate = [g for g in state.list_runs(_runs_root(tmp_path))[-1].gates if g.name == "approve-task-prompt"][-1]
+    assert gate.mechanism == "spec-gap"
+    assert "verdict=Blocked" in gate.detail
+
+
+@pytest.mark.parametrize("mechanism", ["spec-gap", "unclassified"])
+def test_g11_classification_stops_are_not_resume_fix_cycles(mechanism: str) -> None:
+    """W1 must refuse both classification stops rather than offering a fixer continuation."""
+    run = state.RunState(
+        run_id="20260101T000000Z-g11-prompt",
+        workflow="prompt",
+        created_at=state.utcnow_iso(),
+        repo_root=".",
+    )
+    run.record_gate(
+        state.GateRecord(
+            name=prompt_workflow.GATE,
+            decision="denied",
+            mechanism=mechanism,
+            at=state.utcnow_iso(),
+        )
+    )
+
+    assert prompt_workflow.review_loop_block(run) is False
+    assert f"mechanism `{mechanism}`" in prompt_workflow.blocked_resume_reason(run)
+
+
+def test_g11_prompt_gap_findings_keep_the_existing_fix_loop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`prompt-gap` findings are fixed exactly as before: no classification stop."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    seen, fake = _fake_stages(TASK_REVIEW_CHANGES)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(tmp_path), label=RUN_LABEL, approve_all=True
+    )
+
+    assert code == 0
+    assert [name for name, _, _ in seen] == [
+        "task-prompt",
+        "task-review-1",
+        "task-review-fixes-1-1",
+        "task-review-fixes-1-2",
+        "task-review-fixes-1-3",
+        "task-review-reconcile-1",
+        "task-review-2",
+    ]
+    latest = state.list_runs(_runs_root(tmp_path))[-1]
+    gate = [g for g in latest.gates if g.name == "approve-task-prompt"][-1]
+    assert gate.decision == "approved"
+    assert not any(
+        g.decision == "denied" and g.mechanism in ("spec-gap", "unclassified")
+        for g in latest.gates
+    )
+
+
+def test_g11_rendered_reviewer_prompt_requires_kind_and_a_full_re_read() -> None:
+    """G1.1 req 1/7: the prompt is the contract the reviewer and parser share."""
+    rendered = render_prompt_file(
+        toolkit_root() / "prompts" / "task-review.md",
+        ["docs/task-prompts/03-E4.1-prompt.md"],
+    )
+
+    format_block = rendered.split("```text", 1)[1].split("```", 1)[0]
+    labels = [
+        f"{line.split(':', 1)[0]}:" for line in format_block.splitlines() if ":" in line
+    ]
+    assert "Kind:" in labels
+    assert labels[labels.index("Confidence:") + 1] == "Kind:"
+    assert "Kind: spec-gap / prompt-gap" in rendered
+    # Both classes are defined in one line each, in the prompt's own words.
+    assert "`spec-gap`: a defect only the cited specification or roadmap can close" in rendered
+    assert "`prompt-gap`: a defect the prompt itself can close" in rendered
+    assert "A finding without a valid `Kind:` is not a complete review" in rendered
+    # "Keep the labels plain" is extended to the new label (no bold, no backticks).
+    plain = rendered.split("Keep the labels plain", 1)[1].split("\n\n", 1)[0]
+    assert "`Kind:`" in plain
+    # Requirement 7: a grep/diff-only re-read of a previously flagged section is not proof.
+    assert "re-read the previously flagged material in full" in rendered
+    assert "never sufficient to approve" in rendered
+
+
+def test_g11_task_reviewer_context_mirrors_kind_and_stays_read_only() -> None:
+    """G1.1 req 6: the agent context states the requirement without widening its boundary."""
+    agent_md = (
+        toolkit_root() / "agents" / "task-reviewer" / "AGENTS.md"
+    ).read_text(encoding="utf-8")
+
+    assert "`Kind:`" in agent_md
+    assert "`spec-gap`" in agent_md and "`prompt-gap`" in agent_md
+    assert "not a\n  complete review" in agent_md
+    # The read-only boundary is unchanged, not relaxed by the new output requirement.
+    assert "Read-only" in agent_md
 
 
 def test_commit_reviewed_prompt_commits_changes(tmp_path: Path) -> None:
@@ -2774,8 +3090,9 @@ def test_l22_rendered_reviewer_prompt_requires_verified_revision() -> None:
         assert forbidden not in added_line, forbidden
     assert not re.search(r"\b0[0-9]-E[0-9]", added_line), "no product task-id example"
 
-    # Format unchanged: the seven finding labels and the three verdict tokens are
-    # byte-stable, so `aidw/findings.py:_LABELS` and `aidw/verdict.py` still parse.
+    # Format unchanged apart from G1.1's required `Kind:` label: the eight finding labels and
+    # the three verdict tokens are byte-stable, so `aidw/findings.py:_LABELS` and
+    # `aidw/verdict.py` still parse.
     format_block = rendered.split("```text", 1)[1].split("```", 1)[0]
     assert [
         f"{line.split(':', 1)[0]}:"
@@ -2784,6 +3101,7 @@ def test_l22_rendered_reviewer_prompt_requires_verified_revision() -> None:
     ] == [
         "Priority:",
         "Confidence:",
+        "Kind:",
         "What I found:",
         "Why it matters:",
         "Trigger and effect:",
@@ -7517,7 +7835,7 @@ def _synthesized_review(blocking: int, could_fix: int, *, unparseable: bool) -> 
     """A review body with the requested finding counts, in the reviewer's block format."""
     if unparseable:
         return (
-            "Priority: terrible\nConfidence: 9\nWhat I found: broken\n"
+            "Priority: terrible\nConfidence: 9\nKind: prompt-gap\nWhat I found: broken\n"
             "\n## Verdict\n\nRequest changes\n"
         )
 
@@ -7526,6 +7844,7 @@ def _synthesized_review(blocking: int, could_fix: int, *, unparseable: bool) -> 
             "```text\n"
             f"Priority: {priority}\n"
             "Confidence: 4\n"
+            "Kind: prompt-gap\n"
             "What I found: something\n"
             "Why it matters: because\n"
             "Trigger and effect: always\n"

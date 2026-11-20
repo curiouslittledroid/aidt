@@ -76,8 +76,9 @@ changes`, a `Blocked` verdict, or M2's approve-with-blocking-findings) — conti
 ``--resume``: the same loop, in the same run id and worktree, under an *extended* budget of
 one added review round (``state.task["effective_max_revisions"]``), so the recorded round's
 findings finally get their fix batch and reconcile and the added review is terminal (L4.1).
-An author-``blocked:`` run and a human-gate denial hold no terminal review whose findings
-drive a fix batch, so ``--resume`` keeps H1.2's exit-3 refusal naming the recorded reason.
+An author-``blocked:`` run, a human-gate denial, and the two **classification** stops
+(``spec-gap`` / ``unclassified``, G1.1) hold no terminal review whose findings a fix batch
+could take, so ``--resume`` keeps H1.2's exit-3 refusal naming the recorded reason.
 ``--from-prompt <path>`` is either shape's path: it copies the operator's content into the
 canonical prompt path (refusing exit 4 when the blocked run left uncommitted edits there,
 design §13), records its provenance in ``state.task["from_prompt"]``, and re-runs the review
@@ -138,6 +139,11 @@ from aidw import stage_registry
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.findings import (
     ParsedFinding,
+    # G1.1: the classification stop surfaces the offending finding(s) in the reviewer's own
+    # block format, which is what ``_finding_text_block`` emits (``stage_registry`` reuses it
+    # for the delta brief's shrink for the same reason: one re-emitter, no second format).
+    _finding_text_block,
+    SPEC_GAP,
     findings_summary,
     finding_title,
     parse_review_findings,
@@ -195,6 +201,13 @@ from aidw.verdict import APPROVE, BLOCKED as VERDICT_BLOCKED, parse_verdict
 from aidw.workflows.implement import derive_branch_name
 
 GATE = "approve-task-prompt"
+
+#: Gate mechanisms for the two fail-closed classification stops (G1.1, design §8.1). Both
+#: are deliberately **not** ``review-loop``: :func:`review_loop_block` keys W1's fix-cycle
+#: ``--resume`` continuation on that mechanism, and handing a spec-gap (or an unclassifiable
+#: review) straight back to the fixer is exactly the behaviour this stop removes.
+SPEC_GAP_MECHANISM = SPEC_GAP
+UNCLASSIFIED_MECHANISM = "unclassified"
 
 #: Remote the base-branch preflight fetches (L1.1, design §8.1). Full ``git fetch origin``
 #: keeps ``refs/remotes/origin/<base>`` current; a partial refspec would not.
@@ -1283,6 +1296,50 @@ def _record_review_outcome(
     return summary
 
 
+def classification_stop(
+    findings_: list[ParsedFinding],
+) -> tuple[str, list[ParsedFinding]] | None:
+    """The fail-closed classification stop this review triggers, or ``None`` (G1.1).
+
+    Pure and total, and ordered deliberately. An **unclassified** finding is checked first:
+    when a review carries both an unclassified and a ``spec-gap`` finding, the stop whose
+    classification cannot be trusted wins, because such a review must not be acted on even
+    in part. A ``spec-gap`` then wins over every verdict branch the loop evaluates after
+    this check (``Approve``, ``Blocked``, the terminal budget), because no fix batch can
+    close it — only the cited spec or roadmap can (design §8.1).
+
+    ``kind`` is already normalised by :func:`aidw.findings.parse_review_findings`, so an
+    empty value covers missing, empty and unrecognised alike. A resolution verdict never clears a
+    spec-gap: the loop never fixes one, so a reviewer marking one resolved is a
+    self-contradiction and the conservative reading is the stop.
+    """
+    unclassified = [finding for finding in findings_ if not finding.kind]
+    if unclassified:
+        return UNCLASSIFIED_MECHANISM, unclassified
+    spec_gaps = [finding for finding in findings_ if finding.kind == SPEC_GAP]
+    if spec_gaps:
+        return SPEC_GAP_MECHANISM, spec_gaps
+    return None
+
+
+def _report_classification_stop(
+    *,
+    mechanism: str,
+    offending: list[ParsedFinding],
+) -> str:
+    """The one headline both classification stops print (stderr, ``run.log``)."""
+    if mechanism == UNCLASSIFIED_MECHANISM:
+        return (
+            f"task review left {len(offending)} finding(s) unclassified (missing, empty "
+            "or unrecognised `Kind:`); a review whose classification cannot be trusted is "
+            "not acted on and a human must settle it."
+        )
+    return (
+        f"task review reported {len(offending)} spec-gap finding(s); only the cited spec "
+        "or roadmap can close them, so no fix batch can — a human must settle it."
+    )
+
+
 def _prompt_plan(
     *,
     config: ResolvedConfig,
@@ -1579,9 +1636,11 @@ def review_loop_block(state: RunState) -> bool:
 
     Pure. The marker is ``_record_review_outcome``'s ``mechanism == "review-loop"``: the
     terminal `Request changes`, a `Blocked` verdict, and M2's approve-with-blocking-findings
-    exit. An author-``blocked:`` run recorded no gate, and a human-gate denial recorded
-    ``decide``'s own mechanism; neither has terminal findings that could drive a fix batch,
-    so neither is a fix-cycle continuation. Branching on the ``mechanism`` rather than on
+    exit. An author-``blocked:`` run recorded no gate, a human-gate denial recorded
+    ``decide``'s own mechanism, and G1.1's classification stops record ``spec-gap`` /
+    ``unclassified``; none has terminal findings that a fix batch could drive (a spec-gap is
+    closed by the spec or roadmap, and an unclassifiable review must not be acted on), so
+    none is a fix-cycle continuation. Branching on the ``mechanism`` rather than on
     ``status == BLOCKED`` alone is what keeps a human-gate-denied run (review already
     approved) out of the fix cycle, which would re-commit an approved prompt.
 
@@ -1670,8 +1729,9 @@ def blocked_resume_reason(state: RunState) -> str:
     last recorded review's verdict plus findings summary (the loop's own
     :func:`aidw.verdict.parse_verdict`/:func:`aidw.findings.parse_review_findings`, the
     same re-read a resume rebuild uses); and a denied ``approve-task-prompt`` gate, whose
-    mechanism ``review-loop`` marks the loop's own verdict shapes while anything else is a
-    gate decision. Never raises: artifacts that are gone degrade to
+    mechanism ``review-loop`` marks the loop's own verdict shapes, ``spec-gap`` /
+    ``unclassified`` mark G1.1's classification stops, and anything else is a gate decision.
+    Never raises: artifacts that are gone degrade to
     ``the run recorded no reason`` rather than a traceback.
     """
     parts: list[str] = []
@@ -1702,6 +1762,13 @@ def blocked_resume_reason(state: RunState) -> str:
     if gate is not None:
         if gate.mechanism == "review-loop":
             parts.append(f"the `{GATE}` gate was denied by the review loop")
+        elif gate.mechanism in (SPEC_GAP_MECHANISM, UNCLASSIFIED_MECHANISM):
+            # G1.1's stops are the loop's own decisions about the review's classification,
+            # not a human-gate denial, so the generic wording below would mislabel them.
+            parts.append(
+                f"the `{GATE}` gate was denied by the task review's finding "
+                f"classification (mechanism `{gate.mechanism}`)"
+            )
         else:
             parts.append(
                 f"the `{GATE}` gate was denied by a human decision "
@@ -2631,6 +2698,41 @@ def run(
                     return EXIT_REFUSED
 
             blocking, could_fix = partition_findings(findings)
+            # G1.1: classification is enforced here, in the prompt review only — the shared
+            # parser stays optional because §8.3's code-review findings carry no `Kind:`.
+            # Deliberately *after* `partition_findings` and *before* the M2/`Approve`/
+            # `Blocked`/terminal branches and the `unparseable` whole-review fallback: a
+            # spec-gap wins over any verdict token, and an unclassified finding must never
+            # reach the fixer even when the rest of the review parsed cleanly. A replayed
+            # recorded round is exempt for the same reason the verdict branches are: a
+            # pre-change run's Kind-less review would otherwise block its own resume.
+            classification = classification_stop(findings)
+            if classification is not None and not replay_only:
+                mechanism, offending = classification
+                headline = _report_classification_stop(
+                    mechanism=mechanism, offending=offending
+                )
+                # The prompt stays uncommitted (no `_commit_reviewed_prompt`), no fix stage
+                # or reconcile is planned, and the gate records the classification as its
+                # `mechanism` — a non-`review-loop` value, so W1's `--resume` refuses this
+                # block instead of offering a fix cycle it cannot satisfy.
+                _record_round(rounds, review_index, findings_count, 0)
+                logger.error(headline)
+                _record_review_outcome(
+                    state,
+                    logger,
+                    verdict=verdict,
+                    revisions=revisions,
+                    max_revisions=loop_max_revisions,
+                    rounds=rounds,
+                    decision="denied",
+                    mechanism=mechanism,
+                )
+                _mark_blocked(state, directory)
+                print(headline, file=sys.stderr)
+                for finding in offending:
+                    print(_finding_text_block(finding), file=sys.stderr)
+                return 3
             if verdict == APPROVE and blocking and not replay_only:
                 # M2: `Approve` while reporting must-fix/should-fix findings is a
                 # self-contradicting review — the mirror image of `review`'s "requires

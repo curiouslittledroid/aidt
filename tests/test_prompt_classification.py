@@ -21,13 +21,14 @@ in (iii) even though it named the toolkit's own prompt directory. The table↔di
 bidirectional in both directions that matter now: a file present here with no row fails, and a file
 §4.2 assigns that is neither present nor listed as moved fails.
 
-**One deliberate exception was carved out after the cutover (class (v)).** C1.3 inlines the
+**Deliberate exceptions were carved out after the cutover (class (v)).** C1.3 inlines the
 repo's resolved gate commands into the five gate-recording prompts (design §7.3 step 5);
-``code-review.md`` is one of them, so its review-order step 6 gained gate-command guidance. A
-byte-frozen file nobody may edit cannot stay frozen once it is edited: ``code-review.md`` is
-re-classified ``(v)`` in the doc and removed from :data:`BYTE_FROZEN`, while every other bucket
-(i) file stays byte-frozen. The spec's own bucket (i) list is still §4.2's six — the exception is
-asserted explicitly rather than silently narrowing the spec's membership.
+``code-review.md`` is one of them, so its review-order step 6 gained gate-command guidance. G1.1
+adds the required ``Kind:`` classification line and the full-re-read rule to ``task-review.md``
+(design §8.1, §17 Z18). A byte-frozen file nobody may edit cannot stay frozen once it is edited:
+both are re-classified ``(v)`` in the doc and removed from :data:`BYTE_FROZEN`, while every other
+bucket (i) file stays byte-frozen. The spec's own bucket (i) list is still §4.2's six — the
+exceptions are asserted explicitly rather than silently narrowing the spec's membership.
 
 **Two retired mechanisms are gone by design.** E7.1's ``destination:`` frontmatter marker travelled
 with the 17 files and no toolkit prompt carries it any more (asserted below, so it cannot creep
@@ -119,12 +120,13 @@ POST_CUTOVER = (
 )
 
 #: The post-cutover **re-classification** (class (v)): a file §4.2 placed in bucket (i) that a
-#: later task had to edit, so it can no longer honestly be called "ship as-is". ``code-review.md``
-#: is C1.3's one file — its review-order step 6 gained the resolved-gate-commands guidance — and
-#: it is deliberately **not** folded into bucket (ii) (whose five files are fixed by §4.2 as
-#: product-neutralised) or bucket (iv) (which means "added after the cutover"). Every other
-#: bucket-(i) file stays byte-frozen.
-RECLASSIFIED_AFTER_CUTOVER = ("code-review.md",)
+#: later task had to edit, so it can no longer honestly be called "ship as-is".
+#: ``code-review.md`` is C1.3's file — its review-order step 6 gained the resolved-gate-commands
+#: guidance — and ``task-review.md`` is G1.1's, whose finding block gained the required ``Kind:``
+#: line plus the full-re-read rule (design §8.1, §17 Z18). Neither is deliberately folded into
+#: bucket (ii) (whose five files are fixed by §4.2 as product-neutralised) or bucket (iv) (which
+#: means "added after the cutover"). Every other bucket-(i) file stays byte-frozen.
+RECLASSIFIED_AFTER_CUTOVER = ("code-review.md", "task-review.md")
 
 #: Every prompt the toolkit ships, and the only files the table may list.
 TOOLKIT_PROMPTS = (
@@ -152,7 +154,7 @@ ACTION_BY_CLASS = {
     "ii": "neutralised in E7.2",
     "iii": "retained and neutralised in MF.2",
     "iv": "added after the cutover",
-    "v": "re-classified out of (i) after the cutover (C1.3)",
+    "v": "re-classified out of (i) after the cutover",
 }
 
 #: The destination cell for every class: all fourteen stay in the toolkit. The seventeen
@@ -409,24 +411,25 @@ def test_the_table_parser_fails_closed_on_a_malformed_row():
         _table_rows(duplicate)
 
 
-def test_the_reclassified_prompt_is_out_of_the_spec_bucket_and_the_freeze():
-    """C1.3's one class-(v) file: §4.2 still says (i), the tree no longer can.
+def test_the_reclassified_prompts_are_out_of_the_spec_bucket_and_the_freeze():
+    """The class-(v) files: §4.2 still says (i), the tree no longer can.
 
     §4.2's bucket-(i) list is a historical authoring claim, so it is kept verbatim (the test
     above still reads it). What must not survive is the *freeze*: a file whose bytes changed
     cannot be called byte-identical to its baseline without the guard disagreeing with the
-    tree. The exception is asserted in both directions, so neither the doc nor the constant
-    can drift and no second file can quietly leave the freeze.
+    tree. The exceptions are asserted in both directions, so neither the doc nor the constant
+    can drift and no third file can quietly leave the freeze.
     """
-    assert RECLASSIFIED_AFTER_CUTOVER == ("code-review.md",)
-    assert EXPECTED_CLASS["code-review.md"] == "v"
-    assert "code-review.md" in BUCKET_GENERIC
-    assert "code-review.md" not in BYTE_FROZEN
+    assert RECLASSIFIED_AFTER_CUTOVER == ("code-review.md", "task-review.md")
+    for name in RECLASSIFIED_AFTER_CUTOVER:
+        assert EXPECTED_CLASS[name] == "v", name
+        assert name in BUCKET_GENERIC, name
+        assert name not in BYTE_FROZEN, name
+        # Non-vacuous: the file really did move, which is why the class is required.
+        assert _raw(name) != _parent_prompt_text()[name], name
     # The split is complete: every §4.2 (i) file is either still frozen or explicitly freed.
     assert set(BYTE_FROZEN) | set(RECLASSIFIED_AFTER_CUTOVER) == set(BUCKET_GENERIC)
     assert set(BYTE_FROZEN) & set(RECLASSIFIED_AFTER_CUTOVER) == set()
-    # Non-vacuous: the file really did move, which is why the reclassification is required.
-    assert _raw("code-review.md") != _parent_prompt_text()["code-review.md"]
 
 
 # ---------------------------------------------------------------------------
@@ -453,8 +456,9 @@ def test_bucket_i_prompts_are_unchanged_since_the_pre_marker_baseline(name: str)
 
     Scoped to bucket (i) minus class (v): §5.4 excludes bucket (ii) from byte-frozen coverage
     precisely because E7.2 neutralised it, bucket (iii) was rewritten at MF.2, and C1.3 edited
-    ``code-review.md`` (class (v), ``test_the_reclassified_prompt_is_out_of_the_spec_bucket_and_the_freeze``).
-    The contracts for the neutralised files are ``tests/test_prompt_neutrality.py``.
+    ``code-review.md`` and G1.1 edited ``task-review.md`` (class (v),
+    ``test_the_reclassified_prompts_are_out_of_the_spec_bucket_and_the_freeze``). The contracts
+    for the neutralised files are ``tests/test_prompt_neutrality.py``.
     """
     assert _raw(name) == _parent_prompt_text()[name]
 

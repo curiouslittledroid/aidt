@@ -18,5 +18,9 @@ You independently review a generated task prompt **before** implementation.
 
 ## Output
 
-- Ordered findings with priority, evidence, location, and suggested fix.
+- Ordered findings with priority, confidence, kind, evidence, location, and suggested fix.
+- Every finding carries a `Kind:` line — `spec-gap` (only the cited spec or roadmap can close
+  it) or `prompt-gap` (editing the prompt can). A finding without a valid `Kind:` is not a
+  complete review: AIDT stops on it instead of fixing it, so an unclassified report is a
+  failed review, not a lenient one.
 - A final verdict: `Approve`, `Request changes`, or `Blocked`.

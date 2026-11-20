@@ -19,6 +19,7 @@ The reviewer must:
 - Read the roadmap task that the prompt expands, the cited specification sections in full, and `Design 21 — Monorepo Layout` when the prompt creates or changes repository artifacts.
 - Read `AGENTS.md`, the specification/task documentation guidance, and relevant repository conventions or analysis documents.
 - Inspect the current repository structure and existing implementation where needed to verify assumptions about paths, APIs, schemas, package conventions, dependencies, infrastructure, tests, and task ordering.
+- On any round after the first, re-read the previously flagged material in full before reporting a previous finding resolved: the task prompt at `task-prompt-file`, the cited specification section, and the repository file or symbol the finding named. A grep, a diff, or a partial re-read of the previously flagged section is never sufficient to approve a resolution.
 - Treat the prompt as the review boundary. Do not perform an implementation review and do not propose unrelated repository cleanup.
 
 If the prompt has no clear source roadmap task, specification citation, acceptance condition, or scope boundary, report that as a finding rather than silently inventing the missing context.
@@ -67,6 +68,7 @@ Use this format for every finding:
 ```text
 Priority: Must fix / Should fix / Could fix
 Confidence: 0 to 5
+Kind: spec-gap / prompt-gap
 What I found: Describe the defect in the task prompt or its source context.
 Why it matters: Explain how an implementer could produce incorrect, unsafe, incomplete, or unverifiable work.
 Trigger and effect: State the condition under which the problem appears and the resulting implementation or review failure.
@@ -76,9 +78,19 @@ Suggested fix: Give a short, practical direction for correcting the prompt, sour
 
 A `Suggested fix` is a direction, not a decision: when two readings both satisfy the cited sources, mark the finding `Blocked` and name the choice in the finding body instead of prescribing one reading.
 
-Keep the labels plain — exactly as shown above, with no bold or backticks around `Priority:` /
-`Confidence:` and a bare value after the colon. AIDT parses these blocks to count the findings and
-fix them one at a time; a bolded label (`**Priority: Should fix**`) defeats that.
+`Kind:` classifies who can close the defect, and it is required on every finding:
+
+- `spec-gap`: a defect only the cited specification or roadmap can close. The prompt cannot be
+  fixed without changing its source of truth, so editing the prompt would paper over it.
+- `prompt-gap`: a defect the prompt itself can close. Editing the prompt is enough.
+
+A finding without a valid `Kind:` is not a complete review. AIDT reads this line mechanically: an
+unclassified finding fails the review closed, and a `spec-gap` stops the run before any fixer stage
+instead of being reworked as prompt prose.
+
+Keep the labels plain — exactly as shown above, with no bold or backticks around `Priority:`,
+`Confidence:` or `Kind:` and a bare value after the colon. AIDT parses these blocks to count the
+findings and fix them one at a time; a bolded label (`**Priority: Should fix**`) defeats that.
 
 Priority means:
 

@@ -637,6 +637,29 @@ def test_delta_brief_renders_structured_findings_when_strictly_smaller() -> None
     assert "### Previous review\n\n" + registry.DELTA_BRIEF_FINDINGS_LEAD in rendered
 
 
+def test_delta_brief_structured_shrink_preserves_kind_classification() -> None:
+    """G1.1: the delta-brief shrink must not drop a prompt finding's ``Kind:`` line."""
+    finding = ParsedFinding(
+        priority="must-fix",
+        confidence=5,
+        what_found="The cited spec leaves a required field undefined.",
+        why_it_matters="The prompt cannot settle the schema.",
+        trigger_and_effect="Any implementation would invent the field.",
+        where="docs/task-prompts/03-E4.1-prompt.md",
+        suggested_fix="Change the source specification first.",
+        kind="spec-gap",
+    )
+    previous = _finding_text_block(finding) + "\n" + ("reviewer context " * 100)
+    expected = _expected_blocks(previous)
+    assert len(expected) < len(previous)
+
+    rendered = registry.render_delta_brief(previous_review=previous, diff=None)
+
+    assert expected in rendered
+    assert "Kind: spec-gap" in rendered
+    assert previous not in rendered
+
+
 def test_delta_brief_keeps_prose_verbatim_when_blocks_are_not_smaller() -> None:
     """H2.1 req 2: a bare block review renders prose; the blocks would add characters."""
     expected = _expected_blocks(BARE_BLOCK_REVIEW)

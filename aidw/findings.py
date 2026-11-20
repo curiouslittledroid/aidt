@@ -24,6 +24,12 @@ contradicted``). Those blocks are *verdicts on earlier findings*, not new findin
 everything would contradict itself under M2 and block the run (observed on PR #282's
 `04-A1.3`, 2026-11-16). An absent or unrecognised verdict keeps the block blocking, which
 is the fail-closed direction: no finding is silently cleared.
+
+The **prompt** review additionally classifies each finding with an optional ``Kind:`` line
+(``spec-gap`` / ``prompt-gap``, G1.1, design §8.1). It is parsed here but **not** made a
+required field and **not** published: §8.3's code-review findings carry no ``Kind:`` and
+must keep parsing clean, so the prompt workflow is where a missing, empty or unrecognised
+kind fails closed (see :func:`normalise_kind` and :data:`KIND_MAP`).
 """
 
 from __future__ import annotations
@@ -32,6 +38,11 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+#: The two canonical ``Kind:`` tokens (G1.1, design §8.1). Spelled once so the parser, the
+#: workflow's classification stop and the tests cannot drift on the strings.
+SPEC_GAP = "spec-gap"
+PROMPT_GAP = "prompt-gap"
+
 PRIORITY_MAP = {
     "must fix": "must-fix",
     "must-fix": "must-fix",
@@ -39,6 +50,22 @@ PRIORITY_MAP = {
     "should-fix": "should-fix",
     "could fix": "could-fix",
     "could-fix": "could-fix",
+}
+
+#: The prompt-review finding classifications (G1.1, design §8.1), normalised exactly as
+#: :data:`PRIORITY_MAP` is — same ``_clean_scalar`` path, so a space or a hyphen both parse.
+#:
+#: The pair means: a ``spec-gap`` is a defect only the cited spec or roadmap can close (the
+#: prompt cannot be fixed without changing its source of truth), and a ``prompt-gap`` is
+#: fixable by editing the prompt. Only the prompt review enforces the field
+#: (``aidw/workflows/prompt.py``); parsing stays optional so §8.3's code-review findings,
+#: which carry no ``Kind:``, keep parsing clean and the published manifest shape does not
+#: change.
+KIND_MAP = {
+    "spec gap": SPEC_GAP,
+    "spec-gap": SPEC_GAP,
+    "prompt gap": PROMPT_GAP,
+    "prompt-gap": PROMPT_GAP,
 }
 
 #: Manifest field order after ``id``/``priority``/``confidence``.
@@ -53,6 +80,10 @@ STRING_FIELDS = (
 _LABELS = {
     "priority": "priority",
     "confidence": "confidence",
+    # Optional at parse level and prompt-review only (G1.1, design §8.1): code-review
+    # findings have no ``Kind:``, and the prompt review enforces the field itself. Recognised
+    # as a label so it never appends itself to the confidence field's text.
+    "kind": "kind",
     "what i found": "whatFound",
     "why it matters": "whyItMatters",
     "trigger and effect": "triggerAndEffect",
@@ -102,8 +133,20 @@ def normalise_resolution(value: str) -> str:
     return ""
 
 
+def normalise_kind(value: str) -> str:
+    """The canonical ``Kind:`` token, or ``""`` when absent or unrecognised.
+
+    Optional at parse level and deliberately **not** a ``problems`` entry: §8.3's
+    code-review findings carry no ``Kind:``, so a required-at-parse field would fail every
+    one of them closed and change the published manifest. The prompt review's own
+    fail-closed classification check (``aidw/workflows/prompt.py``) is where a missing,
+    empty or unrecognised kind stops the run — parse here, enforce there (G1.1).
+    """
+    return KIND_MAP.get(_clean_scalar(value).lower(), "")
+
+
 def _clean_scalar(value: str) -> str:
-    """Strip markdown emphasis and whitespace from a one-word field (priority)."""
+    """Strip markdown emphasis and whitespace from a one-word field (priority, kind)."""
     return value.strip().strip(_EMPHASIS_STRIP).strip()
 
 
@@ -118,6 +161,9 @@ class ParsedFinding:
     suggested_fix: str
     #: Later rounds only: ``resolved`` / ``not-resolved`` / ``newly-contradicted``, else ``""``.
     resolution: str = ""
+    #: Prompt review only (G1.1): ``spec-gap`` / ``prompt-gap``, else ``""``. Never published
+    #: (``to_manifest_entry`` omits it), so §8.3's manifest shape is unchanged.
+    kind: str = ""
 
     def to_manifest_entry(self, index: int) -> dict[str, Any]:
         return {
@@ -220,6 +266,7 @@ def parse_review_findings(text: str) -> tuple[list[ParsedFinding], list[str]]:
                 where=values["where"],
                 suggested_fix=values["suggestedFix"],
                 resolution=normalise_resolution(block.get("resolution", "")),
+                kind=normalise_kind(block.get("kind", "")),
             )
         )
 
@@ -227,7 +274,11 @@ def parse_review_findings(text: str) -> tuple[list[ParsedFinding], list[str]]:
 
 
 def to_manifest(findings: list[ParsedFinding]) -> dict[str, Any]:
-    """The exact JSON shape the bundled publisher validates."""
+    """The exact JSON shape the bundled publisher validates.
+
+    ``kind`` is deliberately absent from every entry (G1.1): the manifest is §8.3's contract
+    and its shape does not change for a prompt-review-only classification.
+    """
     return {"findings": [f.to_manifest_entry(i) for i, f in enumerate(findings, start=1)]}
 
 
@@ -283,11 +334,20 @@ def findings_summary(findings: list[ParsedFinding]) -> str:
 
 
 def _finding_text_block(finding: ParsedFinding) -> str:
-    """One finding rendered in the reviewer's own ``Priority:``/``Confidence:`` format."""
+    """One finding rendered in the reviewer's own ``Priority:``/``Confidence:`` format.
+
+    ``Kind:`` is re-emitted **when present** (G1.1). This is the single re-emitter for both
+    the fix stages and ``stage_registry.render_delta_brief``'s shrink, so dropping it here
+    would hand a spec-gap finding's classification to a fixer or lose it in a shrunk brief —
+    the same trap Z8 closed for ``Verdict on this finding:``. A code-review finding has no
+    kind and renders byte-identically to before.
+    """
+    kind = f"Kind: {finding.kind}\n" if finding.kind else ""
     return (
         "```text\n"
         f"Priority: {finding.priority}\n"
         f"Confidence: {finding.confidence}\n"
+        f"{kind}"
         f"What I found: {finding.what_found}\n"
         f"Why it matters: {finding.why_it_matters}\n"
         f"Trigger and effect: {finding.trigger_and_effect}\n"
