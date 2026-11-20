@@ -3,7 +3,7 @@
 **Branch:** `05-C1.3`
 **Date:** 2026-11-20
 **Spec:** `design.md` §7.3 (prompt rendering, decision D2 — the new step 5 gate-block injection beside step 4's read channel), §8.2 (`aidw implement`, the gate/citation flow whose stage prompts re-derive the repo's commands per stage), §17 (resolved decisions, row Z17); roadmap entry C1.3 in `docs/tasks/05 - Pipeline efficiency.md`; `docs/task-prompts/05-C1.3-prompt.md`; `docs/migration/prompt-classification.md` (the bucket-(i) byte-freeze and its re-classification); `aidw/conventions.md` (traceability artefacts)
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** [#174](https://github.com/curiouslittledroid/aidt/pull/174)
 
 ## Summary
 
