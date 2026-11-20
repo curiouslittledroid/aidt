@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 from aidw import findings
 
 REVIEW = """\
@@ -356,3 +358,205 @@ def test_re_render_keeps_the_verdict_so_a_shrink_cannot_clear_it() -> None:
     assert "Verdict on this finding: resolved" in rendered
     reparsed, _ = findings.parse_review_findings(rendered)
     assert reparsed[0].resolution == findings.RESOLVED
+
+
+# ── G1.1: the prompt review's `Kind:` classification (design §8.1) ──────────────────
+#
+# `Kind:` is prompt-review only. It is parsed here, optionally — §8.3's code-review
+# findings carry none and must keep parsing clean — and it is never published in the
+# manifest. The prompt workflow's own fail-closed check is where a missing kind stops a
+# run; these are the module's contract tests for the parser half.
+
+KIND_REVIEW = """\
+## Findings
+
+```text
+Priority: Must fix
+Confidence: 5
+Kind: spec-gap
+What I found: The prompt requires a field the cited spec never defines.
+Why it matters: The implementer would invent a schema decision.
+Trigger and effect: Any implementation follows the invented field.
+Where: docs/task-prompts/03-E4.1-prompt.md, requirement 4.
+Suggested fix: Change the spec first; the prompt cannot settle it.
+```
+
+```text
+Priority: Could fix
+Confidence: 3
+Kind: prompt-gap
+What I found: A stale path in the deliverables.
+Why it matters: Minor confusion.
+Trigger and effect: None observable today.
+Where: docs/task-prompts/03-E4.1-prompt.md, Deliverables.
+Suggested fix: Point at the current path.
+```
+
+## Verdict
+
+Request changes
+"""
+
+
+def test_kind_parses_into_the_two_canonical_tokens() -> None:
+    """`Kind: spec-gap` / `Kind: prompt-gap` land in `ParsedFinding.kind`."""
+    parsed, problems = findings.parse_review_findings(KIND_REVIEW)
+
+    assert problems == []
+    assert [finding.kind for finding in parsed] == [
+        findings.SPEC_GAP,
+        findings.PROMPT_GAP,
+    ]
+    # The classification never changes the priority partition the loop keys on.
+    blocking, non_blocking = findings.partition_findings(parsed)
+    assert [finding.priority for finding in blocking] == ["must-fix"]
+    assert [finding.priority for finding in non_blocking] == ["could-fix"]
+
+
+def test_the_space_form_and_a_bolded_label_both_parse() -> None:
+    """Same tolerance as `Priority:`: `_clean_scalar`, so a space or emphasis parses."""
+    for line, expected in (
+        ("Kind: spec-gap", findings.SPEC_GAP),
+        ("Kind: spec gap", findings.SPEC_GAP),
+        ("Kind: prompt gap", findings.PROMPT_GAP),
+        ("Kind: PROMPT-GAP", findings.PROMPT_GAP),
+        ("Kind: `spec-gap`", findings.SPEC_GAP),
+        ("**Kind: prompt-gap**", findings.PROMPT_GAP),
+        ("**Kind:** spec-gap", findings.SPEC_GAP),
+    ):
+        text = KIND_REVIEW.replace("Kind: spec-gap\n", f"{line}\n", 1)
+        parsed, problems = findings.parse_review_findings(text)
+
+        assert problems == [], line
+        assert parsed[0].kind == expected, line
+
+
+def test_an_absent_kind_parses_clean_for_code_review_compatibility() -> None:
+    """§8.3's code-review findings have no `Kind:`; parsing must not fail closed on that."""
+    parsed, problems = findings.parse_review_findings(REVIEW)
+
+    assert problems == []
+    assert [finding.kind for finding in parsed] == ["", ""]
+    # An unrecognised or empty value is equally not a problem at parse level: the prompt
+    # workflow's classification check is the enforcement point (G1.1 req 2/3).
+    for line in ("Kind: nope", "Kind:"):
+        text = KIND_REVIEW.replace("Kind: spec-gap\n", f"{line}\n", 1)
+        parsed, problems = findings.parse_review_findings(text)
+        assert problems == [], line
+        assert parsed[0].kind == "", line
+
+
+def test_the_manifest_shape_never_gains_a_kind_key() -> None:
+    """The published manifest is §8.3's contract; a prompt-only classification stays out."""
+    parsed, _ = findings.parse_review_findings(KIND_REVIEW)
+
+    manifest = findings.to_manifest(parsed)
+
+    assert all("kind" not in entry for entry in manifest["findings"])
+    assert all(finding.kind for finding in parsed)
+    assert set(manifest["findings"][0]) == {
+        "id",
+        "priority",
+        "confidence",
+        "title",
+        "whatFound",
+        "whyItMatters",
+        "triggerAndEffect",
+        "where",
+        "suggestedFix",
+    }
+
+
+def test_the_text_block_re_emits_kind_only_when_present() -> None:
+    """The single re-emitter keeps the classification through a fix stage and a shrink."""
+    parsed, _ = findings.parse_review_findings(KIND_REVIEW)
+
+    block = findings._finding_text_block(parsed[0])
+    assert "Kind: spec-gap" in block
+    reparsed, problems = findings.parse_review_findings(block)
+    assert problems == []
+    assert reparsed[0].kind == findings.SPEC_GAP
+
+    # A code-review finding (no kind) renders byte-identically to the pre-G1.1 format.
+    code_review, _ = findings.parse_review_findings(REVIEW)
+    plain = findings._finding_text_block(code_review[0])
+    assert "Kind:" not in plain
+    assert findings.parse_review_findings(plain)[0][0].kind == ""
+
+
+#: Pinned seed and run count (AGENTS.md "Tests": pytest only, no ``hypothesis``, so a
+#: reproducible sample is the generator and there is no shrinking).
+KIND_PROPERTY_SEED = 5118
+KIND_PROPERTY_RUNS = 24
+
+#: The spellings `_clean_scalar` has to normalise, and the values it must reject.
+_KIND_FORMS = [
+    ("spec-gap", findings.SPEC_GAP),
+    ("spec gap", findings.SPEC_GAP),
+    ("SPEC-GAP", findings.SPEC_GAP),
+    ("`spec-gap`", findings.SPEC_GAP),
+    ("**spec-gap**", findings.SPEC_GAP),
+    ("prompt-gap", findings.PROMPT_GAP),
+    ("prompt gap", findings.PROMPT_GAP),
+    ("`prompt-gap`", findings.PROMPT_GAP),
+    ("nope", ""),
+    ("", ""),
+]
+_PRIORITIES = ["Must fix", "Should fix", "Could fix", "could fix"]
+_RESOLUTIONS = [None, "resolved", "not resolved", "newly contradicted", "unrecognised"]
+
+
+def _kind_property_block(
+    *, kind_line: str, priority: str, resolution: str | None
+) -> str:
+    """One synthetic finding block, in the reviewer's own format."""
+    lines = ["```text", f"Priority: {priority}", "Confidence: 3"]
+    if kind_line:
+        lines.append(f"Kind: {kind_line}")
+    lines += [
+        "What I found: A synthetic finding.",
+        "Why it matters: It is the property sweep's subject.",
+        "Trigger and effect: Always, by construction.",
+        "Where: docs/task-prompts/synthetic-prompt.md.",
+        "Suggested fix: None; this block is generated.",
+    ]
+    if resolution is not None:
+        lines.append(f"Verdict on this finding: {resolution}")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def test_kind_round_trips_independently_of_every_other_field() -> None:
+    """Seeded property run (seed/runs pinned above): classification is metamorphic.
+
+    For every sampled ``Kind:`` spelling, priority and resolution verdict, parsing yields
+    the canonical kind (or ``""`` for an absent/unrecognised one) with **no** problem;
+    re-rendering through ``_finding_text_block`` and re-parsing preserves it; the published
+    manifest entry never gains a ``kind`` key; and both calls are pure — the input text is
+    untouched and a repeated parse returns an equal result.
+    """
+    rng = random.Random(KIND_PROPERTY_SEED)
+
+    for _ in range(KIND_PROPERTY_RUNS):
+        kind_line, expected = rng.choice(_KIND_FORMS)
+        priority = rng.choice(_PRIORITIES)
+        resolution = rng.choice(_RESOLUTIONS)
+        text = _kind_property_block(
+            kind_line=kind_line, priority=priority, resolution=resolution
+        )
+        before = text
+
+        parsed, problems = findings.parse_review_findings(text)
+
+        assert problems == [], (kind_line, priority, resolution)
+        assert len(parsed) == 1
+        assert parsed[0].kind == expected, (kind_line, priority, resolution)
+        assert text == before, "parsing must not mutate its input"
+        assert findings.parse_review_findings(text)[0] == parsed
+        assert "kind" not in findings.to_manifest(parsed)["findings"][0]
+
+        re_rendered = findings._finding_text_block(parsed[0])
+        reparsed, re_problems = findings.parse_review_findings(re_rendered)
+        assert re_problems == []
+        assert reparsed[0].kind == expected
+        assert ("Kind:" in re_rendered) is bool(expected)

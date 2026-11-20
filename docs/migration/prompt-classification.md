@@ -16,17 +16,19 @@ Membership stays **spec-fixed**, never re-derived by grepping for product tokens
 kept `git-update.md` and `review-findings-to-github.md` in bucket (i) despite their frozen marker
 strings, and `task-prompt.md` in bucket (iii) even though it named the toolkit's own directory.
 `tests/test_prompt_classification.py` asserts both halves of that partition — the files present
-Class `(v)` is the post-cutover **re-classification**: `code-review.md`, which §4.2 placed in
-bucket (i) "generic, ship as-is", moved out of the byte-frozen class by C1.3. That task inlines
-the repo's resolved gate commands into the five prompts that record gate outcomes (design §7.3
-step 5), and `code-review.md` is one of the five: its review-order step 6 now names the injected
-`## Resolved gate commands` block, `aidw gate run`, and both conventions sources. A freeze is a
-contract about a file nobody edits; leaving the file edited while still calling it byte-frozen
-would make the guard disagree with the tree. It is **not** folded into bucket (ii) — §4.2 fixes
-that bucket's five product-neutralised files, and this edit is neither a path nor a tooling-name
-neutralisation — and it is not bucket (iv), which means "added after the cutover" and would
-misstate its provenance. The spec's own bucket (i) list is still asserted verbatim, with this one
-deliberate exception stated here and in the table.
+Class `(v)` is the post-cutover **re-classification**: a file §4.2 placed in bucket (i)
+"generic, ship as-is" that a later task had to edit, so it can no longer honestly be called
+byte-frozen. Two files carry it. `code-review.md` left the freeze in C1.3, which inlines the
+repo's resolved gate commands into the five prompts that record gate outcomes (design §7.3
+step 5): its review-order step 6 now names the injected `## Resolved gate commands` block,
+`aidw gate run`, and both conventions sources. `task-review.md` left it in G1.1, which adds the
+required `Kind:` classification line and the full-re-read rule to the task-prompt review (design
+§8.1, §17 Z18). A freeze is a contract about a file nobody edits; leaving a file edited while
+still calling it byte-frozen would make the guard disagree with the tree. Neither is folded
+into bucket (ii) — §4.2 fixes that bucket's five product-neutralised files, and these
+edits are neither path nor tooling-name neutralisations — and neither is bucket (iv), which
+means "added after the cutover" and would misstate its provenance. The spec's own bucket (i)
+list is still asserted verbatim, with these deliberate exceptions stated here and in the table.
 
 Class `(iv)` is the post-cutover additions: `update-roadmap.md`, the core `I7` stage H3.1 added so
 the roadmap tick has an owner independent of the repo-optional traceability stage;
@@ -48,11 +50,11 @@ fails there rather than after the next release.
 | Prompt file | Class | Action | Destination |
 |---|---|---|---|
 | `approve-review-followups.md` | (i) | ship as-is | toolkit `prompts/` |
-| `code-review.md` | (v) | re-classified out of (i) after the cutover (C1.3) | toolkit `prompts/` |
+| `code-review.md` | (v) | re-classified out of (i) after the cutover | toolkit `prompts/` |
 | `git-update.md` | (i) | ship as-is | toolkit `prompts/` |
 | `review-findings-to-github.md` | (i) | ship as-is | toolkit `prompts/` |
 | `task-review-fixes.md` | (i) | ship as-is | toolkit `prompts/` |
-| `task-review.md` | (i) | ship as-is | toolkit `prompts/` |
+| `task-review.md` | (v) | re-classified out of (i) after the cutover | toolkit `prompts/` |
 | `fix-next-review-followup.md` | (ii) | neutralised in E7.2 | toolkit `prompts/` |
 | `impliment-task.md` | (ii) | neutralised in E7.2 | toolkit `prompts/` |
 | `pr.md` | (ii) | neutralised in E7.2 | toolkit `prompts/` |

@@ -163,7 +163,10 @@ preflight (control worktree on the base branch, clean tree; fetch; predecessor c
 - **`P2` task-review-{iteration}** — read-only review of the current prompt against its own
   evidence bundle (`stages/<stage>.evidence.md`: prompt path, roadmap entry, cited headings,
   prerequisite tick state, gate commands, base revisions). Parsed verdict is `Approve`,
-  `Request changes` or `Blocked`; an unparseable verdict fails closed.
+  `Request changes` or `Blocked`; an unparseable verdict fails closed. Every finding carries a
+  required bare `Kind: spec-gap | prompt-gap` (design §8.1, G1.1): a `spec-gap` is a defect
+  only the cited spec or roadmap can close, a `prompt-gap` is fixable by editing the prompt,
+  and a missing, empty or unrecognised kind fails closed before any fix stage.
 - **`P2-fix-blocking`** — one stage per blocking finding, given that finding in the reviewer's
   own block format, so progress is reported per change. The fixer verifies the finding against
   the repository before editing — the reviewer's `Suggested fix` is a hypothesis, not an order.
@@ -179,7 +182,10 @@ preflight (control worktree on the base branch, clean tree; fetch; predecessor c
 
 Ends: `Approve` → commit and exit 0. Residual `Request changes` after the **terminal** review →
 run `blocked` (exit 3), the gate recorded `denied` with mechanism `review-loop`, findings printed
-for a human. `Blocked` verdict → the same exit-3 outcome with its own message.
+for a human. `Blocked` verdict → the same exit-3 outcome with its own message. A `spec-gap`
+finding → the same exit-3 outcome before any fix stage, mechanism `spec-gap`; a finding with no
+usable `Kind:` → mechanism `unclassified` and the offending findings printed. Neither
+classification stop is `review-loop`, so `--resume` refuses it instead of offering a fix cycle.
 
 ## `aidw implement` — implement a task prompt and open the PR
 
@@ -466,12 +472,13 @@ declared under `workflows.fix.stages`.
 
 Gates are human decisions recorded in `state.json` (`GateRecord`) and printed with their
 mechanism: `--yes`, `--skip-gates <name>`, `--deny-gates <name>`, `human`, `human-default`,
-`human-denied`, `noninteractive`, and `review-loop` for the `prompt` loop's terminal
-non-approval. A gate's `detail` carries the per-round summary the operator reads.
+`human-denied`, `noninteractive`, `review-loop` for the `prompt` loop's terminal non-approval,
+and `spec-gap` / `unclassified` for that loop's two finding-classification stops. A gate's
+`detail` carries the per-round summary the operator reads.
 
 | Workflow | Gates | Asked |
 |---|---|---|
-| `prompt` | `approve-task-prompt` | Between the loop and the commit; **off by default**, enabled with `--require-approval`. Also recorded `denied`/`review-loop` when the loop ends non-approving. |
+| `prompt` | `approve-task-prompt` | Between the loop and the commit; **off by default**, enabled with `--require-approval`. Also recorded `denied` when the loop ends non-approving (`review-loop`), when a finding is a `spec-gap` (`spec-gap`), or when a finding carries no usable `Kind:` (`unclassified`). |
 | `implement` | `approve-implementation-pr` | Between `I7` and `I6`: the last chance to stop before the commit, push and PR. |
 | `review` | none | `review` publishes and stops; there is no decision to make. |
 | `fix` | `approve-followups`, `approve-fix-pr` | `approve-followups` at entry and after every round that published new findings; `approve-fix-pr` when a re-review approves. A denial is exit 3 (`blocked`). |

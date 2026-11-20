@@ -890,3 +890,89 @@ def test_section_17_keeps_rewritten_extraction_decisions_traceable() -> None:
         "| F6 | Auto-detect repo root from any cwd; absolute paths internally. |",
     )
     assert not [row for row in stale_rows if row in section]
+
+
+def test_g11_section_81_states_the_kind_contract_and_the_two_stops() -> None:
+    """G1.1: §8.1 carries the `Kind:` contract, the re-read rule and both fail-closed stops.
+
+    Without it the next reader would find a `spec-gap` blocking a run with no design behind
+    it, and would be free to "fix" the loop back to handing spec gaps to the task-fixer.
+    """
+    block = " ".join(_section_81_block(_design_md()).split())
+
+    assert "`Kind:`" in block
+    assert "`spec-gap`" in block and "`prompt-gap`" in block
+    assert "only the cited spec or roadmap can close" in block
+    assert "fixable by editing the prompt" in block
+    # Both stops: exit 3, surfaced findings, prompt uncommitted, and their mechanisms.
+    assert "BLOCKED" in block and "exit 3" in block
+    assert "mechanism `spec-gap`" in block
+    assert "mechanism `unclassified`" in block
+    assert "no fix stage or reconcile" in block
+    assert "wins over an `Approve` or `Blocked` verdict" in block
+    assert "never acted on even in part" in block
+    # The parser/enforcement split and the unchanged manifest shape are both stated.
+    assert "`to_manifest_entry`" in block
+    assert "`_finding_text_block`" in block
+    assert "§8.3's code-review findings carry none" in block
+    # W1's resume rule is keyed on `review-loop`, so the new mechanisms must not be it.
+    assert "**not** `review-loop`" in block
+    assert "refuses the block instead of offering a fix cycle" in block
+    # G1.1 req 7's re-read rule is design, not only prompt copy.
+    assert "re-read the previously flagged material in full" in block
+    assert "diff-only re-read" in block
+
+
+def test_g11_decision_row_records_the_classification_contract() -> None:
+    """G1.1: exactly one §17 row records the task, its files and its prompt-fixed choices.
+
+    Matched by task id + wording, never by a ``Z`` number: the roadmap's "recorded as Z13"
+    is stale (``Z13`` is 05-S1.2's roadmap-ownership row) and ``aidw/conventions.md`` forbids
+    reusing or renumbering an id, so this pin must not pin the number.
+    """
+    decisions = _section(_design_md(), "## 17. Resolved decisions", "## 18. Risks")
+    rows = [
+        line
+        for line in decisions.splitlines()
+        if re.match(r"^\| Z\d+ \|", line)
+        and "G1.1" in line
+        and "unclassified" in line
+        and "spec-gap" in line
+    ]
+    assert len(rows) == 1, f"expected exactly one G1.1 decision row, found {len(rows)}"
+    row = rows[0]
+    # The behaviour the code implements, on both sides of the parser/enforcement split.
+    assert "`Kind:`" in row
+    assert "`prompt-gap`" in row
+    assert "`ParsedFinding.kind`" in row
+    assert "`KIND_MAP`" in row
+    assert "`_finding_text_block`" in row
+    assert "`partition_findings`" in row
+    assert "`STRING_FIELDS`" in row
+    # The stale-id correction and the conventions rule travel with the row.
+    assert "Z13" in row
+    assert "`aidw/conventions.md`" in row
+    assert "`Z18`" in row
+    # The prompt-fixed decisions travel with the row (Z2/Z9/Z11's precedent).
+    assert "Prompt-fixed decisions" in row
+    for decision in ("(a)", "(b)", "(c)", "(d)"):
+        assert decision in row, decision
+    # The spec sections and the touched set are named, so the contract tests are findable.
+    assert "§§8.1, 8.3" in row
+    for path in (
+        "prompts/task-review.md",
+        "agents/task-reviewer/AGENTS.md",
+        "aidw/findings.py",
+        "aidw/workflows/prompt.py",
+        "docs/migration/prompt-classification.md",
+        "tests/test_findings.py",
+        "tests/test_prompt_workflow.py",
+        "tests/test_design_doc.py",
+        "tests/test_prompt_classification.py",
+    ):
+        assert path in row, path
+    # No §17 id is reused.
+    ids = re.findall(r"^\| (Z\d+) \|", decisions, re.M)
+    duplicates = sorted({identifier for identifier in ids if ids.count(identifier) > 1})
+    assert duplicates == [], f"reused §17 decision ids: {duplicates}"
+    assert not row.startswith("| Z13 |")

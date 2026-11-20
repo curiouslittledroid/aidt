@@ -112,7 +112,7 @@ the prompt, and re-reviews approve on grep-level checks — so a spec-level defe
 review and costs a fix cycle. This epic classifies findings and checks feasibility before the
 expensive authoring stage.
 
-- [ ] **G1.1. Classify prompt-review findings as `spec-gap` vs `prompt-gap` and short-circuit spec-gaps** (Design 8.1)
+- [x] **G1.1. Classify prompt-review findings as `spec-gap` vs `prompt-gap` and short-circuit spec-gaps** (Design 8.1)
   - Done when: `prompts/task-review.md` requires every finding to carry a `Kind: spec-gap | prompt-gap` classification; a `spec-gap` finding stops the run `blocked` (exit 3) with the finding surfaced, instead of handing it to the `task-fixer`; `prompt-gap` findings flow through the existing fix/reconcile loop unchanged; the reviewer prompt forbids approving on grep-only re-reads of previously flagged sections (the cited file/section must be re-read in full); design §8.1 is updated and the decision recorded as Z13; and the five gates above are green.
   - Deliverable: `prompts/task-review.md`, `aidw/findings.py` (parse the classification), `aidw/workflows/prompt.py` (the short-circuit), `agents/task-reviewer/AGENTS.md`, design.md §§8.1, 17 (row Z13), and the tests below.
   - Tests: `tests/test_findings.py`, `tests/test_prompt_workflow.py`, `tests/test_design_doc.py`.
