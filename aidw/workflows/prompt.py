@@ -43,8 +43,12 @@ Stages:
 A real run requires the configured base branch (``repo.base_branch``) checked out in the
 control worktree and a clean working tree. It then refuses (exit 4) when an earlier task in
 the same roadmap phase file is unticked, unless ``--allow-incomplete-prereqs``
-is given, then fetches ``origin`` and refuses (exit 4) when the base branch is behind or
-diverged from ``origin/<base>``; ``--no-fetch`` skips both the fetch and the comparison.
+is given, then refuses (exit 3) when a spec section the entry cites is missing, not
+uniquely locatable or empty (G1.2: a local, Pi-free check of both citation channels through
+the one enumerator the evidence bundle uses), and then fetches ``origin`` and refuses
+(exit 4) when the base branch is behind or diverged from ``origin/<base>``; ``--no-fetch``
+skips both the fetch and the comparison. A ``--dry-run`` reports each of those findings as a
+note and never refuses.
 It derives the branch/worktree name from ``repo.branch_pattern`` and **locates** the task
 worktree before the author stage, creating it only when none exists; a malformed pattern is
 a usage error (exit 2) and a git refusal is exit 4, both before any stage or run state
@@ -130,7 +134,7 @@ import os
 import re
 import shutil
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import mkdtemp
 
@@ -428,6 +432,26 @@ def _done_when_block(lines: list[str], task_index: int) -> str:
     return "\n".join(block)
 
 
+def _task_citation_inputs(
+    repo: TargetRepo, entry: RoadmapTask, *, roadmap_dir: str
+) -> tuple[str, str]:
+    """The entry's own line and full ``Done when:`` block (L2.4; G1.2 shares them).
+
+    One reader for the two consumers that must agree about what an entry cites: the
+    ``P2`` evidence bundle (``_render_evidence_bundle``) and the cited-spec preflight
+    (:func:`_spec_feasibility_gaps`). Both start from the same ``_roadmap_lines`` re-read
+    of ``entry.file`` and the same ``entry.line - 1`` index, so a citation the bundle shows
+    is a citation the preflight checked.
+    """
+    lines = _roadmap_lines(repo, entry, roadmap_dir=roadmap_dir)
+    index = entry.line - 1
+    if lines is None:
+        return "", _EVIDENCE_UNAVAILABLE
+    done_block = _done_when_block(lines, index)
+    task_line = lines[index] if index < len(lines) else ""
+    return task_line, done_block
+
+
 def _locate_doc(root: Path, name: str) -> Path | None:
     """The unique ``<name>.md`` file under ``root``, or ``None`` when absent/ambiguous.
 
@@ -462,20 +486,54 @@ def _decision_section(text: str, decision: str) -> str | None:
     return None
 
 
-def _render_cited_specs(
-    repo: TargetRepo, entry: RoadmapTask, task_line: str, done_block: str
-) -> str:
-    """``Design N`` citations plus the ``<NAME>.md`` doc refs ``RoadmapTask`` drops.
+@dataclass(frozen=True)
+class _CitedSpec:
+    """One cited spec reference, after both citation channels are enumerated (G1.2).
 
-    ``CITATION_RE`` captures only ``Design N`` tokens, so the non-``Design`` doc
-    references (``EXTRACTION.md D16``) are recovered by re-reading the task line's
-    parenthesised detail and the ``Done when:`` line and mapping each ``<NAME>.md``
-    token to file+section — ``§n`` directly, ``D<nn>`` via the heading that names it.
+    ``path`` is the file the citation names — ``repo.root / "design.md"`` for the
+    ``Design N`` channel (which need not exist; the checker reports that) and the located
+    file for a ``<NAME>.md`` token, or ``None`` when the token could not be located
+    uniquely. ``section`` is the cited (or decision-resolved) section number exactly as the
+    citation writes it, so the evidence bundle prints it verbatim while
+    :func:`_spec_feasibility_gaps` compares it canonically; ``decision`` is set when the
+    section came from a ``D<nn>`` id rather than a literal ``§N``.
     """
-    rendered: list[str] = []
-    for citation in entry.citations:
-        number = citation.split(maxsplit=1)[-1]
-        rendered.append(f"- {citation} → design.md §{number}")
+
+    label: str
+    relative: str
+    path: Path | None
+    section: str | None = None
+    decision: str | None = None
+
+
+def _cited_specs(
+    repo: TargetRepo, entry: RoadmapTask, task_line: str, done_block: str
+) -> list[_CitedSpec]:
+    """Enumerate every cited spec reference, in citation order (roadmap-format.md §8).
+
+    The single enumerator the evidence bundle and the cited-spec preflight share (G1.2), so
+    they cannot drift on what is cited. Both channels are enumerated exactly as
+    :func:`_render_cited_specs` has always rendered them:
+
+    - ``Design N``/``Design N.M`` from ``RoadmapTask.citations`` → ``design.md``;
+    - ``<NAME>.md`` tokens recovered from ``{task_line}\n{done_block}`` → the located file,
+      with a ``§N`` section taken verbatim from the token's window or a ``D<nn>`` id mapped
+      to the section of the file's heading that names it.
+
+    The bare ``design.md`` token is skipped because the ``Design N`` channel already covers
+    that file (roadmap-format.md §8.2), and a repeated ``<NAME>.md`` token is enumerated
+    once, so neither a duplicated reference nor the two channels covering one file can
+    report the same citation twice.
+    """
+    cited: list[_CitedSpec] = [
+        _CitedSpec(
+            label=citation,
+            relative="design.md",
+            path=repo.root / "design.md",
+            section=citation.split(maxsplit=1)[-1],
+        )
+        for citation in entry.citations
+    ]
 
     blob = f"{task_line}\n{done_block}"
     tokens = list(_DOC_TOKEN_RE.finditer(blob))
@@ -491,28 +549,186 @@ def _render_cited_specs(
         window = blob[match.end() : window_end]
         path = _locate_doc(repo.root, token)
         if path is None:
-            rendered.append(
-                f"- {token} → unavailable — could not locate the file uniquely"
-            )
+            cited.append(_CitedSpec(label=token, relative=token, path=None))
             continue
         relative = path.relative_to(repo.root).as_posix()
         section_match = _SECTION_RE.search(window)
         section: str | None = None
+        decision: str | None = None
         if section_match:
-            section = f"§{section_match.group(1)}"
+            section = section_match.group(1)
         else:
             decision_match = _DECISION_RE.search(window)
             if decision_match:
+                decision = decision_match.group(0)
                 try:
-                    section = _decision_section(
-                        path.read_text(encoding="utf-8"), decision_match.group(0)
+                    resolved = _decision_section(
+                        path.read_text(encoding="utf-8"), decision
                     )
                 except OSError:
-                    section = None
-        rendered.append(
-            f"- {token} → {relative} {section}" if section else f"- {token} → {relative}"
+                    resolved = None
+                # ``_decision_section`` returns ``§N``; the number is what is compared.
+                section = resolved[1:] if resolved else None
+        cited.append(
+            _CitedSpec(
+                label=token,
+                relative=relative,
+                path=path,
+                section=section,
+                decision=decision,
+            )
         )
+    return cited
+
+
+def _render_cited_specs(
+    repo: TargetRepo, entry: RoadmapTask, task_line: str, done_block: str
+) -> str:
+    """``Design N`` citations plus the ``<NAME>.md`` doc refs ``RoadmapTask`` drops.
+
+    ``CITATION_RE`` captures only ``Design N`` tokens, so the non-``Design`` doc
+    references (``EXTRACTION.md D16``) are recovered by re-reading the task line's
+    parenthesised detail and the ``Done when:`` line and mapping each ``<NAME>.md``
+    token to file+section — ``§n`` directly, ``D<nn>`` via the heading that names it.
+    The enumeration itself is :func:`_cited_specs` (G1.2); this function only renders it,
+    printing each section number verbatim, exactly as before.
+    """
+    rendered: list[str] = []
+    for cited in _cited_specs(repo, entry, task_line, done_block):
+        if cited.path is None:
+            rendered.append(
+                f"- {cited.label} → unavailable — could not locate the file uniquely"
+            )
+        elif cited.section:
+            rendered.append(f"- {cited.label} → {cited.relative} §{cited.section}")
+        else:
+            rendered.append(f"- {cited.label} → {cited.relative}")
     return "\n".join(rendered) if rendered else _EVIDENCE_UNAVAILABLE
+
+
+def _heading_level(line: str) -> int | None:
+    """The ``#`` count of an ATX heading line, or ``None`` when it is not one.
+
+    The boundary is :data:`_HEADING_NUMBER_RE`'s — the ``#`` run must be followed by
+    whitespace or the end of the line — so ``#not a heading`` and ``#hashtag`` stay body
+    prose, as CommonMark's ATX rule has it. Section emptiness depends on it (G1.2 req 2),
+    and a laxer test here reported a section whose body is hash-prefixed text as empty.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("#"):
+        return None
+    hashes = len(stripped) - len(stripped.lstrip("#"))
+    if len(stripped) > hashes and not stripped[hashes].isspace():
+        return None
+    return hashes
+
+
+def _canonical_number(number: str) -> tuple[int, ...]:
+    """A dotted section number as an integer tuple, so leading zeros never matter.
+
+    ``CITATION_RE`` accepts zero-padded citations (roadmap-format.md §8.1), so ``Design 09``
+    and ``## 9`` are the same section: compare ``(9,) == (9,)``, never the strings. The
+    canonical form lives in this comparison only — the evidence bundle keeps printing the
+    cited number verbatim (G1.2 requirement 2).
+    """
+    return tuple(int(part) for part in number.split("."))
+
+
+def _section_state(lines: list[str], number: str) -> bool | None:
+    """Whether the section numbered ``number`` exists, and whether it has content.
+
+    ``None`` — no heading is numbered ``number`` (compared canonically). ``True`` — the
+    heading is followed, before the next heading of equal-or-higher level, by at least one
+    non-blank, non-heading line. ``False`` — the heading exists but its body holds only
+    blank lines and deeper subheadings, so it is an empty section (G1.2 requirement 2).
+
+    "Non-empty" is deliberately not "any text anywhere after the heading": a title
+    immediately followed by the next equal-level heading, or by subheadings with no prose,
+    documents nothing.
+    """
+    target = _canonical_number(number)
+    for index, line in enumerate(lines):
+        level = _heading_level(line)
+        if level is None:
+            continue
+        match = _HEADING_NUMBER_RE.match(line.strip())
+        if match is None or _canonical_number(match.group(1)) != target:
+            continue
+        for body in lines[index + 1 :]:
+            body_level = _heading_level(body)
+            if body_level is not None and body_level <= level:
+                return False
+            if body_level is None and body.strip():
+                return True
+        return False
+    return None
+
+
+def _spec_feasibility_gaps(
+    repo: TargetRepo, entry: RoadmapTask, task_line: str, done_block: str
+) -> list[str]:
+    """Every cited-spec problem for ``entry``, one gap string per problem (G1.2).
+
+    A pure, deterministic, Pi-free preflight for ``aidw prompt`` (design §8.1): it walks
+    :func:`_cited_specs` in citation order and reports, per cited reference, a file that
+    cannot be located uniquely or does not exist, a ``D<nn>`` id no numbered heading names,
+    a cited section number no heading carries, and a section with no content. A bare
+    ``<NAME>.md`` ref asks only that the file locate uniquely.
+
+    It never judges *whether* the section contradicts the roadmap or whether a
+    prerequisite's work exists — that is the author's ``blocked:`` job (design §8.1).
+    """
+    gaps: list[str] = []
+    for cited in _cited_specs(repo, entry, task_line, done_block):
+        if cited.path is None:
+            gaps.append(f"{cited.label} → could not locate the cited file uniquely")
+            continue
+        if not cited.path.is_file():
+            gaps.append(f"{cited.label} → {cited.relative}: file not found")
+            continue
+        if cited.decision is not None and cited.section is None:
+            gaps.append(
+                f"{cited.label} → {cited.relative}: no numbered heading names "
+                f"`{cited.decision}`"
+            )
+            continue
+        if cited.section is None:
+            # A bare ``<NAME>.md``: located uniquely is all it claims.
+            continue
+        try:
+            lines = cited.path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            gaps.append(f"{cited.label} → {cited.relative}: could not read the file")
+            continue
+        state = _section_state(lines, cited.section)
+        if state is None:
+            gaps.append(
+                f"{cited.label} → {cited.relative}: no heading numbered §{cited.section}"
+            )
+        elif not state:
+            gaps.append(f"{cited.label} → {cited.relative}: §{cited.section} is empty")
+    return gaps
+
+
+def _refuse_spec_gaps(entry: RoadmapTask, gaps: list[str]) -> None:
+    """Exit-3 refusal naming the entry and every cited-spec gap (G1.2, design §8.1/§14).
+
+    Exit 3 is "workflow blocked (needs human)": a missing, unlocatable or empty cited
+    section is a spec/roadmap defect only a human can fix, exactly the condition the
+    author's ``blocked:`` line reports later and more expensively.
+    """
+    print(
+        f"refusing: cannot author `{entry.task}` in `{entry.file}`; a cited spec section "
+        "is missing, not uniquely locatable, or empty:",
+        file=sys.stderr,
+    )
+    for gap in gaps:
+        print(f"  {gap}", file=sys.stderr)
+    print(
+        "Repair the cited spec or the roadmap entry — this check is deterministic and "
+        "never guesses — then re-run `aidw prompt`.",
+        file=sys.stderr,
+    )
 
 
 def _render_prerequisites(entries: list[RoadmapTask], entry: RoadmapTask) -> str:
@@ -593,14 +809,9 @@ def _render_evidence_bundle(
     renderers, so the bundle is always produced even when ``AGENTS.md`` is missing or the
     roadmap file cannot be read.
     """
-    lines = _roadmap_lines(repo, entry, roadmap_dir=roadmap_dir)
-    task_index = entry.line - 1
-    done_block = (
-        _done_when_block(lines, task_index)
-        if lines is not None
-        else _EVIDENCE_UNAVAILABLE
+    task_line, done_block = _task_citation_inputs(
+        repo, entry, roadmap_dir=roadmap_dir
     )
-    task_line = lines[task_index] if lines and task_index < len(lines) else ""
     return "\n".join(
         [
             f"# Evidence bundle — stage `{stage}`",
@@ -1943,6 +2154,22 @@ def run(
     # line) and never across files (phase 00's unticked backlog must not block phase 02).
     incomplete = _incomplete_predecessors(entries, entry)
 
+    # G1.2 (design §8.1, §17 Z19): the cited-spec preflight. Computed once, beside
+    # `incomplete` and before the `dry_run` split, so the dry-run note and the real-run
+    # refusal cannot disagree — and from exactly the inputs `_render_evidence_bundle`
+    # uses (`_task_citation_inputs`), so the evidence bundle and this check cannot drift on
+    # what an entry cites. It is local, in-memory and spends no Pi invocation: a roadmap
+    # entry citing a missing, unlocatable or empty spec section is a defect only a human
+    # can fix, so the refusal is exit 3 (design §14, "workflow blocked (needs human)") —
+    # the same code the author-side `blocked:` uses, and deliberately not 2 (usage) or 4
+    # (safety/git refusal).
+    citation_task_line, citation_done_block = _task_citation_inputs(
+        repo, entry, roadmap_dir=roadmap_dir
+    )
+    spec_gaps = _spec_feasibility_gaps(
+        repo, entry, citation_task_line, citation_done_block
+    )
+
     # --- the run this invocation continues or replaces (H1.2 req 1/6) ------------- #
     # The lookup runs on a fresh invocation too, mirroring `implement.run`: a crashed run
     # releases its worktree lock but keeps a stale `running` record, and a fresh run that
@@ -2074,6 +2301,16 @@ def run(
             )
         else:
             print(f"[dry-run] no incomplete predecessors in `{entry.file}`.")
+        # G1.2 requirement 4: a dry run is a write-free *plan* (design §8.1, §17 Z14), so
+        # it reports the cited-spec gaps beside the predecessor note and falls through to
+        # the normal planning — never an early return and never a refusal.
+        if spec_gaps:
+            print(
+                f"[dry-run] cited spec sections for `{entry.task}` have problems:\n"
+                + "\n".join(f"  {gap}" for gap in spec_gaps)
+            )
+        else:
+            print(f"[dry-run] no cited-spec-section problems for `{entry.task}`.")
         print(
             "[dry-run] a real run will fetch and verify the base branch against "
             f"`{REMOTE}/{repo.base_branch}`."
@@ -2106,6 +2343,14 @@ def run(
                     _refuse_incomplete_predecessors(entry, incomplete)
                     return EXIT_REFUSED
                 _warn_incomplete_predecessors(entry, incomplete)
+            # G1.2: after the L1.2 predecessor refusal (roadmap ordering is the first
+            # authority, so a predecessor wins when both fire) and immediately before the
+            # fetch, because this check is purely local: an unreachable `origin` must not
+            # be spent first. Runs before `load_all`, branch setup and `create_run`, so a
+            # refused run leaves no run directory, branch, worktree or prompt file behind.
+            if spec_gaps:
+                _refuse_spec_gaps(entry, spec_gaps)
+                return 3
             refusal = _verify_base_branch(repo, no_fetch=no_fetch)
             if refusal is not None:
                 return refusal

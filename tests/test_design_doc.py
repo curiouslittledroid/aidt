@@ -976,3 +976,76 @@ def test_g11_decision_row_records_the_classification_contract() -> None:
     duplicates = sorted({identifier for identifier in ids if ids.count(identifier) > 1})
     assert duplicates == [], f"reused §17 decision ids: {duplicates}"
     assert not row.startswith("| Z13 |")
+
+
+def test_g12_section_81_states_the_cited_spec_preflight() -> None:
+    """G1.2: §8.1 documents the preflight's position, gap rule, exit code and backstop.
+
+    The preflight is behaviour a later reader can only know from the design: without it,
+    the exit-3 refusal would look like a bug beside §14's exit-4 preflight refusals, and
+    the canonical (non-string) section comparison would be "simplified" back into a broken
+    exact match.
+    """
+    block = " ".join(_section_81_block(_design_md()).split())
+
+    # The stage diagram's `preflight (...)` line carries it, in execution order.
+    assert "refuse on a cited spec section that is missing, unlocatable or empty" in block
+    # The bullet: position, gap rule, cost, exit code and the author-side backstop.
+    assert "cited spec section" in block
+    assert "before `P1`" in block
+    assert "exit 3" in block
+    assert "non-empty" in block
+    assert "semantic backstop" in block
+    assert "spends no Pi invocation" in block
+    assert "roadmap-format.md §8" in block
+    assert "canonically" in block
+    assert "leading zeros ignored" in block
+    assert "L1.2" in block
+    assert "--dry-run" in block and "never refuses" in block
+
+
+def test_g12_decision_row_records_the_cited_spec_preflight() -> None:
+    """G1.2: exactly one §17 row records the task, its files and its prompt-fixed choices.
+
+    Matched by task id + wording, never by a ``Z`` number: ``aidw/conventions.md`` forbids
+    reusing or renumbering an id, so this pin must not pin the number.
+    """
+    decisions = _section(_design_md(), "## 17. Resolved decisions", "## 18. Risks")
+    rows = [
+        line
+        for line in decisions.splitlines()
+        if re.match(r"^\| Z\d+ \|", line)
+        and "G1.2" in line
+        and "spec section" in line
+        and "exit 3" in line
+    ]
+    assert len(rows) == 1, f"expected exactly one G1.2 decision row, found {len(rows)}"
+    row = rows[0]
+    # The behaviour the code implements, on both sides of the shared enumerator.
+    assert "`_spec_feasibility_gaps`" in row
+    assert "`_cited_specs`" in row
+    assert "`_render_cited_specs`" in row
+    assert "`D<nn>`" in row
+    assert "empty" in row
+    # The prompt-fixed decisions travel with the row (Z2/Z9/Z11's precedent).
+    assert "Prompt-fixed decisions" in row
+    for decision in ("(a)", "(b)", "(c)", "(d)"):
+        assert decision in row, decision
+    assert "not 2 or 4" in row
+    assert "roadmap-format.md §10" in row
+    assert "`not takeover`" in row
+    assert "§17 Z14" in row
+    # The spec sections and the touched set are named, so the contract tests are findable.
+    assert "§§8.1, 14" in row
+    for path in (
+        "aidw/workflows/prompt.py",
+        "tests/test_prompt_workflow.py",
+        "tests/test_design_doc.py",
+    ):
+        assert path in row, path
+    # The fixture re-baseline travels with the row (no citation was stripped).
+    assert "`READ_PATH_FILES`" in row
+    # No §17 id is reused, and the appended id is a fresh one.
+    ids = re.findall(r"^\| (Z\d+) \|", decisions, re.M)
+    duplicates = sorted({identifier for identifier in ids if ids.count(identifier) > 1})
+    assert duplicates == [], f"reused §17 decision ids: {duplicates}"

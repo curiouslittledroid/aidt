@@ -19,6 +19,7 @@ from aidw.cli import app
 from aidw.config import ERROR, Issue
 from aidw.paths import ToolkitPaths, TargetRepo, WorkspacePaths, repo_root, toolkit_root
 from aidw.prompts import PromptError, render_prompt_file
+from aidw.roadmap import RoadmapTask
 from aidw.target_config import config_identity, resolve_workflow_config
 from aidw.workflows import prompt as prompt_workflow
 
@@ -201,9 +202,30 @@ def _init_repo(path: Path) -> None:
 #: The §3.4 read-paths ``aidw prompt``'s preflight validates (E3.7), as ``path -> text``.
 #: Every committed fixture repo in this module carries them: the defaults name them (D17),
 #: so a repo without them refuses at the preflight rather than planning stages.
+#:
+#: ``design.md`` is not a validated read-path but the file the fixtures' ``Design N``
+#: citations name (G1.2): the cited-spec preflight refuses when a cited section is missing,
+#: so this seed keeps ``Design 09`` (``ROADMAP_FIXTURE`` and its siblings) and ``Design 8.1``
+#: (``ROADMAP_EVIDENCE``) resolvable against non-empty headings — a section with prose, never
+#: a bare heading. ``Design 09`` matches ``## 9`` canonically, not as a string
+#: (roadmap-format.md §8.1 accepts the zero-padded form), which is the comparison the check
+#: pins. A test that needs a gap overrides this file rather than stripping a citation.
 READ_PATH_FILES = {
     "docs/task-prompts/.gitkeep": "",
     "docs/implementation-results/TEMPLATE.md": "# Build results template\n",
+    "design.md": (
+        "# Design\n"
+        "\n"
+        "## 8. Workflow specifications\n"
+        "\n"
+        "### 8.1 Cited spec sections\n"
+        "\n"
+        "A fixture section with prose, so a `Design 8.1` citation is non-empty.\n"
+        "\n"
+        "## 9. Test fixture\n"
+        "\n"
+        "A fixture section with prose, so a `Design 09` citation is non-empty.\n"
+    ),
 }
 
 
@@ -7446,9 +7468,10 @@ def test_from_prompt_applies_control_preflights_but_skips_run_scoped_preflights(
     _patch_prompt_repo(tmp_path, monkeypatch, roadmap=roadmap)
     _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
     # The blocking baseline must be faked too: without this the first run reaches real Pi
-    # (design §15 — no test may invoke a model), which passed locally only because the
-    # live author happened to answer `blocked:` for this fixture's dangling `Design 09..`.
-    # CI has no model credential, so it exited 1 and the run stopped at the author.
+    # (design §15 — no test may invoke a model), and CI has no model credential, so it
+    # would exit 1 at the author. G1.2's `READ_PATH_FILES` now commits a `design.md` whose
+    # `## 9` section satisfies this fixture's `Design 09` citation, so the cited-spec
+    # preflight passes and the run really would reach the author.
     monkeypatch.setattr(prompt_workflow, "run_stage", fake1)
     assert _run_prompt(tmp_path, allow_incomplete_prereqs=True) == 3
     capsys.readouterr()  # discard the initial run's expected predecessor warning
@@ -8138,3 +8161,596 @@ def test_a_recorded_review_that_now_ends_the_run_refuses_to_resume(
     assert "task-review-fixes-1-1" in err
     assert seen2 == []  # no stage ran, nothing was re-authored
     assert _state_text(tmp_path, failed.run_id) == before
+
+
+# ---------------------------------------------------------------------------
+# G1.2 — refuse before authoring when a cited spec section is unusable
+#        (design §8.1, §17 Z19; roadmap-format.md §§8, 10)
+# ---------------------------------------------------------------------------
+
+#: A roadmap whose only citation no fixture heading can satisfy: the committed
+#: ``design.md`` carries `## 8.1` and `## 9`, never `## 42.7`.
+ROADMAP_MISSING_SPEC = """# Phase 3: Test Phase
+
+## Epic E4: Defensive Combat
+
+- [ ] **E4.1. Implement Total Defense** per Design 42.7..
+  - Done when: applyTotalDefense returns the fixed effect.
+"""
+
+#: A citation that is present but says nothing: `## 9` is followed only by a deeper
+#: subheading title before the next equal-level heading, so its own body holds no prose.
+DESIGN_EMPTY_SECTION = """# Design
+
+## 9. Test fixture
+
+### 9.1 A subheading with no prose
+
+## 10. Filled section
+
+Real prose.
+"""
+
+
+def _spec_repo(tmp_path: Path, files: dict[str, str]) -> TargetRepo:
+    """A ``TargetRepo`` over plain files (no git), for the pure cited-spec checker."""
+    for rel, text in files.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return TargetRepo(
+        root=tmp_path, git_dir=tmp_path / ".git", common_dir=tmp_path / ".git"
+    )
+
+
+def _spec_entry(citations: list[str] | None = None) -> RoadmapTask:
+    """The fixture task entry the pure checker is called with."""
+    return RoadmapTask(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        title="Implement Total Defense",
+        done=False,
+        file="03 - Test Phase.md",
+        line=4,
+        citations=list(citations or []),
+    )
+
+
+def _spec_gaps(
+    repo: TargetRepo,
+    *,
+    citations: list[str] | None = None,
+    task_line: str = "",
+    done_block: str = "",
+) -> list[str]:
+    return prompt_workflow._spec_feasibility_gaps(
+        repo, _spec_entry(citations), task_line, done_block
+    )
+
+
+def _tree_snapshot(root: Path) -> dict[str, bytes]:
+    """Every file under ``root`` and its bytes: the purity check's before/after image."""
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_g12_missing_design_md_is_a_gap_and_a_present_section_is_not(
+    tmp_path: Path,
+) -> None:
+    """One gap per problem: the cited file, then the mirror where the section exists."""
+    repo = _spec_repo(tmp_path, {})
+
+    assert _spec_gaps(repo, citations=["Design 8.1"]) == [
+        "Design 8.1 → design.md: file not found"
+    ]
+
+    # The same citation against a present, non-empty section is no gap at all.
+    (tmp_path / "design.md").write_text(
+        "# Design\n\n## 8.1 Cited sections\n\nThe evidence channel.\n", encoding="utf-8"
+    )
+    assert _spec_gaps(repo, citations=["Design 8.1"]) == []
+
+
+def test_g12_a_citation_no_heading_carries_is_a_gap(tmp_path: Path) -> None:
+    """A `Design N` whose section is absent names the citation and the missing heading."""
+    repo = _spec_repo(
+        tmp_path, {"design.md": "# Design\n\n## 9. Test fixture\n\nProse.\n"}
+    )
+
+    assert _spec_gaps(repo, citations=["Design 8.1"]) == [
+        "Design 8.1 → design.md: no heading numbered §8.1"
+    ]
+
+
+def test_g12_a_heading_with_no_prose_is_an_empty_section(tmp_path: Path) -> None:
+    """A heading whose body is only blanks and deeper subheading titles is empty."""
+    repo = _spec_repo(tmp_path, {"design.md": DESIGN_EMPTY_SECTION})
+
+    assert _spec_gaps(repo, citations=["Design 9"]) == [
+        "Design 9 → design.md: §9 is empty"
+    ]
+    # The rule is level-independent: the prose-free `### 9.1` is an empty section too,
+    # while the next equal-level heading with prose is not.
+    assert _spec_gaps(repo, citations=["Design 9.1"]) == [
+        "Design 9.1 → design.md: §9.1 is empty"
+    ]
+    assert _spec_gaps(repo, citations=["Design 10"]) == []
+
+    # A deeper subheading carrying prose is content inside its parent (the body is what
+    # lies before the next equal-or-higher heading), so the parent is not empty.
+    (tmp_path / "design.md").write_text(
+        "# Design\n\n## 9. Test fixture\n\n### 9.1 Subsection\n\nProse.\n",
+        encoding="utf-8",
+    )
+    assert _spec_gaps(repo, citations=["Design 9"]) == []
+
+
+def test_g12_zero_padded_citations_match_canonically(tmp_path: Path) -> None:
+    """`Design 09` matches `## 9` (and `Design 9` matches `## 09`), never exact strings."""
+    repo = _spec_repo(
+        tmp_path, {"design.md": "# Design\n\n## 9. Test fixture\n\nProse.\n"}
+    )
+    assert _spec_gaps(repo, citations=["Design 09"]) == []
+    assert _spec_gaps(repo, citations=["Design 9"]) == []
+
+    repo = _spec_repo(
+        tmp_path, {"design.md": "# Design\n\n## 09. Test fixture\n\nProse.\n"}
+    )
+    assert _spec_gaps(repo, citations=["Design 9"]) == []
+    assert _spec_gaps(repo, citations=["Design 09"]) == []
+
+
+def test_g12_hash_prefix_without_heading_space_is_section_body(
+    tmp_path: Path,
+) -> None:
+    """Only Markdown ATX headings delimit a section; ``#text`` remains body prose."""
+    repo = _spec_repo(
+        tmp_path,
+        {"design.md": "# Design\n\n## 9. Test fixture\n\n#not a heading\n"},
+    )
+
+    assert _spec_gaps(repo, citations=["Design 9"]) == []
+
+
+def test_g12_a_doc_token_that_cannot_be_located_uniquely_is_a_gap(
+    tmp_path: Path,
+) -> None:
+    """`_locate_doc`'s ambiguity is a named gap, never a crash or a guess."""
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "a/EXTRACTION.md": "# A\n\n## 3.1 Section\n\nProse.\n",
+            "b/EXTRACTION.md": "# B\n\n## 3.1 Section\n\nProse.\n",
+        },
+    )
+    assert _spec_gaps(repo, task_line="(EXTRACTION.md §3.1)") == [
+        "EXTRACTION.md → could not locate the cited file uniquely"
+    ]
+
+    # A uniquely locatable bare ref asks only that the file locate: no section needed.
+    (tmp_path / "b" / "EXTRACTION.md").unlink()
+    assert _spec_gaps(repo, task_line="(EXTRACTION.md §3.1)") == []
+    assert _spec_gaps(repo, task_line="(EXTRACTION.md)") == []
+
+
+def test_g12_a_doc_section_no_heading_carries_is_a_gap(tmp_path: Path) -> None:
+    """A `§N` after a located `<NAME>.md` must name a heading that exists."""
+    repo = _spec_repo(
+        tmp_path,
+        {"docs/migration/EXTRACTION.md": "# Extraction\n\n## 4.9 Other\n\nProse.\n"},
+    )
+
+    assert _spec_gaps(repo, task_line="(EXTRACTION.md §3.9)") == [
+        "EXTRACTION.md → docs/migration/EXTRACTION.md: no heading numbered §3.9"
+    ]
+
+
+def test_g12_a_decision_id_resolves_to_the_heading_that_names_it(
+    tmp_path: Path,
+) -> None:
+    """`D16` → the section its heading names; unresolvable or empty targets are gaps."""
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "docs/migration/EXTRACTION.md": (
+                "# Extraction\n\n## 3.8 Task-prompt format (D16)\n\nProse.\n"
+            )
+        },
+    )
+    assert _spec_gaps(repo, task_line="**E4.1. Title** (EXTRACTION.md D16)") == []
+
+    repo = _spec_repo(
+        tmp_path,
+        {"docs/migration/EXTRACTION.md": "# Extraction\n\n## 3.8 Other\n\nProse.\n"},
+    )
+    assert _spec_gaps(repo, task_line="(EXTRACTION.md D16)") == [
+        "EXTRACTION.md → docs/migration/EXTRACTION.md: no numbered heading names `D16`"
+    ]
+
+    # Resolved, but its section documents nothing: the same empty-section rule applies.
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "docs/migration/EXTRACTION.md": (
+                "# Extraction\n\n## 3.8 Roadmap (D16)\n\n### 3.8.1 deeper\n"
+            )
+        },
+    )
+    assert _spec_gaps(repo, task_line="(EXTRACTION.md D16)") == [
+        "EXTRACTION.md → docs/migration/EXTRACTION.md: §3.8 is empty"
+    ]
+
+
+def test_g12_a_located_but_unreadable_cited_file_fails_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An unreadable file cannot prove a section exists, so it is a gap, never a pass."""
+    repo = _spec_repo(
+        tmp_path, {"design.md": "# Design\n\n## 9. Test fixture\n\nProse.\n"}
+    )
+    real_read_text = Path.read_text
+
+    def failing_read_text(self: Path, *args, **kwargs):
+        if self.name == "design.md":
+            raise OSError("injected unreadable file")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", failing_read_text)
+
+    assert _spec_gaps(repo, citations=["Design 9"]) == [
+        "Design 9 → design.md: could not read the file"
+    ]
+
+
+def test_g12_gaps_follow_citation_order_and_deduplicate_doc_tokens(
+    tmp_path: Path,
+) -> None:
+    """Both channels are enumerated in citation order; a repeated token is reported once."""
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "design.md": "# Design\n\n## 9. Test fixture\n\nProse.\n",
+            "docs/migration/EXTRACTION.md": "# Extraction\n\n## 4.9 Other\n\nProse.\n",
+        },
+    )
+
+    assert _spec_gaps(
+        repo,
+        citations=["Design 8.1", "Design 9"],
+        task_line="(Design 8.1, Design 9, EXTRACTION.md §3.9, EXTRACTION.md §3.9)",
+    ) == [
+        "Design 8.1 → design.md: no heading numbered §8.1",
+        "EXTRACTION.md → docs/migration/EXTRACTION.md: no heading numbered §3.9",
+    ]
+
+
+def test_g12_spec_gap_checker_is_pure(tmp_path: Path) -> None:
+    """No input mutation, no write, and the same answer twice (the check is deterministic)."""
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "design.md": "# Design\n\n## 9. Test fixture\n\nProse.\n",
+            "docs/migration/EXTRACTION.md": "# Extraction\n\n## 4.9 Other\n\nProse.\n",
+        },
+    )
+    entry = _spec_entry(["Design 8.1", "Design 9"])
+    task_line = "(Design 8.1, EXTRACTION.md §3.9)"
+    before_entry = dataclasses.replace(entry, citations=list(entry.citations))
+    before_tree = _tree_snapshot(tmp_path)
+
+    first = prompt_workflow._spec_feasibility_gaps(repo, entry, task_line, "")
+    second = prompt_workflow._spec_feasibility_gaps(repo, entry, task_line, "")
+
+    assert first == second
+    assert first == [
+        "Design 8.1 → design.md: no heading numbered §8.1",
+        "EXTRACTION.md → docs/migration/EXTRACTION.md: no heading numbered §3.9",
+    ]
+    assert entry == before_entry
+    assert _tree_snapshot(tmp_path) == before_tree
+
+
+def test_g12_shared_citation_enumeration_preserves_rendering_and_deduplication(
+    tmp_path: Path,
+) -> None:
+    """The checker and evidence bundle see the same refs without normalising their display."""
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "design.md": "# Design\n\n## 9. Test fixture\n\nDesign prose.\n",
+            "docs/migration/EXTRACTION.md": (
+                "# Extraction\n\n### 3.8 Contract (D16)\n\nDoc prose.\n"
+            ),
+        },
+    )
+    entry = _spec_entry(["Design 09"])
+    task_line = "(design.md, EXTRACTION.md §03.8, EXTRACTION.md §03.8)"
+
+    rendered = prompt_workflow._render_cited_specs(repo, entry, task_line, "")
+
+    # The bare design.md token is skipped and the repeated document token is rendered once;
+    # cited numbers remain verbatim in the evidence bundle even though the checker compares
+    # them canonically against the unpadded headings.
+    assert rendered.splitlines() == [
+        "- Design 09 → design.md §09",
+        "- EXTRACTION.md → docs/migration/EXTRACTION.md §03.8",
+    ]
+    assert prompt_workflow._spec_feasibility_gaps(repo, entry, task_line, "") == []
+
+
+def test_g12_missing_cited_section_refuses_exit_3_before_any_side_effect(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Exit 3 names the citation and its gap, and no fetch/run/branch/prompt ever happens."""
+    _origin, clone = _origin_and_clone(tmp_path, roadmap=ROADMAP_MISSING_SPEC)
+    _break_origin(clone)
+    fetch_calls: list[tuple] = []
+
+    def spy_fetch(*args, **kwargs):
+        fetch_calls.append(args)
+        return False, "boom"
+
+    monkeypatch.setattr(git, "fetch", spy_fetch)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert "Design 42.7" in err
+    assert "no heading numbered §42.7" in err
+    # Cheap-failure order: the local check precedes the network fetch, branch and run state.
+    assert fetch_calls == []
+    assert state.list_runs(_runs_root(clone)) == []
+    assert git.worktree_for_branch(clone, "03-E4.1") is None
+    assert git.rev_parse(clone, "refs/heads/03-E4.1") is None
+    assert not (clone / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
+    assert not _task_worktree(clone).exists()
+
+
+def test_g12_empty_cited_section_refuses_exit_3(tmp_path: Path, monkeypatch, capsys) -> None:
+    """A present-but-empty section is a gap, not a pass by citation count."""
+    _make_control_repo(
+        tmp_path,
+        files={
+            "docs/tasks/03 - Test Phase.md": ROADMAP_FIXTURE,
+            "design.md": DESIGN_EMPTY_SECTION,
+        },
+    )
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = _run_prompt(tmp_path)
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert "Design 09" in err and "§09 is empty" in err
+    assert state.list_runs(_runs_root(tmp_path)) == []
+
+
+def test_g12_incomplete_predecessor_wins_over_spec_gap(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """L1.2 remains the first authority when both local preflights would refuse."""
+    roadmap = """# Phase 3: Test Phase
+
+## Epic E4: Defensive Combat
+
+- [ ] **E4.0. Earlier task** per Design 41.1..
+  - Done when: the earlier task is complete.
+- [ ] **E4.1. Target task** per Design 42.7..
+  - Done when: the target task is complete.
+"""
+    _origin, clone = _origin_and_clone(tmp_path, roadmap=roadmap)
+    _break_origin(clone)
+    fetch_calls: list[tuple] = []
+    monkeypatch.setattr(git, "fetch", lambda *args, **kwargs: fetch_calls.append(args))
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert "earlier tasks in the same file are incomplete" in err
+    assert "Design 42.7" not in err
+    assert fetch_calls == []
+    assert state.list_runs(_runs_root(clone)) == []
+
+
+def test_g12_all_cited_sections_present_and_non_empty_proceeds_to_the_author(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Both channels resolve against content, so the run reaches P1 — no Pi is invoked."""
+    _evidence_repo(tmp_path, monkeypatch)  # cites Design 8.1 and EXTRACTION.md D16
+    seen, fake = _fake_stages("## Verdict\n\n**Approve**\n", approve_review=1)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake)
+
+    code = prompt_workflow.run(
+        phase="03",
+        epic="E4",
+        task="E4.1",
+        **_roots(tmp_path),
+        label=RUN_LABEL,
+        approve_all=True,
+        allow_incomplete_prereqs=True,
+    )
+
+    assert code == 0
+    assert seen[0][0] == "task-prompt"
+
+
+def test_g12_dry_run_reports_the_gaps_and_still_plans(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """`--dry-run` notes every gap, plans normally and writes nothing (no early return)."""
+    _patch_prompt_repo(tmp_path, monkeypatch, roadmap=ROADMAP_MISSING_SPEC)
+
+    code = _run_prompt(tmp_path, dry_run=True)
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[dry-run] cited spec sections for `E4.1` have problems" in out
+    assert "Design 42.7 → design.md: no heading numbered §42.7" in out
+    # The normal plan still prints: the note is beside the plan, not a return at the split.
+    assert "branch-setup (planned): worktree add -b 03-E4.1" in out
+    assert "stage:  task-prompt" in out
+    assert "dry-run complete; Pi not invoked" in out
+    assert not _runs_root(tmp_path).exists()
+    assert not _task_worktree(tmp_path).exists()
+    assert not (tmp_path / "docs" / "task-prompts" / "03-E4.1-prompt.md").exists()
+
+
+def test_g12_dry_run_reports_no_problems_when_citations_resolve(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The mirror note: a resolvable citation says so instead of naming a gap."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+
+    code = _run_prompt(tmp_path, dry_run=True)
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[dry-run] no cited-spec-section problems for `E4.1`." in out
+    assert "Design 09" not in out
+
+
+def test_g12_takeover_does_not_repeat_the_cited_spec_check(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The refusal is run-scoped: a `--resume` continues even though the spec is now gone."""
+    _patch_prompt_repo(tmp_path, monkeypatch)
+    _seen1, fake1 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=None)
+    blocked = _blocked_run(tmp_path, monkeypatch, fake1)
+
+    # Make the citation genuinely dangling *and keep the control tree clean*, so a
+    # re-run check would refuse and only the takeover guard can let this resume through.
+    _run_git(["rm", "-q", "design.md"], tmp_path)
+    _run_git(["commit", "-qm", "drop the cited spec"], tmp_path)
+    assert git.is_clean(tmp_path) is True
+    target = _roots(tmp_path)["repo"]
+    assert prompt_workflow._spec_feasibility_gaps(
+        target, _spec_entry(["Design 09"]), "", ""
+    ) == ["Design 09 → design.md: file not found"]
+
+    _seen2, fake2 = _fake_stages(TASK_REVIEW_CHANGES, approve_review=4)
+    monkeypatch.setattr(prompt_workflow, "run_stage", fake2)
+    monkeypatch.setattr(prompt_workflow, "create_run", _explode_create)
+
+    code = _run_prompt(tmp_path, resume=True, approve_all=True)
+
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "refusing: cannot author" not in err
+    assert _only_run(tmp_path).run_id == blocked.run_id
+
+
+#: Pinned seed and run count (AGENTS.md "Tests": pytest only, no ``hypothesis``, so a
+#: reproducible sample is the generator and there is no shrinking).
+SPEC_GAP_PROPERTY_SEED = 5187
+SPEC_GAP_PROPERTY_RUNS = 24
+
+
+def _gap_reason(gap: str) -> str:
+    """A gap's reason with its cited section number normalised, for padding comparisons."""
+    return re.sub(r"§[\d.]+", "§N", gap.split(" → ", 1)[1])
+
+
+def _padded_number(rng: random.Random, number: str) -> str:
+    """The same dotted number with random leading zeros on one of its parts."""
+    parts = number.split(".")
+    index = rng.randrange(len(parts))
+    return ".".join(
+        "0" * rng.randint(1, 2) + part if position == index else part
+        for position, part in enumerate(parts)
+    )
+
+
+def test_g12_cited_spec_gap_property(tmp_path: Path) -> None:
+    """Seeded property run (seed/runs pinned above): padding never changes a verdict.
+
+    For each sampled fixture the check reports a gap exactly when a cited reference is
+    absent, unlocatable or empty — never because a citation is zero-padded (`Design 01` and
+    `Design 1` name one section), and never for a bare `<NAME>.md` whose file locates. The
+    check is also pinned as pure and deterministic: repeating it returns an equal list and
+    leaves the sampled tree byte-identical.
+    """
+    rng = random.Random(SPEC_GAP_PROPERTY_SEED)
+
+    for case in range(SPEC_GAP_PROPERTY_RUNS):
+        case_root = tmp_path / f"case-{case}"
+        case_root.mkdir(parents=True)
+
+        empty_design = rng.random() < 0.5
+        design_body = (
+            "### 1.99 A deeper heading with no prose\n"
+            if empty_design
+            else "Prose that makes the section non-empty.\n"
+        )
+        doc_present = rng.random() < 0.8
+        empty_doc = rng.random() < 0.5
+        doc_body = (
+            "#### 3.4.1 A deeper heading with no prose\n"
+            if empty_doc
+            else "The roadmap contract.\n"
+        )
+        files = {"design.md": f"# Design\n\n## 1. Cited section\n\n{design_body}"}
+        if doc_present:
+            files["notes/SPEC.md"] = (
+                f"# Spec\n\n### 3.4 Roadmap contract (D16)\n\n{doc_body}"
+            )
+        if doc_present and rng.random() < 0.5:
+            # A second copy makes the token ambiguous even though it is present.
+            files["other/SPEC.md"] = "# Spec\n\n### 3.4 Roadmap contract (D16)\n\nProse.\n"
+        repo = _spec_repo(case_root, files)
+
+        design_citation = f"Design {_padded_number(rng, '1')}"
+        doc_mode = rng.choice(("section", "decision", "bare"))
+        doc_section = _padded_number(rng, "3.4")
+        doc_ref = {
+            "section": f"SPEC.md §{doc_section}",
+            "decision": "SPEC.md D16",
+            "bare": "SPEC.md",
+        }[doc_mode]
+        ambiguous = "other/SPEC.md" in files
+
+        expected: list[str] = []
+        if empty_design:
+            # The gap names the citation verbatim, so a zero-padded `Design 01` reads `§01`.
+            expected.append(
+                f"{design_citation} → design.md: §{design_citation.split()[-1]} is empty"
+            )
+        if not doc_present:
+            expected.append("SPEC.md → could not locate the cited file uniquely")
+        elif ambiguous:
+            expected.append("SPEC.md → could not locate the cited file uniquely")
+        elif doc_mode != "bare" and empty_doc:
+            expected.append(f"SPEC.md → notes/SPEC.md: §{doc_section} is empty")
+
+        entry = _spec_entry([design_citation])
+        task_line = f"(Design {design_citation.split()[-1]}, {doc_ref})"
+        before = _tree_snapshot(case_root)
+        gaps = prompt_workflow._spec_feasibility_gaps(repo, entry, task_line, "")
+        assert gaps == expected
+        # The unpadded spelling of the same citations reaches the same verdicts; only the
+        # citation label differs, which is what the gaps name (padding is never a cause).
+        unpadded_doc_ref = {
+            "section": "SPEC.md §3.4",
+            "decision": "SPEC.md D16",
+            "bare": "SPEC.md",
+        }[doc_mode]
+        unpadded = prompt_workflow._spec_feasibility_gaps(
+            repo, _spec_entry(["Design 1"]), f"(Design 1, {unpadded_doc_ref})", ""
+        )
+        assert [_gap_reason(gap) for gap in unpadded] == [
+            _gap_reason(gap) for gap in gaps
+        ]
+        # Pure and deterministic: same answer, no write, no input mutation.
+        assert prompt_workflow._spec_feasibility_gaps(repo, entry, task_line, "") == gaps
+        assert _tree_snapshot(case_root) == before
+        assert entry.citations == [design_citation]

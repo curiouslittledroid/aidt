@@ -131,7 +131,8 @@ loop. The branch and worktree are created by AIDT (Python), not by a stage, and 
 prompt is committed by AIDT after the loop — **neither is a stage**.
 
 ```text
-preflight (control worktree on the base branch, clean tree; fetch; predecessor check)
+preflight (control worktree on the base branch, clean tree; predecessor check;
+           cited-spec-section check; fetch)
   Python: create/reuse the task worktree for the derived branch
   → P1 task-prompt                     task-author
   → P2 task-review-1..N                task-reviewer   (verdict)
