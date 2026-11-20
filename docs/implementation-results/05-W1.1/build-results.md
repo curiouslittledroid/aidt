@@ -3,7 +3,7 @@
 **Branch:** `05-W1.1`
 **Date:** 2026-11-20
 **Spec:** `design.md` §8.2 (`I3 update-traceability` and `I7 update-roadmap`, including `I7`'s byte-exact tick postcondition), §12.1 (the resolved target config and `aidw/conventions.md`), §17 row `Z13`, §18 (the open-risk row it points at); roadmap entry W1.1 in `docs/tasks/05 - Pipeline efficiency.md`; `docs/task-prompts/05-W1.1-prompt.md`
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** #170 — https://github.com/curiouslittledroid/aidt/pull/170
 
 ## Summary
 
