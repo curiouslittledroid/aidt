@@ -21,10 +21,18 @@ in (iii) even though it named the toolkit's own prompt directory. The table↔di
 bidirectional in both directions that matter now: a file present here with no row fails, and a file
 §4.2 assigns that is neither present nor listed as moved fails.
 
+**One deliberate exception was carved out after the cutover (class (v)).** C1.3 inlines the
+repo's resolved gate commands into the five gate-recording prompts (design §7.3 step 5);
+``code-review.md`` is one of them, so its review-order step 6 gained gate-command guidance. A
+byte-frozen file nobody may edit cannot stay frozen once it is edited: ``code-review.md`` is
+re-classified ``(v)`` in the doc and removed from :data:`BYTE_FROZEN`, while every other bucket
+(i) file stays byte-frozen. The spec's own bucket (i) list is still §4.2's six — the exception is
+asserted explicitly rather than silently narrowing the spec's membership.
+
 **Two retired mechanisms are gone by design.** E7.1's ``destination:`` frontmatter marker travelled
 with the 17 files and no toolkit prompt carries it any more (asserted below, so it cannot creep
 back); and the "metadata-only edit changed no body" comparisons are now meaningful only for bucket
-(i), which is the one class whose contract is still "byte-identical".
+(i) minus class (v), which is the one class whose contract is still "byte-identical".
 """
 
 from __future__ import annotations
@@ -110,6 +118,14 @@ POST_CUTOVER = (
     "fix-commit.md",
 )
 
+#: The post-cutover **re-classification** (class (v)): a file §4.2 placed in bucket (i) that a
+#: later task had to edit, so it can no longer honestly be called "ship as-is". ``code-review.md``
+#: is C1.3's one file — its review-order step 6 gained the resolved-gate-commands guidance — and
+#: it is deliberately **not** folded into bucket (ii) (whose five files are fixed by §4.2 as
+#: product-neutralised) or bucket (iv) (which means "added after the cutover"). Every other
+#: bucket-(i) file stays byte-frozen.
+RECLASSIFIED_AFTER_CUTOVER = ("code-review.md",)
+
 #: Every prompt the toolkit ships, and the only files the table may list.
 TOOLKIT_PROMPTS = (
     *BUCKET_GENERIC,
@@ -119,7 +135,12 @@ TOOLKIT_PROMPTS = (
 )
 
 EXPECTED_CLASS: dict[str, str] = {
-    **{name: "i" for name in BUCKET_GENERIC},
+    **{
+        name: "i"
+        for name in BUCKET_GENERIC
+        if name not in RECLASSIFIED_AFTER_CUTOVER
+    },
+    **{name: "v" for name in RECLASSIFIED_AFTER_CUTOVER},
     **{name: "ii" for name in BUCKET_MIXED},
     **{name: "iii" for name in BUCKET_RETAINED},
     **{name: "iv" for name in POST_CUTOVER},
@@ -131,6 +152,7 @@ ACTION_BY_CLASS = {
     "ii": "neutralised in E7.2",
     "iii": "retained and neutralised in MF.2",
     "iv": "added after the cutover",
+    "v": "re-classified out of (i) after the cutover (C1.3)",
 }
 
 #: The destination cell for every class: all fourteen stay in the toolkit. The seventeen
@@ -142,10 +164,13 @@ TARGET_DESTINATION = "aidw/prompts/"
 #: cannot creep back into a prompt body, where it would render into the agent message.
 RETIRED_MARKER = "destination:"
 
-#: Bucket (i) alone is byte-frozen: it is the class whose action was "ship as-is". Buckets
-#: (ii)/(iii) were edited by E7.2 and MF.2 respectively, and their contracts are
-#: ``tests/test_prompt_neutrality.py``.
-BYTE_FROZEN = BUCKET_GENERIC
+#: Bucket (i) minus the post-cutover re-classification is byte-frozen: it is the class whose
+#: action was "ship as-is". Buckets (ii)/(iii) were edited by E7.2 and MF.2 respectively, class
+#: (v) was edited by C1.3, and their contracts are ``tests/test_prompt_neutrality.py`` (for the
+#: neutralised four) and the C1.3 gate-block tests.
+BYTE_FROZEN = tuple(
+    name for name in BUCKET_GENERIC if name not in RECLASSIFIED_AFTER_CUTOVER
+)
 
 #: The positional variables each retained default must declare, as its stage passes them
 #: (``aidw/stage_registry.py``): P1 passes phase/epic/task, I3 the branch, I4 branch+base.
@@ -354,7 +379,7 @@ def test_each_row_states_its_class_action_and_destination():
     """Action and destination follow the class; the table states one of each per row."""
     for name, (class_cell, action, destination) in _table_rows().items():
         expected_class = EXPECTED_CLASS[name]
-        (shown,) = re.findall(r"\((iv|i{1,3})\)", class_cell) or [""]
+        (shown,) = re.findall(r"\((iv|v|i{1,3})\)", class_cell) or [""]
 
         assert shown == expected_class, (
             f"{name}: classified as ({shown}), the cutover says ({expected_class})"
@@ -384,6 +409,26 @@ def test_the_table_parser_fails_closed_on_a_malformed_row():
         _table_rows(duplicate)
 
 
+def test_the_reclassified_prompt_is_out_of_the_spec_bucket_and_the_freeze():
+    """C1.3's one class-(v) file: §4.2 still says (i), the tree no longer can.
+
+    §4.2's bucket-(i) list is a historical authoring claim, so it is kept verbatim (the test
+    above still reads it). What must not survive is the *freeze*: a file whose bytes changed
+    cannot be called byte-identical to its baseline without the guard disagreeing with the
+    tree. The exception is asserted in both directions, so neither the doc nor the constant
+    can drift and no second file can quietly leave the freeze.
+    """
+    assert RECLASSIFIED_AFTER_CUTOVER == ("code-review.md",)
+    assert EXPECTED_CLASS["code-review.md"] == "v"
+    assert "code-review.md" in BUCKET_GENERIC
+    assert "code-review.md" not in BYTE_FROZEN
+    # The split is complete: every §4.2 (i) file is either still frozen or explicitly freed.
+    assert set(BYTE_FROZEN) | set(RECLASSIFIED_AFTER_CUTOVER) == set(BUCKET_GENERIC)
+    assert set(BYTE_FROZEN) & set(RECLASSIFIED_AFTER_CUTOVER) == set()
+    # Non-vacuous: the file really did move, which is why the reclassification is required.
+    assert _raw("code-review.md") != _parent_prompt_text()["code-review.md"]
+
+
 # ---------------------------------------------------------------------------
 # The retired marker and the surviving byte-frozen class
 # ---------------------------------------------------------------------------
@@ -406,9 +451,10 @@ def test_no_toolkit_prompt_carries_the_retired_destination_marker(name: str) -> 
 def test_bucket_i_prompts_are_unchanged_since_the_pre_marker_baseline(name: str) -> None:
     """Bucket (i)'s action is "ship as-is", so its bytes must not have moved.
 
-    Scoped to bucket (i): §5.4 excludes bucket (ii) from byte-frozen coverage precisely because
-    E7.2 neutralised it, bucket (iii) was rewritten at MF.2, and the contracts for both are
-    ``tests/test_prompt_neutrality.py``.
+    Scoped to bucket (i) minus class (v): §5.4 excludes bucket (ii) from byte-frozen coverage
+    precisely because E7.2 neutralised it, bucket (iii) was rewritten at MF.2, and C1.3 edited
+    ``code-review.md`` (class (v), ``test_the_reclassified_prompt_is_out_of_the_spec_bucket_and_the_freeze``).
+    The contracts for the neutralised files are ``tests/test_prompt_neutrality.py``.
     """
     assert _raw(name) == _parent_prompt_text()[name]
 

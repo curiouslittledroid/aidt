@@ -46,8 +46,11 @@ stage's artifacts, specs, the roadmap, or architecture docs.
 3. Read the task prompt (`paths.task_prompts_dir`/`<branch>-prompt.md`) and the implementation's final
    response for the task id, purpose, scope, deviations, and non-goals.
 4. Run the **full verification gate** and capture the real output of each command. The commands are
-   the **repo's own**, taken by name from its `aidw/conventions.md`, its root `AGENTS.md`, or the
-   task prompt for this task — never inlined here:
+   the **repo's own**. When this prompt carries a **resolved gate commands** block, that block is the
+   authoritative source: the repo's own gate commands, taken verbatim from its root `AGENTS.md`
+   and/or its `aidw/conventions.md` and injected by the renderer. When no such block is present,
+   take the commands by name from its `aidw/conventions.md`, its root `AGENTS.md`, or the task
+   prompt for this task.
    ```bash
    <the repo's full lint command>
    <the repo's full build command>

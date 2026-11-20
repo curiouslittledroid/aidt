@@ -355,6 +355,74 @@ def test_c1_2_sections_and_decision_row_record_the_gate_heading_contract() -> No
     assert not row.startswith("| Z15 |")
 
 
+def test_c1_3_section_7_3_and_decision_row_record_the_gate_block_injection() -> None:
+    """C1.3: §7.3 gets the injection step and one §17 row records the prompt-fixed choices.
+
+    Matched by task id + wording, never by a ``Z`` number (``aidw/conventions.md`` forbids
+    reusing or renumbering an id; the next free id was ``Z17``). C1.1's and C1.2's claims
+    must survive: C1.3 adds a *consumer* of the resolved block, not a second resolution.
+    """
+    design = _design_md()
+
+    # Whitespace-flattened: the steps are hard-wrapped, and the pinned sentences span lines.
+    block73 = " ".join(_section_73_block(design).split())
+    assert "resolved gate commands" in block73
+    assert "`aidw/prompts.py:GATE_PROMPTS`" in block73
+    assert "`## Resolved gate commands" in block73
+    # The shared resolution and its single-consumer wrapper are both named.
+    assert "`aidw/prompts.py:resolved_gate_block`" in block73
+    assert "`aidw/workflows/prompt.py:_gate_block`" in block73
+    # The five prompts are named so a reader can check the set without reading the code.
+    for basename in (
+        "`impliment-task.md`",
+        "`test.md`",
+        "`fix-next-review-followup.md`",
+        "`record-implementation-results.md`",
+        "`code-review.md`",
+    ):
+        assert basename in block73, basename
+    # The two hard guarantees: the wrapper idiom stays, no-resolution is byte-identity.
+    assert "`aidw gate run <key> $SCOPE -- <command>`" in block73
+    assert "byte-identically" in block73
+    assert "never injects an `unavailable` note" in block73
+    # C1.1's split is not undone by this task.
+    assert "The root `AGENTS.md` is **not** appended" in block73
+    assert "`append_agents_md: true`" in block73
+
+    decisions = _section(design, "## 17. Resolved decisions", "## 18. Risks")
+    rows = [
+        line
+        for line in decisions.splitlines()
+        if re.match(r"^\| Z\d+ \|", line)
+        and "C1.3" in line
+        and "GATE_PROMPTS" in line
+        and "resolved_gate_block" in line
+    ]
+    assert len(rows) == 1, f"expected exactly one C1.3 decision row, found {len(rows)}"
+    row = rows[0]
+    assert "§§7.3, 8.2" in row
+    assert "`inject_gate_block" in row
+    assert "Prompt-fixed decisions" in row
+    for decision in ("(a)", "(b)", "(c)", "(d)", "(e)", "(f)"):
+        assert decision in row, decision
+    # The duplication corner is decided, not left silent: the focused block is authoritative.
+    assert "authoritative" in row
+    # The code-review re-classification is named with its new class, not as a weaker guard.
+    assert "byte-frozen" in row and "class (v)" in row
+    # The touched set is named, so a later reader can find the contract tests.
+    for path in (
+        "aidw/prompts.py",
+        "aidw/workflows/prompt.py",
+        "aidw/runner.py",
+        "prompts/code-review.md",
+        "docs/migration/prompt-classification.md",
+        "tests/test_conventions_injection.py",
+        "tests/test_prompt_classification.py",
+    ):
+        assert path in row, path
+    assert not row.startswith("| Z16 |")
+
+
 def _section_83_block(design: str) -> str:
     """The §8.3 ``aidw review`` block: its heading up to the §8.4 heading."""
     start = design.index("### 8.3 `aidw review --pr <n>`")

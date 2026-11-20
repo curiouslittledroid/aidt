@@ -99,7 +99,7 @@ heading. This epic removes the duplication and makes gate commands resolve once,
   - Tests: `tests/test_prompt_workflow.py`, `tests/test_doctor.py`.
   - Notes: Root cause observed in Mythical Forge: `aidw/conventions.md` uses `## Gate commands`, `_GATES_HEADING` is exactly `## Gates`, so every prompt-workflow evidence bundle reported the gate commands unavailable and the prompt reviewer could not verify the prompt's acceptance commands against the repo's real gates.
 
-- [ ] **C1.3. Inline the resolved gate commands into the stage prompts that reference them** (Design 7.3, Design 8.2)
+- [x] **C1.3. Inline the resolved gate commands into the stage prompts that reference them** (Design 7.3, Design 8.2)
   - Done when: the stage prompts that today say "never inlined here — take them from conventions.md" (`prompts/impliment-task.md`, `prompts/test.md`, `prompts/fix-next-review-followup.md`, `prompts/record-implementation-results.md`, `prompts/code-review.md`) instead carry the target repo's resolved gate block — the exact `aidw gate run <key> <scope> -- <command>` lines from the single conventions channel — while a repo with no conventions keeps the pointer behaviour; rendering is covered by tests with no Pi model invoked; and the five gates above are green.
   - Deliverable: `aidw/prompts.py` (inject the gate block into the named prompts), the five prompt files, design.md §7.3, and the tests below.
   - Tests: `tests/test_prompts.py`, `tests/test_inventory.py`, `tests/test_design_doc.py`.

@@ -33,7 +33,7 @@ The verdict is independent agent evidence. It is not GitHub approval or a replac
    - Assert behavior a user or caller can observe, or a documented internal contract.
    - Would fail under a broken implementation.
    - Do not copy implementation logic or hide the scenario in setup.
-6. Run focused checks that can confirm or disprove a claim that could change a finding or verdict.
+6. Run focused checks that can confirm or disprove a claim that could change a finding or verdict. Use the repository's own commands. When this prompt carries a **resolved gate commands** block, that block is the authoritative source: the repository's gate commands, taken verbatim from its root `AGENTS.md` and/or its `aidw/conventions.md` and injected by the renderer. When no such block is present, take the commands by name from `aidw/conventions.md` or the root `AGENTS.md`. Record a passing outcome through `aidw gate run <key> -- <command>` when a later stage should cite it; a check run only to disprove a finding may stay a bare command.
 7. **Check specialist coverage.** Identify security, privacy, concurrency, accessibility, internationalization, or domain-specific work. Mark a risk unverified when the reviewer lacks the evidence or skill to judge it. Use `Blocked` when that gap could hide a problem that breaks a rule and no qualified reviewer covers it.
 8. **Report findings.** Return actionable findings in priority order using the format below.
 

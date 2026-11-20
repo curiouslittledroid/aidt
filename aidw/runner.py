@@ -37,7 +37,7 @@ from aidw.paths import (
     STAGE_ENV_VAR,
 )
 from aidw.progress import ProgressIndicator, resolve_enabled
-from aidw.prompts import inject_repo_conventions, render_prompt_file
+from aidw.prompts import inject_gate_block, inject_repo_conventions, render_prompt_file
 from aidw.report import cost_note
 from aidw.target_config import SOURCE_CONFIG, ResolvedConfig
 from aidw.state import (
@@ -767,6 +767,15 @@ def run_stage(
     # never adds noise or fails a stage. ``repo_root`` is the target root: reading
     # ``toolkit_root()`` would pass every self-hosted test and break only after extraction.
     rendered = inject_repo_conventions(rendered, spec.prompt, repo_root)
+    # C1.3 (design §7.3 step 5): the five gate-recording prompts receive the target's
+    # **resolved** gate commands, appended verbatim under a source-labelled header, so the
+    # agent reads the repo's actual commands instead of re-deriving them from prose. Applied
+    # after the conventions block so the same text reaches both the written
+    # ``.rendered.md`` below and the stdin payload to Pi. A prompt outside ``GATE_PROMPTS``
+    # and a repo that resolves no gate section both return the text byte-identically — the
+    # evidence bundle's ``unavailable`` degrade is a different consumer and is never injected
+    # into a stage prompt. ``repo_root`` is the target root (AGENTS.md "Two roots").
+    rendered = inject_gate_block(rendered, spec.prompt, repo_root)
     directory = run_dir(runs_root, state.run_id)
     # W1.2: a dry run writes no ``prompts/<stage>.rendered.md``. The relative name stays
     # on the returned record (that is the file a real run would write, and the record's

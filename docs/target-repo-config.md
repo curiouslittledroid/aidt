@@ -74,7 +74,7 @@ In the tables below:
 | `schema_version` | integer | unset | The version of this schema the file is written against. Required whenever the file exists. A value **greater than** the toolkit's `SUPPORTED_SCHEMA_VERSION` (`1`) is refused (D10, §3.11): upgrade `aidt`, or lower the value. |
 | `requires_toolkit` | string | unset | An optional minimum toolkit version as a PEP 440 specifier (`">=1.0.0"`), compared with `packaging`; the toolkit refuses to run when its own version does not satisfy it, or when the specifier is not valid PEP 440 (D10, §3.11). |
 | `max_revisions` | integer | `3` | The revision budget of the `prompt` workflow (design §12): how many author→review→fix rounds run before the run blocks. `aidw prompt --max-revisions` overrides it; see the precedence section. |
-| `gates_heading` | string | unset | An additional heading that introduces the target's gate commands, recognised beside the two built-in headings `## Gates` and `## Gate commands` (C1.2, design §7.3 step 4). The value is the **full heading line including its `## ` prefix** — for example `gates_heading: "## Verification gates"` — matched verbatim by the same prefix rule, never a bare title the code prefixes. It is read by the prompt workflow's evidence-bundle gate list (`aidw/workflows/prompt.py:_gate_block`) from `<target>/AGENTS.md` and `<target>/aidw/conventions.md`; an empty string is an error naming the field. A non-standard heading that is neither built-in nor declared leaves the bundle's gate list `unavailable` (a normal degraded state) and `aidw doctor` reports it as a `gates heading` WARN. |
+| `gates_heading` | string | unset | An additional heading that introduces the target's gate commands, recognised beside the two built-in headings `## Gates` and `## Gate commands` (C1.2, design §7.3 step 4). The value is the **full heading line including its `## ` prefix** — for example `gates_heading: "## Verification gates"` — matched verbatim by the same prefix rule, never a bare title the code prefixes. It is read from `<target>/AGENTS.md` and `<target>/aidw/conventions.md` by `aidw/prompts.py:resolved_gate_block`, the one resolution both consumers use: the prompt workflow's evidence-bundle gate list (`aidw/workflows/prompt.py:_gate_block`, which maps a miss to `unavailable`) and the resolved gate block injected into the five gate-recording prompts (C1.3, design §7.3 step 5); an empty string is an error naming the field. A non-standard heading that is neither built-in nor declared leaves the bundle's gate list `unavailable` (a normal degraded state) and `aidw doctor` reports it as a `gates heading` WARN. |
 | `repo` | mapping | unset | Repository and branch conventions (two fields below). |
 | `paths` | mapping | unset | Per-repo path conventions (seven fields below). |
 | `workflows` | mapping, open | unset | Workflow overrides keyed by workflow name. An open map, so a repo may add its own workflow as well as override `prompt`/`implement` (D12). |
@@ -487,8 +487,9 @@ declared it).
   §3.11 (the D10 refusal), §3.12 (repo layout).
 - `design.md` §12 (`max_revisions`), §5 (agent configs), §11 (roadmap).
 - `<target>/AGENTS.md` — the project's system prompt, loaded by Pi as project context, and the
-  first of the two D16 sources the prompt workflow's gate list reads
-  (`aidw/workflows/prompt.py:_gate_block`). It is **not** appended to rendered prompts (C1.1,
-  design §7.3/§17 Z15).
+  first of the two D16 sources the gate list is resolved from
+  (`aidw/prompts.py:resolved_gate_block`; the evidence bundle's
+  `aidw/workflows/prompt.py:_gate_block` wraps it). It is **not** appended to rendered prompts
+  (C1.1, design §7.3/§17 Z15).
 - The optional `<target>/aidw/conventions.md` — repo conventions injected into rendered prompts
   (D16/§3.8).
