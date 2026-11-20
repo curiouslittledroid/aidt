@@ -47,3 +47,36 @@ class RunLogger:
 
     def section(self, title: str) -> None:
         self._write("----", title)
+
+
+class NullLogger:
+    """``RunLogger``'s interface with **no** run directory and no file (W1.2, design §9.4).
+
+    A ``--dry-run`` creates no run, so it cannot construct a :class:`RunLogger`: that
+    constructor mkdirs the run directory, which would resurrect the very phantom run the
+    no-write rule exists to prevent. This class keeps the callers' contract instead —
+    ``info``/``warn``/``error``/``section`` and :meth:`RunLogger._write`'s
+    ``<ts> [LEVEL] <msg>`` line — and echoes to stderr exactly when
+    ``RunLogger(stream=True)`` would, so a plan on an interactive terminal prints the same
+    lines a real run prints there and nothing is opened or created.
+    """
+
+    def __init__(self, *, stream: bool = False) -> None:
+        self.stream = stream
+
+    def _write(self, level: str, message: str) -> None:
+        if self.stream:
+            line = f"{utcnow_iso()} [{level}] {message}"
+            print(line, file=sys.stderr, flush=True)
+
+    def info(self, message: str) -> None:
+        self._write("INFO", message)
+
+    def warn(self, message: str) -> None:
+        self._write("WARN", message)
+
+    def error(self, message: str) -> None:
+        self._write("ERROR", message)
+
+    def section(self, title: str) -> None:
+        self._write("----", title)

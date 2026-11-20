@@ -56,6 +56,7 @@ from aidw.config import ERROR, AgentConfig, load_all
 from aidw.log import RunLogger
 from aidw.paths import toolkit_root
 from aidw.prompts import render_prompt_file
+from aidw.prompts import inject_repo_conventions, render_prompt_file
 from aidw.runner import StageSpec, plan_stages, run_stage
 from aidw.state import SUCCEEDED, RunState, StageRecord, create_run, run_dir
 from aidw.target_config import (
@@ -215,9 +216,14 @@ def _dry_run(
         dry_run=True,
         runs_root=runs_root,
     )
-    rendered = (directory / "prompts" / f"{spec.name}.rendered.md").read_text(
-        encoding="utf-8"
-    )
+    # W1.2: a dry run writes no ``prompts/<stage>.rendered.md``; the text is computed with
+    # the same pure calls ``run_stage`` applies (pinned by
+    # `tests/test_conventions_injection.py::test_written_render_and_pi_stdin_receive_...`).
+    rendered = render_prompt_file(spec.prompt, list(spec.variables))
+    if spec.extra:
+        rendered = f"{rendered}\n\n{spec.extra}"
+    rendered = inject_repo_conventions(rendered, spec.prompt, target)
+    assert not (directory / "prompts" / f"{spec.name}.rendered.md").exists()
     return captured["argv"], rendered, record
 
 

@@ -144,12 +144,17 @@ from aidw.findings import (
     partition_findings,
 )
 from aidw.gates import GateOutcome, decide
-from aidw.log import RunLogger
+from aidw.log import NullLogger, RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.prompts import read_conventions_sources
 from aidw.report import empty_final_message_error, print_stage
 from aidw.roadmap import DONE_RE, TASK_RE, RoadmapTask, find_task, load_tasks
-from aidw.runner import StageSpec, declared_stage_issues, plan_stages, run_stage
+from aidw.runner import (
+    StageSpec,
+    declared_stage_issues,
+    plan_stages,
+    run_stage,
+)
 # ``DEFAULT_MAX_REVISIONS`` lives in ``aidw.target_config``, its single home (design
 # §12/H8). The direction must not be reversed: ``target_config`` is the low-level config
 # module, and importing this workflow module from it would be an import cycle.
@@ -170,8 +175,10 @@ from aidw.state import (
     SUCCEEDED,
     GateRecord,
     RunState,
+    PLANNED_RUN_DIR_TEXT,
     create_run,
     list_runs,
+    planned_run,
     run_dir,
     save,
     utcnow_iso,
@@ -2246,8 +2253,9 @@ def run(
     # stay locked until process exit. It lives in the state root, never in a target
     # repo or worktree (§3.1), and it is neither ``_STATE_LOCK`` (in-process, per
     # ``state.json`` write) nor ``--parallel`` (concurrent stages inside one run).
-    # A dry run reaches ``create_run`` too, so it holds and releases the same lock
-    # (against the control worktree, the only tree a dry run has).
+    # A dry run acquires the same lock (against the control worktree, the only tree a dry
+    # run has), so a peer run is refused here (exit 4, §19 item 8) before any plan output;
+    # the lock is released on every exit path.
     try:
         run_lock = lock.acquire(workspace.state_root, target.root)
     except lock.LockHeldError as exc:
@@ -2292,7 +2300,10 @@ def run(
             # EXTRACTION.md §3.11 (E8.2): what produced this run. One helper so the five
             # workflows cannot record different values for one config.
             config_schema_version, config_hash = config_identity(resolved_config)
-            state = create_run(
+            # W1.2: a plan creates no run — `planned_run` is `create_run` under the
+            # never-saved PLANNED_RUN_ID (identical signature, no write), and the plan's
+            # directory is the `<run dir>` placeholder a real run replaces with run_dir().
+            state = (planned_run if dry_run else create_run)(
                 runs_root,
                 target.root,
                 "prompt",
@@ -2304,10 +2315,15 @@ def run(
                 config_schema_version=config_schema_version,
                 config_hash=config_hash,
             )
-            directory = run_dir(runs_root, state.run_id)
-            logger = RunLogger(directory, stream=stream)
+            if dry_run:
+                directory = Path(PLANNED_RUN_DIR_TEXT)
+                logger = NullLogger(stream=stream)
+            else:
+                directory = run_dir(runs_root, state.run_id)
+                logger = RunLogger(directory, stream=stream)
         logger.info(f"prompt workflow {phase}/{epic}/{task}: {entry.title}")
-        print(f"run:    {state.run_id}")
+        if not dry_run:
+            print(f"run:    {state.run_id}")
         print(f"task:   {entry.title}")
 
         # --- stage selection (H1.2 req 4/5) --------------------------------------- #
@@ -2416,9 +2432,6 @@ def run(
                 config=resolved_config,
             )
             print(f"stage:  {rec2.name} [{rec2.status}] (planned) model={rec2.model}")
-            state.status = SUCCEEDED
-            state.resume = {"next_stage": None}
-            save(directory, state)
             print("dry-run complete; Pi not invoked")
             return 0
 

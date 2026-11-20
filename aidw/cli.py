@@ -30,7 +30,7 @@ from aidw.config import ERROR, WARNING, Issue, format_issues, load_all
 from aidw.doctor import run_doctor
 from aidw.gates import GateDefault
 from aidw.layout import LayoutError, check_layout
-from aidw.log import RunLogger
+from aidw.log import NullLogger, RunLogger
 from aidw.paths import (
     RUN_ID_ENV_VAR,
     STAGE_ENV_VAR,
@@ -941,7 +941,7 @@ def exec_stage(
     ),
     workflow: str = typer.Option("stage", "--workflow", help="Workflow label for the run."),
     label: str = typer.Option("manual", "--label", help="Run label (run id suffix)."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Plan only; do not invoke Pi."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Plan only; no writes."),
     strict: bool = typer.Option(False, "--strict", help="Fail on config warnings."),
     retry_transient: bool = typer.Option(
         True, "--retry-transient/--no-retry-transient",
@@ -985,7 +985,11 @@ def exec_stage(
     # `exec` resolves no target config (wiring the config preflight into it would change
     # its failure surface, which E8.2 does not own), so it records the toolkit version and
     # leaves both config fields `None` rather than asserting an identity it never used.
-    run = state_mod.create_run(
+    # W1.2: `exec --dry-run` is a plan, so it creates no run — the same rule the five
+    # workflows follow. `state_mod.planned_run` has `create_run`'s exact signature and
+    # publishes nothing, and `NullLogger` has `RunLogger`'s interface without the mkdir,
+    # so neither the run directory nor `state.json` nor a `run.log` is created.
+    run = (state_mod.planned_run if dry_run else state_mod.create_run)(
         runs_root,
         repo.root,
         workflow,
@@ -994,8 +998,12 @@ def exec_stage(
         branch=git.current_branch(repo.root),
         toolkit_version=__version__,
     )
-    directory = state_mod.run_dir(runs_root, run.run_id)
-    logger = RunLogger(directory, stream=bool(_state["verbose"]))
+    if dry_run:
+        directory = Path(state_mod.PLANNED_RUN_DIR_TEXT)
+        logger = NullLogger(stream=bool(_state["verbose"]))
+    else:
+        directory = state_mod.run_dir(runs_root, run.run_id)
+        logger = RunLogger(directory, stream=bool(_state["verbose"]))
     spec = StageSpec(
         name=prompt_path.stem,
         agent_id=agent,
@@ -1021,16 +1029,24 @@ def exec_stage(
         typer.echo(str(exc), err=True)
         raise typer.Exit(EXIT_USAGE) from exc
 
-    typer.echo(f"run:      {run.run_id}")
+    if not dry_run:
+        typer.echo(f"run:      {run.run_id}")
     for line in stage_lines(record, repo_root=repo.root):
         typer.echo(line)
-    if record.rendered_prompt:
+    # A dry run writes no `prompts/<stage>.rendered.md`, so it echoes no path: a *planned*
+    # path would name the run id this plan never created (W1.2 req 6). The real-run echo is
+    # unchanged.
+    if record.rendered_prompt and not dry_run:
         rendered_rel = (
             runs_root / run.run_id / record.rendered_prompt
         ).relative_to(state_root)
         typer.echo(f"rendered: {rendered_rel}")
 
-    if record.status == state_mod.SUCCEEDED and run.status != state_mod.SUCCEEDED:
+    if (
+        not dry_run
+        and record.status == state_mod.SUCCEEDED
+        and run.status != state_mod.SUCCEEDED
+    ):
         run.status = state_mod.SUCCEEDED
         state_mod.save(directory, run)
 

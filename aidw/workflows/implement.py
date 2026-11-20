@@ -131,7 +131,7 @@ from aidw import __version__, git, lock, roadmap, verification
 from aidw import stage_registry
 from aidw.config import ERROR, WARNING, format_issues, load_all
 from aidw.gates import decide
-from aidw.log import RunLogger
+from aidw.log import NullLogger, RunLogger
 from aidw.paths import TargetRepo, ToolkitPaths, WorkspacePaths
 from aidw.report import print_stage
 from aidw.runner import (
@@ -150,8 +150,10 @@ from aidw.state import (
     GateRecord,
     RunState,
     StageRecord,
+    PLANNED_RUN_DIR_TEXT,
     create_run,
     list_runs,
+    planned_run,
     run_dir,
     save,
     utcnow_iso,
@@ -1226,8 +1228,9 @@ def run(
     # stay locked until process exit. It lives in the state root, never in a target
     # repo or worktree (§3.1), and it is neither ``_STATE_LOCK`` (in-process, per
     # ``state.json`` write) nor ``--parallel`` (concurrent stages inside one run).
-    # A dry run reaches this line too (``create_run`` writes ``state.json``
-    # unconditionally), so it holds and releases the same lock.
+    # A dry run acquires the same lock, so a peer run in this worktree is refused
+    # (exit 4, §19 item 8) whether the invocation would write or merely plan; it holds
+    # and releases it on every exit path below.
     try:
         run_lock = lock.acquire(workspace.state_root, target.root)
     except lock.LockHeldError as exc:
@@ -1245,7 +1248,10 @@ def run(
             # EXTRACTION.md §3.11 (E8.2): what produced this run. One helper so the
             # five workflows cannot record different values for one config.
             config_schema_version, config_hash = config_identity(resolved_config)
-            state = create_run(
+            # W1.2: a plan creates no run — `planned_run` is `create_run` under the
+            # never-saved PLANNED_RUN_ID (identical signature, no write), and the plan's
+            # directory is the `<run dir>` placeholder a real run replaces with run_dir().
+            state = (planned_run if dry_run else create_run)(
                 runs_root,
                 target.root,
                 "implement",
@@ -1259,12 +1265,17 @@ def run(
             )
             if pr is not None:
                 state.pr = {**state.pr, "number": pr}
-            directory = run_dir(runs_root, state.run_id)
-            logger = RunLogger(directory, stream=stream)
-            save(directory, state)
+            if dry_run:
+                directory = Path(PLANNED_RUN_DIR_TEXT)
+                logger = NullLogger(stream=stream)
+            else:
+                directory = run_dir(runs_root, state.run_id)
+                logger = RunLogger(directory, stream=stream)
+                save(directory, state)
 
         logger.info(f"implement workflow {task_id}: {prompt_rel}")
-        print(f"run:    {state.run_id}")
+        if not dry_run:
+            print(f"run:    {state.run_id}")
         print(f"branch: {branch_name}")
         print(f"prompt: {prompt_rel}")
 
@@ -1285,8 +1296,6 @@ def run(
                 print(f"{entry.id} {record.name} [{record.status}] (planned) "
                       f"agent={record.agent} model={record.model}")
             print(f"gate (planned): {GATE}")
-            state.status = SUCCEEDED
-            save(directory, state)
             print("dry-run complete; Pi not invoked")
             return 0
 

@@ -21,8 +21,9 @@ from aidw.paths import (
 )
 from aidw.pi import AttemptDetail, PiResult, Usage
 from aidw import runner as runner_mod
+from aidw.prompts import render_prompt_file
 from aidw.runner import StageSpec, declared_stage_issues, resolve_prompt, run_stage
-from aidw.state import FAILED, SUCCEEDED, create_run
+from aidw.state import FAILED, SUCCEEDED, create_run, session_id
 
 
 def _noop_prompt() -> Path:
@@ -47,10 +48,13 @@ def test_resolve_prompt_by_path() -> None:
     assert resolved == _noop_prompt()
 
 
-def test_dry_run_writes_state_and_rendered_prompt(tmp_path: Path) -> None:
+def test_dry_run_does_not_persist_stage_state_or_rendered_prompt(tmp_path: Path) -> None:
+    """W1.2: planning returns metadata without adding stage artifacts or saving state."""
     agents, _ = load_all(toolkit_root(), repo_root())
     run = create_run(tmp_path, repo_root(), "stage", label="dry")
     logger = RunLogger(tmp_path / run.run_id)
+    directory = tmp_path / run.run_id
+    before_state = (directory / "state.json").read_bytes()
 
     record = run_stage(
         StageSpec(name="noop", agent_id="code-reviewer", prompt=_noop_prompt(), variables=[]),
@@ -63,20 +67,25 @@ def test_dry_run_writes_state_and_rendered_prompt(tmp_path: Path) -> None:
         runs_root=tmp_path,
     )
 
-    directory = tmp_path / run.run_id
-    assert (directory / "state.json").is_file()
-    assert (directory / "prompts" / "noop.rendered.md").is_file()
+    assert not (directory / "prompts" / "noop.rendered.md").exists()
+    assert (directory / "state.json").read_bytes() == before_state
+    # `state.record_stage` is in-memory and stays (W1.2 (c1)); it is the `save` that would
+    # publish evidence for a stage that never ran, so the record is planned but unwritten.
+    assert [item.name for item in run.stages] == ["noop"]
+    assert b'"noop"' not in before_state
+    assert record.name == "noop"
+    assert record.agent == "code-reviewer"
+    assert record.model
+    # W1.2 req 3: the returned record keeps the shape the workflows print, session id
+    # included — only the writes are suppressed.
+    assert record.session_id == session_id(run.run_id, "code-reviewer", "noop", shared=False)
     assert record.status == SUCCEEDED
     assert record.exit_code is None
-    assert run.status == SUCCEEDED
+    assert run.status != SUCCEEDED
 
 
-def test_run_stage_writes_under_the_threaded_runs_root(tmp_path: Path) -> None:
-    """``state.json`` and ``prompts/`` are siblings under the caller's ``runs_root``.
-
-    The toolkit-root fallback was deleted in E1.4: ``run_stage`` must not re-derive a
-    write directory, or the run would split across two locations.
-    """
+def test_run_stage_dry_run_does_not_recreate_a_toolkit_runs_tree(tmp_path: Path) -> None:
+    """The caller's runs root remains the only possible artifact location."""
     agents, _ = load_all(toolkit_root(), repo_root())
     run = create_run(tmp_path, repo_root(), "stage", label="threaded")
     logger = RunLogger(tmp_path / run.run_id)
@@ -93,8 +102,7 @@ def test_run_stage_writes_under_the_threaded_runs_root(tmp_path: Path) -> None:
     )
 
     directory = tmp_path / run.run_id
-    assert (directory / "state.json").is_file()
-    assert (directory / "prompts" / "noop.rendered.md").is_file()
+    assert not (directory / "prompts" / "noop.rendered.md").exists()
     assert not (toolkit_root() / "runs" / run.run_id).exists()
 
 
@@ -103,22 +111,9 @@ def test_dry_run_renders_variables(tmp_path: Path) -> None:
     run = create_run(tmp_path, repo_root(), "stage", label="dry")
     logger = RunLogger(tmp_path / run.run_id)
 
-    run_stage(
-        StageSpec(
-            name="task-prompt",
-            agent_id="task-author",
-            prompt=toolkit_root() / "prompts" / "task-prompt.md",
-            variables=["03", "E2", "E2.9"],
-        ),
-        repo_root=repo_root(),
-        toolkit_root=toolkit_root(),
-        state=run,
-        logger=logger,
-        agents=agents,
-        dry_run=True,
-        runs_root=tmp_path,
+    rendered = render_prompt_file(
+        toolkit_root() / "prompts" / "task-prompt.md", ["03", "E2", "E2.9"]
     )
-    rendered = (tmp_path / run.run_id / "prompts" / "task-prompt.rendered.md").read_text()
     assert "$1" not in rendered
     assert "$3" not in rendered
 
@@ -1058,7 +1053,12 @@ def _run_named_stage(tmp_path: Path, monkeypatch, name: str, *, dry_run: bool = 
         runs_root=tmp_path,
     )
     directory = tmp_path / run.run_id
-    rendered = (directory / "prompts" / f"{name}.rendered.md").read_text(encoding="utf-8")
+    # W1.2: a dry run writes no rendered prompt, so the real-run cases read it back and
+    # the dry-run case gets ``None`` (the file must not exist).
+    rendered_path = directory / "prompts" / f"{name}.rendered.md"
+    rendered = (
+        rendered_path.read_text(encoding="utf-8") if rendered_path.is_file() else None
+    )
     log = (directory / "run.log").read_text(encoding="utf-8")
     saved = json.loads((directory / "state.json").read_text(encoding="utf-8"))
     return record, rendered, saved, log
@@ -1104,12 +1104,14 @@ def test_the_dry_run_path_records_neither_the_size_nor_the_line(
     This is what keeps ``--dry-run`` output byte-identical to the pre-H2.1 plan: the
     record still gains the additive key (null), and nothing is printed.
     """
-    record, _rendered, saved, log = _run_named_stage(
+    record, rendered, saved, log = _run_named_stage(
         tmp_path, monkeypatch, "task-review-1", dry_run=True
     )
 
     assert record.status == SUCCEEDED
     assert record.rendered_chars is None
-    stage = next(item for item in saved["stages"] if item["name"] == "task-review-1")
-    assert stage["rendered_chars"] is None
+    # W1.2: the plan writes no rendered prompt and publishes no stage record at all, so
+    # the additive key cannot appear in `state.json` either.
+    assert rendered is None
+    assert saved["stages"] == []
     assert "rendered prompt" not in log

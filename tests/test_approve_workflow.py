@@ -81,6 +81,13 @@ class _FakeStages:
     def __call__(self, spec, **kwargs):
         self.names.append(spec.name)
         self.specs.append(spec)
+        if kwargs.get("dry_run"):
+            return StageRecord(
+                name=spec.name,
+                agent=spec.agent_id,
+                model="test/model",
+                status=SUCCEEDED,
+            )
         directory = run_dir(kwargs["runs_root"], kwargs["state"].run_id)
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
@@ -136,6 +143,8 @@ def test_dry_run_plans_stage_and_gate(tmp_path: Path, monkeypatch, capsys) -> No
     assert "child:  #101 Fix the loop" in out
     assert "approve-review-followups [succeeded] (planned) agent=review-approver" in out
     assert "gate (planned): approve-followups" in out
+    runs_root = _runs_root(tmp_path)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
 
 
 def test_gate_denied_stops_without_stage(tmp_path: Path, monkeypatch) -> None:

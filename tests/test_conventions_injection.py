@@ -132,6 +132,28 @@ def _target(
     return target
 
 
+def _render_text(
+    prompt: Path,
+    variables: list[str] | None = None,
+    extra: str = "",
+    repo_root: Path | None = None,
+) -> str:
+    """The text ``run_stage`` renders on the real-run path (W1.2).
+
+    A ``--dry-run`` writes no ``prompts/<stage>.rendered.md``, so this module computes the
+    text with the same two pure calls the runner applies, in the same order: the prompt and
+    its positional variables, then ``spec.extra``, then the target repo's conventions last.
+    ``test_written_render_and_pi_stdin_receive_the_same_injection`` pins it against the file
+    (and Pi stdin payload) a **real** run produces, so the two cannot drift.
+    """
+    rendered = render_prompt_file(prompt, list(variables or []))
+    if extra:
+        rendered = f"{rendered}\n\n{extra}"
+    if repo_root is not None:
+        rendered = inject_repo_conventions(rendered, prompt, repo_root)
+    return rendered
+
+
 def _dry_run(
     tmp_path: Path,
     target: Path,
@@ -141,9 +163,9 @@ def _dry_run(
     variables: list[str] | None = None,
     extra: str | None = None,
 ) -> tuple[str, str]:
-    """Dry-run one stage against ``target``; return the rendered text and ``state.json``.
+    """Dry-run one stage against ``target``; return the rendered text and the record.
 
-    The rendered file and the record's status are the two observable outcomes the task
+    The rendered text and the record's status are the two observable outcomes the task
     cares about (the stdin payload is the same string, ``run_stage`` passes ``rendered``).
     """
     runs_root = tmp_path / "runs"
@@ -166,13 +188,15 @@ def _dry_run(
         dry_run=True,
         runs_root=runs_root,
     )
-    rendered = (
+    # W1.2: a dry run writes no ``prompts/<stage>.rendered.md``, so the text is computed
+    # with the same pure calls ``run_stage`` applies (pinned against a real run's file
+    # below, in ``test_written_render_and_pi_stdin_receive_the_same_injection``).
+    rendered = _render_text(prompt, variables, extra or "", target)
+    assert not (
         run_dir(runs_root, state.run_id) / "prompts" / f"{name}.rendered.md"
-    ).read_text(encoding="utf-8")
+    ).exists()
     assert record.status == SUCCEEDED
-    return rendered, (run_dir(runs_root, state.run_id) / "state.json").read_text(
-        encoding="utf-8"
-    )
+    return rendered, record
 
 
 # --------------------------------------------------------------------------- #
@@ -188,7 +212,7 @@ def test_each_of_the_five_prompts_receives_both_sources_in_d16_order(
     target = _target(tmp_path)
     prompt = toolkit_root() / "prompts" / basename
 
-    rendered, state_json = _dry_run(
+    rendered, record = _dry_run(
         tmp_path,
         target,
         name=basename.removesuffix(".md"),
@@ -209,7 +233,7 @@ def test_each_of_the_five_prompts_receives_both_sources_in_d16_order(
     assert "Stack rules the toolkit must not inline." in rendered
     # Injected after the prompt body, never before it.
     assert rendered.index("## Repo conventions (AGENTS.md)") > 0
-    assert '"status": "succeeded"' in state_json
+    assert record.status == SUCCEEDED
 
 
 def test_the_five_prompts_are_exactly_the_injection_set() -> None:
@@ -347,7 +371,11 @@ def test_written_render_and_pi_stdin_receive_the_same_injection(
 
     rendered_path = run_dir(runs_root, state.run_id) / "prompts" / "test-with-stdin.rendered.md"
     assert record.status == SUCCEEDED
-    assert captured["prompt"] == rendered_path.read_text(encoding="utf-8")
+    written = rendered_path.read_text(encoding="utf-8")
+    assert captured["prompt"] == written
+    # W1.2: the dry-run plan's text is this same string — the helper the dry-run tests use
+    # is pinned to the real-run file, so the two compositions cannot drift.
+    assert _render_text(toolkit_root() / "prompts" / "test.md", [], "", target) == written
     assert CONVENTIONS_SENTINEL in captured["prompt"]
 
 
@@ -600,7 +628,7 @@ def test_a_non_utf8_conventions_file_does_not_fail_a_dry_run(
     target = _target(tmp_path)
     (target / "aidw" / "conventions.md").write_bytes(b"\xff invalid utf8")
 
-    rendered, state_json = _dry_run(
+    rendered, record = _dry_run(
         tmp_path,
         target,
         name="test",
@@ -609,7 +637,8 @@ def test_a_non_utf8_conventions_file_does_not_fail_a_dry_run(
 
     assert AGENTS_SENTINEL in rendered
     assert CONVENTIONS_SENTINEL not in rendered
-    assert '"status": "succeeded"' in state_json
+    # An unreadable conventions file degrades; the stage still plans successfully.
+    assert record.status == SUCCEEDED
 
 
 def test_an_empty_source_contributes_no_dangling_header(tmp_path: Path) -> None:

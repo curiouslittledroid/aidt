@@ -65,26 +65,38 @@ def _runs_root(repo: Path) -> Path:
     return WorkspacePaths.resolve(TargetRepo.resolve(repo)).state_root / "runs"
 
 
-def _spy_run_stage(monkeypatch, module) -> list[tuple[Path, Path]]:
-    """Wrap a workflow module's ``run_stage``, recording ``(repo_root, toolkit_root)``."""
+def _spy_run_stage(monkeypatch, module) -> list[tuple[Path, Path, Path]]:
+    """Wrap a workflow module's ``run_stage``: ``(repo_root, toolkit_root, runs_root)``."""
     real = module.run_stage
-    calls: list[tuple[Path, Path]] = []
+    calls: list[tuple[Path, Path, Path]] = []
 
     def spy(spec, **kwargs):
-        calls.append((kwargs["repo_root"], kwargs["toolkit_root"]))
+        calls.append(
+            (kwargs["repo_root"], kwargs["toolkit_root"], kwargs["runs_root"])
+        )
         return real(spec, **kwargs)
 
     monkeypatch.setattr(module, "run_stage", spy)
     return calls
 
 
-def _assert_two_roots(calls: list[tuple[Path, Path]], target: Path) -> None:
-    """Every planned stage reads the target working tree and the toolkit assets."""
+def _assert_two_roots(calls: list[tuple[Path, Path, Path]], target: Path) -> None:
+    """Every planned stage reads the target tree, the toolkit assets and the target state."""
     assert calls, "no stages were planned"
     assert toolkit_root().resolve() != target.resolve()
-    for repo_root, toolkit in calls:
+    for repo_root, toolkit, runs_root in calls:
         assert repo_root == target.resolve()
         assert toolkit == toolkit_root()
+        # W1.2: a dry run writes no run state, so the planned `runs_root` — not a written
+        # directory — is what proves the state root is the *target's*.
+        assert runs_root == _runs_root(target)
+
+
+def _assert_no_run_state(target: Path) -> None:
+    """W1.2: a dry run creates no run — under the target or under the toolkit."""
+    runs = _runs_root(target)
+    assert not runs.exists() or list(runs.iterdir()) == []
+    assert not (toolkit_root() / "runs").exists()
 
 
 def test_version_command() -> None:
@@ -301,12 +313,8 @@ def test_runs_show_recovers_tool_time_from_an_old_stage_log(tmp_path: Path) -> N
     assert "tools:  read=42s bash=8s" in shown.stdout
 
 
-def test_exec_dry_run_writes_one_run_under_the_state_root(tmp_path: Path) -> None:
-    """E1.4 ``_run_dir`` move: state.json, run.log and rendered prompt are siblings.
-
-    The literal ``rg`` gate cannot catch a split here (a stray ``toolkit_root() /
-    "runs"`` matches neither banned name), so this test proves the run is whole.
-    """
+def test_exec_dry_run_creates_no_run_and_prints_no_rendered_path(tmp_path: Path) -> None:
+    """W1.2: ``exec --dry-run`` is a plan, not a run-store write."""
     _init_repo(tmp_path)
     result = runner.invoke(
         app,
@@ -327,19 +335,57 @@ def test_exec_dry_run_writes_one_run_under_the_state_root(tmp_path: Path) -> Non
     )
     assert result.exit_code == 0, result.output
     assert "aidt/runs" not in result.stdout
-    assert "rendered: runs/" in result.stdout
+    assert "rendered:" not in result.stdout
+    # W1.2 (c2): no run id is minted, so no `run:` line is printed either.
+    assert "run:" not in result.stdout
+    runs_root = _runs_root(tmp_path)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    # `<run dir>` is relative, so a stray write would land in the working tree.
+    assert not Path(state_mod.PLANNED_RUN_DIR_TEXT).exists()
 
-    run_dirs = list(_runs_root(tmp_path).iterdir())
-    assert len(run_dirs) == 1
-    directory = run_dirs[0]
-    assert (directory / "state.json").is_file()
-    assert (directory / "run.log").is_file()
-    assert (directory / "prompts" / "code-review.rendered.md").is_file()
-    exec_state = state_mod.load(directory)
-    assert exec_state.toolkit_version == __version__
-    assert exec_state.config_schema_version is None
-    assert exec_state.config_hash is None
-    assert not (toolkit_root() / "runs" / directory.name).exists()
+
+def test_exec_dry_run_help_advertises_no_writes() -> None:
+    result = runner.invoke(app, ["exec", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "Plan only; no writes." in result.stdout
+
+
+def test_exec_real_run_still_prints_rendered_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The no-write dry-run branch must not remove the real-run echo."""
+    _init_repo(tmp_path)
+
+    def fake_run_stage(spec, **_kwargs):
+        return state_mod.StageRecord(
+            name=spec.name,
+            agent=spec.agent_id,
+            model="test/model",
+            status=state_mod.SUCCEEDED,
+            rendered_prompt="prompts/code-review.rendered.md",
+        )
+
+    monkeypatch.setattr("aidw.cli.run_stage", fake_run_stage)
+    result = runner.invoke(
+        app,
+        [
+            "--repo",
+            str(tmp_path),
+            "exec",
+            "--agent",
+            "code-reviewer",
+            "--prompt",
+            "code-review",
+            "--workflow",
+            "stage",
+            "--label",
+            "cli-real",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "rendered: runs/" in result.stdout
 
 
 # --------------------------------------------------------------------------- #
@@ -526,9 +572,7 @@ def test_prompt_dry_run_reads_target_and_uses_toolkit_prompts(
 
     assert result.exit_code == 0, result.output
     _assert_two_roots(calls, target)
-    runs = list(_runs_root(target).iterdir())
-    assert len(runs) == 1
-    assert not (toolkit_root() / "runs" / runs[0].name).exists()
+    _assert_no_run_state(target)
 
 
 def test_implement_dry_run_reads_target_and_uses_toolkit_prompts(
@@ -548,9 +592,7 @@ def test_implement_dry_run_reads_target_and_uses_toolkit_prompts(
 
     assert result.exit_code == 0, result.output
     _assert_two_roots(calls, target)
-    runs = list(_runs_root(target).iterdir())
-    assert len(runs) == 1
-    assert not (toolkit_root() / "runs" / runs[0].name).exists()
+    _assert_no_run_state(target)
 
 
 def test_review_dry_run_reads_target_and_uses_toolkit_prompts(
@@ -565,7 +607,7 @@ def test_review_dry_run_reads_target_and_uses_toolkit_prompts(
 
     assert result.exit_code == 0, result.output
     _assert_two_roots(calls, target)
-    assert list(_runs_root(target).iterdir())
+    _assert_no_run_state(target)
 
 
 def test_fix_dry_run_reads_target_and_uses_toolkit_prompts(
@@ -579,7 +621,7 @@ def test_fix_dry_run_reads_target_and_uses_toolkit_prompts(
 
     assert result.exit_code == 0, result.output
     _assert_two_roots(calls, target)
-    assert list(_runs_root(target).iterdir())
+    _assert_no_run_state(target)
 
 
 def test_approve_dry_run_reads_target_and_uses_toolkit_prompts(
@@ -595,7 +637,7 @@ def test_approve_dry_run_reads_target_and_uses_toolkit_prompts(
 
     assert result.exit_code == 0, result.output
     _assert_two_roots(calls, target)
-    assert list(_runs_root(target).iterdir())
+    _assert_no_run_state(target)
 
 
 def test_exec_resolves_prompts_from_toolkit_and_state_from_target(
@@ -634,7 +676,7 @@ def test_exec_resolves_prompts_from_toolkit_and_state_from_target(
     assert result.exit_code == 0, result.output
     assert resolved == [toolkit_root()]
     _assert_two_roots(calls, target)
-    assert len(list(_runs_root(target).iterdir())) == 1
+    _assert_no_run_state(target)
 
 
 # --------------------------------------------------------------------------- #

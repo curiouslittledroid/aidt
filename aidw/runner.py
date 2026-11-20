@@ -126,7 +126,6 @@ DEFAULT_PROGRESS: bool | None = None
 #: lock; only the short record/save sections are held.
 _STATE_LOCK = threading.Lock()
 
-
 def resolve_prompt(
     toolkit_root: Path,
     target_root: Path,
@@ -767,10 +766,14 @@ def run_stage(
     # ``toolkit_root()`` would pass every self-hosted test and break only after extraction.
     rendered = inject_repo_conventions(rendered, spec.prompt, repo_root)
     directory = run_dir(runs_root, state.run_id)
-    prompts_dir = directory / "prompts"
-    prompts_dir.mkdir(parents=True, exist_ok=True)
-    rendered_path = prompts_dir / f"{spec.name}.rendered.md"
-    rendered_path.write_text(rendered, encoding="utf-8")
+    # W1.2: a dry run writes no ``prompts/<stage>.rendered.md``. The relative name stays
+    # on the returned record (that is the file a real run would write, and the record's
+    # shape is the workflows' contract), but neither the directory nor the file is
+    # created — creating them is what made a plan into a phantom run.
+    rendered_path = directory / "prompts" / f"{spec.name}.rendered.md"
+    if not dry_run:
+        rendered_path.parent.mkdir(parents=True, exist_ok=True)
+        rendered_path.write_text(rendered, encoding="utf-8")
 
     sid = session_id(state.run_id, agent.id, spec.name, shared=agent.session == "shared")
     # ``run_stage`` is the only place the target root is in scope, so it — not
@@ -831,9 +834,14 @@ def run_stage(
         rendered_chars=rendered_chars,
         artifacts={"prompt_source": str(spec.prompt)},
     )
+    # W1.2: only a real run publishes the PLANNED record. Recording it in memory stays
+    # (the workflow prints the returned record either way, and `state` is the caller's);
+    # the `save` is what would create the run directory and the evidence for a stage that
+    # never ran, so it is the part gated on `not dry_run`.
     with _STATE_LOCK:
         state.record_stage(record)
-        save(directory, state)
+        if not dry_run:
+            save(directory, state)
 
     logger.section(f"stage {spec.name} ({agent.id})")
     logger.info(f"model={agent.qualified_model} session={sid}")
@@ -848,9 +856,6 @@ def run_stage(
         logger.info("argv: " + _redact_argv(argv))
         record.status = SUCCEEDED
         record.ended_at = utcnow_iso()
-        with _STATE_LOCK:
-            state.status = SUCCEEDED
-            save(directory, state)
         return record
 
     with _STATE_LOCK:
@@ -978,6 +983,7 @@ def record_skipped(
     directory: Path,
     agents: Mapping[str, AgentConfig],
     reason: str,
+    dry_run: bool = False,
 ) -> StageRecord:
     """Record a stage the workflow withheld before Pi was ever invoked (H3.2 req 4).
 
@@ -985,6 +991,10 @@ def record_skipped(
     :class:`~aidw.state.StageRecord` published exactly the way ``run_stage`` publishes
     its own — under :data:`_STATE_LOCK`, through ``state.record_stage`` and ``save`` — so
     the observable evidence cannot depend on which dispatch path reached it.
+
+    ``dry_run=True`` keeps the record in memory and skips the ``save`` (W1.2): the ``fix``
+    dry run plans a withheld tick the same way it plans a runnable stage, and a plan must
+    not create the run it would have written to. The returned record is unchanged.
 
     ``status`` is :data:`aidw.state.SKIPPED` and ``error`` stays **unset**: ``error``
     renders as a failure (design §9.3) and a skip is not one. The reason travels in
@@ -1008,7 +1018,8 @@ def record_skipped(
     )
     with _STATE_LOCK:
         state.record_stage(record)
-        save(directory, state)
+        if not dry_run:
+            save(directory, state)
     return record
 
 
