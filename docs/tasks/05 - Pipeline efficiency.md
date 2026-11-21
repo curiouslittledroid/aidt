@@ -138,7 +138,7 @@ accountability.
 
 ## Epic O1: Operator ergonomics
 
-- [ ] **O1.1. Teach agents to handle blocked bash commands** (Design 5.5)
+- [x] **O1.1. Teach agents to handle blocked bash commands** (Design 5.5)
   - Done when: the bundled agent context files (`agents/*/AGENTS.md`, or the shared context they assemble from) tell agents that a `Blocked bash command with unapproved operations` result is a hard deny — do not retry the command with cosmetic variants, and report it as a blocker naming the denied command — instead of the observed blind-retry loop; the guidance is covered by `aidw agents validate --strict`; and the five gates above are green.
   - Deliverable: the agent context files under `agents/*/AGENTS.md` (or the shared section), design.md §5.5 if a contract is added, and the tests below.
   - Tests: `tests/test_agent_configs.py` (or the equivalent that exercises `agents validate`), `tests/test_design_doc.py`.

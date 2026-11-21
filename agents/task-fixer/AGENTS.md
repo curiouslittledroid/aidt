@@ -49,3 +49,14 @@ A stage gives you either a single finding to fix, or one batch of the review's n
 - The sweep report: which of the six sections — `Requirements`, `Traps / prior review findings`,
   `Explicit non-goals`, `Tests`, `Done when`, and the closing prompt-fixed/ambiguity list — you
   re-checked in the sweep, and which you changed because of the sweep.
+
+## Blocked bash commands
+
+A bash result that reads `Blocked bash command with unapproved operations` is a hard deny: the
+operation was refused, not interrupted, so it is not retryable.
+
+- Do not retry the command.
+- Do not retry a cosmetic variant of it either. Reordering, re-quoting, splitting it, using
+  alternative syntax, or renaming it are the same denied operation.
+- Report it as a blocker naming the denied command, then stop. The block is a signal to surface,
+  not a puzzle to work around.

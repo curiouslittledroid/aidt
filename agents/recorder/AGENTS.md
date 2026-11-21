@@ -93,3 +93,14 @@ integration-test guide a human follows, and flipping the one roadmap checkbox th
 
 - The path written, the four sections it contains, the scenarios marked unconfirmed, and the
   recorded `unverified` rows the guide therefore carries as unverified.
+
+## Blocked bash commands
+
+A bash result that reads `Blocked bash command with unapproved operations` is a hard deny: the
+operation was refused, not interrupted, so it is not retryable.
+
+- Do not retry the command.
+- Do not retry a cosmetic variant of it either. Reordering, re-quoting, splitting it, using
+  alternative syntax, or renaming it are the same denied operation.
+- Report it as a blocker naming the denied command, then stop. The block is a signal to surface,
+  not a puzzle to work around.

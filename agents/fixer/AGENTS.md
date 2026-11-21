@@ -37,3 +37,14 @@ when you run `select`, and never assume or widen a width of your own.
   real results, and the closing-body path you wrote for it.
 - Batch-level: confirmation that every child is still open and in progress, and the overall
   verification result.
+
+## Blocked bash commands
+
+A bash result that reads `Blocked bash command with unapproved operations` is a hard deny: the
+operation was refused, not interrupted, so it is not retryable.
+
+- Do not retry the command.
+- Do not retry a cosmetic variant of it either. Reordering, re-quoting, splitting it, using
+  alternative syntax, or renaming it are the same denied operation.
+- Report it as a blocker naming the denied command, then stop. The block is a signal to surface,
+  not a puzzle to work around.

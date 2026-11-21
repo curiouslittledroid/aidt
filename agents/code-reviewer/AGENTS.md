@@ -20,3 +20,14 @@ result or make the change unsafe. You did not author it.
 
 - Findings in priority order (`Must fix` / `Should fix` / `Could fix`) using the required
   format, followed by exactly one verdict: `Approve`, `Request changes`, or `Blocked`.
+
+## Blocked bash commands
+
+A bash result that reads `Blocked bash command with unapproved operations` is a hard deny: the
+operation was refused, not interrupted, so it is not retryable.
+
+- Do not retry the command.
+- Do not retry a cosmetic variant of it either. Reordering, re-quoting, splitting it, using
+  alternative syntax, or renaming it are the same denied operation.
+- Report it as a blocker naming the denied command, then stop. The block is a signal to surface,
+  not a puzzle to work around.

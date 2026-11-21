@@ -1,4 +1,5 @@
-"""Neutrality contract for the shipped agent guidance (E7.4, EXTRACTION.md §4.3).
+"""Neutrality and blocked-bash contracts for the shipped agent guidance (E7.4,
+EXTRACTION.md §4.3; 05-O1.1, design §5.5).
 
 Executable half of §6 E7.4: every file in ``agents/*/AGENTS.md`` is agent context shipped to Pi
 for **any** target repo, so none of them may name a product, a package manager, or a product
@@ -34,6 +35,10 @@ guard that must stay quiet.
 4. *The implementer's core drop would go untested.* Dropping ``/update-traceability`` and
    ``/update-architecture`` removes text no vocabulary token matches, so it needs its own
    assertion (``test_the_implementer_names_no_traceability_or_architecture_stage``).
+5. *Reachability is not content.* ``aidw agents validate --strict`` only proves each config's
+   ``agents_md:`` file exists and reads, so the blocked-bash hard-deny guidance a stage needs
+   when Pi answers ``Blocked bash command with unapproved operations`` is pinned by its own
+   content sweep over the same glob (05-O1.1, design §5.5).
 """
 
 from __future__ import annotations
@@ -146,6 +151,27 @@ STAGE_REFERENCES: dict[str, tuple[str, ...]] = {
 #: either string, so without this tuple the core drop of E7.4 would go untested.
 DROPPED_STAGES = ("/update-traceability", "/update-architecture")
 
+#: 05-O1.1 / design §5.5: Pi's real tool result for an operation the bash allowlist refused.
+#: Quoted verbatim from the roadmap entry, because a close reword would not match the block
+#: the agent actually sees.
+BLOCKED_BASH_PHRASE = "Blocked bash command with unapproved operations"
+
+#: The three behaviours the guidance must state, lowercased for a case-insensitive sweep and
+#: pinned one by one: a file that keeps the phrase but drops "cosmetic variant" re-opens the
+#: blind-retry loop the task exists to close.
+BLOCKED_BASH_CLAUSES = (
+    "hard deny",
+    "not retryable",
+    "do not retry",
+    "cosmetic variant",
+    "report it as a blocker naming the denied command",
+)
+
+#: Series-3 seeded property sweep (AGENTS.md "Tests": pytest only, no ``hypothesis``, so the
+#: sample *is* the seed): every guidance file × every clause, with an explicit pinned count —
+#: ``numRuns = BLOCKED_BASH_NUM_RUNS = AGENTS_NUM_RUNS * len(BLOCKED_BASH_CLAUSES)``.
+BLOCKED_BASH_NUM_RUNS = AGENTS_NUM_RUNS * len(BLOCKED_BASH_CLAUSES)
+
 
 def _path(name: str) -> Path:
     return toolkit_root() / "agents" / name / "AGENTS.md"
@@ -162,6 +188,20 @@ def _flat(name: str) -> str:
     the sentence, not the line break.
     """
     return " ".join(_read(name).split())
+
+
+def _blocked_bash_gaps(text: str) -> list[str]:
+    """What a guidance text is missing from the 05-O1.1 blocked-bash contract.
+
+    ``phrase missing`` names the verbatim tool result; every other entry is one missing
+    behaviour clause. Collected rather than asserted one at a time so a file that loses the
+    whole section reports every gap in one run.
+    """
+    flat = " ".join(text.split())
+    lowered = flat.lower()
+    gaps = [] if BLOCKED_BASH_PHRASE in flat else ["phrase missing"]
+    gaps.extend(clause for clause in BLOCKED_BASH_CLAUSES if clause not in lowered)
+    return gaps
 
 
 # --------------------------------------------------------------------------- #
@@ -615,6 +655,67 @@ def test_fixer_guidance_matches_the_bounded_batch_contract() -> None:
     # must not contradict the prompt by telling the agent that the width is non-positional.
     assert "$3" in text
     assert "not a positional argument" not in text.lower()
+
+
+# --------------------------------------------------------------------------- #
+# 05-O1.1: the blocked-bash hard-deny contract (design §5.5)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_blocked_bash_property_seed_is_pinned() -> None:
+    """The sweep's run count is pinned to the two seeds, not recomputed at will."""
+    assert BLOCKED_BASH_NUM_RUNS == AGENTS_NUM_RUNS * len(BLOCKED_BASH_CLAUSES)
+    assert len(BLOCKED_BASH_CLAUSES) == 5
+    assert BLOCKED_BASH_PHRASE not in BLOCKED_BASH_CLAUSES
+
+
+@pytest.mark.parametrize("name", sorted(_iter_agents()))
+def test_every_agents_guidance_teaches_the_blocked_bash_contract(name: str) -> None:
+    """05-O1.1 / design §5.5: every shipped guidance file carries the three behaviours.
+
+    Pi answers a denied operation with ``Blocked bash command with unapproved operations``;
+    a file without the verbatim phrase cannot recognise the block, and one without the
+    "cosmetic variant" clause re-opens the blind-retry loop (reordering, re-quoting,
+    splitting, alternative syntax, a rename).
+    """
+    flat = _flat(name)
+
+    assert BLOCKED_BASH_PHRASE in flat, (
+        f"agents/{name}/AGENTS.md: missing the verbatim blocked result"
+    )
+    assert _blocked_bash_gaps(_read(name)) == [], f"agents/{name}/AGENTS.md"
+
+
+def test_the_blocked_bash_guard_is_live_on_the_two_observed_drops() -> None:
+    """The guard is non-vacuous: the phrase and the "cosmetic variant" clause are load-bearing.
+
+    The two drops are the ones the task's trap list names: losing the phrase means the agent
+    cannot recognise the result, and losing "cosmetic variant" is the retry loop itself.
+    """
+    shipped = _read("implementer")
+
+    assert _blocked_bash_gaps(shipped) == []
+    assert _blocked_bash_gaps(shipped.replace(BLOCKED_BASH_PHRASE, "a denied command")) != []
+    assert _blocked_bash_gaps(re.sub(r"cosmetic variant", "different command", shipped)) != []
+
+
+@pytest.mark.parametrize("name", sorted(_iter_agents()))
+def test_property_every_missing_blocked_bash_clause_is_detected(name: str) -> None:
+    """Sweep 3 over the file seed × the five clauses (``numRuns = BLOCKED_BASH_NUM_RUNS``).
+
+    For every guidance file and every clause, the text as shipped has no gap, and the same
+    text with that one clause removed reports that gap — so a file that keeps the phrase but
+    drops a behaviour cannot pass the sweep.
+    """
+    text = _read(name)
+
+    assert _blocked_bash_gaps(text) == [], name
+
+    for clause in BLOCKED_BASH_CLAUSES:
+        # Every occurrence: "do not retry" opens two bullets, and dropping only one of them
+        # would leave the behaviour stated and the guard correctly still satisfied.
+        mutated = re.sub(re.escape(clause), "", text, flags=re.IGNORECASE)
+        assert clause in _blocked_bash_gaps(mutated), (name, clause)
 
 
 # --------------------------------------------------------------------------- #
