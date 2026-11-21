@@ -794,6 +794,11 @@ Four shipped contracts are the reference for what AIDT reads around a target rep
 Each is cross-linked rather than restated here: a second copy of a field table or an example
 drifts from the one the parser and config tests read.
 
+[`docs/onboarding-overview.md`](./docs/onboarding-overview.md) is the developer onboarding
+guide: an architecture overview, a guided tour of the codebase, complexity hotspots, and the
+contributor gates — generated from the project's knowledge graph and worth a skim before the
+first change.
+
 ## Development
 
 This is the one place the **checkout** forms belong. Everywhere else in this guide the command
