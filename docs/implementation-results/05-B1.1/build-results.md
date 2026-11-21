@@ -3,7 +3,7 @@
 **Branch:** `05-B1.1`
 **Date:** 2026-11-21
 **Spec:** `design.md` §8.4 (`aidw fix --pr <n>`), §17 (Resolved decisions); roadmap `docs/tasks/05 - Pipeline efficiency.md`, epic B1, task B1.1
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** [#177](https://github.com/curiouslittledroid/aidt/pull/177)
 
 ## Summary
 
