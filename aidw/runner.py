@@ -335,8 +335,10 @@ def plan_stages(
     per-workflow field set: ``implement`` (``prompt_rel``/``branch``/``task_id``/
     ``base_branch``), ``prompt`` (``phase``/``epic``/``task``/``rel``/``max_revisions``/
     ``rounds``), ``review`` (``pr``/``manifest_path``/``findings``), ``fix`` (``pr``/
-    ``round_index``/``iteration``/``manifest_path``/``closing_body``, plus
-    ``roadmap_file``/``checkbox_id`` when ``include_post_loop``) and ``approve`` (``pr``).
+    ``round_index``/``iteration``/``manifest_path``/``closing_bodies``, ``fix_batch``
+    (05-B1.1: the run's resolved ``--fix-batch`` width, which F1's ``select --limit``
+    must match), plus ``roadmap_file``/``checkbox_id`` when ``include_post_loop``) and
+    ``approve`` (``pr``).
     Each expanded
     :class:`~aidw.stage_registry.PlannedStage` becomes one :class:`StageSpec`: its prompt is
     resolved through :func:`resolve_prompt` (D4/D14), ``variables`` is a fresh ``list``

@@ -322,10 +322,10 @@ publish" without a second `gh` query. `review` has **no gate**.
 preflight (PR exists, targets main, the PR head's worktree is located)
   → list open children; show GitHub state
   ◇  approve-followups                 AIDT's gate, then A1
-  ⟳  one approved child at a time:
-       → F1 fix-next-review-followup  fixer           (fresh)
-       → F2 test                      tester          (fresh)
-       → F3 code-review               code-reviewer   (fresh)
+  ⟳  up to --fix-batch approved children (default 3) per iteration:
+       → F1 fix-next-review-followup  fixer           (fresh, over the batch)
+       → F2 test                      tester          (fresh, over the batch)
+       → F3 code-review               code-reviewer   (fresh, over the batch)
        if F3 has findings:
          → F4 review-findings-to-github (new children, ungated) then ◇ approve-followups
        else:
@@ -341,7 +341,7 @@ preflight (PR exists, targets main, the PR head's worktree is located)
 | Id | Runtime name | Agent | Prompt | Variables | Runs when | Context |
 |---|---|---|---|---|---|---|
 | `A1` | `round{round_index}-approve-review-followups` | `review-approver` | `approve-review-followups.md` | `{pr}` | — | — |
-| `F1` | `iter{iteration}-fix-next-review-followup` | `fixer` | `fix-next-review-followup.md` | `{pr}`, `{closing_body}` | — | — |
+| `F1` | `iter{iteration}-fix-next-review-followup` | `fixer` | `fix-next-review-followup.md` | `{pr}`, `{closing_bodies}`, `{fix_batch}` | — | — |
 | `F2` | `iter{iteration}-test` | `tester` | `test.md` | — | — | `stage context` |
 | `F3` | `iter{iteration}-code-review` | `code-reviewer` | `code-review.md` | — | — | — |
 | `F4` | `iter{iteration}-review-findings-to-github` | `review-publisher` | `review-findings-to-github.md` | `{pr}` | `findings` | `manifest pointer` |
@@ -365,17 +365,23 @@ stage list or in a dry-run plan.
   (`github.verify_approvals`), because an agent that reports success is not evidence the GitHub
   writes happened. `fix` runs one approval round at entry and another after every round that
   published new findings.
-- **`F1` fix-next-review-followup** — fixes exactly **one** approved child issue and writes its
-  closing comment body to the absolute path `{closing_body}` (`<run_dir>/artifacts/
-  iter{N}-closing-body.md`). It does **not** post `Status: fixed` and does **not** close the
-  issue: the issue stays `OPEN` with the exact `Status: in progress` comment `start` posted until
-  the close step runs after `F5`. "Available" is always re-derived from
-  `review_followup.py select`, never by counting, so the loop is driven by real GitHub state — and
-  `Status: in progress` is what keeps the just-fixed child out of the next `select`.
-- **`F2` test** — re-verifies that one fix against its acceptance criteria. It does not fix
-  implementation code: a real defect is reported `Fail` and handed back to `F1`.
-- **`F3` code-review** — read-only re-review of the fix, verdict `Approve` / `Request changes` /
-  `Blocked`. An ambiguous verdict or `Blocked` fails closed (exit 3).
+- **`F1` fix-next-review-followup** — fixes a bounded batch of approved child issues (up to the
+  run's `--fix-batch`, default 3, in the native order `select --limit` returned; the width is
+  rendered as `{fix_batch}`, so the agent's own `select --limit` asks for exactly the bound the
+  workflow selected with) and writes one
+  closing comment body per issue into the absolute directory `{closing_bodies}`
+  (`<run_dir>/artifacts/iter{N}/closing-body-{issue}.md`). It does **not** post `Status: fixed`
+  and does **not** close any issue: they stay `OPEN` with the exact `Status: in progress`
+  comment `start` posted until the close step runs after `F5`. "Available" is always re-derived
+  from `review_followup.py select`, never by counting, so the loop is driven by real GitHub
+  state — and `Status: in progress` is what keeps the just-fixed children out of the next
+  `select`.
+- **`F2` test** — re-verifies the batch's combined change set against each fixed child's
+  acceptance criteria, with **one** run per iteration. It does not fix implementation code: a
+  real defect is reported `Fail` and fails the whole batch (no issue in it is closed).
+- **`F3` code-review** — read-only re-review of the batch's change set, verdict `Approve` /
+  `Request changes` / `Blocked`, with **one** run per iteration. An ambiguous verdict or
+  `Blocked` fails closed (exit 3).
 - **`F4` review-findings-to-github** — publishes the re-review's findings as new child issues,
   ungated, from the manifest AIDT writes at `artifacts/iter{N}-review-manifest.json` (with
   `artifacts/iter{N}-findings.json` beside it). A human then approves the new children on GitHub
@@ -463,8 +469,12 @@ declared under `workflows.fix.stages`.
 
 - One iteration is `F1` → `F2` → `F3` (+ `F4` when `F3` has findings, sending the loop through
   another `A1` round).
-- Bounded by `--max-iterations` (default 10) and, in practice, by GitHub state: `select` reporting
-  no available child ends the loop **successfully**.
+- **Width**: one iteration fixes up to `--fix-batch` approved children (default 3) — exactly the
+  ones `select --limit` returned, in native order — and `F2`/`F3` run **once** over the batch's
+  combined change set, never once per child.
+- Bounded by `--max-iterations` (default 10) **iterations (batches)**, not fixes, and, in
+  practice, by GitHub state: `select` reporting no available child ends the loop
+  **successfully**.
 - `expand("fix", …)` *is* the per-iteration expansion, which is why `I7` and `F5` live in the
   workflow's `post_loop` half and are emitted only when a caller asks
   (`include_post_loop=True`) — once each, after the loop, by `aidw fix` itself.

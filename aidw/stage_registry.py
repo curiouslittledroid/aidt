@@ -837,16 +837,22 @@ _FIX = WorkflowDefinition(
         id="F",
         kind=LOOP_FIX_ITERATIONS,
         head=(
-            # 05-P1.2 (Z9's close-after-push half): ``{closing_body}`` is the absolute path
-            # the fixer writes its closing comment body to and the workflow reads back as
-            # ``close --body-file`` once ``F5`` has proved the push. F1 therefore records the
-            # fix and writes the body; it never posts ``Status: fixed`` and never closes.
+            # 05-P1.2 (Z9's close-after-push half): ``{closing_bodies}`` is the absolute
+            # ``<run_dir>/artifacts/iter{N}`` directory the fixer writes one closing comment
+            # body per issue into (05-B1.1 makes it per-issue: a variable batch cannot carry
+            # N positional paths). The workflow reads them back as ``close --body-file`` once
+            # ``F5`` has proved the push. F1 therefore records the fixes and writes the
+            # bodies; it never posts ``Status: fixed`` and never closes.
+            # ``{fix_batch}`` is the run's resolved ``--fix-batch`` width (default 3): the
+            # prompt's own ``select --limit`` must be asked for exactly the bound the
+            # workflow selected with, and nothing exports that value to the stage, so
+            # leaving it implicit let ``--fix-batch 1`` fix up to three children.
             StageDefinition(
                 "F1",
                 "iter{iteration}-fix-next-review-followup",
                 "fixer",
                 "fix-next-review-followup.md",
-                ("{pr}", "{closing_body}"),
+                ("{pr}", "{closing_bodies}", "{fix_batch}"),
             ),
             StageDefinition(
                 "F2",
@@ -1397,7 +1403,10 @@ def expand(
     * ``review`` — ``pr``, ``manifest_path``, ``findings`` (``True``/``False``; ``False``
       omits R2).
     * ``fix`` — ``pr``, ``round_index``, ``iteration``, ``manifest_path``,
-      ``closing_body`` (05-P1.2: F1's absolute closing-body path), plus ``roadmap_file`` and
+      ``closing_bodies`` (05-P1.2/05-B1.1: the absolute ``<run_dir>/artifacts/iter{N}``
+      directory F1 writes one closing body per issue into), ``fix_batch`` (05-B1.1: the
+      run's resolved ``--fix-batch`` width, which F1's ``select --limit`` must match), plus
+      ``roadmap_file`` and
       ``checkbox_id`` **for the post-loop half only** (H3.3 req 1: the shared ``I7`` renders
       them, and it is emitted only when ``include_post_loop`` is true; 05-P1.1's ``F5``
       renders ``{pr}`` and 05-P1.2's close step renders no prompt at all).

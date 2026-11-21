@@ -60,6 +60,12 @@ scripts_dir="${AIDW_SCRIPTS_DIR:-/path/to/toolkit/prompts/scripts}"
 # Read-only: resolve PR -> parent issue -> first available child
 "$scripts_dir/review-followup/review_followup.py" select --pr 174
 
+# Read-only: the bounded batch the fix loop asks for (`aidw fix --fix-batch`, default 3)
+# `--limit` is explicit, so `selected` is an ARRAY of up to n available children in
+# native sub-issue order — `--limit 1` included. Without the flag `selected` stays the
+# single object `start`, `fixed` and the approval preview read.
+"$scripts_dir/review-followup/review_followup.py" select --pr 174 --limit 3
+
 # Record the exact "Status: in progress" comment (idempotent)
 "$scripts_dir/review-followup/review_followup.py" start --pr 174 [--issue 176] [--dry-run]
 
@@ -86,6 +92,16 @@ scripts_dir="${AIDW_SCRIPTS_DIR:-/path/to/toolkit/prompts/scripts}"
 | `2` | Usage, validation, or GitHub-command error |
 | `3` | No approved open review follow-up is available |
 | `4` | The requested issue conflicts with the workflow's selection rules |
+
+### `select --limit` semantics
+
+`select` without `--limit` returns the first available child as a single `selected`
+object (or `null`), the contract `start`, `fixed` and `fix`'s approval round keep. With
+`--limit <n>` it returns up to `n` available children in native `subIssues` order as an
+**array** — an explicit `--limit 1` is a one-element array, never an object — plus the
+`skipped` children encountered up to and including the last selected one, so
+`childrenInspected` is `len(skipped) + len(selected)`. Exit code `3` means the batch is
+empty; no child after the batch is inspected.
 
 ### `--issue` semantics
 

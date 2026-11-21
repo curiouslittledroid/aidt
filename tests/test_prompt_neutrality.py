@@ -66,8 +66,9 @@ from aidw.target_config import (
 # The five files §4.2 lists as bucket (ii), each with the positional variables the
 # workflow passes it. `test.md` takes none; the record prompt its optional branch override,
 # the pr prompt its task id, the implement prompt its task-prompt file. The fix prompt keeps
-# its `$1` PR (§6 E7.2) and gained `$2`, the absolute closing-body path, when 05-P1.2 moved
-# the close behind the push — so it takes two here, which is what the F1 stage passes.
+# its `$1` PR (§6 E7.2) and gained `$2` when 05-P1.2 moved the close behind the push — so it
+# takes two here, which is what the F1 stage passes. `$2` is the absolute
+# `<run_dir>/artifacts/iter{N}` directory since 05-B1.1 made the closing body per issue.
 # --------------------------------------------------------------------------- #
 
 VARIABLES: Mapping[str, tuple[str, ...]] = {
@@ -75,7 +76,8 @@ VARIABLES: Mapping[str, tuple[str, ...]] = {
     "pr.md": ("07-E9.9",),
     "fix-next-review-followup.md": (
         "https://example.test/pull/1",
-        "/state/runs/fix-1/artifacts/iter1-closing-body.md",
+        "/state/runs/fix-1/artifacts/iter1",
+        "2",
     ),
     "record-implementation-results.md": ("07-E9.9",),
     "impliment-task.md": ("07-E9.9-prompt.md",),
@@ -447,6 +449,26 @@ def test_each_prompt_points_at_the_repos_conventions_source(name: str) -> None:
 
     for source in CONVENTIONS_SOURCES:
         assert source in rendered, f"{name}: does not name {source}"
+
+
+def test_the_fixer_prompt_describes_the_batch_not_a_single_issue() -> None:
+    """05-B1.1: the F1 prompt renders the batch directory and no stale single-issue rule.
+
+    The registry renders `{closing_bodies}` as the `iter{N}` **directory** (one file per
+    issue), and the prose must say "batch" — a stale "exactly one issue per invocation"
+    sentence would tell the agent to fix a subset of the children the loop selected.
+    """
+    rendered = _rendered("fix-next-review-followup.md")
+
+    assert "/state/runs/fix-1/artifacts/iter1" in rendered
+    assert "closing-body-<issue-number>.md" in rendered
+    assert "batch" in rendered
+    for stale in (
+        "exactly one issue per invocation",
+        "first available child",
+        "select the first available",
+    ):
+        assert stale not in rendered, stale
 
 
 def test_the_record_prompt_states_the_neutral_replacements_requirements_4_and_5_fix() -> None:

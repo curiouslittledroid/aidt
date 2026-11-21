@@ -355,11 +355,13 @@ skipped with `--skip-gates approve-followups`.
 ### `aidw fix` — fix approved review follow-ups
 
 Takes a PR whose review follow-up issues have been decided **on GitHub**, then runs the
-review → fix → re-review loop one approved child at a time:
+review → fix → re-review loop over a bounded batch of approved children per iteration
+(`--fix-batch`, default 3; the selection is re-derived from `review_followup.py select
+--limit`):
 
 ```text
 ◇  approve-followups      run /approve-review-followups (review-approver)
-⟳  per approved child (selection re-derived from review_followup.py select):
+⟳  per approved batch of up to --fix-batch children:
      F1 fix-next-review-followup  fixer
      F2 test                      tester
      F3 code-review               code-reviewer
@@ -372,13 +374,16 @@ review_followup.py close   (Python)      one call per recorded issue, after the 
 ```
 
 ```bash
-aidw fix --pr 42 --dry-run              # lists the next approved child via select
-aidw fix --pr 42 --max-iterations 5     # live loop
+aidw fix --pr 42 --dry-run              # lists the batch select would return
+aidw fix --pr 42 --max-iterations 5     # live loop, up to 3 fixes per iteration
+aidw fix --pr 42 --fix-batch 5          # up to 5 fixes per iteration
 ```
 
 The re-review models must differ from the fixer model; `agents validate`/`aidw fix` warn
 when no distinct reviewer model exists (and `--strict` fails). `--max-iterations` (default
-10) bounds the loop; reaching it stops the run as blocked. All GitHub writes are performed
+10) bounds the number of **iterations** (batches), not the number of fixes; reaching it
+stops the run as blocked. `--fix-batch` (default 3) is how many approved children one
+iteration fixes before the single `test`/`code-review` pair judges the combined change set. All GitHub writes are performed
 by the bundled prompts/scripts (the fixer and approver agents, and the deferred close); AIDT
 only reads `gh pr view` and `review_followup.py select` itself.
 
@@ -393,9 +398,9 @@ records `state.pr["commit_skip_reason"]` and exits 0 rather than committing a st
 an empty commit. `F5` never force-pushes, never merges, and refuses outright when the resolved PR
 head is the base branch; `commit`/`push` remain the `pr-publisher` agent's, never Python's.
 
-The fixer no longer closes the issue it fixed. Each `F1` writes its closing comment body to
-`<run_dir>/artifacts/iter{N}-closing-body.md` and leaves the issue `OPEN` with its exact
-`Status: in progress` comment; once `F5`'s push is verified, AIDT runs `review_followup.py
+The fixer no longer closes the issues it fixed. Each `F1` writes one closing comment body
+per issue to `<run_dir>/artifacts/iter{N}/closing-body-{issue}.md` and leaves each issue
+`OPEN` with its exact `Status: in progress` comment; once `F5`'s push is verified, AIDT runs `review_followup.py
 close --issue <n> --body-file <path>` for each issue this run recorded, which posts the exact
 `Status: fixed` comment (idempotent) and closes the issue with that body. A close that fails —
 `close` exits non-zero, or a recorded fix has no verified push — fails the run instead of
