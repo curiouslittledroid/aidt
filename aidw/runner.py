@@ -335,7 +335,7 @@ def plan_stages(
     per-workflow field set: ``implement`` (``prompt_rel``/``branch``/``task_id``/
     ``base_branch``), ``prompt`` (``phase``/``epic``/``task``/``rel``/``max_revisions``/
     ``rounds``), ``review`` (``pr``/``manifest_path``/``findings``), ``fix`` (``pr``/
-    ``round_index``/``iteration``/``manifest_path``/``closing_body``, plus
+    ``round_index``/``iteration``/``manifest_path``/``closing_bodies``, plus
     ``roadmap_file``/``checkbox_id`` when ``include_post_loop``) and ``approve`` (``pr``).
     Each expanded
     :class:`~aidw.stage_registry.PlannedStage` becomes one :class:`StageSpec`: its prompt is

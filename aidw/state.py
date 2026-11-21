@@ -509,7 +509,7 @@ PLANNED_RUN_ID = "<planned>"
 
 #: The run-directory text a ``--dry-run`` plan renders where a real run's directory would go
 #: (W1.2, design §9.4): ``review``'s manifest pointer, its publisher argv and ``fix``'s
-#: per-iteration manifest / ``{closing_body}`` paths. A planned path is *named*, never
+#: per-iteration manifest / ``{closing_bodies}`` paths. A planned path is *named*, never
 #: fabricated — a real-looking run id would name a run that does not exist. Real runs keep the
 #: absolute ``run_dir(...)`` path (E7.3's PR 110), and because this text is relative, a stray
 #: write would land in the working tree, which is why the tests assert none appears.

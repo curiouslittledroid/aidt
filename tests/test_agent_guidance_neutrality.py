@@ -597,6 +597,26 @@ def test_the_prompt_creates_guard_rejects_the_reverted_wording() -> None:
     )
 
 
+def test_fixer_guidance_matches_the_bounded_batch_contract() -> None:
+    """A fixer agent receives this context verbatim alongside the batch prompt.
+
+    The B1.1 prompt was widened to multiple children, so the shipped fixer guidance must not
+    tell the agent to process one issue or write one shared body. This is a caller-visible
+    contract guard: stale agent context can make a real Pi run silently fix only child #1 even
+    though the workflow selected a batch.
+    """
+    text = _flat("fixer")
+
+    assert "batch" in text.lower()
+    assert "one issue per invocation" not in text.lower()
+    assert "one issue" not in text.lower()
+    assert "one file per issue" in text.lower()
+    # The workflow passes the resolved width as F1's third positional variable; guidance
+    # must not contradict the prompt by telling the agent that the width is non-positional.
+    assert "$3" in text
+    assert "not a positional argument" not in text.lower()
+
+
 # --------------------------------------------------------------------------- #
 # Purity: reading the guidance changes nothing, and the matcher is order-free
 # --------------------------------------------------------------------------- #

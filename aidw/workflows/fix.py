@@ -4,10 +4,10 @@
 preflight (PR exists, targets main, the PR head's worktree is located)
   → list open children; show GitHub state
   ◇  approve-followups              runs /approve-review-followups (agent review-approver)
-  ⟳  one approved child at a time:
-       → F1 fix-next-review-followup  (agent fixer, fresh)
-       → F2 test                      (agent tester, fresh)
-       → F3 code-review               (agent code-reviewer, fresh)
+  ⟳  up to --fix-batch approved children (default 3) per iteration:
+       → F1 fix-next-review-followup  (agent fixer, fresh, over the batch)
+       → F2 test                      (agent tester, fresh, over the batch)
+       → F3 code-review               (agent code-reviewer, fresh, over the batch)
        if F3 has findings:
          → F4 review-findings-to-github (ungated)  then ◇ approve-followups
        else:
@@ -19,7 +19,17 @@ preflight (PR exists, targets main, the PR head's worktree is located)
 ```
 
 Selection is always re-derived from ``review_followup.py select`` (never by counting), so
-the loop is driven by real GitHub state. ``--max-iterations`` bounds the number of fixes.
+the loop is driven by real GitHub state: each iteration asks it for a **bounded batch**
+(``--limit <fix_batch>``, default 3) and runs one F1, one F2 and one F3 over exactly the
+children it returned — never ``len(closed_issues)`` or ``childrenInspected`` arithmetic.
+``--max-iterations`` bounds the number of **iterations** (batches), never the total number
+of fixes: a batch of 3 with ``--max-iterations 2`` can fix up to six children.
+
+The approval round is deliberately **not** batched: it calls ``select`` without ``--limit``
+and its summary reads the single ``selected`` object. The loop and the dry-run preview both
+always pass the flag, so both read the payload through the same :func:`_selected_batch`
+guard and accept only the array shape — the object-to-batch normalisation lives entirely in
+``cmd_select``'s flag branch (req 2), never on this side.
 
 Since H3.3 the run then ticks the task's roadmap checkbox **once**, after the loop converges
 (design §8.4; H3.1's stage, H3.2's condition): the tick is the shared ``I7 update-roadmap``
@@ -54,15 +64,18 @@ four-case table) and verifies what landed (D6's head comparison). Python never c
 never pushes.
 
 Since 05-P1.2 (design §8.4, §17 Z9's close-after-push half) the **close is not the fixer's
-job**. ``F1`` leaves each issue ``OPEN`` with the exact ``Status: in progress`` comment that
-``start`` posted, and writes its closing comment body to ``<run_dir>/artifacts/
-iter{N}-closing-body.md`` — the absolute path rendered into the prompt as ``{closing_body}``.
+job**. ``F1`` leaves every issue it fixed ``OPEN`` with the exact ``Status: in progress``
+comment that ``start`` posted, and writes one closing comment body per issue to
+``<run_dir>/artifacts/iter{N}/closing-body-{issue}.md`` — the absolute directory rendered
+into the prompt as ``{closing_bodies}`` (05-B1.1: a per-iteration file could not say which
+body belongs to which of the batch's issues, and a variable batch cannot carry N paths).
 After the loop, and only once :func:`run_commit` has proved the push (`HEAD` moved,
 `HEAD == origin/<branch>`, clean tree, ``state.pr["head_sha"]`` written), Python runs
 ``review_followup.py close --issue <n> --body-file <path>`` for each ``closed_issues`` entry
 this run recorded. A non-zero ``close`` fails the run (exit 1) naming the PR, the branch and
 the issue; an issue is therefore never reported fixed before its work reached the PR. The
-loop stays one fix per iteration, and the close stays one issue per entry — never a batch.
+close stays one issue per entry — never a batch: batching fixes is not a licence to batch
+closes, where a half-failed call would strand an issue half-closed.
 
 All GitHub writes are performed by AIDT's bundled prompts/scripts (the fixer and approver
 agents, and — for the deferred close — this module, through the same script). AIDT only
@@ -132,6 +145,23 @@ from aidw.workflows.implement import (
 GATE_FOLLOWUPS = "approve-followups"
 GATE_FIX_PR = "approve-fix-pr"
 DEFAULT_MAX_ITERATIONS = 10
+
+#: The default batch width of one fix iteration (05-B1.1, design §8.4): how many approved
+#: child issues one ``F1`` fixes, and how many one ``F2``/``F3`` pair then judges. Bounded on
+#: purpose — an unbounded batch would turn one bad fix into a whole unreviewable change set,
+#: and the roadmap's default is three.
+DEFAULT_FIX_BATCH = 3
+
+#: Why a ``select`` read under ``--limit`` is refused (05-B1.1 reqs 2/3, design §8.4):
+#: ``--limit`` is always passed — by the loop **and** by the dry-run preview — so ``selected``
+#: must be the array shape. One wording for both readers because it is one rule: an object
+#: here means the batch contract was not honoured, and acting on a one-child batch would
+#: silently restore the one-fix-per-iteration behaviour this task reverses.
+SELECT_NOT_A_BATCH = (
+    "select did not return a batch of children with issue numbers (`--limit` is always "
+    "passed, by the loop and the dry-run preview); failing closed instead of acting on a "
+    "subset."
+)
 
 #: The runtime name of ``F5`` (``stage_registry``'s ``_COMMIT_PUSH_STAGE``). The workflow
 #: keys on the *name* — the same rule ``implement.TICK_STAGE_NAME`` follows — because
@@ -329,16 +359,29 @@ def commit_decision(
     return CommitDecision(COMMIT_ACTION_COMMIT)
 
 
-def closing_body_path(directory: Path, iteration: int) -> Path:
-    """The **absolute** path ``F1`` writes its closing comment body to (P1.2 req 4).
+def closing_bodies_dir(directory: Path, iteration: int) -> Path:
+    """The **absolute** directory ``F1`` writes this iteration's closing bodies into.
 
-    One per iteration, inside the run directory — never a ``mktemp`` file and never relative.
-    Absolute for the same reason ``_planned_iteration`` passes an absolute ``manifest_path``:
-    ``F1`` runs with the target repo as its cwd, so a relative path would write the body into
-    the repo tree and pollute the very diff ``F5`` pushes. It is run state (design §9.1), so
-    it lives with the run, not in the worktree.
+    This is the value rendered into the prompt as ``{closing_bodies}`` (05-B1.1 req 5): one
+    directory per iteration, inside the run directory — never a ``mktemp`` directory and
+    never relative. Absolute for the same reason ``_planned_iteration`` passes an absolute
+    ``manifest_path``: ``F1`` runs with the target repo as its cwd, so a relative path would
+    write the bodies into the repo tree and pollute the very diff ``F5`` pushes. It is run
+    state (design §9.1), so it lives with the run, not in the worktree.
     """
-    return Path(directory) / f"artifacts/iter{iteration}-closing-body.md"
+    return Path(directory) / "artifacts" / f"iter{iteration}"
+
+
+def closing_body_path(directory: Path, iteration: int, issue_number: int) -> Path:
+    """The **absolute** per-issue body path ``F1`` writes for one child (05-B1.1 req 5).
+
+    ``<run_dir>/artifacts/iter{N}/closing-body-{issue}.md``: the directory is
+    :func:`closing_bodies_dir`, and the filename names the issue so each ``closed_issues``
+    entry can record its own body and the deferred close can pass it back as
+    ``--body-file``. A per-iteration body could not say which of a batch's fixes it
+    describes. Pure: the path is derived, never created.
+    """
+    return closing_bodies_dir(directory, iteration) / f"closing-body-{issue_number}.md"
 
 
 def close_failure_message(
@@ -366,10 +409,10 @@ def run_close(
     """Run the bundled ``review_followup.py close`` for one recorded issue (req 2/req 3).
 
     ``entry`` is one of this run's own ``closed_issues`` records: it carries the issue
-    ``number`` and the absolute ``closing_body`` path ``F1`` wrote. The script posts the
-    exact ``Status: fixed`` comment if it is absent and closes the issue with that body; its
-    guards (labels, refuse-to-reopen, a body that repeats the status marker) run again here,
-    so a bad body fails the close before any close action.
+    ``number`` and the absolute ``closing_body`` path ``F1`` wrote for **that** issue. The
+    script posts the exact ``Status: fixed`` comment if it is absent and closes the issue
+    with that body; its guards (labels, refuse-to-reopen, a body that repeats the status
+    marker) run again here, so a bad body fails the close before any close action.
     """
     script = github.script_path(aidt, github.FOLLOWUP_SCRIPT)
     argv = github.build_followup_argv(
@@ -567,6 +610,7 @@ def _post_loop_specs(
     aidt: Path,
     repo: Path,
     directory: Path,
+    fix_batch: int = DEFAULT_FIX_BATCH,
 ) -> dict[str, StageSpec]:
     """The post-loop half as runnable specs, keyed by stage name — **one** planning call.
 
@@ -592,7 +636,12 @@ def _post_loop_specs(
         round_index=round_index,
         iteration=iteration,
         manifest_path=str(directory / f"artifacts/iter{iteration}-review-manifest.json"),
-        closing_body=str(closing_body_path(directory, iteration)),
+        closing_bodies=str(closing_bodies_dir(directory, iteration)),
+        # 05-B1.1: the run's own `--fix-batch` width. It rides the plan even though this
+        # call's F1 stage is discarded (`I7`/`F5` are all the caller runs), because the
+        # registry renders F1's variables here too — an omitted field would raise rather
+        # than quietly plan a wrong width.
+        fix_batch=str(fix_batch),
         include_post_loop=True,
         roadmap_file=str(target.roadmap_file) if target.roadmap_file else "",
         checkbox_id=target.task,
@@ -619,6 +668,7 @@ def _planned_iteration(
     aidt: Path,
     repo: Path,
     directory: Path,
+    fix_batch: int = DEFAULT_FIX_BATCH,
 ) -> dict[str, StageSpec]:
     """One fix iteration's stage specs from the registry, keyed by stage name (E4.3).
 
@@ -628,9 +678,12 @@ def _planned_iteration(
     directory ``directory`` — the value the registry renders into F4's pointer — so the dry
     run and a real run plan the same ``extra``. It is absolute for the same reason
     ``review.py`` passes an absolute path: F4 runs with the target repo as its cwd.
-    ``closing_body`` is F1's counterpart (05-P1.2 req 4): the absolute path the fixer writes
-    its closing comment body to and the close step reads back after the push
-    (:func:`closing_body_path`).
+    ``closing_bodies`` is F1's counterpart (05-P1.2 req 4, widened per issue by 05-B1.1):
+    the absolute directory the fixer writes one closing comment body per issue into, and the
+    close step reads one file per entry back after the push (:func:`closing_body_path`).
+    ``fix_batch`` is the run's resolved width: F1 renders it as its third positional
+    variable so the agent's own `select --limit` asks for exactly the bound Python selected
+    with (05-B1.1; nothing exports that value to the stage environment).
 
     Deliberately **no** ``include_post_loop``: this is the per-iteration expansion, and the
     roadmap tick and ``F5`` run once per run, after the loop (H3.3 req 1/req 7; 05-P1.1
@@ -645,7 +698,8 @@ def _planned_iteration(
         round_index=round_index,
         iteration=iteration,
         manifest_path=str(directory / f"artifacts/iter{iteration}-review-manifest.json"),
-        closing_body=str(closing_body_path(directory, iteration)),
+        closing_bodies=str(closing_bodies_dir(directory, iteration)),
+        fix_batch=str(fix_batch),
     )
     return {spec.name: spec for spec in planned}
 
@@ -681,6 +735,33 @@ def _filter_force_model(warnings: list[Issue]) -> list[Issue]:
         for w in warnings
         if "reviewer != author" not in w.message and "differs from the fixer" not in w.message
     ]
+
+
+def _selected_batch(payload: Mapping[str, Any]) -> list[dict] | None:
+    """``select``'s array-shaped ``selected``, or ``None`` when it is not a batch.
+
+    The **one** fail-closed read of a ``select --limit`` payload (05-B1.1 reqs 2/3, design
+    §8.4), shared by the loop and the dry-run preview so the two cannot disagree about the
+    same malformed result. ``--limit`` is always passed by both, so ``selected`` must be a
+    non-empty array whose entries each carry an integer ``number`` and a ``title``. Anything
+    else — the old single object, an empty array on exit 0, a child without a usable issue
+    number — is ``None``, never ``[payload]`` or ``[batch[0]]``: coercing it would silently
+    fix (or preview) a one-child batch, and deriving a width from ``childrenInspected`` is
+    the count arithmetic §8.4 forbids. Pure.
+    """
+    batch = payload.get("selected")
+    if (
+        not isinstance(batch, list)
+        or not batch
+        or not all(
+            isinstance(child, dict)
+            and isinstance(child.get("number"), int)
+            and child.get("title")
+            for child in batch
+        )
+    ):
+        return None
+    return batch
 
 
 def _followup_summary(selection: github.ScriptResult, round_index: int) -> str:
@@ -732,6 +813,7 @@ def _approval_round(
     skip: set[str],
     deny: set[str] | None = None,
     gate_default: str | None = None,
+    fix_batch: int = DEFAULT_FIX_BATCH,
 ) -> int | None:
     """Gate ``approve-followups`` and, on approval, run the approver agent.
 
@@ -747,6 +829,7 @@ def _approval_round(
         aidt=aidt,
         repo=repo,
         directory=directory,
+        fix_batch=fix_batch,
     )
     spec = planned[f"round{round_index}-approve-review-followups"]
     name = spec.name
@@ -806,6 +889,7 @@ def run(
     aidt: ToolkitPaths,
     workspace: WorkspacePaths,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    fix_batch: int = DEFAULT_FIX_BATCH,
     approve_all: bool = False,
     skip_gates: list[str] | None = None,
     deny_gates: list[str] | None = None,
@@ -945,6 +1029,13 @@ def run(
         print("--max-iterations must be positive.", file=sys.stderr)
         return 2
 
+    # 05-B1.1: the batch width is refused exactly as `--max-iterations` is — same message
+    # shape, same place (before any run record, worktree or stage, `--dry-run` included).
+    # `--max-iterations` still bounds *iterations* (batches), never the total fixes.
+    if fix_batch <= 0:
+        print("--fix-batch must be positive.", file=sys.stderr)
+        return 2
+
     # --- locate the PR-head worktree (E2.6 req 3) ---------------------------- #
     # The PR head is authoritative, not the control worktree's current branch. A
     # missing worktree is a preflight refusal (exit 4, design §14) in a real run; a
@@ -1042,9 +1133,9 @@ def run(
             config_hash=config_hash,
             branch=branch,
         )
-        # A dry run has no run directory, so the paths it renders (F1's ``{closing_body}``,
-        # F4's manifest) are *planned* ones: the `<run dir>` placeholder names where a real
-        # run would write, and never a fabricated id.
+        # A dry run has no run directory, so the paths it renders (F1's
+        # ``{closing_bodies}``, F4's manifest) are *planned* ones: the `<run dir>`
+        # placeholder names where a real run would write, and never a fabricated id.
         if dry_run:
             directory = Path(PLANNED_RUN_DIR_TEXT)
             logger = NullLogger(stream=stream)
@@ -1138,6 +1229,7 @@ def run(
                 aidt=aidt.root,
                 repo=repo.root,
                 directory=directory,
+                fix_batch=fix_batch,
             )
             withhold_tick(stop_reason, specs)
             withhold_commit(stop_reason, specs)
@@ -1327,6 +1419,7 @@ def run(
                 aidt=aidt.root,
                 repo=repo.root,
                 directory=directory,
+                fix_batch=fix_batch,
             )
             if target.roadmap_file is None:
                 withhold_tick(target.reason, specs)
@@ -1405,21 +1498,35 @@ def run(
         if dry_run:
             script = github.script_path(aidt.root, github.FOLLOWUP_SCRIPT)
             if github.gh_available():
+                # The preview passes `--limit` like the loop does, so the plan shows the
+                # whole batch and the `select` argv it prints is the argv a real run uses.
                 selection = github.select_followups(
-                    aidt.root, repo.root, pr, config=resolved_config
+                    aidt.root,
+                    repo.root,
+                    pr,
+                    config=resolved_config,
+                    limit=fix_batch,
                 )
                 payload = github.parse_json_output(selection.stdout) or {}
                 if selection.exit_code == github.EXIT_NONE_AVAILABLE:
                     print("child:  none available")
                 elif selection.exit_code == github.EXIT_OK:
-                    selected = payload.get("selected") or {}
-                    print(
-                        f"child:  #{selected.get('number')} {selected.get('title')} "
-                        f"({selected.get('priority')})"
-                    )
+                    # The preview reads the payload through the same guard as the loop, so a
+                    # non-array `selected` fails the plan instead of being normalised into a
+                    # one-child batch the real run would never fix (05-B1.1 reqs 2/3).
+                    batch = _selected_batch(payload)
+                    if batch is None:
+                        print(SELECT_NOT_A_BATCH, file=sys.stderr)
+                        return 1
+                    for child in batch:
+                        print(
+                            f"child:  #{child.get('number')} {child.get('title')} "
+                            f"({child.get('priority')})"
+                        )
                     print(
                         f"children: {payload.get('childrenInspected')} inspected "
-                        f"of {payload.get('totalChildren')}"
+                        f"of {payload.get('totalChildren')} "
+                        f"(up to {fix_batch} per iteration)"
                     )
                 else:
                     print(
@@ -1429,7 +1536,12 @@ def run(
                     )
             else:
                 print("child:  unknown (`gh` not found)")
-            print("select argv: " + " ".join(github.build_followup_argv(script, "select", pr)))
+            print(
+                "select argv: "
+                + " ".join(
+                    github.build_followup_argv(script, "select", pr, limit=fix_batch)
+                )
+            )
 
             # The planned iteration's real-run field values (E4.3 req 5): round 1's
             # approval plus iteration 1's F1–F4, with that iteration's manifest path so the
@@ -1442,6 +1554,7 @@ def run(
                 aidt=aidt.root,
                 repo=repo.root,
                 directory=directory,
+                fix_batch=fix_batch,
             )
             for spec in planned.values():
                 record = run_stage(
@@ -1483,6 +1596,7 @@ def run(
                 aidt=aidt.root,
                 repo=repo.root,
                 directory=directory,
+                fix_batch=fix_batch,
             )
             if dry_target.roadmap_file is None:
                 withhold_tick(dry_target.reason, dry_specs)
@@ -1518,7 +1632,10 @@ def run(
                 f"(after the loop, only when this run closed an issue)"
             )
             print("gates (planned): approve-followups, approve-fix-pr")
-            print(f"loop: bounded by --max-iterations={max_iterations}")
+            print(
+                f"loop: bounded by --max-iterations={max_iterations} "
+                f"(iterations; up to --fix-batch={fix_batch} fixes each)"
+            )
             print("dry-run complete; Pi not invoked, no GitHub state written")
             return 0
 
@@ -1538,6 +1655,7 @@ def run(
             skip=skip,
             deny=deny,
             gate_default=gate_default,
+            fix_batch=fix_batch,
         )
         if code is not None:
             state.status = BLOCKED if code == 3 else FAILED
@@ -1564,8 +1682,13 @@ def run(
                 save(directory, state)
                 return 3
 
+            # 05-B1.1: the iteration's work is exactly the children `select --limit N`
+            # returned, in native order — never a count re-derived from `closed_issues` or
+            # `childrenInspected`. The flag is always passed here, so `selected` must be the
+            # array shape; a single object would be the old single-select contract and
+            # would silently fix only the first child.
             selection = github.select_followups(
-                aidt.root, repo.root, pr, config=resolved_config
+                aidt.root, repo.root, pr, config=resolved_config, limit=fix_batch
             )
             payload = github.parse_json_output(selection.stdout) or {}
             if selection.exit_code == github.EXIT_NONE_AVAILABLE:
@@ -1581,21 +1704,37 @@ def run(
                 save(directory, state)
                 return 1
 
-            selected = payload.get("selected") or {}
+            batch = _selected_batch(payload)
+            if batch is None:
+                # Fail closed: a non-array, an empty array on exit 0, or an entry without a
+                # usable issue number is not a batch this loop may fix. Never fall back to
+                # the first element — that is the one-fix-per-iteration contract this task
+                # reverses — and never derive a width from a count (§8.4).
+                print(SELECT_NOT_A_BATCH, file=sys.stderr)
+                state.status = FAILED
+                stop("a `select` read that did not return a batch")
+                save(directory, state)
+                return 1
+
             iterations += 1
             prefix = f"iter{iterations}"
-            print(
-                f"fix:    #{selected.get('number')} {selected.get('title')} "
-                f"({selected.get('priority')})"
-            )
+            for child in batch:
+                print(
+                    f"fix:    #{child.get('number')} {child.get('title')} "
+                    f"({child.get('priority')})"
+                )
 
+            # Each issue gets its own closing body in this iteration's directory
+            # (05-B1.1 req 5). The workflow creates it — never the agent, which cannot know
+            # the run directory — before F1 and only on a real run: this loop is
+            # real-run-only, so a plan still creates nothing (W1.2/Z14).
+            closing_bodies_dir(directory, iterations).mkdir(parents=True, exist_ok=True)
             # This iteration's F1–F4, expanded from the registry once per iteration
             # (E4.3): the stage names carry the iteration count and F2/F4 carry the
             # registry-rendered context and manifest pointer. The loop is re-derived from
             # GitHub state each iteration, so nothing here is pre-planned. F1 also carries
-            # the close-deferral's body path (P1.2 req 4), and it is the same value this
-            # iteration's `closed_issues` entry records below.
-            closing_body = str(closing_body_path(directory, iterations))
+            # the close-deferral's directory (P1.2 req 4, per issue since 05-B1.1), and
+            # each `closed_issues` entry below records its own file inside it.
             planned = _planned_iteration(
                 pr=pr,
                 round_index=round_index,
@@ -1604,9 +1743,10 @@ def run(
                 aidt=aidt.root,
                 repo=repo.root,
                 directory=directory,
+                fix_batch=fix_batch,
             )
 
-            # F1 — fix exactly one approved child.
+            # F1 — fix the approved batch of children, in the order `select` returned.
             record = run_stage(
                 planned[f"{prefix}-fix-next-review-followup"],
                 repo_root=repo.root,
@@ -1749,6 +1889,7 @@ def run(
                     skip=skip,
                     deny=deny,
                     gate_default=gate_default,
+                    fix_batch=fix_batch,
                 )
                 if code is not None:
                     state.status = BLOCKED if code == 3 else FAILED
@@ -1772,7 +1913,10 @@ def run(
             summary = "\n".join(
                 [
                     f"Re-review approved for PR #{pr} (iteration {iterations})",
-                    f"Fixed issue: #{selected.get('number')} {selected.get('title')}",
+                    *(
+                        f"Fixed issue: #{child.get('number')} {child.get('title')}"
+                        for child in batch
+                    ),
                     f"Verdict: {verdict}",
                 ]
             )
@@ -1804,11 +1948,23 @@ def run(
                     file=sys.stderr,
                 )
                 return 3
-            # P1.2 req 4: the entry carries the absolute body path F1 wrote, so the close
-            # step passes it back as `--body-file` after the push. `closed_issues` still
-            # means "fixed, close-pending" — `commit_decision` reads it as "≥1 fix to
-            # publish" (Z9 D3) and is deliberately unchanged.
-            closed_issues.append({**selected, "closing_body": closing_body})
+            # One entry per batch **issue**, each carrying its own absolute body path, so
+            # the close step passes one `--body-file` per issue after the push (05-B1.1
+            # req 4). `closed_issues` still means "fixed, close-pending" —
+            # `commit_decision` reads it as "≥1 fix to publish" (Z9 D3) and is deliberately
+            # unchanged. A failed F2/F3 above returns before any append, so a failed batch
+            # records no entry and no issue in it is closed — never a subset.
+            for child in batch:
+                closed_issues.append(
+                    {
+                        **child,
+                        "closing_body": str(
+                            closing_body_path(
+                                directory, iterations, child.get("number")
+                            )
+                        ),
+                    }
+                )
 
         # --- the post-loop half, once per run (H3.3 req 1/req 7; 05-P1.1 req 1-5) -- #
         # The loop only reaches here through its `break` on `select` exit

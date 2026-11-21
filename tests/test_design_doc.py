@@ -582,7 +582,9 @@ def test_section_84_documents_the_deferred_close() -> None:
 
     assert "The deferred close" in block
     assert "review_followup.py close" in block
-    assert "{closing_body}" in block
+    # 05-B1.1 made the body per issue: the rendered variable is the `iter{N}` directory.
+    assert "{closing_bodies}" in block
+    assert "closing-body-{issue}.md" in block
     # The ordering rule, and the flag that it is no longer a future change.
     assert "only **after** `F5` has pushed" in block
     assert "unrepresentable later" not in block
@@ -1049,3 +1051,71 @@ def test_g12_decision_row_records_the_cited_spec_preflight() -> None:
     ids = re.findall(r"^\| (Z\d+) \|", decisions, re.M)
     duplicates = sorted({identifier for identifier in ids if ids.count(identifier) > 1})
     assert duplicates == [], f"reused §17 decision ids: {duplicates}"
+
+
+def test_b11_section_84_states_the_bounded_batch_and_not_one_fix_per_iteration() -> None:
+    """05-B1.1: §8.4's loop is a bounded batch, with one F2/F3 over the batch.
+
+    The reversed sentences are pinned as *absent*, because leaving them would have the
+    design claim a contract the code no longer keeps (and the per-child cost model that
+    motivated the task).
+    """
+    block = " ".join(_section_84_block(_design_md()).split())
+
+    assert "--fix-batch" in block
+    assert "One bounded batch of fixes per iteration" in block
+    assert "default 3" in block
+    assert "`F2`/`F3` run **once** over the batch's combined change set" in block
+    assert "never by counting" in block
+    assert "one entry per batch **issue**" in block
+    # The reversed prose must be gone, including the per-iteration diagram line.
+    assert "One fix per iteration" not in block
+    assert "per available approved child issue (serial, one at a time)" not in block
+    # The deferred-close contract it must NOT change is still stated.
+    assert "never a batch and never a re-derived count" in block
+    assert "The workflow — never the agent — creates `artifacts/iter{N}/` before `F1`" in block
+
+
+def test_b11_decision_row_records_the_batch_and_the_stale_z14() -> None:
+    """05-B1.1: exactly one §17 row, appended under the next free id.
+
+    Matched by task id + wording, never by a ``Z`` number (``aidw/conventions.md`` forbids
+    reusing or renumbering an id), and the row records that the roadmap's "Z14" was stale.
+    """
+    decisions = _section(_design_md(), "## 17. Resolved decisions", "## 18. Risks")
+    rows = [
+        line
+        for line in decisions.splitlines()
+        if re.match(r"^\| Z\d+ \|", line)
+        and "05-B1.1" in line
+        and "--fix-batch" in line
+    ]
+    assert len(rows) == 1, f"expected exactly one 05-B1.1 decision row, found {len(rows)}"
+    row = rows[0]
+    # The behaviour the code implements.
+    assert "`select_available(children, limit)`" in row
+    assert "`{closing_bodies}`" in row
+    assert "`closing-body-{issue}.md`" in row
+    assert "one entry per batch issue" in row
+    assert "one `close` call per entry" in row
+    assert "iterations" in row
+    # The prompt-fixed decisions travel with the row (Z2/Z9/Z11's precedent).
+    assert "Prompt-fixed decisions" in row
+    for decision in ("(a)", "(b)", "(c)", "(d)", "(e)"):
+        assert decision in row, decision
+    # The stale id is recorded, not reused.
+    assert "`Z14`" in row and "stale" in row
+    assert "next free id" in row
+    # The touched set is named, so the contract tests are findable.
+    for path in (
+        "aidw/workflows/fix.py",
+        "aidw/cli.py",
+        "aidw/github.py",
+        "aidw/stage_registry.py",
+        "prompts/fix-next-review-followup.md",
+        "prompts/scripts/review-followup/logic.py",
+        "docs/workflow-stages.md",
+        "tests/test_fix_workflow.py",
+        "prompts/scripts/review-followup/tests/test_logic.py",
+    ):
+        assert path in row, path

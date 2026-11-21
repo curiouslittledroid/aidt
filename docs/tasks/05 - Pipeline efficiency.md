@@ -130,7 +130,7 @@ expensive authoring stage.
 cycles. This epic batches independent issues per iteration while keeping per-issue
 accountability.
 
-- [ ] **B1.1. Fix multiple approved follow-ups per iteration** (Design 8.4)
+- [x] **B1.1. Fix multiple approved follow-ups per iteration** (Design 8.4)
   - Done when: `fix` processes a bounded batch of approved child issues per iteration (default 3, overridable via a `--fix-batch <n>` flag), each with its own files-changed accountability, followed by a single `test` and a single `code-review` over the batch; the loop still re-derives availability via `review_followup.py select` and never by counting; the "one fix per iteration" prose in §8.4 and the fixer prompt is updated and the decision recorded as Z14; a finding in the batch re-review still creates new children; and the five gates above are green.
   - Deliverable: `aidw/workflows/fix.py`, `prompts/fix-next-review-followup.md`, `prompts/scripts/review-followup/review_followup.py` (batch select), design.md §§8.4, 17 (row Z14), and the tests below.
   - Tests: `tests/test_fix_workflow.py`, `tests/test_prompt_workflow.py`, `tests/test_design_doc.py`.

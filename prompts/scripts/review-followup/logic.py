@@ -63,6 +63,21 @@ class Selection:
     skipped: list[SkippedChild] = field(default_factory=list)
 
 
+@dataclass
+class BatchSelection:
+    """The bounded batch ``select --limit`` returns (05-B1.1, design §8.4).
+
+    Unlike :class:`Selection`, ``selected`` is **always** a list — a one-child batch is a
+    one-element list, never a single object — so the JSON shape the workflow reads keys on
+    the ``--limit`` flag and not on how many children happened to be available.
+    """
+
+    selected: list[ChildIssue]
+    #: Unavailable children encountered up to and including the last selected child, in
+    #: native order. Children after the batch are not inspected and are not reported.
+    skipped: list[SkippedChild]
+
+
 # ── Status comments ───────────────────────────────────────────────────────
 
 
@@ -124,7 +139,9 @@ def select_first_available(children: list[ChildIssue]) -> Selection:
     ``children`` must already be in the parent's native ``subIssues`` order;
     this function deliberately does not sort. Selection stops at the first
     available child, so children after it are not inspected and are not reported
-    as skipped — the workflow processes exactly one child per run.
+    as skipped — the single-select contract ``start``, ``fixed`` and the
+    flag-absent ``select`` path keep (05-B1.1: the batch path is
+    :func:`select_available`, and the approval round never passes ``--limit``).
     """
     skipped: list[SkippedChild] = []
     for child in children:
@@ -140,6 +157,48 @@ def select_first_available(children: list[ChildIssue]) -> Selection:
             )
         )
     return Selection(selected=None, skipped=skipped)
+
+
+def select_available(children: list[ChildIssue], limit: int) -> BatchSelection:
+    """Select up to ``limit`` available children in native order (05-B1.1, design §8.4).
+
+    The batch counterpart of :func:`select_first_available`, deliberately a separate pure
+    function so neither contract can blur into the other:
+
+    * ``children`` must already be in the parent's native ``subIssues`` order — this never
+      sorts, and the workflow never re-derives "available" by counting;
+    * selection stops as soon as ``limit`` children are selected, so children after the
+      batch are not inspected and are not reported as skipped — the same native-order
+      prefix :func:`select_first_available` walks, widened by ``limit``;
+    * ``skipped`` is every unavailable child encountered **up to and including** the last
+      selected child, which makes ``len(skipped) + len(selected)`` the number of children
+      inspected (the ``childrenInspected`` contract);
+    * a ``limit`` larger than the number of available children returns all of them, and
+      none available returns an empty batch (the caller's ``EXIT_NONE_AVAILABLE`` case).
+
+    Fails closed on a non-positive ``limit`` rather than returning an empty batch a caller
+    could mistake for "nothing available". Pure: no I/O, no mutation of ``children``.
+    """
+    if limit <= 0:
+        raise UsageError(f'--limit must be a positive integer, got "{limit}".')
+    selected: list[ChildIssue] = []
+    skipped: list[SkippedChild] = []
+    for child in children:
+        verdict = availability(child)
+        if verdict.available:
+            selected.append(child)
+            if len(selected) == limit:
+                break
+            continue
+        skipped.append(
+            SkippedChild(
+                number=child.number,
+                title=child.title,
+                url=child.url,
+                reason=verdict.reason or "CLOSED",
+            )
+        )
+    return BatchSelection(selected=selected, skipped=skipped)
 
 
 def is_in_flight(child: ChildIssue) -> bool:
@@ -299,6 +358,10 @@ class ParsedArgs:
     command: str = "help"
     pr: str | None = None
     issue: int | None = None
+    #: ``--limit`` (05-B1.1): ``None`` means the flag was **absent**, which is the
+    #: single-object ``select`` contract; any explicit value (``--limit 1`` included)
+    #: selects the array-shaped batch. The distinction is the flag, never the value.
+    limit: int | None = None
     body_file: str | None = None
     dry_run: bool = False
     allow_branch_mismatch: bool = False
@@ -338,6 +401,9 @@ def parse_args(argv: list[str]) -> ParsedArgs:
             value = read_value()
             parsed.issue = _positive_int(value)
             index += 2
+        elif flag == "--limit":
+            parsed.limit = _positive_int(read_value(), "--limit")
+            index += 2
         elif flag == "--dry-run":
             parsed.dry_run = True
             index += 1
@@ -353,13 +419,19 @@ def parse_args(argv: list[str]) -> ParsedArgs:
     return parsed
 
 
-def _positive_int(value: str) -> int:
+def _positive_int(value: str, flag: str = "--issue") -> int:
+    """A positive integer flag value, naming the flag it belongs to.
+
+    ``flag`` is a parameter because 05-B1.1 added a second positive-int flag
+    (``--limit``): a refusal that said ``--issue`` for a bad ``--limit`` would send the
+    operator to the wrong argument.
+    """
     try:
         parsed = int(value, 10)
     except ValueError:
         parsed = 0
     if parsed <= 0:
-        raise UsageError(f'--issue must be a positive integer, got "{value}".')
+        raise UsageError(f'{flag} must be a positive integer, got "{value}".')
     return parsed
 
 

@@ -448,7 +448,17 @@ def review(
 def fix(
     pr: int = typer.Option(..., "--pr", help="Pull request number."),
     max_iterations: int = typer.Option(
-        10, "--max-iterations", help="Bound the review/fix loop."
+        10,
+        "--max-iterations",
+        help="Bound the number of fix iterations (batches), not the number of fixes.",
+    ),
+    fix_batch: int = typer.Option(
+        3,
+        "--fix-batch",
+        help=(
+            "Approved follow-ups to fix per iteration (default 3); each iteration runs "
+            "one test and one code-review over the whole batch. Must be positive."
+        ),
     ),
     yes: bool = typer.Option(False, "--yes"),
     skip_gates: list[str] = typer.Option([], "--skip-gates"),
@@ -458,7 +468,7 @@ def fix(
     dry_run: bool = typer.Option(False, "--dry-run"),
     force_model: bool = typer.Option(False, "--force-model"),
 ) -> None:
-    """Fix approved review follow-ups, one at a time (workflow group 4)."""
+    """Fix approved review follow-ups in bounded batches (workflow group 4)."""
     repo, aidt, workspace = _roots()
     code = fix_workflow.run(
         pr=pr,
@@ -466,6 +476,7 @@ def fix(
         aidt=aidt,
         workspace=workspace,
         max_iterations=max_iterations,
+        fix_batch=fix_batch,
         approve_all=yes,
         skip_gates=list(skip_gates),
         deny_gates=list(deny_gates),

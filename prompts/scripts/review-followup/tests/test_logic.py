@@ -5,17 +5,21 @@ Run with: uv run pytest prompts/scripts/review-followup/tests
 
 from __future__ import annotations
 
+import json
 import random
 
 import pytest
 
+import gh
 import logic
+import review_followup
 from logic import (
     CLOSE_ACTION_CLOSE,
     CLOSE_ACTION_NOOP,
     CLOSE_REFUSAL_MISSING_LABELS,
     CLOSE_REFUSAL_NOT_OPEN,
     ApprovalPlan,
+    BatchSelection,
     ChildIssue,
     ClosePlan,
     ParsedArgs,
@@ -30,10 +34,16 @@ from logic import (
     is_in_flight,
     parse_args,
     priority_label,
+    select_available,
     select_first_available,
     status_flags,
 )
 from proc import UsageError
+
+#: Pinned seed and run count for the property sweep below (AGENTS.md "Tests": pytest only, no
+#: ``hypothesis``, so a reproducible sample is the generator and there is no shrinking).
+PROPERTY_SEED = 20261120
+PROPERTY_RUNS = 64
 
 
 def child(**overrides: object) -> ChildIssue:
@@ -154,6 +164,142 @@ def test_handles_an_empty_child_list() -> None:
     assert selection.skipped == []
 
 
+# ── selectAvailable (05-B1.1, design §8.4) ─────────────────────────────────
+
+
+def test_select_available_returns_the_first_n_available_in_native_order() -> None:
+    """Hand-calculated: #1 closed, #2/#3/#4 available, limit 2 → #2 and #3."""
+    batch = select_available(
+        [
+            child(number=1, state="CLOSED"),
+            child(number=2),
+            child(number=3),
+            child(number=4),
+        ],
+        2,
+    )
+    assert [selected.number for selected in batch.selected] == [2, 3]
+    assert [(skipped.number, skipped.reason) for skipped in batch.skipped] == [
+        (1, "CLOSED")
+    ]
+    # The scan contract: inspected up to and including the last selected child.
+    assert len(batch.skipped) + len(batch.selected) == 3
+
+
+def test_select_available_with_limit_one_is_the_single_select_as_a_list() -> None:
+    """The batch path never returns a bare object, even for one child."""
+    children = [child(number=1, state="CLOSED"), child(number=2), child(number=3)]
+    single = select_first_available(children)
+    batch = select_available(children, 1)
+
+    assert isinstance(batch.selected, list)
+    assert [selected.number for selected in batch.selected] == [single.selected.number]
+    assert [skipped.number for skipped in batch.skipped] == [
+        skipped.number for skipped in single.skipped
+    ]
+
+
+def test_select_available_limit_beyond_availability_returns_all_available() -> None:
+    batch = select_available(
+        [child(number=1), child(number=2, state="CLOSED"), child(number=3)], 10
+    )
+    assert [selected.number for selected in batch.selected] == [1, 3]
+    assert [skipped.number for skipped in batch.skipped] == [2]
+
+
+def test_select_available_with_no_available_child_is_an_empty_batch() -> None:
+    """The empty batch is the caller's `EXIT_NONE_AVAILABLE` case, not a usage error."""
+    batch = select_available([child(number=1, state="CLOSED"), child(number=2, state="CLOSED")], 3)
+    assert batch.selected == []
+    assert [skipped.number for skipped in batch.skipped] == [1, 2]
+
+
+def test_select_available_does_not_inspect_children_after_the_batch() -> None:
+    batch = select_available([child(number=1), child(number=2), child(number=3, state="CLOSED")], 2)
+    assert [selected.number for selected in batch.selected] == [1, 2]
+    assert batch.skipped == []
+
+
+def test_select_available_skips_only_up_to_the_last_selected_child() -> None:
+    """#1/#3 unavailable, #2/#4/#5 available, limit 2 → #2 and #4; #3 skipped, #5 not."""
+    batch = select_available(
+        [
+            child(number=1, state="CLOSED"),
+            child(number=2),
+            child(number=3, labels=["review-follow-up"]),
+            child(number=4),
+            child(number=5),
+        ],
+        2,
+    )
+    assert [selected.number for selected in batch.selected] == [2, 4]
+    assert [(skipped.number, skipped.reason) for skipped in batch.skipped] == [
+        (1, "CLOSED"),
+        (3, "MISSING_APPROVE_FIX"),
+    ]
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_select_available_refuses_a_non_positive_limit(limit: int) -> None:
+    """Fail closed, naming `--limit`: an empty result would read as "none available"."""
+    with pytest.raises(UsageError, match="--limit must be a positive integer"):
+        select_available([child(number=1)], limit)
+
+
+def test_select_available_does_not_mutate_its_input() -> None:
+    children = [child(number=1, state="CLOSED"), child(number=2), child(number=3)]
+    before = [(item.number, item.state, list(item.labels), list(item.comment_bodies)) for item in children]
+
+    select_available(children, 2)
+
+    assert [
+        (item.number, item.state, list(item.labels), list(item.comment_bodies))
+        for item in children
+    ] == before
+
+
+def test_select_available_property_native_order_prefix_and_bounded_width() -> None:
+    """Property sweep over random availability: the batch is always a native-order prefix.
+
+    ``selected`` must be available children only, in native order, at most ``limit`` of them;
+    ``skipped`` must be unavailable children only; and the two together must be exactly the
+    children up to and including the last selected one (the inspected prefix).
+    """
+    rng = random.Random(PROPERTY_SEED)
+    for _ in range(PROPERTY_RUNS):
+        size = rng.randint(0, 8)
+        available = {number: rng.random() < 0.5 for number in range(1, size + 1)}
+        children = [
+            child(number=number)
+            if available[number]
+            else child(number=number, state="CLOSED")
+            for number in range(1, size + 1)
+        ]
+        limit = rng.randint(1, 6)
+
+        batch = select_available(children, limit)
+
+        numbers = [selected.number for selected in batch.selected]
+        assert numbers == sorted(numbers)
+        assert all(available[number] for number in numbers)
+        assert all(not available[skipped.number] for skipped in batch.skipped)
+        assert len(batch.selected) <= limit
+        assert len(batch.selected) == min(limit, sum(available.values()))
+        inspected = batch.skipped + [
+            logic.SkippedChild(selected.number, selected.title, selected.url, "")
+            for selected in batch.selected
+        ]
+        by_number = sorted(item.number for item in inspected)
+        # The inspected set is always a native-order prefix, with no holes.
+        assert by_number == list(range(1, len(by_number) + 1))
+        if len(numbers) == limit:
+            # The batch filled up: the scan stopped at the last selected child.
+            assert max(by_number) == max(numbers)
+        else:
+            # Fewer than `limit` were available, so every child was inspected.
+            assert by_number == list(range(1, size + 1))
+
+
 # ── isInFlight ────────────────────────────────────────────────────────────
 
 
@@ -246,6 +392,19 @@ def test_parses_issue_as_a_positive_integer() -> None:
 def test_rejects_a_non_numeric_issue() -> None:
     with pytest.raises(UsageError, match="positive integer"):
         parse_args(["verify", "--pr", "174", "--issue", "abc"])
+
+
+def test_parses_limit_as_a_positive_integer_and_distinguishes_it_from_absent() -> None:
+    """The flag, not the value: `--limit 1` is set, and parsed as the batch width."""
+    assert parse_args(["select", "--pr", "174"]).limit is None
+    assert parse_args(["select", "--pr", "174", "--limit", "1"]).limit == 1
+    assert parse_args(["select", "--pr", "174", "--limit", "3"]).limit == 3
+
+
+@pytest.mark.parametrize("value", ["0", "-2", "abc"])
+def test_a_bad_limit_names_the_limit_flag(value: str) -> None:
+    with pytest.raises(UsageError, match="--limit must be a positive integer"):
+        parse_args(["select", "--pr", "174", "--limit", value])
 
 
 def test_rejects_a_flag_missing_its_value() -> None:
@@ -439,3 +598,133 @@ def test_is_approved_requires_open_approve_fix_no_pending_and_the_exact_comment(
         )
         is False
     )
+
+
+# ── cmd_select: the flag-keyed JSON shape (05-B1.1, design §8.4) ──────────
+#
+# The load-bearing contract is the *shape*: an explicit `--limit` (even `--limit 1`) makes
+# `selected` an array, while an absent flag keeps today's single object. `start`, `fixed`
+# and `fix`'s approval round read the object, so only the flag may switch the shape.
+
+
+def _patch_select(monkeypatch, children: list[ChildIssue]) -> None:
+    """Point ``select`` at an in-memory repository; nothing here reaches ``gh``."""
+    context = review_followup.Context(
+        repo="o/r",
+        pr=gh.PrInfo(
+            number=7,
+            title="A PR",
+            url="https://github.com/o/r/pull/7",
+            state="OPEN",
+            headRefName="03-E4.1",
+            baseRefName="main",
+        ),
+        branch="03-E4.1",
+        branch_matches=True,
+    )
+    monkeypatch.setattr(review_followup, "resolve_context", lambda _pr: context)
+    monkeypatch.setattr(review_followup, "assert_processable", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        review_followup,
+        "find_single_parent",
+        lambda _repo, _url: gh.ParentIssue(
+            number=100,
+            title="Review follow-ups",
+            url="https://github.com/o/r/issues/100",
+            state="OPEN",
+        ),
+    )
+    monkeypatch.setattr(
+        review_followup, "load_children", lambda _repo, _parent: list(children)
+    )
+
+
+def _run_select(argv: list[str], capsys) -> tuple[int, dict]:
+    code = review_followup.main(argv)
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_select_without_limit_keeps_the_single_object(monkeypatch, capsys) -> None:
+    """Today's contract, unchanged: `start`, `fixed` and the approval round read it."""
+    _patch_select(
+        monkeypatch,
+        [child(number=1, state="CLOSED"), child(number=2), child(number=3)],
+    )
+
+    code, payload = _run_select(["select", "--pr", "7"], capsys)
+
+    assert code == 0
+    assert isinstance(payload["selected"], dict)
+    assert payload["selected"]["number"] == 2
+    assert [skipped["number"] for skipped in payload["skipped"]] == [1]
+    assert payload["childrenInspected"] == 2
+    assert payload["totalChildren"] == 3
+
+
+def test_select_with_limit_returns_an_array_and_scan_metadata(monkeypatch, capsys) -> None:
+    """Hand-calculated: #1 closed, #2/#3 available, #4 closed, limit 2.
+
+    The batch is #2/#3; `skipped` is only what was encountered up to #3, so #4 is neither
+    selected nor reported, and `childrenInspected` is `len(skipped) + len(selected)` = 3.
+    """
+    _patch_select(
+        monkeypatch,
+        [
+            child(number=1, state="CLOSED"),
+            child(number=2),
+            child(number=3),
+            child(number=4, state="CLOSED"),
+        ],
+    )
+
+    code, payload = _run_select(["select", "--pr", "7", "--limit", "2"], capsys)
+
+    assert code == 0
+    assert isinstance(payload["selected"], list)
+    assert [selected["number"] for selected in payload["selected"]] == [2, 3]
+    assert [skipped["number"] for skipped in payload["skipped"]] == [1]
+    assert payload["childrenInspected"] == 3
+    assert payload["totalChildren"] == 4
+
+
+def test_select_with_limit_one_is_a_one_element_array(monkeypatch, capsys) -> None:
+    """The shape keys on the flag, never on the value."""
+    _patch_select(monkeypatch, [child(number=1), child(number=2)])
+
+    code, payload = _run_select(["select", "--pr", "7", "--limit", "1"], capsys)
+
+    assert code == 0
+    assert isinstance(payload["selected"], list)
+    assert [selected["number"] for selected in payload["selected"]] == [1]
+
+
+def test_select_with_a_limit_beyond_availability_returns_all(monkeypatch, capsys) -> None:
+    _patch_select(
+        monkeypatch, [child(number=1), child(number=2, state="CLOSED"), child(number=3)]
+    )
+
+    code, payload = _run_select(["select", "--pr", "7", "--limit", "9"], capsys)
+
+    assert code == 0
+    assert [selected["number"] for selected in payload["selected"]] == [1, 3]
+    assert payload["childrenInspected"] == 3
+
+
+def test_select_with_limit_and_nothing_available_exits_three(monkeypatch, capsys) -> None:
+    """An empty array, not `null`: the batch path always returns the array shape."""
+    _patch_select(monkeypatch, [child(number=1, state="CLOSED")])
+
+    code, payload = _run_select(["select", "--pr", "7", "--limit", "3"], capsys)
+
+    assert code == 3
+    assert payload["selected"] == []
+    assert [skipped["reason"] for skipped in payload["skipped"]] == ["CLOSED"]
+
+
+def test_select_without_limit_and_nothing_available_keeps_null(monkeypatch, capsys) -> None:
+    _patch_select(monkeypatch, [child(number=1, state="CLOSED")])
+
+    code, payload = _run_select(["select", "--pr", "7"], capsys)
+
+    assert code == 3
+    assert payload["selected"] is None

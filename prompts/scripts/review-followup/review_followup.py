@@ -3,7 +3,8 @@
 ``aidt/prompts/fix-next-review-followup.md``.
 
 Subcommands:
-  select   Read-only. PR -> parent issue -> first available child, as JSON.
+  select   Read-only. PR -> parent issue -> first available child (or, with
+           --limit <n>, up to n of them), as JSON.
   start    Post the exact ``Status: in progress`` comment (idempotent).
   fixed    Post the exact ``Status: fixed`` comment and close the issue.
   close    The deferred close: the same action, for one named issue, no selection.
@@ -73,6 +74,7 @@ from logic import (
     CLOSE_REFUSAL_MISSING_LABELS,
     CLOSE_REFUSAL_NOT_OPEN,
     ApprovalPlan,
+    BatchSelection,
     ChildIssue,
     ClosePlan,
     ParsedArgs,
@@ -84,6 +86,7 @@ from logic import (
     is_approved,
     parse_args,
     priority_label,
+    select_available,
     select_first_available,
     status_flags,
 )
@@ -250,7 +253,18 @@ def cmd_select(args: ParsedArgs) -> int:
     assert_processable(context, args.allow_branch_mismatch)
     parent = find_single_parent(context.repo, context.pr.url)
     children = load_children(context.repo, parent)
-    selection = select_first_available(children)
+    # 05-B1.1 (design §8.4): the JSON shape keys on the **flag**, never on the value, so an
+    # explicit `--limit 1` is a one-element array and an absent `--limit` keeps today's
+    # single object. The object-to-batch normalisation lives only in this branch, which is
+    # why `start`, `fixed` and the approval round keep reading a single object.
+    if args.limit is None:
+        selection = select_first_available(children)
+        batch = BatchSelection(
+            selected=[selection.selected] if selection.selected else [],
+            skipped=selection.skipped,
+        )
+    else:
+        batch = select_available(children, args.limit)
 
     emit(
         {
@@ -270,7 +284,11 @@ def cmd_select(args: ParsedArgs) -> int:
                 "url": parent.url,
                 "state": parent.state,
             },
-            "selected": summarize(selection.selected) if selection.selected else None,
+            "selected": (
+                [summarize(child) for child in batch.selected]
+                if args.limit is not None
+                else (summarize(batch.selected[0]) if batch.selected else None)
+            ),
             "skipped": [
                 {
                     "number": skipped.number,
@@ -278,16 +296,14 @@ def cmd_select(args: ParsedArgs) -> int:
                     "url": skipped.url,
                     "reason": skipped.reason,
                 }
-                for skipped in selection.skipped
+                for skipped in batch.skipped
             ],
-            "childrenInspected": (
-                len(selection.skipped) + 1 if selection.selected else len(selection.skipped)
-            ),
+            "childrenInspected": len(batch.skipped) + len(batch.selected),
             "totalChildren": len(children),
         }
     )
 
-    return EXIT_OK if selection.selected else EXIT_NONE_AVAILABLE
+    return EXIT_OK if batch.selected else EXIT_NONE_AVAILABLE
 
 
 # ── start ─────────────────────────────────────────────────────────────────
@@ -657,7 +673,7 @@ def cmd_verify(args: ParsedArgs) -> int:
 HELP = """review-followup — GitHub bookkeeping for review follow-up issues
 
 Usage:
-  review_followup.py select  --pr <number-or-url> [--allow-branch-mismatch]
+  review_followup.py select  --pr <number-or-url> [--limit <n>] [--allow-branch-mismatch]
   review_followup.py start   --pr <number-or-url> [--issue <n>] [--dry-run]
   review_followup.py fixed   --pr <number-or-url> --body-file <path> [--issue <n>] [--dry-run]
   review_followup.py close   --pr <number-or-url> --issue <n> --body-file <path> [--dry-run]
@@ -665,6 +681,10 @@ Usage:
   review_followup.py approve --pr <number-or-url> [--dry-run]
 
 Notes:
+  `select --limit <n>` returns an ARRAY of up to n available children in native
+  sub-issue order (an explicit `--limit 1` included). Without `--limit` the
+  selected child is a single object, as it always was.
+
   --issue may only name the child chosen by native-order selection, or the
   workflow's in-flight child (open, with an exact "Status: in progress"
   comment). It cannot bypass the "first available in native sub-issue order"

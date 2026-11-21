@@ -113,9 +113,14 @@ def _runs_root(repo: Path) -> Path:
     return _roots(repo)["workspace"].state_root / "runs"
 
 
+def _child(number: int, title: str = "Fix the loop") -> dict:
+    return {"number": number, "title": title, "priority": "must-fix"}
+
+
 def _select_ok(number: int = 101, title: str = "Fix the loop") -> github.ScriptResult:
+    """A batch payload (05-B1.1: ``selected`` is an array); the fake narrows it per call."""
     payload = {
-        "selected": {"number": number, "title": title, "priority": "must-fix"},
+        "selected": [_child(number, title)],
         "childrenInspected": 1,
         "totalChildren": 1,
         "skipped": [],
@@ -123,9 +128,22 @@ def _select_ok(number: int = 101, title: str = "Fix the loop") -> github.ScriptR
     return github.ScriptResult([], 0, json.dumps(payload), "")
 
 
+def _select_batch(
+    numbers: tuple[int, ...] = (101, 102, 103), *, title: str = "Fix the loop"
+) -> github.ScriptResult:
+    """A batch-shaped ``select --limit`` payload (05-B1.1): ``selected`` is an array."""
+    payload = {
+        "selected": [_child(number, f"{title} #{number}") for number in numbers],
+        "childrenInspected": len(numbers),
+        "totalChildren": len(numbers),
+        "skipped": [],
+    }
+    return github.ScriptResult([], 0, json.dumps(payload), "")
+
+
 def _select_none() -> github.ScriptResult:
     payload = {
-        "selected": None,
+        "selected": [],
         "childrenInspected": 1,
         "totalChildren": 1,
         "skipped": [{"number": 101, "reason": "STATUS_FIXED", "title": "Fix the loop"}],
@@ -133,12 +151,48 @@ def _select_none() -> github.ScriptResult:
     return github.ScriptResult([], github.EXIT_NONE_AVAILABLE, json.dumps(payload), "")
 
 
+def _shape_selection(
+    result: github.ScriptResult, limit: int | None
+) -> github.ScriptResult:
+    """Model ``select``'s **flag-keyed** shape (05-B1.1, design §8.4).
+
+    ``--limit`` passed → ``selected`` is an array of up to ``limit`` children, exit 0 (3 when
+    empty); absent → today's single object and the fixture's own exit code. Every ``fix``
+    loop and dry-run call passes a limit, so a fixture written as a batch exercises the real
+    array contract, while the approval round (which never passes one) keeps its object read.
+    """
+    payload = json.loads(result.stdout) if result.stdout else {}
+    if not isinstance(payload, dict):  # pragma: no cover - every fixture is a payload
+        return result
+    selected = payload.get("selected")
+    if limit is None:
+        if isinstance(selected, list):
+            payload["selected"] = selected[0] if selected else None
+        return github.ScriptResult(
+            result.argv, result.exit_code, json.dumps(payload), result.stderr
+        )
+    batch = [selected] if isinstance(selected, dict) else list(selected or [])
+    batch = batch[:limit]
+    payload["selected"] = batch
+    payload["childrenInspected"] = len(payload.get("skipped") or []) + len(batch)
+    return github.ScriptResult(
+        result.argv,
+        github.EXIT_OK if batch else github.EXIT_NONE_AVAILABLE,
+        json.dumps(payload),
+        result.stderr,
+    )
+
+
 def _select_seq(items: list[github.ScriptResult]):
+    """The fake ``select``; records the ``limit`` each call was made with (05-B1.1)."""
     queue = list(items)
 
-    def _next(aidt, repo, pr, timeout=github.DEFAULT_TIMEOUT, **_kwargs):
-        return queue.pop(0) if queue else _select_none()
+    def _next(aidt, repo, pr, timeout=github.DEFAULT_TIMEOUT, *, limit=None, **_kwargs):
+        _next.calls.append(limit)
+        result = queue.pop(0) if queue else _select_none()
+        return _shape_selection(result, limit)
 
+    _next.calls = []
     return _next
 
 
@@ -159,10 +213,11 @@ class _FakeStages:
 
     Since 05-P1.2 it also models the **deferred close**, which is *not* an agent stage: the
     workflow runs the bundled ``review_followup.py close`` itself, so :meth:`close_script` is
-    installed as the fake ``github.run_script``. ``F1`` writes its closing comment body to
-    the ``{closing_body}`` variable it was given, ``events`` records the push and the close in
-    one timeline (so a test can prove the order), and ``issues`` is the fake GitHub state the
-    close flips — ``OPEN`` when the push happened, ``CLOSED`` only afterwards.
+    installed as the fake ``github.run_script``. ``F1`` writes one closing comment body per
+    batch issue into the ``{closing_bodies}`` directory it was given, ``events`` records the
+    push and the close in one timeline (so a test can prove the order), and ``issues`` is the
+    fake GitHub state the close flips — ``OPEN`` when the push happened, ``CLOSED`` only
+    afterwards.
     """
 
     def __init__(
@@ -177,6 +232,7 @@ class _FakeStages:
         write_closing_body: bool = True,
         close_exit_code: int = 0,
         issues: dict[int, str] | None = None,
+        batch: tuple[int, ...] = (101,),
     ) -> None:
         self.names: list[str] = []
         self.specs: list = []
@@ -190,6 +246,9 @@ class _FakeStages:
         self.write_closing_body = write_closing_body
         self.close_exit_code = close_exit_code
         self.issues: dict[int, str] = dict(issues or {})
+        #: The issue numbers the fake fixer is told to fix in each iteration, so it can write
+        #: one closing body per child (05-B1.1). A batch test sets the batch it selects.
+        self.batch = tuple(batch)
         #: One ordered timeline of what the run did: ``("stage", name)``, ``("push", state)``
         #: and ``("close", issue)``. The state snapshot at push time is *copied*, so the
         #: assertion "the issue was still OPEN before the push" cannot pass by accident.
@@ -205,12 +264,19 @@ class _FakeStages:
         path.write_text("fixed", encoding="utf-8")
 
     def _write_closing_body(self, spec) -> None:
-        """Play the fixer's other part: write the body to ``{closing_body}`` (P1.2 req 4)."""
+        """Play the fixer's other part: one body per batch issue in ``{closing_bodies}``.
+
+        Since 05-B1.1 ``$2`` is the iteration's directory and the fixer names each file after
+        its issue, which is the path the deferred close passes back as ``--body-file``.
+        """
         if not self.write_closing_body or len(spec.variables) < 2:
             return
-        path = Path(spec.variables[1])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("Implemented on the current PR branch.\n", encoding="utf-8")
+        directory = Path(spec.variables[1])
+        directory.mkdir(parents=True, exist_ok=True)
+        for number in self.batch:
+            (directory / f"closing-body-{number}.md").write_text(
+                f"Implemented #{number} on the current PR branch.\n", encoding="utf-8"
+            )
 
     def close_script(self, argv: list[str], repo_root: Path) -> github.ScriptResult:
         """Model ``review_followup.py close`` as the workflow invokes it (P1.2 req 2/3).
@@ -375,6 +441,9 @@ def test_dry_run_lists_child_and_plans(tmp_path: Path, monkeypatch, capsys) -> N
     assert code == 0
     out = capsys.readouterr().out
     assert "child:  #101 Fix the loop" in out
+    # 05-B1.1: the preview echoes the batch's `select --limit` argv and the bound.
+    assert "--limit 3" in out
+    assert "loop: bounded by --max-iterations=10 (iterations; up to --fix-batch=3 fixes each)" in out
     assert "iter1-fix-next-review-followup" in out
     assert "review-findings-to-github" in out
     # The PR-head worktree is located and planned against (E2.6 req 3/req 6).
@@ -383,12 +452,13 @@ def test_dry_run_lists_child_and_plans(tmp_path: Path, monkeypatch, capsys) -> N
     assert stages.repo_roots and all(root == worktree for root in stages.repo_roots)
     # W1.2 (c3): the paths F1 and F4 render are *named*, never fabricated — one
     # placeholder root in place of the run directory, and the field shapes are unchanged.
+    # 05-B1.1: F1's `$2` is the iteration's **directory**, one body file per issue inside it.
     fixup = next(
         spec for spec in stages.specs if spec.name.endswith("fix-next-review-followup")
     )
-    assert fixup.variables[-1] == (
-        f"{PLANNED_RUN_DIR_TEXT}/artifacts/iter1-closing-body.md"
-    )
+    assert fixup.variables[1] == f"{PLANNED_RUN_DIR_TEXT}/artifacts/iter1"
+    # 05-B1.1: the third variable is the run's width, so the dry-run plan states it too.
+    assert fixup.variables[2] == str(fix_workflow.DEFAULT_FIX_BATCH)
     manifest = f"{PLANNED_RUN_DIR_TEXT}/artifacts/iter1-review-manifest.json"
     assert any(manifest in spec.extra for spec in stages.specs)
     # `<run dir>` is relative, so a stray write would land in the working tree, not `runs/`.
@@ -2035,9 +2105,9 @@ def test_a_failed_tick_leaves_no_commit_record(tmp_path: Path, monkeypatch) -> N
 
 
 def _closing_bodies(control: Path) -> list[Path]:
-    """Every closing-body file this run's iterations wrote, in iteration order."""
+    """Every closing-body file this run's iterations wrote, in path order (05-B1.1)."""
     directory = _runs_root(control) / _state_of(control).run_id
-    return sorted((directory / "artifacts").glob("iter*-closing-body.md"))
+    return sorted((directory / "artifacts").glob("iter*/closing-body-*.md"))
 
 
 def test_a_converged_run_closes_the_recorded_issue_after_the_push(
@@ -2077,8 +2147,13 @@ def test_a_converged_run_closes_the_recorded_issue_after_the_push(
     body = Path(recorded)
     assert body.is_absolute()
     assert body == _closing_bodies(control)[0]
+    # 05-B1.1: F1 renders the iteration's **directory**, and the entry points at this issue's
+    # file inside it — one body per child, so the close names the issue it closes.
     f1 = next(spec for spec in stages.specs if spec.name.startswith("iter1-fix"))
-    assert f1.variables == ["7", recorded]
+    # The batch width is the third positional variable (05-B1.1): the run's resolved
+    # `--fix-batch` (the default here), so the agent's own `select --limit` cannot widen it.
+    assert f1.variables == ["7", str(body.parent), str(fix_workflow.DEFAULT_FIX_BATCH)]
+    assert body.name == "closing-body-101.md"
     state = _state_of(control)
     assert state.pr["closed_issues"][0]["number"] == 101
     assert state.pr["closed_issues"][0]["closing_body"] == recorded
@@ -2237,14 +2312,18 @@ def test_two_iterations_close_one_issue_each_in_order(
             ]
         ),
     )
-    stages = _FakeStages(issues={101: "OPEN", 102: "OPEN"})
+    stages = _FakeStages(issues={101: "OPEN", 102: "OPEN"}, batch=(101, 102))
     monkeypatch.setattr(fix_workflow, "run_stage", stages)
 
     assert fix_workflow.run(pr=7, **_roots(control), approve_all=True) == 0
 
     assert [call["issue"] for call in stages.closes] == [101, 102]
-    bodies = [Path(call["body_file"]).name for call in stages.closes]
-    assert bodies == ["iter1-closing-body.md", "iter2-closing-body.md"]
+    bodies = [Path(call["body_file"]) for call in stages.closes]
+    # 05-B1.1: each iteration's directory, one file named for its issue.
+    assert [(body.parent.name, body.name) for body in bodies] == [
+        ("iter1", "closing-body-101.md"),
+        ("iter2", "closing-body-102.md"),
+    ]
     # Both closes still come after the single post-loop push.
     push_at = stages.events.index(("push", {101: "OPEN", 102: "OPEN"}))
     assert stages.events.index(("close", 101)) > push_at
@@ -2256,15 +2335,27 @@ def test_two_iterations_close_one_issue_each_in_order(
     ]
 
 
-def test_closing_body_path_is_absolute_and_per_iteration(tmp_path: Path) -> None:
-    """Purity: the path is derived, absolute, and never shares a file across iterations."""
-    first = fix_workflow.closing_body_path(tmp_path / "run", 1)
-    second = fix_workflow.closing_body_path(tmp_path / "run", 2)
+def test_closing_body_path_is_absolute_and_per_issue(tmp_path: Path) -> None:
+    """Purity (05-B1.1): the path is derived, absolute, and names the issue it closes.
 
+    The directory is the value F1 renders as ``{closing_bodies}``; the file inside it is the
+    per-issue body the deferred close passes back as ``--body-file``, and it is never created
+    by this helper — only the workflow's real-run loop creates the directory.
+    """
+    directory = fix_workflow.closing_bodies_dir(tmp_path / "run", 1)
+    first = fix_workflow.closing_body_path(tmp_path / "run", 1, 42)
+    other_issue = fix_workflow.closing_body_path(tmp_path / "run", 1, 43)
+    second_iteration = fix_workflow.closing_body_path(tmp_path / "run", 2, 42)
+
+    assert directory.is_absolute(), directory
+    assert directory == tmp_path / "run" / "artifacts" / "iter1"
     assert first.is_absolute(), first
-    assert first == tmp_path / "run" / "artifacts" / "iter1-closing-body.md"
-    assert first.name != second.name
-    assert fix_workflow.closing_body_path(tmp_path / "run", 1) == first
+    assert first == tmp_path / "run" / "artifacts" / "iter1" / "closing-body-42.md"
+    assert first != other_issue
+    assert first != second_iteration
+    assert fix_workflow.closing_body_path(tmp_path / "run", 1, 42) == first
+    # The helper derives paths and creates nothing; the worktree is untouched.
+    assert not directory.exists()
 
 
 def test_close_failure_message_names_the_pr_the_branch_and_the_issue() -> None:
@@ -2556,3 +2647,341 @@ def test_reverse_branch_pattern_is_a_faithful_inverse_property() -> None:
         if not any(char in phase or char in task for char in "-/"):
             assert len(splits) == 1, (case, pattern, branch, splits)
         assert fix_workflow.reverse_branch_pattern(branch, pattern) == splits
+
+
+# --------------------------------------------------------------------------- #
+# The bounded batch (05-B1.1, design §8.4)
+# --------------------------------------------------------------------------- #
+
+#: Pinned seed and run count for the batch property run below (AGENTS.md "Tests": pytest
+#: only, so a reproducible sample is the generator and there is no shrinking).
+BATCH_PROPERTY_SEED = 20261120
+BATCH_PROPERTY_RUNS = 3
+
+
+def _batch_run(
+    tmp_path: Path, monkeypatch, numbers: tuple[int, ...], **kwargs
+) -> tuple[int, "_FakeStages", Path]:
+    """Run one converging ``fix`` whose single iteration selects ``numbers``."""
+    control, _worktree = _fix_layout(tmp_path)
+    select_impl = _select_seq(
+        [_select_batch(numbers), _select_batch(numbers), _select_none()]
+    )
+    _patch(monkeypatch, select_impl=select_impl)
+    stages = _FakeStages(
+        issues={number: "OPEN" for number in numbers}, batch=numbers, **kwargs
+    )
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True, fix_batch=len(numbers))
+    stages.select_calls = select_impl.calls  # type: ignore[attr-defined]
+    return code, stages, control
+
+
+def test_a_three_child_batch_is_one_iteration_with_one_f1_f2_and_f3(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 3: the batch runs **one** F1, **one** F2 and **one** F3 — never three of each."""
+    code, stages, control = _batch_run(tmp_path, monkeypatch, (101, 102, 103))
+
+    assert code == 0
+    assert [
+        name for name in stages.names if name.startswith("iter1")
+    ] == [
+        "iter1-fix-next-review-followup",
+        "iter1-test",
+        "iter1-code-review",
+    ]
+    # The loop asked for the batch with `--limit`, the approval round never did.
+    assert stages.select_calls == [None, 3, 3]
+    # One `closed_issues` entry per batch **issue**, each with its own body file.
+    state = _state_of(control)
+    recorded = state.pr["closed_issues"]
+    assert [entry["number"] for entry in recorded] == [101, 102, 103]
+    bodies = [entry["closing_body"] for entry in recorded]
+    assert len(set(bodies)) == 3
+    assert [Path(body).name for body in bodies] == [
+        "closing-body-101.md",
+        "closing-body-102.md",
+        "closing-body-103.md",
+    ]
+    assert all(Path(body).is_absolute() for body in bodies)
+    # The close is still one call per entry, after the single push.
+    assert [call["issue"] for call in stages.closes] == [101, 102, 103]
+    assert [call["body_file"] for call in stages.closes] == bodies
+    push_at = stages.events.index(
+        ("push", {101: "OPEN", 102: "OPEN", 103: "OPEN"})
+    )
+    assert all(
+        stages.events.index(("close", number)) > push_at
+        for number in (101, 102, 103)
+    )
+    assert stages.issues == {101: "CLOSED", 102: "CLOSED", 103: "CLOSED"}
+
+
+def test_a_failed_batch_test_records_and_closes_nothing(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Req 9: a red F2 fails the **whole** batch — no entry, no close, no subset."""
+    code, stages, control = _batch_run(
+        tmp_path, monkeypatch, (101, 102, 103), failing=("iter1-test",)
+    )
+
+    assert code == 1
+    assert "iter1-code-review" not in stages.names
+    assert stages.closes == []
+    assert stages.issues == {101: "OPEN", 102: "OPEN", 103: "OPEN"}
+    state = _state_of(control)
+    assert "closed_issues" not in state.pr
+    directory = _runs_root(control) / state.run_id
+    assert not (directory / "artifacts" / "fix.json").exists()
+    assert any(
+        record.name == "iter1-test" and record.status == FAILED for record in state.stages
+    )
+    # Fail-closed, not a defect: the children stay OPEN and in progress for the resume path.
+    assert "commit-and-push" not in stages.names
+    assert "iter1-test" in capsys.readouterr().err
+
+
+def test_a_batch_failed_before_any_review_closes_nothing_on_a_failed_f3(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 9's other half: a red F3 is the same all-or-nothing batch failure."""
+    code, stages, control = _batch_run(
+        tmp_path, monkeypatch, (101, 102), failing=("iter1-code-review",)
+    )
+
+    assert code == 1
+    assert stages.closes == []
+    assert stages.issues == {101: "OPEN", 102: "OPEN"}
+    assert "closed_issues" not in _state_of(control).pr
+
+
+def test_a_batch_review_with_findings_still_publishes_new_children(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 3: F3's findings still route to F4 → new children and the approval round."""
+    numbers = (101, 102)
+    control, _worktree = _fix_layout(tmp_path)
+    _patch(
+        monkeypatch,
+        select_impl=_select_seq([_select_batch(numbers), _select_batch(numbers), _select_none()]),
+    )
+    stages = _FakeStages(FINDINGS_REVIEW, issues={101: "OPEN", 102: "OPEN"}, batch=numbers)
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True, fix_batch=2)
+
+    assert code == 0
+    assert stages.names.count("iter1-fix-next-review-followup") == 1
+    assert "iter1-review-findings-to-github" in stages.names
+    assert "round2-approve-review-followups" in stages.names
+    # Findings mean the re-review was not clean, so nothing was recorded as fixed.
+    assert _state_of(control).pr["closed_issues"] == []
+    assert stages.closes == []
+
+
+@pytest.mark.parametrize("fix_batch", [0, -1])
+def test_a_non_positive_fix_batch_is_refused_before_any_run(
+    tmp_path: Path, monkeypatch, capsys, fix_batch: int
+) -> None:
+    """Req 1: refused exactly as ``--max-iterations`` is — stderr, exit 2, no run."""
+    control, _worktree = _fix_layout(tmp_path)
+    _patch(monkeypatch, select_impl=_select_seq([_select_ok()]))
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), fix_batch=fix_batch)
+
+    assert code == 2
+    assert "--fix-batch must be positive." in capsys.readouterr().err
+    assert stages.names == []
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def test_fix_batch_is_the_select_limit_and_bounds_the_fixed_subset(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 3: the flag becomes ``--limit``, so a 2-wide batch fixes 2 of 3 children."""
+    control, _worktree = _fix_layout(tmp_path)
+    select_impl = _select_seq(
+        [_select_batch((101, 102, 103)), _select_batch((101, 102, 103)), _select_none()]
+    )
+    _patch(monkeypatch, select_impl=select_impl)
+    stages = _FakeStages(
+        issues={101: "OPEN", 102: "OPEN", 103: "OPEN"}, batch=(101, 102)
+    )
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True, fix_batch=2)
+
+    assert code == 0
+    assert select_impl.calls == [None, 2, 2]
+    assert [entry["number"] for entry in _state_of(control).pr["closed_issues"]] == [
+        101,
+        102,
+    ]
+    # The third child was not inspected, so it is neither fixed nor marked in progress.
+    assert stages.issues[103] == "OPEN"
+    assert 103 not in [call["issue"] for call in stages.closes]
+
+
+def test_the_iteration_directory_exists_and_is_empty_before_f1(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Req 5: the workflow — never the agent — creates ``artifacts/iter{N}/`` before F1."""
+    numbers = (101, 102)
+    control, _worktree = _fix_layout(tmp_path)
+    _patch(
+        monkeypatch,
+        select_impl=_select_seq([_select_batch(numbers), _select_batch(numbers), _select_none()]),
+    )
+    stages = _FakeStages(issues={101: "OPEN", 102: "OPEN"}, batch=numbers)
+    seen: dict = {}
+
+    def _run_stage(spec, **kwargs):
+        if spec.name.endswith("fix-next-review-followup"):
+            directory = fix_workflow.closing_bodies_dir(
+                run_dir(kwargs["runs_root"], kwargs["state"].run_id), 1
+            )
+            seen["path"] = directory
+            seen["existed_empty"] = directory.is_dir() and not any(
+                directory.iterdir()
+            )
+        return stages(spec, **kwargs)
+
+    monkeypatch.setattr(fix_workflow, "run_stage", _run_stage)
+
+    assert fix_workflow.run(pr=7, **_roots(control), approve_all=True, fix_batch=2) == 0
+
+    assert seen["existed_empty"] is True, seen
+    assert seen["path"] == (
+        _runs_root(control) / _state_of(control).run_id / "artifacts" / "iter1"
+    )
+
+
+def test_a_dry_run_creates_no_iteration_directory(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Req 5 + Z14: a plan names the directory and creates nothing."""
+    control, _worktree = _fix_layout(tmp_path)
+    _patch(
+        monkeypatch,
+        select_impl=_select_seq([_select_batch((101, 102, 103)), _select_none()]),
+    )
+    stages = _FakeStages(batch=(101, 102, 103))
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), dry_run=True, fix_batch=3)
+
+    assert code == 0
+    out = capsys.readouterr().out
+    # The whole batch is previewed, with the argv a real run would use.
+    for number in (101, 102, 103):
+        assert f"child:  #{number} " in out
+    assert "--limit 3" in out
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+    assert not Path(PLANNED_RUN_DIR_TEXT).exists()
+
+
+def test_a_select_that_ignores_the_limit_fails_closed(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Reqs 2/3: an object-shaped ``selected`` under ``--limit`` fixes no subset — exit 1.
+
+    ``fix.py`` always passes ``--limit``, so a return value that is not an array means the
+    batch contract was not honoured. Falling back to the first child would silently restore
+    the one-fix-per-iteration behaviour this task reverses.
+    """
+    control, _worktree = _fix_layout(tmp_path)
+
+    def _object_only(aidt, repo, pr, timeout=github.DEFAULT_TIMEOUT, *, limit=None, **_kwargs):
+        # The approval round's read is fine; the loop's must not be. Every call returns the
+        # single-object shape, whatever `--limit` was passed.
+        return _shape_selection(_select_ok(), None)
+
+    _patch(monkeypatch, select_impl=_object_only)
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), approve_all=True)
+
+    assert code == 1
+    assert "iter1-fix-next-review-followup" not in stages.names
+    assert "did not return a batch" in capsys.readouterr().err
+    assert _state_of(control).status == FAILED
+
+
+def test_dry_run_rejects_object_shaped_select_results(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Reqs 2/3: the dry-run preview must not normalize an old single-object result.
+
+    ``--limit`` is always passed by the preview, so the array contract belongs to
+    ``cmd_select``. Accepting an object here would make the preview claim a one-child
+    batch even though the real loop correctly fails closed on the same malformed result.
+    """
+    control, _worktree = _fix_layout(tmp_path)
+
+    def _object_only(aidt, repo, pr, timeout=github.DEFAULT_TIMEOUT, *, limit=None, **_kwargs):
+        return _shape_selection(_select_ok(), None)
+
+    _patch(monkeypatch, select_impl=_object_only)
+    stages = _FakeStages()
+    monkeypatch.setattr(fix_workflow, "run_stage", stages)
+
+    code = fix_workflow.run(pr=7, **_roots(control), dry_run=True, fix_batch=3)
+
+    assert code == 1
+    assert "iter1-fix-next-review-followup" not in stages.names
+    assert "did not return a batch" in capsys.readouterr().err
+    runs_root = _runs_root(control)
+    assert not runs_root.exists() or list(runs_root.iterdir()) == []
+
+
+def test_a_batch_records_and_closes_exactly_one_entry_per_issue(tmp_path: Path, monkeypatch) -> None:
+    """Property sweep (pinned seed + runs): |closed_issues| == |batch|, bodies all distinct.
+
+    A metamorphic check on the loop's bookkeeping: however wide the batch, one F1 runs and
+    every selected issue gets its own entry and its own body — the failure mode this pins is
+    "one entry per iteration", which would close only the first child.
+    """
+    rng = random.Random(BATCH_PROPERTY_SEED)
+    base_numbers = (101, 102, 103, 104, 105)
+
+    for case in range(BATCH_PROPERTY_RUNS):
+        width = rng.randint(1, len(base_numbers))
+        numbers = base_numbers[:width]
+        case_dir = tmp_path / f"case-{case}"
+        case_dir.mkdir()
+
+        code, _stages, control = _batch_run(case_dir, monkeypatch, numbers)
+
+        assert code == 0, (case, numbers)
+        recorded = _state_of(control).pr["closed_issues"]
+        assert [entry["number"] for entry in recorded] == list(numbers)
+        assert len({entry["closing_body"] for entry in recorded}) == width
+
+
+def test_the_cli_flag_threads_fix_batch_into_run(monkeypatch) -> None:
+    """Req 1: ``aidw fix --fix-batch N`` reaches ``run(fix_batch=...)``, defaulting to 3.
+
+    The workflow's own validation is proved above; this pins the CLI seam, so a renamed or
+    unthreaded option fails here instead of silently running with the default width.
+    """
+    from typer.testing import CliRunner
+
+    from aidw import cli
+
+    seen: list[dict] = []
+
+    def _fake_run(**kwargs):
+        seen.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli.fix_workflow, "run", _fake_run)
+    runner = CliRunner()
+
+    explicit = runner.invoke(cli.app, ["fix", "--pr", "7", "--fix-batch", "5"])
+    default = runner.invoke(cli.app, ["fix", "--pr", "7"])
+
+    assert explicit.exit_code == 0, explicit.output
+    assert default.exit_code == 0, default.output
+    assert [call["fix_batch"] for call in seen] == [5, 3]

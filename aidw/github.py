@@ -282,6 +282,7 @@ def select_followups(
     timeout: int = DEFAULT_TIMEOUT,
     *,
     config: ResolvedConfig | None = None,
+    limit: int | None = None,
 ) -> ScriptResult:
     """Read-only ``review_followup.py select`` for the PR's next approved child.
 
@@ -289,9 +290,15 @@ def select_followups(
     (``selected: null`` plus the skipped reasons). ``config`` carries the resolved
     ``github.markers``/``github.labels`` so the search uses the same parent marker the
     publisher writes (E6.1); ``None`` means "do not set the handoff" (toolkit defaults).
+
+    ``limit`` is the batch width (05-B1.1, design §8.4): it becomes ``--limit <n>``, which
+    makes ``selected`` a JSON **array** of up to ``n`` children. ``None`` omits the flag
+    entirely, so the script keeps its single-object contract — the shape keys on the flag,
+    never on the value. ``aidw fix``'s loop and its dry-run preview always pass a limit; the
+    approval round never does, because its summary reads one child.
     """
     script = script_path(aidt, FOLLOWUP_SCRIPT)
-    argv = build_followup_argv(script, "select", pr)
+    argv = build_followup_argv(script, "select", pr, limit=limit)
     return run_script(argv, repo, timeout, config=config)
 
 
