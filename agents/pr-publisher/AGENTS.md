@@ -37,3 +37,14 @@ Two prompts run on this agent, and **the prompt decides which set of rules appli
 
 - `/pr`: the PR number and URL, and leave the PR open.
 - `/fix-commit`: the pushed branch and the commit SHA, or the blocker that stopped it.
+
+## Blocked bash commands
+
+A bash result that reads `Blocked bash command with unapproved operations` is a hard deny: the
+operation was refused, not interrupted, so it is not retryable.
+
+- Do not retry the command.
+- Do not retry a cosmetic variant of it either. Reordering, re-quoting, splitting it, using
+  alternative syntax, or renaming it are the same denied operation.
+- Report it as a blocker naming the denied command, then stop. The block is a signal to surface,
+  not a puzzle to work around.

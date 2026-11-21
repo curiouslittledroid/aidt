@@ -1119,3 +1119,76 @@ def test_b11_decision_row_records_the_batch_and_the_stale_z14() -> None:
         "prompts/scripts/review-followup/tests/test_logic.py",
     ):
         assert path in row, path
+
+
+def _section_55_block(design: str) -> str:
+    """The §5.5 ``System prompt and context files`` block: its heading up to §6."""
+    start = design.index("### 5.5 System prompt and context files")
+    end = design.index("## 6. Human-in-the-loop gates", start)
+    return design[start:end]
+
+
+def test_o1_1_section_5_5_states_the_blocked_bash_hard_deny_contract() -> None:
+    """05-O1.1: §5.5 states the contract every shipped agent context file now carries.
+
+    The guidance lives in ``agents/*/AGENTS.md`` because prompt text alone does not override
+    an agent file's hard rules (§17 Z9/Z20); leaving the contract out of §5.5 would let the
+    next reader "tidy" the sections away as stage-prompt business.
+    """
+    # Whitespace-flattened: the bullet is hard-wrapped, and the pinned sentences span lines.
+    block = " ".join(_section_55_block(_design_md()).split())
+    lowered = block.lower()
+
+    assert "`agents/*/AGENTS.md`" in block
+    # The verbatim tool result, quoted so the agent can match the block it sees.
+    assert "Blocked bash command with unapproved operations" in block
+    # The three behaviours, not a paraphrase that drops one.
+    assert "hard deny" in lowered
+    assert "not retryable" in lowered
+    assert "does not retry" in lowered
+    assert "cosmetic variant" in lowered
+    assert "naming the denied command" in lowered
+    # Why it lives in the agent files rather than a stage prompt.
+    assert "does not reliably override" in lowered
+    assert "§17 Z9/Z20" in block
+    assert "tests/test_agent_guidance_neutrality.py" in block
+
+
+def test_o1_1_decision_row_records_the_blocked_bash_guidance() -> None:
+    """05-O1.1: exactly one §17 row, matched by task id and wording, never by ``Z`` number.
+
+    The row is appended under the next free id (``aidw/conventions.md`` forbids reusing or
+    renumbering an id), so this pin must survive a future renumbering and fail on a second
+    row or a dropped prompt-fixed decision.
+    """
+    decisions = _section(_design_md(), "## 17. Resolved decisions", "## 18. Risks")
+    rows = [
+        line
+        for line in decisions.splitlines()
+        if re.match(r"^\| Z\d+ \|", line)
+        and "05-O1.1" in line
+        and "Blocked bash command with unapproved operations" in line
+    ]
+    assert len(rows) == 1, f"expected exactly one 05-O1.1 decision row, found {len(rows)}"
+    row = rows[0]
+    # The behaviour the files and §5.5 implement.
+    assert "`agents/*/AGENTS.md`" in row
+    assert "hard deny" in row
+    assert "cosmetic variant" in row
+    assert "naming the denied command" in row
+    assert "next free id" in row
+    # The prompt-fixed decisions travel with the row (Z2/Z9/Z11's precedent).
+    assert "Prompt-fixed decisions" in row
+    for decision in ("(a)", "(b)", "(c)", "(d)", "(e)"):
+        assert decision in row, decision
+    # No §17 id is reused: every Z id appears exactly once (``aidw/conventions.md``).
+    ids = re.findall(r"^\| (Z\d+) \|", decisions, re.M)
+    duplicates = sorted({identifier for identifier in ids if ids.count(identifier) > 1})
+    assert duplicates == [], f"reused §17 decision ids: {duplicates}"
+    # The touched set is named, so the contract tests are findable.
+    for path in (
+        "design.md",
+        "tests/test_agent_guidance_neutrality.py",
+        "tests/test_design_doc.py",
+    ):
+        assert path in row, path
