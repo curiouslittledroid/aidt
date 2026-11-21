@@ -3,7 +3,7 @@
 **Branch:** `05-O1.1`
 **Date:** 2026-11-21
 **Spec:** `design.md` §5.5 "System prompt and context files", `design.md` §17 "Resolved decisions"; roadmap `docs/tasks/05 - Pipeline efficiency.md`, epic O1, task O1.1
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** #180 — https://github.com/curiouslittledroid/aidt/pull/180
 
 ## Summary
 
