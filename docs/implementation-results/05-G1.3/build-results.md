@@ -3,7 +3,7 @@
 **Branch:** `05-G1.3`
 **Date:** 2026-11-22
 **Spec:** `design.md` §§8.1, 11, 12.1, 17 (row Z22); `docs/roadmap-format.md` §8; `docs/target-repo-config.md` (`paths:` table, "Configured paths must exist", worked examples)
-**Pull request:** not yet opened — the /pr stage records it here once the PR exists
+**Pull request:** [#182](https://github.com/curiouslittledroid/aidt/pull/182)
 
 ## Summary
 
