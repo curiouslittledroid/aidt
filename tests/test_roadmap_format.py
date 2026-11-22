@@ -778,3 +778,36 @@ def test_epic_heading_does_not_supply_the_epic(
     assert task.epic == "E5"
     assert task.epic_title == "Mismatched"
     assert find_task([task], roadmap_example.phase, "E5", "E5.1") is not None
+
+
+def test_g13_section_8_1_states_the_specs_dir_resolution(
+    roadmap_example: RoadmapExample,
+) -> None:
+    """G1.3: §8.1 documents where `Design N` resolves, and the doc agrees with the code.
+
+    The document is the format contract, so the specs-directory rule lives here rather than
+    only in `design.md`: without it a reader would keep assuming "section `N` of a root
+    `design.md`". The assertions below are the shipped resolver's own claims — the flat scan,
+    the canonical number comparison, the parent-vs-sub boundary, the `(document, section)`
+    pair and the letter-suffix rule.
+    """
+    text = roadmap_example.doc.read_text(encoding="utf-8")
+    section = _section(text, "### 8.1", level=3)
+
+    assert "paths.specs_dir" in section
+    assert "flat scan, no recursion" in section
+    assert "canonically as dotted integers" in section
+    assert "`Design 04`" in section and "`Design 4 - …`" in section
+    assert "`Design 20` never matches `Design 20.1 - …`" in section
+    assert "next citation token of **either** channel" in section
+    assert "`(document, section)`" in section
+    assert "`§5.3A`" in section and "parent `5.3`" in section
+    assert "lettered-form gap" in section
+    assert "exist and be non-empty" in section
+    assert "root `design.md`" in section
+
+    # The doc's rule is the shipped predicate's, not a re-worded second contract.
+    assert prompt_workflow.spec_document_number("Design 4 - Story.md") == "4"
+    assert prompt_workflow.spec_document_number("Design 20.1 - Sub.md") == "20.1"
+    assert prompt_workflow.spec_document_number("Design draft.md") is None
+    assert prompt_workflow.spec_document_number("design 4 - Lowercase.md") is None

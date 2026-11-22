@@ -124,6 +124,8 @@ EXPECTED_DEFAULTS: dict[str, str] = {
         if getattr(TOOLKIT_DEFAULTS.paths, name) is not None
     },
     "agent_configs_dir": "unset",
+    # G1.3's optional spec directory is the second path field with no default.
+    "specs_dir": "unset",
     # workflows: / stage entry
     "stages": "unset",
     "parallel_groups": "unset",
@@ -177,6 +179,7 @@ MINIMAL_PATHS = frozenset(
         "paths.build_results_template",
         "paths.architecture_dir",
         "paths.agent_configs_dir",
+        "paths.specs_dir",
         "github.markers.parent",
         "github.markers.child",
         "github.markers.summary",
@@ -198,6 +201,7 @@ FULL_PATHS = frozenset(
         "paths.build_results_template",
         "paths.architecture_dir",
         "paths.agent_configs_dir",
+        "paths.specs_dir",
         "github.markers.parent",
         "github.markers.child",
         "github.markers.summary",
@@ -452,6 +456,9 @@ def test_doc_states_the_read_path_contract_and_the_write_target_exemption():
         "paths.agent_configs_dir",
     ):
         assert field in doc
+    # G1.3: specs_dir is the explicit third class — a path, but neither.
+    assert "paths.specs_dir" in doc
+    assert "Neither a read-path nor a write-target" in doc
     assert "write-target" in doc
     assert "paths.architecture_dir" in doc
     # The contract is stated here; the enforcement is E3.7's.
@@ -739,6 +746,7 @@ def test_minimal_resolves_to_the_mythical_forge_layout(tmp_path: Path):
         "paths.build_results_template": "docs/implementation-results/TEMPLATE.md",
         "paths.architecture_dir": "docs/architecture",
         "paths.agent_configs_dir": None,
+        "paths.specs_dir": None,
         "github.markers.parent": (
             "<!-- mythical-forge-review-followups: pr={pr_url} -->"
         ),
@@ -773,12 +781,16 @@ def test_minimal_resolves_to_the_mythical_forge_layout(tmp_path: Path):
     }
     # Provenance: the seeded repo/paths leaves, the budget and the frozen D5 github values
     # come from the defaults; the declared schema version from the file; and only
-    # `requires_toolkit` and E4.6's `paths.agent_configs_dir` (no toolkit default on
-    # purpose) are unset.
+    # `requires_toolkit`, E4.6's `paths.agent_configs_dir` and G1.3's `paths.specs_dir`
+    # (no toolkit default on purpose) are unset.
     for path, entry in resolved.items():
         if path == "schema_version":
             assert entry.source == SOURCE_CONFIG
-        elif path in {"requires_toolkit", "paths.agent_configs_dir"}:
+        elif path in {
+            "requires_toolkit",
+            "paths.agent_configs_dir",
+            "paths.specs_dir",
+        }:
             assert entry.source is None, f"{path} must resolve unset"
         else:
             assert entry.source == SOURCE_DEFAULT, f"{path} must resolve from the defaults"
@@ -816,6 +828,7 @@ def test_full_example_declares_every_field_and_resolves_from_config(tmp_path: Pa
         "docs/implementation-results/TEMPLATE.md"
     )
     assert values["paths.agent_configs_dir"] == "aidw/agent-configs"
+    assert values["paths.specs_dir"] == "docs/specs"
     # D5 literals: the marker templates and every label survive verbatim.
     assert values["github.markers.parent"] == (
         "<!-- mythical-forge-review-followups: pr={pr_url} -->"

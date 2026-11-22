@@ -102,6 +102,7 @@ existence validation is a separate pass (`aidw.target_config.validate_paths` /
 | `build_results_template` | string | `docs/implementation-results/TEMPLATE.md` | The template the record stage fills in to produce the results document. When it is missing the record stage stops and reports it instead of inventing a structure. A read-path. |
 | `architecture_dir` | string | `docs/architecture` | Where the `update-architecture` stage reads and writes the architecture documents. A **write-target**: it may legitimately be absent and is created on demand. |
 | `agent_configs_dir` | string | unset | A target-repo directory of agent configs (`*.yaml`) that **shadow the toolkit's `agent-configs/` by `id`** for every workflow of that repo (D12 "override agent config globally", E4.6). A **read-path** when named, so the directory must exist. Un-overridden toolkit ids still load, a brand-new id loads as an additional agent (a legal `agent:` target), and an empty directory equals the toolkit defaults. When unset the toolkit's own `agent-configs/` is used. |
+| `specs_dir` | string | unset | A target-repo directory of numbered spec documents — `Design <number> - <title>.md`, one design per file — that the `Design N` citation channel resolves against (G1.3, design §8.1). The scan is **flat** (no recursion), the filename's number and the citation's number are compared canonically as dotted integers (`Design 04` ≡ `Design 4 - …`; `Design 20` never matches `Design 20.1 - …`), and a citation resolves only when exactly one candidate exists — zero or several is a gap naming the directory, never a guess. `Design 11 §5.3` checks section `5.3` inside that one document, and a bare `Design 11` asks only that the document exist and hold content. When unset, `Design N` keeps its original meaning: section `N` of a root `design.md`. **Neither a read-path nor a write-target** (see "Configured paths must exist"): absence is valid, and `aidw doctor` reports a missing, non-directory or document-less `specs_dir` — and none declared with no root `design.md` — as an advisory `WARN`, never a failure. |
 
 ### `workflows:` — stage and workflow overrides
 
@@ -266,7 +267,10 @@ pin or change one — it explains why they are config-with-frozen-defaults and w
 
 `paths.agent_configs_dir` is deliberately **not** seeded: its consumer falls back to
 `<toolkit>/agent-configs/`, and seeding a repo-relative directory would make every repo
-without that folder fail the read-path check.
+without that folder fail the read-path check. `paths.specs_dir` is deliberately **not**
+seeded either: unset is the valid case in which the `Design N` channel resolves against a
+root `design.md`, so a default would silently change the citation contract of every repo
+(D15's "no second per-repo dialect").
 
 These are Mythical Forge's current layout, not neutral placeholders (D17/R7) — which is why a
 Mythical-Forge-shaped config file is near-empty and doubles as the Typical example below. A repo
@@ -282,6 +286,9 @@ them as already-defaulting would be wrong about `resolve_config`'s output today:
 - `requires_toolkit` — an optional pin, never a default.
 - `paths.agent_configs_dir` — optional, and unset means "use the toolkit's own
   `agent-configs/`" rather than a repo-relative default (E4.6).
+- `paths.specs_dir` — optional, and unset means the `Design N` citation channel keeps its
+  original contract (section `N` of a root `design.md`) rather than pointing at a
+  repo-relative directory (G1.3).
 
 A workflow name the config does not declare has no `workflows.*` entries at all: the default
 stage registry is **E4.1's** and contributes no resolved values.
@@ -349,6 +356,15 @@ legible when it does not.
 - **Write-targets** are outputs of a stage and may legitimately be absent: `paths.architecture_dir`
   today, and any repo-added stage's directory. They are created on demand and required only when
   a stage that writes there is enabled.
+- **Neither**, as an explicit third class: `paths.specs_dir` (G1.3) is a directory the
+  `Design N` citation channel reads *only when a citation needs it*, and every repo whose
+  specs are a root `design.md` legitimately has none. It is therefore not in
+  `READ_PATHS` — a missing `specs_dir` must never fail `validate_paths` — and not in
+  `WRITE_TARGETS` either, because no stage writes there. `aidw doctor`'s `specs dir` check
+  is the diagnosis: a `WARN` naming the field and the path for a declared directory that is
+  missing, is not a directory or holds no numbered spec document, and for none declared
+  while no root `design.md` exists. `roadmap_glob` is the other unclassified value, for the
+  opposite reason: it is a pattern, not a path.
 - Either way there is **no silent fallback and no agent-side improvisation**: the record stage
   stops and reports a missing build-results template rather than inventing a structure.
 
@@ -360,7 +376,9 @@ field and the path — for a default-sourced value too (D17/R7) — and is read-
 creates a directory. `aidw prompt`'s preflight refuses (exit 2, issues on stderr) before any run
 state, branch or worktree. The loader itself still only records the strings, so a missing directory
 is not a *load-time* error: validation is the separate pass above. `ensure_write_targets`'s call
-site in the implement chain is E4.3's.
+site in the implement chain is E4.3's. G1.3's `paths.specs_dir` is outside both mappings by
+construction (see the third class above), so `validate_paths` never stat's it; its diagnosis
+is the advisory `specs dir` `WARN` in `aidw doctor`.
 
 ## Worked examples
 
@@ -379,8 +397,9 @@ schema_version: 1
 
 Resolves to the full Mythical Forge layout — `repo.*`, the six defaulted `paths.*` leaves,
 `max_revisions` `3` and the three markers plus twelve label leaves from `TOOLKIT_DEFAULTS`, all
-with source `default`, and `schema_version` `1` (`config`). Only `requires_toolkit` and
-`paths.agent_configs_dir` resolve `unset`, and there is no `workflows.*` entry at all.
+with source `default`, and `schema_version` `1` (`config`). Only `requires_toolkit`,
+`paths.agent_configs_dir` and `paths.specs_dir` resolve `unset`, and there is no
+`workflows.*` entry at all.
 
 ### Typical — the defaults echoed explicitly
 
@@ -404,7 +423,7 @@ Resolves to exactly the same **values** as Minimal. Only the provenance differs:
 ### Full — every field declared
 
 §3.4's own example, with `max_revisions` and C1.2's `gates_heading` added — loader-accepted
-top-level keys that §3.4's snippet omits. `github.markers` and `github.labels` carry Mythical
+top-level keys that §3.4's snippet omits — plus G1.3's optional `paths.specs_dir`. `github.markers` and `github.labels` carry Mythical
 Forge's frozen D5 literals:
 declaring them pins them in the file, so `aidw config show` reports them `config` instead of
 `default`. The values are identical either way — that is the point of the freeze.
@@ -428,6 +447,7 @@ paths:
   build_results_template: docs/implementation-results/TEMPLATE.md
   architecture_dir: docs/architecture
   agent_configs_dir: aidw/agent-configs   # global agent-config override (E4.6)
+  specs_dir: docs/specs                   # numbered spec documents for Design N (G1.3)
 
 workflows:
   prompt:

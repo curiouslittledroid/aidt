@@ -45,7 +45,9 @@ control worktree and a clean working tree. It then refuses (exit 4) when an earl
 the same roadmap phase file is unticked, unless ``--allow-incomplete-prereqs``
 is given, then refuses (exit 3) when a spec section the entry cites is missing, not
 uniquely locatable or empty (G1.2: a local, Pi-free check of both citation channels through
-the one enumerator the evidence bundle uses), and then fetches ``origin`` and refuses
+the one enumerator the evidence bundle uses; G1.3 extends the ``Design N`` channel with the
+optional ``paths.specs_dir``, resolving the numbered document and the sections in its own
+window), and then fetches ``origin`` and refuses
 (exit 4) when the base branch is behind or diverged from ``origin/<base>``; ``--no-fetch``
 skips both the fetch and the comparison. A ``--dry-run`` reports each of those findings as a
 note and never refuses.
@@ -372,6 +374,28 @@ _DOC_TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+\.md")
 _SECTION_RE = re.compile(r"§\s*(\d+(?:\.\d+)?)")
 _DECISION_RE = re.compile(r"\bD\d+\b")
 
+#: A ``Design N`` citation token inside a task's citation text. The same shape
+#: ``aidw.roadmap.CITATION_RE`` collects; here it is one half of the merged citation-token
+#: scan whose windows the preflight and the evidence bundle share (G1.3 req 3).
+_DESIGN_TOKEN_RE = re.compile(r"Design\s+\d+(?:\.\d+)?")
+
+#: One citation token of **either** channel (``Design N`` or ``<NAME>.md``) in a task's
+#: citation text. Windows are measured on one merged scan, never on two separate scans, so
+#: a ``§`` following a ``Design N`` belongs to that citation and not to the next file's
+#: window (G1.3 req 3).
+_CITATION_TOKEN_RE = re.compile(
+    rf"{_DESIGN_TOKEN_RE.pattern}|{_DOC_TOKEN_RE.pattern}"
+)
+
+#: A numbered spec document's filename as G1.3's resolver names it: the literal ``Design ``
+#: prefix, a dotted number, then `` - `` before the title. Anchored at the start and
+#: case-sensitive because the citation token it must agree with is (``Design 04`` ≡
+#: ``Design 4 - …``; ``Design 20`` never matches ``Design 20.1 - …``, since the numbers are
+#: compared canonically as tuples). This is the **one** filename rule: ``aidw doctor``
+#: imports :func:`spec_document_number` rather than growing a second regex or glob (G1.3
+#: reqs 2/7).
+_SPEC_DOCUMENT_RE = re.compile(r"^Design (\d+(?:\.\d+)?) - ")
+
 #: A markdown heading's numbering (``### 3.8 Task-prompt format ...``).
 _HEADING_NUMBER_RE = re.compile(r"^#+\s+(\d+(?:\.\d+)?)\b")
 
@@ -488,15 +512,23 @@ def _decision_section(text: str, decision: str) -> str | None:
 
 @dataclass(frozen=True)
 class _CitedSpec:
-    """One cited spec reference, after both citation channels are enumerated (G1.2).
+    """One cited spec reference, after both citation channels are enumerated (G1.2/G1.3).
 
     ``path`` is the file the citation names — ``repo.root / "design.md"`` for the
-    ``Design N`` channel (which need not exist; the checker reports that) and the located
-    file for a ``<NAME>.md`` token, or ``None`` when the token could not be located
-    uniquely. ``section`` is the cited (or decision-resolved) section number exactly as the
-    citation writes it, so the evidence bundle prints it verbatim while
+    ``Design N`` channel when no ``paths.specs_dir`` is declared (that file need not
+    exist; the checker reports it), the one resolved spec document when it is, and the
+    located file for a ``<NAME>.md`` token — or ``None`` when the reference could not be
+    resolved. ``relative`` is the path the evidence bundle prints (repo-relative where
+    possible), and ``section`` is the cited (or decision-resolved) section number exactly
+    as the citation writes it, so the bundle prints it verbatim while
     :func:`_spec_feasibility_gaps` compares it canonically; ``decision`` is set when the
     section came from a ``D<nn>`` id rather than a literal ``§N``.
+
+    G1.3 adds two document-level states: ``problem`` carries a reason the *document*
+    itself could not be resolved (zero or several candidate files, the resolved directory
+    named by ``relative``), and ``document_level`` marks a bare ``Design N`` in
+    specs-directory mode, whose claim is only that the resolved document exists and holds
+    content — never that it carries a ``## N`` heading (the document *is* ``N``).
     """
 
     label: str
@@ -504,49 +536,261 @@ class _CitedSpec:
     path: Path | None
     section: str | None = None
     decision: str | None = None
+    problem: str | None = None
+    document_level: bool = False
+
+
+def spec_document_number(name: str) -> str | None:
+    """The dotted number a spec-document *filename* carries, or ``None`` (G1.3 req 2).
+
+    The resolver's own filename predicate, and the **one** copy of the rule: ``aidw
+    doctor`` imports this (``_check_specs_dir``) instead of matching ``Design *.md``
+    itself, because a doctor-local glob can disagree with the resolver in both directions
+    — OK on a directory that resolves to zero candidates, WARN on one that resolves
+    cleanly. Anchored and case-sensitive (the citation token is), and `` - `` must follow
+    the number directly, so a lettered filename such as ``Design 5.3A - …`` is not a
+    numbered document at all (the section check's letter rule is a different rule, for a
+    ``§`` token).
+    """
+    match = _SPEC_DOCUMENT_RE.match(name)
+    return match.group(1) if match else None
+
+
+def _display_path(root: Path, path: Path) -> str:
+    """``path`` relative to ``root`` when it lies inside it, else its absolute spelling."""
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _spec_document_matches(specs_root: Path, number: str) -> list[Path]:
+    """Every numbered spec document **directly** in ``specs_root`` (flat scan, G1.3).
+
+    No recursion on purpose: a nested ``Design N`` document is not one of the directory's
+    own documents, and walking into subdirectories would silently change the zero/one/many
+    result the gap rule depends on. The number comparison reuses :func:`_canonical_number`,
+    so a zero-padded citation and an unpadded filename are the same document while a parent
+    number never matches a sub-numbered filename. An unreadable/absent directory yields no
+    candidates (the caller reports the gap naming the directory); sorted output keeps the
+    ambiguity message and the scan deterministic.
+    """
+    target = _canonical_number(number)
+    try:
+        children = sorted(specs_root.iterdir())
+    except OSError:
+        return []
+    matches: list[Path] = []
+    for child in children:
+        if not child.is_file():
+            continue
+        carried = spec_document_number(child.name)
+        if carried is None or _canonical_number(carried) != target:
+            continue
+        matches.append(child)
+    return matches
+
+
+def _citation_tokens(blob: str) -> list[tuple[int, int, str, str]]:
+    """Every citation token in ``blob``, in one pass, as ``(start, end, kind, text)``.
+
+    ``kind`` is ``"design"`` for a ``Design N`` token and ``"document"`` for a
+    ``<NAME>.md`` one. Both kinds are one scan so the window boundaries include the other
+    channel: a ``§`` after ``Design 11`` and before the next ``.md`` token belongs to the
+    ``Design`` citation (G1.3 req 3).
+    """
+    tokens: list[tuple[int, int, str, str]] = []
+    for match in _CITATION_TOKEN_RE.finditer(blob):
+        text = match.group(0)
+        kind = "design" if _DESIGN_TOKEN_RE.fullmatch(text) else "document"
+        tokens.append((match.start(), match.end(), kind, text))
+    return tokens
+
+
+def _citation_window(
+    blob: str, tokens: list[tuple[int, int, str, str]], position: int
+) -> str:
+    """The text after token ``position`` up to the next token of either channel."""
+    _start, end, _kind, _text = tokens[position]
+    window_end = tokens[position + 1][0] if position + 1 < len(tokens) else len(blob)
+    return blob[end:window_end]
+
+
+def _design_windows(
+    blob: str, tokens: list[tuple[int, int, str, str]], label: str
+) -> list[str]:
+    """Every window after a ``Design N`` token spelling ``label`` (possibly none).
+
+    One window per **occurrence**, never only the first, because ``RoadmapTask.citations``
+    is the de-duplicated enumerated channel (roadmap-format.md §8): a `Done when` block that
+    cites one design twice with two sections — ``(Design 11 §5.3; Design 11 §5)`` — collapses
+    to a single ``Design 11`` label, so stopping at the first token silently drops ``§5`` and
+    reports no gap for a section that does not exist. Iterating the tokens keeps both
+    windows; :func:`_specs_mode_citations` still dedups on the ``(document, section)`` pair,
+    so the same pair cited twice is checked and rendered once (roadmap-format.md §8.1: "a
+    repeated citation is not checked twice while `§5.3` and `§5` together are two pairs").
+
+    A citation whose token is not literally in the citation text (a caller passing a
+    citation explicitly) has no window; that keeps the enumeration byte-identical while
+    still letting the merged scan supply the boundaries for the tokens that are there.
+    """
+    key = " ".join(label.split())
+    return [
+        _citation_window(blob, tokens, position)
+        for position, (_start, _end, kind, text) in enumerate(tokens)
+        if kind == "design" and " ".join(text.split()) == key
+    ]
+
+
+def _specs_mode_citations(
+    *,
+    repo: TargetRepo,
+    entry: RoadmapTask,
+    blob: str,
+    tokens: list[tuple[int, int, str, str]],
+    specs_dir: str,
+    pairs: set[tuple[object, ...]],
+) -> list[_CitedSpec]:
+    """The ``Design N`` channel resolved against ``paths.specs_dir`` (G1.3 reqs 2/3).
+
+    One entry per ``(document, section)`` pair: the document comes from the flat scan and
+    the sections from the ``§M`` tokens in **that occurrence's** window, so a citation whose
+    token is written twice is two windows and each carries its own claim — ``(Design 11
+    §5.3; Design 11 §5)`` checks both sections, and an occurrence with no ``§`` token is
+    document-level (exists + non-empty) even when a sibling occurrence names a section.
+    ``pairs`` is shared across citations, so the same pair cited twice is checked (and
+    rendered) once — dedupe is on the pair, never on the token spelling or on the
+    occurrence. Zero or several candidates is a gap naming the resolved directory and the
+    reason; there is deliberately no fallback to a root ``design.md``.
+    """
+    specs_root = repo.root / specs_dir
+    specs_display = _display_path(repo.root, specs_root)
+    cited: list[_CitedSpec] = []
+    for citation in entry.citations:
+        number = citation.split(maxsplit=1)[-1]
+        # A citation passed without its token in the text (a caller handing one in
+        # explicitly) opens no window; one empty window keeps the document-level claim.
+        windows = _design_windows(blob, tokens, citation) or [""]
+        matches = _spec_document_matches(specs_root, number)
+        if len(matches) != 1:
+            key: tuple[object, ...] = ("gap", specs_display, _canonical_number(number))
+            if key in pairs:
+                continue
+            pairs.add(key)
+            problem = (
+                f"no spec document numbered {number}"
+                if not matches
+                else (
+                    f"{len(matches)} spec documents numbered {number}: "
+                    + ", ".join(path.name for path in matches)
+                )
+            )
+            cited.append(
+                _CitedSpec(
+                    label=citation,
+                    relative=specs_display,
+                    path=None,
+                    problem=problem,
+                )
+            )
+            continue
+        document = matches[0]
+        display = _display_path(repo.root, document)
+        for window in windows:
+            sections = [match.group(1) for match in _SECTION_RE.finditer(window)]
+            if not sections:
+                key = ("document", display)
+                if key in pairs:
+                    continue
+                pairs.add(key)
+                cited.append(
+                    _CitedSpec(
+                        label=citation,
+                        relative=display,
+                        path=document,
+                        document_level=True,
+                    )
+                )
+                continue
+            for section in sections:
+                key = ("section", display, _canonical_number(section))
+                if key in pairs:
+                    continue
+                pairs.add(key)
+                cited.append(
+                    _CitedSpec(
+                        label=citation,
+                        relative=display,
+                        path=document,
+                        section=section,
+                    )
+                )
+    return cited
 
 
 def _cited_specs(
-    repo: TargetRepo, entry: RoadmapTask, task_line: str, done_block: str
+    repo: TargetRepo,
+    entry: RoadmapTask,
+    task_line: str,
+    done_block: str,
+    *,
+    specs_dir: str | None = None,
 ) -> list[_CitedSpec]:
     """Enumerate every cited spec reference, in citation order (roadmap-format.md §8).
 
-    The single enumerator the evidence bundle and the cited-spec preflight share (G1.2), so
-    they cannot drift on what is cited. Both channels are enumerated exactly as
-    :func:`_render_cited_specs` has always rendered them:
+    The single enumerator the evidence bundle and the cited-spec preflight share (G1.2,
+    extended by G1.3), so they cannot drift on what is cited. ``{task_line}\\n{done_block}``
+    is scanned **once** for the tokens of both channels, and each citation's window is the
+    text after its token up to the next token of either channel.
 
-    - ``Design N``/``Design N.M`` from ``RoadmapTask.citations`` → ``design.md``;
-    - ``<NAME>.md`` tokens recovered from ``{task_line}\n{done_block}`` → the located file,
-      with a ``§N`` section taken verbatim from the token's window or a ``D<nn>`` id mapped
-      to the section of the file's heading that names it.
+    - ``Design N`` comes from ``RoadmapTask.citations``. With ``specs_dir`` declared it
+      resolves to the one flat ``Design <number> - <title>.md`` document and each ``§M``
+      in its window is a ``(document, section)`` pair (G1.3); with ``specs_dir`` unset the
+      channel is byte-identical to G1.2 — the document is a root ``design.md`` and the
+      section is the citation's own number.
+    - ``<NAME>.md`` tokens recovered from the blob resolve by unique basename, with a
+      ``§N`` taken verbatim from the token's window or a ``D<nn>`` id mapped to the
+      section of the file's heading that names it.
 
     The bare ``design.md`` token is skipped because the ``Design N`` channel already covers
     that file (roadmap-format.md §8.2), and a repeated ``<NAME>.md`` token is enumerated
     once, so neither a duplicated reference nor the two channels covering one file can
     report the same citation twice.
     """
-    cited: list[_CitedSpec] = [
-        _CitedSpec(
-            label=citation,
-            relative="design.md",
-            path=repo.root / "design.md",
-            section=citation.split(maxsplit=1)[-1],
-        )
-        for citation in entry.citations
-    ]
-
     blob = f"{task_line}\n{done_block}"
-    tokens = list(_DOC_TOKEN_RE.finditer(blob))
+    tokens = _citation_tokens(blob)
+
+    cited: list[_CitedSpec] = []
+    if specs_dir is not None:
+        cited.extend(
+            _specs_mode_citations(
+                repo=repo,
+                entry=entry,
+                blob=blob,
+                tokens=tokens,
+                specs_dir=specs_dir,
+                pairs=set(),
+            )
+        )
+    else:
+        cited.extend(
+            _CitedSpec(
+                label=citation,
+                relative="design.md",
+                path=repo.root / "design.md",
+                section=citation.split(maxsplit=1)[-1],
+            )
+            for citation in entry.citations
+        )
+
     seen: set[str] = set()
-    for position, match in enumerate(tokens):
-        token = match.group(0)
+    for position, (_start, _end, kind, token) in enumerate(tokens):
+        if kind != "document":
+            continue
         if token == "design.md" or token in seen:
             continue
         seen.add(token)
-        window_end = (
-            tokens[position + 1].start() if position + 1 < len(tokens) else len(blob)
-        )
-        window = blob[match.end() : window_end]
+        window = _citation_window(blob, tokens, position)
         path = _locate_doc(repo.root, token)
         if path is None:
             cited.append(_CitedSpec(label=token, relative=token, path=None))
@@ -581,8 +825,24 @@ def _cited_specs(
     return cited
 
 
+def _document_has_content(lines: list[str]) -> bool:
+    """Whether a document holds at least one non-blank, non-heading line (G1.3 req 3).
+
+    The document-level analogue of :func:`_section_state`: a file carrying only a title
+    and headings documents nothing, exactly as a heading with no body does. It counts
+    hash-prefixed prose (``#not a heading``) as content because :func:`_heading_level`
+    does.
+    """
+    return any(_heading_level(line) is None and line.strip() for line in lines)
+
+
 def _render_cited_specs(
-    repo: TargetRepo, entry: RoadmapTask, task_line: str, done_block: str
+    repo: TargetRepo,
+    entry: RoadmapTask,
+    task_line: str,
+    done_block: str,
+    *,
+    specs_dir: str | None = None,
 ) -> str:
     """``Design N`` citations plus the ``<NAME>.md`` doc refs ``RoadmapTask`` drops.
 
@@ -590,12 +850,18 @@ def _render_cited_specs(
     references (``EXTRACTION.md D16``) are recovered by re-reading the task line's
     parenthesised detail and the ``Done when:`` line and mapping each ``<NAME>.md``
     token to file+section — ``§n`` directly, ``D<nn>`` via the heading that names it.
-    The enumeration itself is :func:`_cited_specs` (G1.2); this function only renders it,
-    printing each section number verbatim, exactly as before.
+    The enumeration itself is :func:`_cited_specs` (G1.2/G1.3); this function only renders
+    it, printing each section number verbatim. With ``specs_dir`` declared it therefore
+    renders the resolved document path and every section the preflight checked, from the
+    same enumeration, so the bundle and the preflight cannot disagree (G1.3 req 6).
     """
     rendered: list[str] = []
-    for cited in _cited_specs(repo, entry, task_line, done_block):
-        if cited.path is None:
+    for cited in _cited_specs(
+        repo, entry, task_line, done_block, specs_dir=specs_dir
+    ):
+        if cited.problem is not None:
+            rendered.append(f"- {cited.label} → {cited.relative}: {cited.problem}")
+        elif cited.path is None:
             rendered.append(
                 f"- {cited.label} → unavailable — could not locate the file uniquely"
             )
@@ -627,9 +893,11 @@ def _canonical_number(number: str) -> tuple[int, ...]:
     """A dotted section number as an integer tuple, so leading zeros never matter.
 
     ``CITATION_RE`` accepts zero-padded citations (roadmap-format.md §8.1), so ``Design 09``
-    and ``## 9`` are the same section: compare ``(9,) == (9,)``, never the strings. The
-    canonical form lives in this comparison only — the evidence bundle keeps printing the
-    cited number verbatim (G1.2 requirement 2).
+    and ``## 9`` are the same section: compare ``(9,) == (9,)``, never the strings. G1.3's
+    spec-document resolver reuses it for the filename's number, so ``Design 04`` and
+    ``Design 4 - …`` are one document while ``(20,) != (20, 1)`` keeps a parent citation
+    from matching a sub-numbered document. The canonical form lives in these comparisons
+    only — the evidence bundle keeps printing the cited number verbatim (G1.2 req 2).
     """
     return tuple(int(part) for part in number.split("."))
 
@@ -665,9 +933,14 @@ def _section_state(lines: list[str], number: str) -> bool | None:
 
 
 def _spec_feasibility_gaps(
-    repo: TargetRepo, entry: RoadmapTask, task_line: str, done_block: str
+    repo: TargetRepo,
+    entry: RoadmapTask,
+    task_line: str,
+    done_block: str,
+    *,
+    specs_dir: str | None = None,
 ) -> list[str]:
-    """Every cited-spec problem for ``entry``, one gap string per problem (G1.2).
+    """Every cited-spec problem for ``entry``, one gap string per problem (G1.2/G1.3).
 
     A pure, deterministic, Pi-free preflight for ``aidw prompt`` (design §8.1): it walks
     :func:`_cited_specs` in citation order and reports, per cited reference, a file that
@@ -675,11 +948,22 @@ def _spec_feasibility_gaps(
     a cited section number no heading carries, and a section with no content. A bare
     ``<NAME>.md`` ref asks only that the file locate uniquely.
 
+    With ``paths.specs_dir`` declared (G1.3) the ``Design N`` channel is document-mode: zero
+    or several candidate documents is a gap naming the resolved directory and the reason,
+    each ``§M`` in the citation's window is checked as a section of *that* document, and a
+    bare citation is a document-level claim (exists and holds content). Every gap names the
+    resolved path and its reason.
+
     It never judges *whether* the section contradicts the roadmap or whether a
     prerequisite's work exists — that is the author's ``blocked:`` job (design §8.1).
     """
     gaps: list[str] = []
-    for cited in _cited_specs(repo, entry, task_line, done_block):
+    for cited in _cited_specs(
+        repo, entry, task_line, done_block, specs_dir=specs_dir
+    ):
+        if cited.problem is not None:
+            gaps.append(f"{cited.label} → {cited.relative}: {cited.problem}")
+            continue
         if cited.path is None:
             gaps.append(f"{cited.label} → could not locate the cited file uniquely")
             continue
@@ -693,7 +977,16 @@ def _spec_feasibility_gaps(
             )
             continue
         if cited.section is None:
-            # A bare ``<NAME>.md``: located uniquely is all it claims.
+            if not cited.document_level:
+                # A bare ``<NAME>.md``: located uniquely is all it claims.
+                continue
+            try:
+                document = cited.path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                gaps.append(f"{cited.label} → {cited.relative}: could not read the file")
+                continue
+            if not _document_has_content(document):
+                gaps.append(f"{cited.label} → {cited.relative}: the document is empty")
             continue
         try:
             lines = cited.path.read_text(encoding="utf-8").splitlines()
@@ -710,12 +1003,24 @@ def _spec_feasibility_gaps(
     return gaps
 
 
-def _refuse_spec_gaps(entry: RoadmapTask, gaps: list[str]) -> None:
-    """Exit-3 refusal naming the entry and every cited-spec gap (G1.2, design §8.1/§14).
+def _refuse_spec_gaps(
+    entry: RoadmapTask,
+    gaps: list[str],
+    *,
+    repo: TargetRepo,
+    specs_dir: str | None,
+) -> None:
+    """Exit-3 refusal naming the entry and every cited-spec gap (G1.2/G1.3, design §8.1/§14).
 
     Exit 3 is "workflow blocked (needs human)": a missing, unlocatable or empty cited
     section is a spec/roadmap defect only a human can fix, exactly the condition the
     author's ``blocked:`` line reports later and more expensively.
+
+    When the cause is the whole channel — no ``paths.specs_dir`` declared and no root
+    ``design.md`` to resolve ``Design N`` against — the refusal appends a remedy line
+    naming the config key as the fix (G1.3 req 5). It is appended for that one cause only:
+    a section gap inside a present document, or a doc-ref gap, already names its own
+    repair and would be misdirected by "declare a specs directory".
     """
     print(
         f"refusing: cannot author `{entry.task}` in `{entry.file}`; a cited spec section "
@@ -729,6 +1034,13 @@ def _refuse_spec_gaps(entry: RoadmapTask, gaps: list[str]) -> None:
         "never guesses — then re-run `aidw prompt`.",
         file=sys.stderr,
     )
+    if specs_dir is None and not (repo.root / "design.md").is_file():
+        print(
+            "Remedy: declare `paths.specs_dir` in `aidw/config.yaml`, naming the directory "
+            "that holds the numbered spec documents (`Design <number> - <title>.md`), or "
+            "commit the root `design.md` the `Design N` channel resolves against.",
+            file=sys.stderr,
+        )
 
 
 def _render_prerequisites(entries: list[RoadmapTask], entry: RoadmapTask) -> str:
@@ -802,12 +1114,16 @@ def _render_evidence_bundle(
     entries: list[RoadmapTask],
     rel: str,
     roadmap_dir: str,
+    specs_dir: str | None = None,
 ) -> str:
     """Render the six-element bundle (L2.4) for one stage.
 
     Every source read is degraded to an explicit ``unavailable`` note by the section
     renderers, so the bundle is always produced even when ``AGENTS.md`` is missing or the
-    roadmap file cannot be read.
+    roadmap file cannot be read. ``specs_dir`` is the resolved ``paths.specs_dir`` (G1.3)
+    and is threaded exactly as ``roadmap_dir`` is: the bundle renders the same enumeration
+    the preflight checked, so the two cannot disagree about the resolved document or the
+    sections checked in it.
     """
     task_line, done_block = _task_citation_inputs(
         repo, entry, roadmap_dir=roadmap_dir
@@ -839,7 +1155,9 @@ def _render_evidence_bundle(
             "",
             "## Cited spec sections",
             "",
-            _render_cited_specs(repo, entry, task_line, done_block),
+            _render_cited_specs(
+                repo, entry, task_line, done_block, specs_dir=specs_dir
+            ),
             "",
             "## Prerequisites (earlier tasks in the same phase file)",
             "",
@@ -866,6 +1184,7 @@ def _write_evidence_bundle(
     entries: list[RoadmapTask],
     rel: str,
     roadmap_dir: str,
+    specs_dir: str | None = None,
 ) -> Path | None:
     """Write ``stages/<stage>.evidence.md`` and return its absolute path, or ``None``.
 
@@ -882,6 +1201,7 @@ def _write_evidence_bundle(
             entries=entries,
             rel=rel,
             roadmap_dir=roadmap_dir,
+            specs_dir=specs_dir,
         )
         stages = directory / "stages"
         stages.mkdir(parents=True, exist_ok=True)
@@ -931,6 +1251,7 @@ def _stage_evidence_pointer(
     entries: list[RoadmapTask],
     rel: str,
     roadmap_dir: str,
+    specs_dir: str | None = None,
 ) -> str:
     """Write this stage's bundle and return the pointer to prepend to its ``extra``."""
     return _evidence_pointer(
@@ -942,6 +1263,7 @@ def _stage_evidence_pointer(
             entries=entries,
             rel=rel,
             roadmap_dir=roadmap_dir,
+            specs_dir=specs_dir,
         )
     )
 
@@ -2122,6 +2444,17 @@ def run(
     # threaded on to the evidence bundle, whose re-read is the second consumer of the same
     # directory (roadmap-format.md §6).
     roadmap_dir = str(resolved_config["paths.roadmap_dir"].value)
+    # G1.3 (design §8.1/§12.1, §17 Z22): the optional ``paths.specs_dir`` the ``Design N``
+    # citation channel resolves against. Unset (the toolkit default, deliberately absent)
+    # is ``None``, which keeps the channel byte-identical to G1.2; it is threaded to the
+    # preflight and the evidence bundle exactly as ``roadmap_dir`` is, so the two read one
+    # resolution. It is not a read-path, so ``validate_paths`` above never stat's it.
+    specs_entry = resolved_config.get("paths.specs_dir")
+    specs_dir = (
+        str(specs_entry.value)
+        if specs_entry is not None and specs_entry.is_set and specs_entry.value is not None
+        else None
+    )
     entries = load_tasks(
         repo.root / roadmap_dir, str(resolved_config["paths.roadmap_glob"].value)
     )
@@ -2167,7 +2500,11 @@ def run(
         repo, entry, roadmap_dir=roadmap_dir
     )
     spec_gaps = _spec_feasibility_gaps(
-        repo, entry, citation_task_line, citation_done_block
+        repo,
+        entry,
+        citation_task_line,
+        citation_done_block,
+        specs_dir=specs_dir,
     )
 
     # --- the run this invocation continues or replaces (H1.2 req 1/6) ------------- #
@@ -2349,7 +2686,7 @@ def run(
             # be spent first. Runs before `load_all`, branch setup and `create_run`, so a
             # refused run leaves no run directory, branch, worktree or prompt file behind.
             if spec_gaps:
-                _refuse_spec_gaps(entry, spec_gaps)
+                _refuse_spec_gaps(entry, spec_gaps, repo=repo, specs_dir=specs_dir)
                 return 3
             refusal = _verify_base_branch(repo, no_fetch=no_fetch)
             if refusal is not None:
@@ -2875,6 +3212,7 @@ def run(
                     entries=entries,
                     rel=rel,
                     roadmap_dir=roadmap_dir,
+                    specs_dir=specs_dir,
                 )
                 rec = run_stage(
                     _with_pointer(spec, pointer, delta),
@@ -3166,6 +3504,7 @@ def run(
                     entries=entries,
                     rel=rel,
                     roadmap_dir=roadmap_dir,
+                    specs_dir=specs_dir,
                 )
                 rec_fix = run_stage(
                     _with_pointer(spec, pointer),
@@ -3256,6 +3595,7 @@ def run(
                     entries=entries,
                     rel=rel,
                     roadmap_dir=roadmap_dir,
+                    specs_dir=specs_dir,
                 )
                 rec_reconcile = run_stage(
                     _with_pointer(reconcile_spec, pointer, reconcile_render),

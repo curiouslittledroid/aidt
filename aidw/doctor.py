@@ -56,6 +56,13 @@ from aidw.target_config import (
     validate_paths,
 )
 
+# G1.3 (design §8.1, §17 Z22): the **one** filename rule for a numbered spec document.
+# Deliberately imported from the resolver rather than re-implemented as a doctor-local
+# regex or ``Design *.md`` glob: a second copy can disagree with the resolver in both
+# directions (OK on a directory that resolves to zero candidates, WARN on one that
+# resolves cleanly), and the doctor must diagnose exactly what the preflight will see.
+from aidw.workflows.prompt import spec_document_number
+
 OK = "OK"
 WARN = "WARN"
 FAIL = "FAIL"
@@ -575,6 +582,86 @@ def _check_gates_heading(root: Path) -> Check:
     )
 
 
+def _check_specs_dir(root: Path) -> Check:
+    """Advisory ``paths.specs_dir`` diagnosis (G1.3; design §8.1/§12.1, §17 Z22).
+
+    A declared ``paths.specs_dir`` is where the ``Design N`` citation channel resolves a
+    spec document by number; it is **optional and not a read-path**, so its absence is
+    never a ``FAIL`` — a repo whose specs are a root ``design.md`` is the valid case that
+    keeps G1.2's channel unchanged. This check is the diagnosis for the four states in
+    which a ``Design N`` citation cannot resolve, each a ``WARN`` with no exit-code
+    effect: the declared directory is missing, is not a directory, holds no numbered spec
+    document, or none is declared while no root ``design.md`` exists.
+
+    "Numbered spec document" is the resolver's own predicate —
+    :func:`aidw.workflows.prompt.spec_document_number`, imported above — never a
+    doctor-local glob, so this check and the preflight cannot disagree about which files
+    count. Read-only: one config load, a few ``stat``/``iterdir`` calls, nothing written
+    (§3.1). A missing/unreadable config degrades to "nothing declared", which is how
+    :func:`aidw.target_config.load_target_config` already reports it.
+    """
+    declared = load_target_config(root / "aidw" / "config.yaml")
+    value = declared.paths.specs_dir if declared.paths is not None else None
+    remedy = (
+        "declare `paths.specs_dir` in `aidw/config.yaml` naming the directory of "
+        "`Design <number> - <title>.md` documents, or keep a root `design.md`."
+    )
+    if value is None:
+        if (root / "design.md").is_file():
+            return Check(
+                "specs dir",
+                OK,
+                "`paths.specs_dir` unset; `Design N` resolves against the root "
+                "design.md",
+            )
+        return Check(
+            "specs dir",
+            WARN,
+            "`paths.specs_dir` is unset and there is no root `design.md`, so a "
+            f"`Design N` citation cannot resolve; {remedy}",
+        )
+
+    path = root / value
+    if not path.exists():
+        return Check(
+            "specs dir",
+            WARN,
+            f"`paths.specs_dir` {path} does not exist; {remedy}",
+        )
+    if not path.is_dir():
+        return Check(
+            "specs dir",
+            WARN,
+            f"`paths.specs_dir` {path} is not a directory; {remedy}",
+        )
+    try:
+        numbered = sorted(
+            child.name
+            for child in path.iterdir()
+            if child.is_file() and spec_document_number(child.name) is not None
+        )
+    except OSError as exc:
+        # An unreadable directory cannot prove a numbered document exists: the same
+        # fail-closed direction the preflight takes, as an advisory WARN (§3.1).
+        return Check(
+            "specs dir",
+            WARN,
+            f"`paths.specs_dir` {path} could not be read ({exc}); {remedy}",
+        )
+    if not numbered:
+        return Check(
+            "specs dir",
+            WARN,
+            f"`paths.specs_dir` {path} holds no numbered spec document "
+            f"(`Design <number> - <title>.md`); {remedy}",
+        )
+    return Check(
+        "specs dir",
+        OK,
+        f"{path} — {len(numbered)} numbered spec document(s)",
+    )
+
+
 def _check_prompts(aidt: Path) -> Check:
     # Toolkit defaults only (E7.5 requirement 7): the resolved-per-target half lives in
     # ``aidw prompts check``, which knows the target; doctor stays toolkit-side.
@@ -746,6 +833,8 @@ def collect_checks(explicit: Path | None = None) -> list[Check]:
     checks.append(_check_architecture_trigger(target.root))
     # C1.2: advisory only — the bundle degrades, so an unrecognised heading is a WARN.
     checks.append(_check_gates_heading(target.root))
+    # G1.3: advisory only — `paths.specs_dir` is optional, so a miss is a WARN, never a FAIL.
+    checks.append(_check_specs_dir(target.root))
 
     aidt = toolkit_root()
     checks.append(_check_prompts(aidt))

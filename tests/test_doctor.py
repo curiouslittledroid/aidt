@@ -44,6 +44,7 @@ from aidw.doctor import (
     _check_git_version,
     _check_pi,
     _check_python,
+    _check_specs_dir,
     _check_target_config,
     _check_toolkit_version,
     _missing_gh_capabilities,
@@ -60,6 +61,7 @@ from aidw.target_config import (
     load_target_config,
     resolve_config,
 )
+from aidw.workflows.prompt import spec_document_number
 
 runner = CliRunner()
 
@@ -1532,3 +1534,119 @@ def test_target_config_docstring_keeps_the_version_source_on_compat() -> None:
     compat_doc = _check_compat.__doc__ or ""
     assert compat_doc, "_check_compat must keep its docstring"
     assert ":data:`aidw.__version__`" in compat_doc
+
+
+# ---------------------------------------------------------------------------
+# G1.3 — the advisory ``specs dir`` WARN (design §8.1/§12.1, §17 Z22)
+# ---------------------------------------------------------------------------
+
+_SPECS_CONFIG = "schema_version: 1\npaths:\n  specs_dir: docs/specs\n"
+
+
+def _specs_control(tmp_path: Path) -> Path:
+    """A supported layout (no root ``design.md``) ready for a ``paths.specs_dir`` case."""
+    _bare, control = _make_supported(tmp_path)
+    return control
+
+
+def test_g13_declared_but_missing_specs_dir_is_a_warn_naming_the_field(
+    tmp_path: Path,
+) -> None:
+    control = _specs_control(tmp_path)
+    _write_target_config(control, _SPECS_CONFIG)
+
+    check = _check_specs_dir(control)
+
+    assert check.status == WARN
+    assert "paths.specs_dir" in check.detail
+    assert "does not exist" in check.detail
+    # Not a read-path: the read-path check must not also fail the same directory.
+    assert _check_target_config(control).status == OK
+
+
+def test_g13_a_declared_specs_dir_that_is_a_file_is_a_warn(tmp_path: Path) -> None:
+    control = _specs_control(tmp_path)
+    (control / "docs" / "specs").write_text("not a directory\n", encoding="utf-8")
+    _write_target_config(control, _SPECS_CONFIG)
+
+    check = _check_specs_dir(control)
+
+    assert check.status == WARN
+    assert "is not a directory" in check.detail
+
+
+def test_g13_a_specs_dir_with_no_numbered_document_is_a_warn(tmp_path: Path) -> None:
+    """The shared predicate, not a doctor-local ``Design *.md`` glob.
+
+    ``Design draft.md`` matches a laxer glob but carries no ``Design <number> - `` prefix,
+    so a doctor-local rule would report OK while the resolver reports zero candidates.
+    """
+    control = _specs_control(tmp_path)
+    specs = control / "docs" / "specs"
+    specs.mkdir(parents=True)
+    (specs / "notes.md").write_text("Notes.\n", encoding="utf-8")
+    (specs / "Design draft.md").write_text("Draft.\n", encoding="utf-8")
+    _write_target_config(control, _SPECS_CONFIG)
+
+    # The doctor's predicate *is* the resolver's, imported rather than copied.
+    assert doctor.spec_document_number is spec_document_number
+    assert spec_document_number("Design draft.md") is None
+    assert spec_document_number("Design 4 - Story.md") == "4"
+
+    check = _check_specs_dir(control)
+
+    assert check.status == WARN
+    assert "no numbered spec document" in check.detail
+
+
+def test_g13_none_declared_and_no_root_design_md_is_a_warn(tmp_path: Path) -> None:
+    control = _specs_control(tmp_path)
+    assert not (control / "design.md").exists()
+
+    check = _check_specs_dir(control)
+
+    assert check.status == WARN
+    assert "paths.specs_dir" in check.detail
+    assert "design.md" in check.detail
+
+
+def test_g13_a_healthy_specs_dir_or_root_design_md_is_silent(tmp_path: Path) -> None:
+    control = _specs_control(tmp_path)
+    specs = control / "docs" / "specs"
+    specs.mkdir(parents=True)
+    (specs / "Design 4 - Story.md").write_text("# Story\n\nProse.\n", encoding="utf-8")
+    _write_target_config(control, _SPECS_CONFIG)
+
+    declared = _check_specs_dir(control)
+    assert declared.status == OK
+    assert "1 numbered spec document" in declared.detail
+
+    # Unset is valid when the root ``design.md`` channel resolves.
+    _write_target_config(control, "schema_version: 1\n")
+    (control / "design.md").write_text("# Design\n\n## 9. X\n\nProse.\n", encoding="utf-8")
+
+    unset = _check_specs_dir(control)
+    assert unset.status == OK
+    assert "design.md" in unset.detail
+
+
+def test_g13_specs_dir_warn_never_fails_the_doctor(
+    tmp_path: Path, fake_external_clis: None  # noqa: ARG001
+) -> None:
+    """Advisory only: every trigger state exits 0 because none of them is a FAIL."""
+    for name, prepare in (
+        ("missing", lambda control: _write_target_config(control, _SPECS_CONFIG)),
+        ("none-and-no-design", lambda control: None),
+    ):
+        case = tmp_path / name
+        case.mkdir()
+        control = _specs_control(case)
+        prepare(control)
+
+        checks = collect_checks(explicit=control)
+
+        assert _named(checks, "specs dir").status == WARN, name
+        assert not [item for item in checks if item.status == FAIL], [
+            (item.name, item.detail) for item in checks if item.status == FAIL
+        ]
+        assert run_doctor(explicit=control) == 0, name
