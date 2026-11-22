@@ -116,6 +116,7 @@ FULL_CONFIG: dict[str, Any] = {
         "build_results_template": "docs/implementation-results/TEMPLATE.md",
         "architecture_dir": "docs/architecture",
         "agent_configs_dir": "aidw/agent-configs",
+        "specs_dir": "docs/specs",
     },
     "workflows": {
         "prompt": {
@@ -169,6 +170,7 @@ PATHS_CONFIG_KEYS = {
     "build_results_template",
     "architecture_dir",
     "agent_configs_dir",
+    "specs_dir",
 }
 MARKERS_CONFIG_KEYS = {"parent", "child", "summary"}
 STAGE_CONFIG_KEYS = {
@@ -253,6 +255,7 @@ def test_full_section_3_4_config_loads_with_every_field_populated(tmp_path: Path
         build_results_template="docs/implementation-results/TEMPLATE.md",
         architecture_dir="docs/architecture",
         agent_configs_dir="aidw/agent-configs",
+        specs_dir="docs/specs",
     )
 
     assert set(config.workflows) == {"prompt", "implement"}
@@ -1387,6 +1390,7 @@ def test_schema_version_only_config_resolves_every_github_leaf_from_the_defaults
     assert {path for path, entry in resolved.items() if entry == ResolvedValue()} == {
         "requires_toolkit",
         "paths.agent_configs_dir",
+        "paths.specs_dir",
     }
 
 
@@ -1591,6 +1595,7 @@ def test_partial_config_resolves_defaults_and_leaves_only_unseeded_leaves_unset(
     } == {
         "requires_toolkit",
         "paths.agent_configs_dir",
+        "paths.specs_dir",
     }
     assert resolved["github.markers.parent"] == ResolvedValue(
         TOOLKIT_DEFAULTS.github.markers.parent, SOURCE_DEFAULT
@@ -1609,6 +1614,26 @@ MYTHICAL_FORGE_LAYOUT = (
     ("paths.build_results_template", "docs/implementation-results/TEMPLATE.md"),
     ("paths.architecture_dir", "docs/architecture"),
 )
+
+
+def test_specs_dir_is_unset_by_default_and_resolves_config_provenance(
+    tmp_path: Path,
+) -> None:
+    """G1.3: the optional spec directory is unset, not defaulted, and round-trips."""
+    assert resolve_config(TargetConfig())["paths.specs_dir"] == ResolvedValue()
+
+    resolved = _resolve_loaded(
+        tmp_path,
+        {"schema_version": 1, "paths": {"specs_dir": "docs/specs"}},
+    )
+
+    assert resolved["paths.specs_dir"] == ResolvedValue("docs/specs", SOURCE_CONFIG)
+    declared = load_target_config(
+        _write_config(
+            tmp_path, {"schema_version": 1, "paths": {"specs_dir": "docs/specs"}}
+        )
+    )
+    assert declared.paths == PathsConfig(specs_dir="docs/specs")
 
 
 def test_schema_version_only_config_resolves_the_mythical_forge_layout() -> None:
@@ -1631,6 +1656,7 @@ def test_schema_version_only_config_resolves_the_mythical_forge_layout() -> None
         "max_revisions",
         * (path for path, _ in MYTHICAL_FORGE_LAYOUT),
         "paths.agent_configs_dir",
+        "paths.specs_dir",
         "github.markers.parent",
         "github.markers.child",
         "github.markers.summary",
@@ -2419,6 +2445,12 @@ def test_path_classification_is_the_roadmap_read_paths_and_the_architecture_writ
     for field in PATTERN_FIELDS:
         assert field not in READ_PATHS
         assert field not in WRITE_TARGETS
+    # G1.3's optional spec directory is the opposite case (a path, but legitimately
+    # absent): in neither mapping, so `validate_paths`/`ensure_write_targets` skip it.
+    assert "specs_dir" in PATHS_CONFIG_KEYS
+    assert "specs_dir" not in READ_PATHS
+    assert "specs_dir" not in WRITE_TARGETS
+    assert getattr(TOOLKIT_DEFAULTS.paths, "specs_dir") is None
 
 
 def test_declared_read_path_that_does_not_exist_is_one_error_naming_field_and_path(

@@ -52,6 +52,10 @@
         "agent_configs_dir": {
           "type": "string",
           "description": "Optional target-repo agent-config directory whose *.yaml files shadow the toolkit's agent-configs/ by id (E4.6). A read-path when named; unset means the toolkit defaults."
+        },
+        "specs_dir": {
+          "type": "string",
+          "description": "Optional directory of numbered spec documents (`Design <number> - <title>.md`, scanned flat) that `Design N` roadmap citations resolve against (G1.3). Neither a read-path nor a write-target: unset means today's root design.md channel."
         }
       }
     },

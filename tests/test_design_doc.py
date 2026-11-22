@@ -1192,3 +1192,102 @@ def test_o1_1_decision_row_records_the_blocked_bash_guidance() -> None:
         "tests/test_design_doc.py",
     ):
         assert path in row, path
+
+
+def test_g13_section_81_states_the_specs_dir_resolution() -> None:
+    """G1.3: §8.1 states the document mode, its canonical comparison and the window rule.
+
+    Without it a later reader would restore the "section `N` of `design.md`" assumption
+    and make a repo whose specs are one document per design number unauthorable again.
+    """
+    block = " ".join(_section_81_block(_design_md()).split())
+
+    assert "`paths.specs_dir`" in block
+    assert "flat scan, no recursion" in block
+    assert "canonically" in block
+    assert "`Design 04` ≡ `Design 4 - …`" in block
+    assert "`Design 20` never matches `Design 20.1 - …`" in block
+    assert "zero or several candidates" in block
+    assert "never a fallback to a root `design.md`" in block
+    assert "own window" in block
+    assert "`(document, section)` pair" in block
+    assert "exist and be non-empty" in block
+    assert "`§5.3A`" in block and "parent `5.3` only" in block
+    assert "lettered-form gap" in block
+    assert "byte-identically" in block
+    # The remedy line is design, not only the error's copy.
+    assert "remedy line" in block
+
+
+def test_g13_section_12_1_states_specs_dir_is_neither_a_read_path_nor_a_target() -> None:
+    """G1.3: §12.1 classifies the key, so a later reader cannot add it to `READ_PATHS`.
+
+    Adding it there would make `validate_paths` FAIL a legitimately-absent optional
+    directory, the opposite of the required advisory WARN.
+    """
+    design = _design_md()
+    block = " ".join(_section(design, "### 12.1", "### 12.2").split())
+
+    assert "`paths.specs_dir`" in block
+    assert "neither a read-path nor a write-target" in block
+    assert "`validate_paths` never stat's it" in block
+    assert "advisory `WARN`, never a FAIL" in block
+
+
+def test_g13_decision_row_records_the_specs_dir_resolution() -> None:
+    """G1.3: exactly one §17 row records the task, its files and its prompt-fixed choices.
+
+    Matched by task id + wording, never by a ``Z`` number: ``aidw/conventions.md`` forbids
+    reusing or renumbering an id, so this pin must not pin the number.
+    """
+    decisions = _section(_design_md(), "## 17. Resolved decisions", "## 18. Risks")
+    rows = [
+        line
+        for line in decisions.splitlines()
+        if re.match(r"^\| Z\d+ \|", line)
+        and "05-G1.3" in line
+        and "specs_dir" in line
+        and "spec_document_number" in line
+    ]
+    assert len(rows) == 1, f"expected exactly one 05-G1.3 decision row, found {len(rows)}"
+    row = rows[0]
+    # The config surface and its classification.
+    assert "`PathsConfig.specs_dir`" in row
+    assert "`PATH_FIELDS`" in row
+    assert "**unset, not defaulted**" in row
+    assert "`READ_PATHS`" in row and "`WRITE_TARGETS`" in row
+    # The resolver and the shared window enumeration.
+    assert "`_SPEC_DOCUMENT_RE`" in row
+    assert "`_spec_document_matches`" in row
+    assert "`_canonical_number`" in row
+    assert "`_cited_specs`" in row
+    assert "`_citation_tokens`" in row
+    # Plural, never `_design_window`: the de-duplicated `citations` list must not make the
+    # first token's window the only one checked (a repeated `Design N` is two windows).
+    assert "`_design_windows`" in row
+    assert "`_document_has_content`" in row
+    assert "`_spec_feasibility_gaps`" in row
+    assert "`_refuse_spec_gaps`" in row
+    assert "`_render_evidence_bundle`" in row
+    assert "`_check_specs_dir`" in row
+    assert "`_SECTION_RE` is not extended to capture letters" in row
+    # The prompt-fixed decisions travel with the row (Z2/Z9/Z11's precedent).
+    assert "Prompt-fixed decisions" in row
+    for decision in ("(a)", "(b)", "(c)", "(d)"):
+        assert decision in row, decision
+    assert "existence-only contract" in row
+    # The spec sections and the touched set are named, so the contract tests are findable.
+    assert "§§8.1, 11, 12.1, 14, 17" in row
+    for path in (
+        "aidw/target_config.py",
+        "aidw/workflows/prompt.py",
+        "aidw/doctor.py",
+        "tests/test_prompt_workflow.py",
+        "tests/test_doctor.py",
+        "tests/test_design_doc.py",
+    ):
+        assert path in row, path
+    # No §17 id is reused: every Z id appears exactly once (``aidw/conventions.md``).
+    ids = re.findall(r"^\| (Z\d+) \|", decisions, re.M)
+    duplicates = sorted({identifier for identifier in ids if ids.count(identifier) > 1})
+    assert duplicates == [], f"reused §17 decision ids: {duplicates}"

@@ -328,6 +328,24 @@ and the first physical `Done when` line. Matches are collected into a set and so
 `aidw tasks --show` prints them as `Specs:     Design 8.1`; the stage evidence bundle
 renders each as `Design 8.1 → design.md §8.1`.
 
+**Where `N` resolves** is configuration (G1.3, design §8.1). With no `paths.specs_dir`
+declared, the document is a root `design.md` and the citation's own number is the section
+checked inside it. With `paths.specs_dir` declared, `Design N` names a **document**, not a
+section: the channel resolves it to the one file sitting directly in that directory whose
+filename carries the `Design <number> - ` prefix (a flat scan, no recursion), comparing
+`<number>` to `N` canonically as dotted integers — so `Design 04` and `Design 4 - …` are one
+document, while `Design 20` never matches `Design 20.1 - …`. Zero or several candidate files
+is a gap naming the directory and the reason; there is no fallback to a root `design.md`.
+The section comes from a `§M` token inside that citation's own window — the text after the
+token up to the next citation token of **either** channel — and each `(document, section)`
+pair is checked once, so a repeated citation is not checked twice while `§5.3` and `§5`
+together are two pairs. A trailing capital letter (`§5.3A`) is a sub-part label: it is
+checked against its parent `5.3` only and never reported as a lettered-form gap, because a
+lettered sub-part is a deeper numbered heading in one spec and a plain list label in
+another, so no deterministic rule spans both. A bare `Design N` (no `§M` in its window)
+asks only that the resolved document exist and be non-empty, the document-level analogue of
+the section rule — never that it carries a `## N` heading.
+
 This channel captures **only** `Design N` tokens. It never captures a filename.
 
 ### 8.2 `<NAME>.md` doc refs → the prompt stage's cited-specs section

@@ -57,7 +57,10 @@ exist when a config or a toolkit default names it, or a **write-target**
 (:data:`WRITE_TARGETS`), which a stage creates on demand. :func:`validate_paths` is the
 read-path check (pure, no writes, no fallback); :func:`ensure_write_targets` is the
 write-target side (``mkdir`` only, and only for a stage that is enabled). ``roadmap_glob``
-is a pattern, not a path, and is neither classified nor existence-checked.
+is a pattern, not a path, and is neither classified nor existence-checked. G1.3's
+``specs_dir`` is a path but also neither: optional and legitimately absent, so ``aidw
+doctor`` WARNs rather than :func:`validate_paths` failing a repo whose ``Design N``
+citations resolve against a root ``design.md``.
 """
 
 from __future__ import annotations
@@ -120,6 +123,10 @@ PATH_FIELDS = (
     # E4.6's global agent-config override (D12 "override agent config globally"): a
     # target-repo directory whose ``*.yaml`` files shadow the toolkit's by id.
     "agent_configs_dir",
+    # G1.3 (design §8.1/§12.1, §17 Z22): the directory a ``Design N`` citation resolves
+    # against — one flat scan for ``Design <number> - <title>.md``. Unset, not defaulted:
+    # a repo whose specs are one root ``design.md`` keeps today's channel unchanged.
+    "specs_dir",
 )
 
 #: ``github.markers`` is a fixed three-key object (D5 / §3.9); any other marker key is a
@@ -419,6 +426,13 @@ class PathsConfig:
     #: (no value in :data:`TOOLKIT_DEFAULTS`): the consumer falls back to the toolkit
     #: directory, so a repo with no such folder never validates a path it does not have.
     agent_configs_dir: str | None = None
+    #: G1.3's spec-directory override: a target-repo directory of one document per design
+    #: number (``Design <number> - <title>.md``), scanned flat. Deliberately **unset, not
+    #: defaulted** (no value in :data:`TOOLKIT_DEFAULTS`), and deliberately neither a
+    #: read-path nor a write-target: absent is the valid case for a repo whose specs are a
+    #: root ``design.md``, so ``aidw doctor`` WARNs rather than :func:`validate_paths`
+    #: failing a directory the workflow reads only when the channel resolves a citation.
+    specs_dir: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1107,9 +1121,9 @@ class ResolvedValue:
     ``source is None`` is the *unset* state (value ``None`` too): the config did not
     declare the field and no default exists for it. After E6.1 the ``paths:``/``repo:``
     leaves and every ``github.markers.*``/``github.labels.*`` leaf always resolve
-    ``default``; the still-unset leaves are ``schema_version``, ``requires_toolkit`` and
-    ``paths.agent_configs_dir``. ``aidw config show`` renders that state as ``unset`` and
-    omits the ``source`` key in its JSON.
+    ``default``; the still-unset leaves are ``schema_version``, ``requires_toolkit``,
+    ``paths.agent_configs_dir`` and G1.3's ``paths.specs_dir``. ``aidw config show``
+    renders that state as ``unset`` and omits the ``source`` key in its JSON.
     """
 
     value: Any = None
@@ -1132,8 +1146,8 @@ class ResolvedConfig(Mapping[str, ResolvedValue]):
     """The merged config as a flat ``dotted path -> ResolvedValue`` mapping.
 
     Flat and dotted on purpose: ``schema_version``, ``max_revisions``,
-    ``repo.base_branch``, the seven ``paths.<field>`` leaves (six seeded defaults plus
-    E4.6's unset ``agent_configs_dir``),
+    ``repo.base_branch``, the eight ``paths.<field>`` leaves (six seeded defaults plus
+    E4.6's unset ``agent_configs_dir`` and G1.3's unset ``specs_dir``),
     ``github.markers.<name>``, ``github.labels.<name>.{color,description}``, and one
     whole-list entry per declared ``workflows.<name>.{stages,parallel_groups}``.
     Mirroring §3.4's YAML nesting would hand E3.4/E4.1/E6 a second addressing scheme, and
@@ -1185,11 +1199,13 @@ class ConfigDefaults:
     through: this module must not import ``aidw.paths`` (layering), so the equality is
     pinned by the tests rather than derived from one shared constant.
 
-    ``paths.agent_configs_dir`` is deliberately absent from the seeded block even though
-    the field exists (§3.4's ``paths:`` example does not name it either): it is
-    "unset, not defaulted", because its consumer falls back to ``<toolkit>/agent-configs``
-    and a seeded repo-relative path would make every repo without that folder fail
-    :func:`validate_paths`. Seeding nothing is what keeps a config-less repo valid.
+    ``paths.agent_configs_dir`` and G1.3's ``paths.specs_dir`` are deliberately absent from
+    the seeded block even though the fields exist (§3.4's ``paths:`` example does not name
+    either): both are "unset, not defaulted". The former's consumer falls back to
+    ``<toolkit>/agent-configs`` and a seeded repo-relative path would make every repo
+    without that folder fail :func:`validate_paths`; the latter resolves ``Design N``
+    citations, and an unset value is the valid case that keeps today's root-``design.md``
+    channel byte-identical. Seeding nothing is what keeps a config-less repo valid.
 
     ``github`` carries the frozen D5 markers and label definitions (E6.1, §3.4/§3.9).
     ``workflows`` is present but empty: an empty slot resolves *unset* rather than
@@ -1553,7 +1569,9 @@ def resolve_workflow_config(
 #: Deliberately not merged with §3.4's *other* use of "write-target" (the gate-scope
 #: declaration: R18's ``implementation_results_dir``/``architecture_dir``/``roadmap_dir``/
 #: ``task_prompts_dir``), which asks a different question — what a gate cannot read —
-#: about a partly overlapping set.
+#: about a partly overlapping set. G1.3's ``specs_dir`` is deliberately **not** here: it
+#: is optional and legitimately absent, so its absence is an advisory ``aidw doctor`` WARN
+#: (``_check_specs_dir``), never a read-path FAIL.
 READ_PATHS = (
     "build_results_template",
     "roadmap_dir",

@@ -726,6 +726,7 @@ CONFIG_LEAF_PATHS = (
     "paths.build_results_template",
     "paths.architecture_dir",
     "paths.agent_configs_dir",
+    "paths.specs_dir",
     "github.markers.parent",
     "github.markers.child",
     "github.markers.summary",
@@ -785,6 +786,8 @@ CONFIG_UNSET_LEAVES = (
     "requires_toolkit",
     # E4.6: the global agent-config override dir is unset, not defaulted.
     "paths.agent_configs_dir",
+    # G1.3: the optional spec directory is unset, not defaulted.
+    "paths.specs_dir",
 )
 
 

@@ -8223,9 +8223,10 @@ def _spec_gaps(
     citations: list[str] | None = None,
     task_line: str = "",
     done_block: str = "",
+    specs_dir: str | None = None,
 ) -> list[str]:
     return prompt_workflow._spec_feasibility_gaps(
-        repo, _spec_entry(citations), task_line, done_block
+        repo, _spec_entry(citations), task_line, done_block, specs_dir=specs_dir
     )
 
 
@@ -8754,3 +8755,440 @@ def test_g12_cited_spec_gap_property(tmp_path: Path) -> None:
         assert prompt_workflow._spec_feasibility_gaps(repo, entry, task_line, "") == gaps
         assert _tree_snapshot(case_root) == before
         assert entry.citations == [design_citation]
+
+
+# ---------------------------------------------------------------------------
+# G1.3 — resolve `Design N` citations against a repo-declared spec directory
+#        (design §8.1, §17 Z22; roadmap-format.md §8.1; docs/target-repo-config.md)
+# ---------------------------------------------------------------------------
+
+#: A synthetic spec directory: the zero-padding pair (`Design 04` ⇒ `Design 4 - …`), a
+#: sub-numbered document a parent citation must not match (`Design 20.1`), an ambiguous
+#: pair (`Design 7` twice), and two files a doctor-local `Design *.md` glob would wrongly
+#: accept (no `Design <number> - ` prefix).
+SPECS_MODE_FILES = {
+    "docs/specs/Design 4 - Story Manager.md": (
+        "# Story Manager\n\n## 5.3 Sub-part\n\nProse.\n"
+    ),
+    "docs/specs/Design 20.1 - Condition Language.md": (
+        "# Condition Language\n\n## 2. Effect\n\nProse.\n"
+    ),
+    "docs/specs/Design 7 - Alpha.md": "# Alpha\n\n## 1. One\n\nProse.\n",
+    "docs/specs/Design 7 - Beta.md": "# Beta\n\n## 1. One\n\nProse.\n",
+    "docs/specs/notes.md": "Notes, not a numbered spec document.\n",
+    "docs/specs/Design draft.md": "A draft whose number is a word.\n",
+}
+
+
+def test_g13_specs_mode_resolves_a_document_by_its_canonical_number(
+    tmp_path: Path,
+) -> None:
+    """`Design 04` ⇒ `Design 4 - …`; `Design 20` never matches `Design 20.1 - …`."""
+    repo = _spec_repo(tmp_path, dict(SPECS_MODE_FILES))
+
+    # Zero padding is not a different document (the filename comparator is canonical).
+    assert _spec_gaps(repo, citations=["Design 04"], specs_dir="docs/specs") == []
+    assert _spec_gaps(repo, citations=["Design 4"], specs_dir="docs/specs") == []
+    # A parent number is not a prefix match on a sub-numbered filename.
+    assert _spec_gaps(repo, citations=["Design 20"], specs_dir="docs/specs") == [
+        "Design 20 → docs/specs: no spec document numbered 20"
+    ]
+    assert _spec_gaps(repo, citations=["Design 20.1"], specs_dir="docs/specs") == []
+    # A citation nothing carries names the resolved directory and the reason.
+    assert _spec_gaps(repo, citations=["Design 99"], specs_dir="docs/specs") == [
+        "Design 99 → docs/specs: no spec document numbered 99"
+    ]
+
+
+def test_g13_ambiguous_spec_documents_are_a_gap_naming_every_candidate(
+    tmp_path: Path,
+) -> None:
+    """Two candidates is no more resolvable than zero, and neither falls back to root."""
+    repo = _spec_repo(tmp_path, dict(SPECS_MODE_FILES))
+
+    assert _spec_gaps(repo, citations=["Design 7"], specs_dir="docs/specs") == [
+        "Design 7 → docs/specs: 2 spec documents numbered 7: "
+        "Design 7 - Alpha.md, Design 7 - Beta.md"
+    ]
+
+
+def test_g13_the_spec_scan_is_flat_and_never_recurses(tmp_path: Path) -> None:
+    """A nested numbered document is not one of the directory's own documents."""
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "docs/specs/nested/Design 8 - Nested.md": "# Nested\n\nProse.\n",
+            "docs/specs/Design draft.md": "Not numbered.\n",
+        },
+    )
+
+    assert _spec_gaps(repo, citations=["Design 8"], specs_dir="docs/specs") == [
+        "Design 8 → docs/specs: no spec document numbered 8"
+    ]
+
+
+def test_g13_unset_specs_dir_keeps_the_root_design_md_channel(tmp_path: Path) -> None:
+    """Unset is byte-identical: root `design.md`, the citation's own number as the section.
+
+    The same citation checked in specs mode names the spec document instead, so this pair
+    proves the two modes read different files rather than one falling back to the other.
+    """
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "design.md": "# Design\n\n## 9. Test fixture\n\nRoot prose.\n",
+            "docs/specs/Design 9 - Other.md": "# Other\n\n## 1. Other\n\nOther prose.\n",
+        },
+    )
+
+    assert _spec_gaps(repo, citations=["Design 9"]) == []
+    # In specs mode the `§9` in the citation's window is checked inside that document;
+    # unset mode ignores the window and checks the citation's own number in design.md.
+    assert _spec_gaps(
+        repo,
+        citations=["Design 9"],
+        task_line="(Design 9 §9)",
+        specs_dir="docs/specs",
+    ) == [
+        "Design 9 → docs/specs/Design 9 - Other.md: no heading numbered §9"
+    ]
+    assert _spec_gaps(repo, citations=["Design 9"], task_line="(Design 9 §9)") == []
+    # The rendering of the unset channel is unchanged (verbatim cited number).
+    assert (
+        prompt_workflow._render_cited_specs(repo, _spec_entry(["Design 09"]), "", "")
+        == "- Design 09 → design.md §09"
+    )
+
+
+def test_g13_citation_windows_enumerate_every_section_and_dedupe_pairs(
+    tmp_path: Path,
+) -> None:
+    """`§5.3` and `§5` are distinct pairs; the same pair cited twice is checked once."""
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "docs/specs/Design 11 - Foo.md": "# Foo\n\n## 5.3 Sub-part\n\nProse.\n",
+            "docs/migration/EXTRACTION.md": "# Extraction\n\n## 3.1 Section\n\nProse.\n",
+        },
+    )
+
+    # Both `§` tokens in the Design citation's window are checked.
+    assert _spec_gaps(
+        repo,
+        citations=["Design 11"],
+        task_line="(Design 11 §5.3 and §5, EXTRACTION.md §3.1)",
+        specs_dir="docs/specs",
+    ) == ["Design 11 → docs/specs/Design 11 - Foo.md: no heading numbered §5"]
+
+    # `Design 11` and `Design 011` resolve to one document and one section: one pair,
+    # so one enumerated reference — dedupe is on the pair, never on the token spelling.
+    entry = _spec_entry(["Design 11", "Design 011"])
+    cited = prompt_workflow._cited_specs(
+        repo,
+        entry,
+        "(Design 11 §5.3, Design 011 §5.3)",
+        "",
+        specs_dir="docs/specs",
+    )
+    assert [
+        (item.relative, item.section, item.path is not None) for item in cited
+    ] == [("docs/specs/Design 11 - Foo.md", "5.3", True)]
+
+
+def test_g13_a_section_after_a_design_token_belongs_to_that_citation(
+    tmp_path: Path,
+) -> None:
+    """One merged token scan: the `§` before the next `.md` token is Design's window."""
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "docs/specs/Design 11 - Foo.md": "# Foo\n\n## 2. Intro\n\nProse.\n",
+            "docs/migration/EXTRACTION.md": (
+                "# Extraction\n\n## 5.3 Leaked\n\nProse.\n\n## 3.1 Real\n\nProse.\n"
+            ),
+        },
+    )
+
+    assert _spec_gaps(
+        repo,
+        citations=["Design 11"],
+        task_line="(Design 11 §5.3, EXTRACTION.md §3.1)",
+        specs_dir="docs/specs",
+    ) == ["Design 11 → docs/specs/Design 11 - Foo.md: no heading numbered §5.3"]
+
+
+def test_g13_repeated_same_design_token_uses_each_token_window(
+    tmp_path: Path,
+) -> None:
+    """Repeated tokens are distinct windows, but the same pair is checked only once.
+
+    The roadmap parser's ``citations`` list is a set-like summary, so this deliberately
+    keeps one ``Design 11`` citation while the source line repeats that token with a second
+    section. The merged token scan must not use only the first occurrence's window.
+    """
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "docs/specs/Design 11 - Foo.md": (
+                "# Foo\n\n## 5.3 Sub-part\n\nProse.\n"
+            ),
+        },
+    )
+
+    assert _spec_gaps(
+        repo,
+        citations=["Design 11"],
+        task_line="(Design 11 §5.3; Design 11 §5)",
+        specs_dir="docs/specs",
+    ) == ["Design 11 → docs/specs/Design 11 - Foo.md: no heading numbered §5"]
+
+
+def test_g13_a_bare_occurrence_keeps_its_document_claim_beside_a_sectioned_one(
+    tmp_path: Path,
+) -> None:
+    """Per-occurrence claims: the bare token still asks for content, the other for §5.3.
+
+    ``(Design 11; Design 11 §5.3)`` is one de-duplicated citation, two tokens and two
+    windows, so neither claim may swallow the other: the bare occurrence checks the
+    document, the sectioned one checks its heading, and the two gaps name different
+    defects (roadmap-format.md §8.1, "the section comes from a `§M` token inside that
+    citation's own window").
+    """
+    repo = _spec_repo(
+        tmp_path,
+        {"docs/specs/Design 11 - Foo.md": "# Foo\n\n## 5.3 Sub-part\n"},
+    )
+
+    assert _spec_gaps(
+        repo,
+        citations=["Design 11"],
+        task_line="(Design 11; Design 11 §5.3)",
+        specs_dir="docs/specs",
+    ) == [
+        "Design 11 → docs/specs/Design 11 - Foo.md: the document is empty",
+        "Design 11 → docs/specs/Design 11 - Foo.md: §5.3 is empty",
+    ]
+
+
+def test_g13_a_trailing_capital_letter_checks_only_its_parent_section(
+    tmp_path: Path,
+) -> None:
+    """`§5.3A` is a sub-part label: `5.3` is checked, never a lettered-form gap."""
+    repo = _spec_repo(
+        tmp_path,
+        {"docs/specs/Design 5 - Foo.md": "# Foo\n\n## 5.3 Sub-part\n\nProse.\n"},
+    )
+
+    assert (
+        _spec_gaps(
+            repo,
+            citations=["Design 5"],
+            task_line="(Design 5 §5.3A)",
+            specs_dir="docs/specs",
+        )
+        == []
+    )
+    # The rule is the regex's: extending `_SECTION_RE` to capture the letter would make
+    # `group(1)` `5.3A`, which this pin rejects (and `_canonical_number` would choke on).
+    assert prompt_workflow._SECTION_RE.search("§5.3A").group(1) == "5.3"
+
+
+def test_g13_a_bare_citation_checks_the_document_not_a_heading_inside_it(
+    tmp_path: Path,
+) -> None:
+    """A bare `Design N` is a document-level claim: exists and is non-empty."""
+    repo = _spec_repo(
+        tmp_path,
+        {
+            # No `## 20` heading anywhere: the document *is* `20`, so this is no gap.
+            "docs/specs/Design 20 - Story.md": "# Story\n\nProse, no numbered heading.\n",
+            "docs/specs/Design 21 - Empty.md": "",
+            "docs/specs/Design 22 - Headings.md": (
+                "# Design 22\n\n## 1. One\n\n### 1.1 Two\n"
+            ),
+        },
+    )
+
+    assert _spec_gaps(repo, citations=["Design 20"], specs_dir="docs/specs") == []
+    assert _spec_gaps(repo, citations=["Design 21"], specs_dir="docs/specs") == [
+        "Design 21 → docs/specs/Design 21 - Empty.md: the document is empty"
+    ]
+    assert _spec_gaps(repo, citations=["Design 22"], specs_dir="docs/specs") == [
+        "Design 22 → docs/specs/Design 22 - Headings.md: the document is empty"
+    ]
+
+
+def test_g13_specs_mode_checker_is_pure_and_deterministic(tmp_path: Path) -> None:
+    """No input mutation, no write, and the same answer twice."""
+    repo = _spec_repo(tmp_path, dict(SPECS_MODE_FILES))
+    entry = _spec_entry(["Design 20", "Design 7"])
+    before_entry = dataclasses.replace(entry, citations=list(entry.citations))
+    before_tree = _tree_snapshot(tmp_path)
+
+    first = prompt_workflow._spec_feasibility_gaps(
+        repo, entry, "", "", specs_dir="docs/specs"
+    )
+    second = prompt_workflow._spec_feasibility_gaps(
+        repo, entry, "", "", specs_dir="docs/specs"
+    )
+
+    assert first == second
+    assert first == [
+        "Design 20 → docs/specs: no spec document numbered 20",
+        "Design 7 → docs/specs: 2 spec documents numbered 7: "
+        "Design 7 - Alpha.md, Design 7 - Beta.md",
+    ]
+    assert entry == before_entry
+    assert _tree_snapshot(tmp_path) == before_tree
+
+
+#: Pinned seed and run count for the resolver property sweep (AGENTS.md "Tests": pytest
+#: only, no ``hypothesis``, so a reproducible sample is the generator and no shrinking).
+SPEC_DOCUMENT_PROPERTY_SEED = 6131
+SPEC_DOCUMENT_PROPERTY_RUNS = 32
+
+
+def test_g13_spec_document_resolution_property(tmp_path: Path) -> None:
+    """Seeded property run (seed/runs pinned above): only one canonical candidate resolves.
+
+    For each sampled directory the flat resolver returns exactly the files whose filename
+    number is canonically equal to the citation's, in sorted order — so zero padding is
+    never a difference, a parent number never matches a sub-number, a non-conforming
+    filename and a nested document never count, and the preflight's gap appears exactly
+    when the candidate count is not one and names the directory and the reason.
+    """
+    rng = random.Random(SPEC_DOCUMENT_PROPERTY_SEED)
+    numbers = ("1", "1.1", "2", "04", "4", "20", "20.1", "007")
+
+    for case in range(SPEC_DOCUMENT_PROPERTY_RUNS):
+        case_root = tmp_path / f"case-{case}"
+        specs = case_root / "docs" / "specs"
+        specs.mkdir(parents=True)
+        chosen = [rng.choice(numbers) for _ in range(rng.randint(0, 4))]
+        for index, number in enumerate(chosen):
+            (specs / f"Design {number} - Doc {index}.md").write_text(
+                "# Doc\n\nProse.\n", encoding="utf-8"
+            )
+        (specs / "notes.md").write_text("Notes.\n", encoding="utf-8")
+        (specs / "Design draft.md").write_text("Draft.\n", encoding="utf-8")
+        nested = specs / "nested"
+        nested.mkdir()
+        (nested / "Design 99 - Nested.md").write_text("# Nested\n", encoding="utf-8")
+
+        citation_number = rng.choice([*numbers, "3", "99"])
+        canonical = prompt_workflow._canonical_number(citation_number)
+        expected = sorted(
+            f"Design {number} - Doc {index}.md"
+            for index, number in enumerate(chosen)
+            if prompt_workflow._canonical_number(number) == canonical
+        )
+        assert [
+            path.name
+            for path in prompt_workflow._spec_document_matches(specs, citation_number)
+        ] == expected
+
+        repo = TargetRepo(
+            root=case_root,
+            git_dir=case_root / ".git",
+            common_dir=case_root / ".git",
+        )
+        before = _tree_snapshot(case_root)
+        gaps = prompt_workflow._spec_feasibility_gaps(
+            repo,
+            _spec_entry([f"Design {citation_number}"]),
+            "",
+            "",
+            specs_dir="docs/specs",
+        )
+        if len(expected) == 1:
+            assert gaps == []
+        else:
+            assert len(gaps) == 1
+            assert gaps[0].startswith(f"Design {citation_number} → docs/specs: ")
+            if expected:
+                assert gaps[0].endswith(": " + ", ".join(expected))
+            else:
+                assert gaps[0].endswith(
+                    f": no spec document numbered {citation_number}"
+                )
+        # Pure and deterministic: same answer, no write, no input mutation.
+        assert (
+            prompt_workflow._spec_feasibility_gaps(
+                repo,
+                _spec_entry([f"Design {citation_number}"]),
+                "",
+                "",
+                specs_dir="docs/specs",
+            )
+            == gaps
+        )
+        assert _tree_snapshot(case_root) == before
+
+
+def test_g13_evidence_bundle_renders_the_resolved_path_and_checked_sections(
+    tmp_path: Path,
+) -> None:
+    """The bundle renders exactly what the preflight checked, from the same enumeration."""
+    repo = _spec_repo(
+        tmp_path,
+        {
+            "docs/tasks/03 - Test Phase.md": (
+                "# Phase 3: Test Phase\n\n## Epic E4: Defensive Combat\n\n"
+                "- [ ] **E4.1. Implement Total Defense** (Design 11 §5.3)\n"
+                "  - Done when: the effect is fixed.\n"
+            ),
+            "docs/specs/Design 11 - Foo.md": "# Foo\n\n## 5.3 Sub-part\n\nProse.\n",
+        },
+    )
+    # The evidence bundle re-reads the entry's own line, so point it at the task line
+    # (5) rather than the fixture default (4).
+    entry = dataclasses.replace(_spec_entry(["Design 11"]), line=5)
+
+    bundle = prompt_workflow._render_evidence_bundle(
+        stage="task-review-1",
+        repo=repo,
+        entry=entry,
+        entries=[entry],
+        rel="docs/task-prompts/03-E4.1-prompt.md",
+        roadmap_dir="docs/tasks",
+        specs_dir="docs/specs",
+    )
+
+    section = bundle.split("## Cited spec sections", 1)[1].split("## Prerequisites", 1)[0]
+    assert "- Design 11 → docs/specs/Design 11 - Foo.md §5.3" in section
+
+
+def test_g13_refusal_appends_the_specs_dir_remedy_when_no_channel_can_resolve(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """No `specs_dir` and no root `design.md`: the exit-3 refusal names the fix."""
+    _origin, clone = _origin_and_clone(tmp_path, roadmap=ROADMAP_MISSING_SPEC)
+    _run_git(["rm", "-q", "design.md"], clone)
+    _run_git(["commit", "-qm", "drop the root design.md"], clone)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert "Design 42.7 → design.md: file not found" in err
+    assert "Remedy:" in err and "paths.specs_dir" in err
+
+
+def test_g13_refusal_has_no_remedy_when_design_md_is_present(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A section gap inside a present `design.md` already names its own repair."""
+    _origin, clone = _origin_and_clone(tmp_path, roadmap=ROADMAP_MISSING_SPEC)
+    monkeypatch.setattr(prompt_workflow, "run_stage", _explode_stage)
+
+    code = prompt_workflow.run(
+        phase="03", epic="E4", task="E4.1", **_roots(clone), label=RUN_LABEL
+    )
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert "no heading numbered §42.7" in err
+    assert "Remedy:" not in err
